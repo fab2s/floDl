@@ -758,7 +758,7 @@ impl Timeline {
         // launcher, and a context would pin VRAM on every device).
         // `(physical nvidia-smi index, total VRAM bytes)` per device;
         // Vec position doubles as the CUDA runtime index.
-        let gpu_statics: Vec<(u8, u64)> = if cfg!(feature = "cuda") {
+        let gpu_statics: Vec<(u8, u64)> = if cfg!(feature = "gpu") {
             crate::sys::detect_gpus()
                 .into_iter()
                 .map(|g| (g.index, g.total_memory_mb * 1024 * 1024))

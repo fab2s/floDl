@@ -188,7 +188,7 @@ struct GpuStatic {
 /// ascending index list; a reordering list like `1,0` would mislabel
 /// allocator stats, which nothing in flodl's launch paths produces).
 fn detect_gpu_statics() -> Vec<GpuStatic> {
-    if !cfg!(feature = "cuda") {
+    if !cfg!(feature = "gpu") {
         return Vec::new();
     }
     crate::sys::detect_gpus()

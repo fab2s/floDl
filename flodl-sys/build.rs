@@ -8,6 +8,61 @@ fn main() {
         return;
     }
 
+    // --- vendor selection -------------------------------------------
+    //
+    // `gpu` is the vendor-neutral gate every GPU code path uses; `cuda`
+    // and `rocm` are the selectors that decide what gets linked. Cargo
+    // features are additive and cannot be made exclusive, so the
+    // combinations that make no sense are rejected here.
+    //
+    // Both checks sit AFTER the DOCS_RS early return above, so an
+    // `--all-features` documentation build (which necessarily enables
+    // both vendors) is unaffected.
+    let want_cuda = cfg!(feature = "cuda");
+    let want_rocm = cfg!(feature = "rocm");
+    if want_cuda && want_rocm {
+        eprintln!(
+            "\nflodl-sys: features `cuda` and `rocm` are mutually exclusive.\n\
+             They select which libtorch backend to link against, and a build\n\
+             can only link one. Enable exactly one.\n"
+        );
+        std::process::exit(1);
+    }
+    if cfg!(feature = "gpu") && !want_cuda && !want_rocm {
+        eprintln!(
+            "\nflodl-sys: feature `gpu` is enabled with no vendor selected.\n\
+             `gpu` marks the vendor-neutral GPU code paths; it does not say\n\
+             what to link. Enable `cuda` or `rocm` instead -- both imply it.\n"
+        );
+        std::process::exit(1);
+    }
+    if want_rocm {
+        // Known-good facts, read off libtorch 2.7.0+rocm6.3's own file
+        // list so P7 does not have to re-derive them:
+        //   link:        torch_hip, c10_hip, amdhip64, rccl  (all four
+        //                ship inside libtorch/lib, RCCL included)
+        //   force-load:  libtorch_hip.so  (the analogue of the
+        //                libtorch_cuda.so dlopen in ops_nn.cpp)
+        //
+        // What is NOT known, and is why this is an error rather than a
+        // blind link: the shim includes <c10/cuda/CUDAFunctions.h>,
+        // <c10/cuda/CUDACachingAllocator.h> and <nccl.h>. PyTorch
+        // hipifies those paths for ROCm builds, and whether they resolve
+        // verbatim against a ROCm libtorch has not been checked on
+        // hardware. Linking blind would fail deep in the C++ compile
+        // with a missing-header error that says nothing about the cause.
+        eprintln!(
+            "\nflodl-sys: the `rocm` feature is declared but the C++ shim's ROCm\n\
+             path is not implemented yet.\n\n\
+             The shim includes <c10/cuda/*> and <nccl.h>, which PyTorch hipifies\n\
+             for ROCm builds; that has not been verified against a real ROCm\n\
+             libtorch, so this build stops here rather than failing later with a\n\
+             missing-header error. Build with `--features cuda`, or with no GPU\n\
+             feature for CPU-only.\n"
+        );
+        std::process::exit(1);
+    }
+
     let libtorch = env::var("LIBTORCH_PATH")
         .unwrap_or_else(|_| "/usr/local/libtorch".to_string());
     let libtorch = PathBuf::from(&libtorch);
@@ -67,9 +122,15 @@ fn main() {
         .include(libtorch.join("include/torch/csrc/api/include"))
         .warnings(false);
 
-    if cfg!(feature = "cuda") {
-        build.define("FLODL_BUILD_CUDA", "1");
-        // CUDA toolkit headers
+    // The define gates the shim's GPU code, which is vendor-neutral:
+    // ROCm libtorch keeps `kCUDA` and the `c10::cuda` namespaces, so the
+    // same blocks serve both backends. Named for what it means.
+    if cfg!(feature = "gpu") {
+        build.define("FLODL_BUILD_GPU", "1");
+    }
+    if want_cuda {
+        // CUDA toolkit headers (the one genuinely vendor-specific part
+        // of the compile step).
         let cuda_home = env::var("CUDA_HOME")
             .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         build.include(format!("{}/include", cuda_home));
@@ -83,7 +144,7 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=torch_cpu");
     println!("cargo:rustc-link-lib=dylib=c10");
 
-    if cfg!(feature = "cuda") {
+    if want_cuda {
         println!("cargo:rustc-link-lib=dylib=torch_cuda");
         println!("cargo:rustc-link-lib=dylib=c10_cuda");
 

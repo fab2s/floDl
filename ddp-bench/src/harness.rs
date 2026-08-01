@@ -410,7 +410,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // the cooperative tier; always in managed).
     if !suppress_artifacts {
         let log_path = format!("{run_dir}/training.log");
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let local_header = {
             let mut h = String::new();
             for dev in flodl::tensor::cuda_devices() {
@@ -422,7 +422,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             }
             h
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let local_header = String::new();
         // Cluster runs: local probing only sees this host's GPUs, so the
         // header would misdescribe the cohort (the historical "Pascals
@@ -458,7 +458,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // Clean up CUDA state between runs. NCCL communicators and cached
     // allocator blocks from the previous run can fragment VRAM or leave
     // stale stream state that interferes with the next NCCL init.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
         let gpu_count = flodl::tensor::cuda_device_count();
         for i in 0..gpu_count {

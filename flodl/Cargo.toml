@@ -19,7 +19,11 @@ include = [
 
 [features]
 default = ["rng"]
-cuda = ["flodl-sys/cuda"]
+# Vendor selectors. `cuda` keeps working exactly as before; `gpu` is the
+# vendor-neutral gate they both imply (see flodl-sys/Cargo.toml).
+gpu = ["flodl-sys/gpu"]
+cuda = ["gpu", "flodl-sys/cuda"]
+rocm = ["gpu", "flodl-sys/rocm"]
 rng = ["rand"]
 
 [dependencies]

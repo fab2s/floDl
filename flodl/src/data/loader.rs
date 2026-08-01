@@ -1350,7 +1350,7 @@ impl StreamingEpochIter<'_> {
             Ok(Ok(batch)) => {
                 // Wait for async H2D copy to complete (typically instant
                 // since the batch was submitted prefetch_depth steps ago)
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(ref event) = batch.ready_event {
                     if let Err(e) = event.synchronize() {
                         return Some(Err(e));

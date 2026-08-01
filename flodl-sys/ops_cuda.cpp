@@ -1,7 +1,7 @@
 // ops_cuda.cpp — CUDA Graphs, Events, Streams, NCCL.
 //
 // All CUDA-dependent functionality. Preserves the original
-// #ifdef FLODL_BUILD_CUDA / #else (CPU stubs) / #endif structure
+// #ifdef FLODL_BUILD_GPU / #else (CPU stubs) / #endif structure
 // so the file is build-feature-aware in a single translation unit.
 //
 // Also contains the NCCL collective and per-rank APIs used by DDP,
@@ -11,7 +11,7 @@
 
 // --- CUDA Graphs ---
 
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAStream.h>
@@ -973,7 +973,7 @@ extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,
     return make_error("NCCL requires a CUDA build");
 }
 
-#endif // FLODL_BUILD_CUDA
+#endif // FLODL_BUILD_GPU
 
 // --- Utility ---
 

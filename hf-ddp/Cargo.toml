@@ -15,7 +15,9 @@ publish = false
 
 [features]
 default = []
-cuda = ["flodl/cuda", "flodl-hf/cuda"]
+gpu = ["flodl/gpu", "flodl-hf/gpu"]
+cuda = ["gpu", "flodl/cuda", "flodl-hf/cuda"]
+rocm = ["gpu", "flodl/rocm", "flodl-hf/rocm"]
 
 [dependencies]
 flodl = { path = "../flodl" }

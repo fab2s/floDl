@@ -67,7 +67,7 @@ fn run_single_pass(
     }
 
     // Sync before measurement
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     flodl::cuda_synchronize(0);
 
     // Measured epochs
@@ -78,7 +78,7 @@ fn run_single_pass(
         let start = Instant::now();
         final_loss = run_epoch(i, false)?;
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         flodl::cuda_synchronize(0);
 
         epoch_times.push(start.elapsed().as_secs_f64() * 1000.0);

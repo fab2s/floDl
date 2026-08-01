@@ -6,7 +6,7 @@
 //! inputs), but the 250k vocab makes the MLM tied decoder
 //! substantially larger — worth exercising on GPU.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 

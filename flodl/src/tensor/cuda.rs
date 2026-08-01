@@ -353,7 +353,7 @@ pub fn hardware_summary() -> String {
     let ram = total_ram_gb();
     let mut s = format!("{} ({} threads, {}GB)", cpu, threads, ram);
 
-    if cfg!(feature = "cuda") {
+    if cfg!(feature = "gpu") {
         for gpu in crate::sys::detect_gpus() {
             let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
                 " | {} ({}GB)", gpu.name, gpu.total_memory_mb / 1024

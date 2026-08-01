@@ -1371,7 +1371,7 @@ impl fmt::Debug for Tensor {
 pub fn test_device() -> Device {
     use std::sync::Once;
     static PRINT: Once = Once::new();
-    let dev = if cfg!(feature = "cuda") && cuda_available() { Device::CUDA(0) } else { Device::CPU };
+    let dev = if cfg!(feature = "gpu") && cuda_available() { Device::CUDA(0) } else { Device::CPU };
     PRINT.call_once(|| eprintln!("\n*** flodl test device: {} ***\n", dev));
     dev
 }

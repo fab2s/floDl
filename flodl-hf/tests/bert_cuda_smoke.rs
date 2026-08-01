@@ -5,10 +5,10 @@
 //! assert output shape and that gradients flowed. Catches CUDA-specific
 //! regressions that CPU unit tests can miss.
 //!
-//! All tests are gated `#[cfg(feature = "cuda")]` — compiled-out under
+//! All tests are gated `#[cfg(feature = "gpu")]` — compiled-out under
 //! `fdl test` (GitHub CI CPU leg), compiled and run under `fdl cuda-test`.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 
