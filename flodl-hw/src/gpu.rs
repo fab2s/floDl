@@ -98,6 +98,7 @@ pub fn survey() -> GpuSurvey {
     }
     let mut out = GpuSurvey::default();
     crate::nvidia::probe(&mut out);
+    crate::amd::probe(&mut out);
     out
 }
 
@@ -109,10 +110,25 @@ pub fn survey() -> GpuSurvey {
 ///
 /// # Masks
 ///
-/// Vendor tools report every physical GPU regardless of the mask, so it
-/// is applied here. `CUDA_VISIBLE_DEVICES=0,2` keeps indices 0 and 2; an
-/// empty value returns nothing (libtorch's "explicitly no CUDA"); unset
-/// keeps everything. This lets tests scope down via
+/// Detection is mask-proof by construction (vendor tools report every
+/// physical GPU, and sysfs ignores masks entirely), so the mask is
+/// applied here instead -- and it is **per vendor**, because the
+/// vendors do not read the same variable.
+///
+/// | Vendor | Variable, in precedence order |
+/// |---|---|
+/// | NVIDIA | `CUDA_VISIBLE_DEVICES` |
+/// | AMD | `HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`, then `CUDA_VISIBLE_DEVICES` |
+///
+/// HIP honours all three and the first one *set* wins, even when it is
+/// empty. Applying a single variable to every device would mis-count in
+/// both directions on a mixed box: `HIP_VISIBLE_DEVICES=0` would hide
+/// nothing, and `CUDA_VISIBLE_DEVICES=0` would wrongly override an AMD
+/// mask that HIP itself would have preferred.
+///
+/// `0,2` keeps those indices. An empty value, or `-1`, returns nothing
+/// (libtorch's "explicitly no devices", and HIP's convention for the
+/// same). Unset keeps everything. This lets tests scope down via
 /// `CUDA_VISIBLE_DEVICES=0 cargo test` and stops auto-promote
 /// surprising the harness on a multi-GPU box.
 ///
@@ -121,11 +137,40 @@ pub fn survey() -> GpuSurvey {
 /// operator's own doing.
 pub fn survey_visible() -> GpuSurvey {
     let mut out = survey();
-    let Ok(mask) = std::env::var("CUDA_VISIBLE_DEVICES") else {
-        return out;
-    };
-    apply_visibility_mask(&mut out, &mask);
+    apply_visibility_masks(&mut out);
     out
+}
+
+/// The mask variable a vendor actually reads, and its value.
+///
+/// Returns the **first variable that is set**, not the first non-empty
+/// one: an explicitly empty `HIP_VISIBLE_DEVICES` means "no devices"
+/// and must not fall through to `CUDA_VISIBLE_DEVICES`.
+fn mask_for(vendor: GpuVendor) -> Option<(&'static str, String)> {
+    let order: &[&str] = match vendor {
+        GpuVendor::Nvidia => &["CUDA_VISIBLE_DEVICES"],
+        // HIP's documented precedence. `GPU_DEVICE_ORDINAL` also exists
+        // and is not handled: it is an OpenCL-era selector that HIP
+        // treats differently across versions, and guessing at it would
+        // be worse than the loud under-count a caller can see.
+        GpuVendor::Amd => &[
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+            "CUDA_VISIBLE_DEVICES",
+        ],
+    };
+    order
+        .iter()
+        .find_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+}
+
+/// Apply each vendor's own mask to its own devices.
+fn apply_visibility_masks(out: &mut GpuSurvey) {
+    for vendor in out.vendors() {
+        if let Some((var, value)) = mask_for(vendor) {
+            apply_visibility_mask(out, vendor, var, &value);
+        }
+    }
 }
 
 /// Enumerate the GPUs the runtime will see. Shorthand for
@@ -140,26 +185,31 @@ pub fn detect_gpus_physical() -> Vec<GpuInfo> {
     survey().devices
 }
 
-/// Filter a survey in place by a `CUDA_VISIBLE_DEVICES` value. Split out
-/// so mask semantics are testable without a GPU.
-fn apply_visibility_mask(out: &mut GpuSurvey, mask: &str) {
+/// Filter one vendor's devices in place by a mask value. Split out so
+/// mask semantics are testable without a GPU.
+fn apply_visibility_mask(out: &mut GpuSurvey, vendor: GpuVendor, var: &str, mask: &str) {
     let trimmed = mask.trim();
-    if trimmed.is_empty() {
-        // Explicit "no CUDA": libtorch treats this as zero devices.
-        if !out.devices.is_empty() {
-            let n = out.devices.len();
-            out.devices.clear();
-            out.note(
-                GpuVendor::Nvidia,
-                NoteKind::MaskApplied,
-                format!(
-                    "CUDA_VISIBLE_DEVICES is set but empty, hiding all {n} device(s). \
-                     Unset it to use them."
-                ),
-            );
-        }
+    let before = out.devices.iter().filter(|g| g.vendor == vendor).count();
+    if before == 0 {
         return;
     }
+
+    // Empty and `-1` are the two spellings of "explicitly none": CUDA
+    // treats an empty value as zero devices, HIP accepts `-1` for the
+    // same, and both must beat "unset means everything".
+    if trimmed.is_empty() || trimmed == "-1" {
+        out.devices.retain(|g| g.vendor != vendor);
+        out.note(
+            vendor,
+            NoteKind::MaskApplied,
+            format!(
+                "{var}={trimmed:?} hides all {before} {vendor} device(s). \
+                 Unset it to use them."
+            ),
+        );
+        return;
+    }
+
     let mut allowed: HashSet<u8> = HashSet::new();
     for entry in trimmed.split(',') {
         let entry = entry.trim();
@@ -174,25 +224,25 @@ fn apply_visibility_mask(out: &mut GpuSurvey, mask: &str) {
                 // one, which is exactly the runtime divergence
                 // detect_gpus exists to prevent.
                 out.note(
-                    GpuVendor::Nvidia,
+                    vendor,
                     NoteKind::MaskApplied,
                     format!(
-                        "CUDA_VISIBLE_DEVICES entry {entry:?} is not a numeric index \
-                         (UUID / MIG forms are not resolved here); GPU detection may \
-                         under-count."
+                        "{var} entry {entry:?} is not a numeric index \
+                         (UUID / MIG forms are not resolved here); {vendor} device \
+                         detection may under-count."
                     ),
                 );
             }
         }
     }
-    let before = out.devices.len();
-    out.devices.retain(|g| allowed.contains(&g.index));
-    let hidden = before - out.devices.len();
+    out.devices
+        .retain(|g| g.vendor != vendor || allowed.contains(&g.index));
+    let hidden = before - out.devices.iter().filter(|g| g.vendor == vendor).count();
     if hidden > 0 {
         out.note(
-            GpuVendor::Nvidia,
+            vendor,
             NoteKind::MaskApplied,
-            format!("CUDA_VISIBLE_DEVICES={trimmed:?} hides {hidden} of {before} device(s)."),
+            format!("{var}={trimmed:?} hides {hidden} of {before} {vendor} device(s)."),
         );
     }
 }
@@ -203,8 +253,23 @@ mod tests {
     use std::sync::Mutex;
 
     // Env mutations must be serialized: cargo test runs in parallel and
-    // `CUDA_VISIBLE_DEVICES` is process-global.
+    // these variables are process-global.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the env lock, **recovering from poison**.
+    ///
+    /// A `#[should_panic]` test that holds this lock poisons it, and a
+    /// plain `.unwrap()` then turns that one intentional panic into a
+    /// `PoisonError` cascade across every sibling test -- which is
+    /// exactly what happened here the moment
+    /// `a_malformed_spoof_panics_rather_than_using_real_hardware`
+    /// landed: nine failures, only one of them real. Each locker resets
+    /// the variables it cares about via `EnvGuard`, and those guards
+    /// still run their `Drop` during unwind, so recovering is safe.
+    /// Same reasoning, and same fix, as `flodl_cli::util::test_env`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// RAII helper that snapshots an env var on construction and
     /// restores it on drop. Pair with `ENV_LOCK`.
@@ -255,15 +320,25 @@ mod tests {
         }
     }
 
+    fn amd(index: u8, gfx: &str) -> GpuInfo {
+        GpuInfo {
+            index,
+            vendor: GpuVendor::Amd,
+            name: format!("AMD Test {index}"),
+            arch: GpuArch::Gfx(gfx.into()),
+            total_memory_mb: 16384,
+        }
+    }
+
     fn masked(devices: Vec<GpuInfo>, mask: &str) -> GpuSurvey {
         let mut s = GpuSurvey { devices, notes: vec![] };
-        apply_visibility_mask(&mut s, mask);
+        apply_visibility_mask(&mut s, GpuVendor::Nvidia, CVD, mask);
         s
     }
 
     #[test]
     fn survey_never_panics_and_agrees_with_itself() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let _g = EnvGuard::unset(CVD);
         let _s = EnvGuard::unset(SPOOF);
         // On CI without GPUs: empty. On a GPU box: parseable info.
@@ -358,7 +433,7 @@ mod tests {
 
     #[test]
     fn detect_gpus_honors_the_live_mask() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let _s = EnvGuard::unset(SPOOF);
         let _g_unset = EnvGuard::unset(CVD);
         let physical = detect_gpus();
@@ -374,8 +449,168 @@ mod tests {
     }
 
     #[test]
+    fn each_vendor_is_filtered_by_its_own_mask() {
+        // A single mask applied to every device mis-counts in BOTH
+        // directions on a mixed box, which is why the filter is
+        // per-vendor.
+        let mut s = GpuSurvey {
+            devices: vec![gpu(0, 8, 6), gpu(1, 8, 6), amd(0, "gfx1030"), amd(1, "gfx1100")],
+            notes: vec![],
+        };
+        apply_visibility_mask(&mut s, GpuVendor::Nvidia, CVD, "1");
+        apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "0");
+        let kept: Vec<(GpuVendor, u8)> =
+            s.devices.iter().map(|g| (g.vendor, g.index)).collect();
+        assert_eq!(kept, vec![(GpuVendor::Nvidia, 1), (GpuVendor::Amd, 0)]);
+    }
+
+    #[test]
+    fn a_mask_for_one_vendor_leaves_the_other_alone() {
+        let mut s = GpuSurvey {
+            devices: vec![gpu(0, 8, 6), amd(0, "gfx1030")],
+            notes: vec![],
+        };
+        apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "");
+        assert_eq!(s.devices.len(), 1, "the NVIDIA device survives an AMD mask");
+        assert_eq!(s.devices[0].vendor, GpuVendor::Nvidia);
+    }
+
+    #[test]
+    fn minus_one_means_none_for_hip() {
+        let mut s = GpuSurvey { devices: vec![amd(0, "gfx1030")], notes: vec![] };
+        apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "-1");
+        assert!(s.devices.is_empty());
+        assert!(s.notes[0].message.contains("hides all 1"), "{:?}", s.notes);
+    }
+
+    #[test]
+    fn masking_a_vendor_with_no_devices_is_silent() {
+        // An AMD mask exported on a pure-NVIDIA box must not produce a
+        // note about zero AMD devices.
+        let mut s = GpuSurvey { devices: vec![gpu(0, 8, 6)], notes: vec![] };
+        apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "");
+        assert_eq!(s.devices.len(), 1);
+        assert!(s.notes.is_empty());
+    }
+
+    #[test]
+    fn hip_mask_precedence_prefers_the_first_variable_that_is_set() {
+        let _lock = env_lock();
+        let _c = EnvGuard::set(CVD, "9");
+        let _r = EnvGuard::set("ROCR_VISIBLE_DEVICES", "5");
+        {
+            let _h = EnvGuard::set("HIP_VISIBLE_DEVICES", "1");
+            assert_eq!(mask_for(GpuVendor::Amd).unwrap().0, "HIP_VISIBLE_DEVICES");
+            // NVIDIA never reads the HIP variables.
+            assert_eq!(
+                mask_for(GpuVendor::Nvidia).unwrap(),
+                ("CUDA_VISIBLE_DEVICES", "9".to_string()),
+            );
+        }
+        let _h = EnvGuard::unset("HIP_VISIBLE_DEVICES");
+        assert_eq!(mask_for(GpuVendor::Amd).unwrap().0, "ROCR_VISIBLE_DEVICES");
+        let _r2 = EnvGuard::unset("ROCR_VISIBLE_DEVICES");
+        assert_eq!(mask_for(GpuVendor::Amd).unwrap().0, "CUDA_VISIBLE_DEVICES");
+    }
+
+    #[test]
+    fn an_empty_hip_mask_does_not_fall_through_to_cuda() {
+        // First variable SET wins, not first non-empty: an explicitly
+        // empty HIP_VISIBLE_DEVICES means "no AMD devices", and falling
+        // through to CUDA_VISIBLE_DEVICES would silently un-hide them.
+        let _lock = env_lock();
+        let _c = EnvGuard::set(CVD, "0");
+        let _h = EnvGuard::set("HIP_VISIBLE_DEVICES", "");
+        assert_eq!(
+            mask_for(GpuVendor::Amd).unwrap(),
+            ("HIP_VISIBLE_DEVICES", String::new()),
+        );
+    }
+
+    // --- the FLODL_TESTING_GPU_JSON injection point -------------------
+    //
+    // These four were reported as landed in P1 and were not: the edit
+    // anchored on a function that had already moved to nvidia.rs, so
+    // the replace silently no-op'd and the test count still rose from
+    // testing.rs. Asserting on every anchor is now the rule.
+
+    #[test]
+    fn spoof_replaces_the_whole_sweep() {
+        let _lock = env_lock();
+        let _cvd = EnvGuard::unset(CVD);
+        let _s = EnvGuard::set(
+            SPOOF,
+            r#"[{"vendor":"amd","arch":"gfx1030","vram_mb":16384},
+                {"vendor":"amd","arch":"gfx1100","vram_mb":24576}]"#,
+        );
+        let s = survey();
+        assert_eq!(s.devices.len(), 2, "spoof stands in for real hardware");
+        assert!(s.devices.iter().all(|g| g.vendor == GpuVendor::Amd));
+        // True on the NVIDIA dev rig too: the spoof is checked before
+        // any probe runs, so the real cards are never consulted.
+        assert!(!s.has_vendor(GpuVendor::Nvidia));
+        assert_eq!(detect_gpus_physical().len(), 2);
+    }
+
+    #[test]
+    fn spoof_composes_with_the_visibility_mask() {
+        // The spoof replaces the HARDWARE, not the mask policy, so the
+        // two layer. The docs promise this.
+        let _lock = env_lock();
+        let _s = EnvGuard::set(
+            SPOOF,
+            r#"[{"arch":"sm_86"},{"arch":"sm_86"},{"arch":"sm_86"},{"arch":"sm_86"}]"#,
+        );
+        let _cvd = EnvGuard::set(CVD, "2");
+        assert_eq!(detect_gpus_physical().len(), 4, "physical view ignores the mask");
+        let visible = detect_gpus();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].index, 2);
+    }
+
+    #[test]
+    fn a_spoofed_amd_device_obeys_the_hip_mask_not_the_cuda_one() {
+        // Ties the two halves of P2 together: spoofed AMD hardware,
+        // filtered by HIP's variable while CUDA_VISIBLE_DEVICES says
+        // something else entirely.
+        let _lock = env_lock();
+        let _s = EnvGuard::set(
+            SPOOF,
+            r#"[{"vendor":"amd","arch":"gfx1030"},{"vendor":"amd","arch":"gfx1100"}]"#,
+        );
+        let _cvd = EnvGuard::set(CVD, "0,1");
+        let _hip = EnvGuard::set("HIP_VISIBLE_DEVICES", "1");
+        let visible = detect_gpus();
+        assert_eq!(visible.len(), 1, "HIP_VISIBLE_DEVICES wins over CUDA_VISIBLE_DEVICES");
+        assert_eq!(visible[0].arch, GpuArch::Gfx("gfx1100".into()));
+    }
+
+    #[test]
+    fn an_empty_spoof_falls_through_to_real_detection() {
+        // Exporting the var as "" is how a shell unsets-in-practice;
+        // treating it as an empty device list would silently claim the
+        // box has no GPUs.
+        let _lock = env_lock();
+        let _cvd = EnvGuard::unset(CVD);
+        let real = {
+            let _s = EnvGuard::unset(SPOOF);
+            detect_gpus_physical().len()
+        };
+        let _s = EnvGuard::set(SPOOF, "   ");
+        assert_eq!(detect_gpus_physical().len(), real);
+    }
+
+    #[test]
+    #[should_panic(expected = "could not be parsed")]
+    fn a_malformed_spoof_panics_rather_than_using_real_hardware() {
+        let _lock = env_lock();
+        let _s = EnvGuard::set(SPOOF, "{ not json");
+        let _ = survey();
+    }
+
+    #[test]
     fn detect_gpus_physical_ignores_the_mask() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = env_lock();
         let _s = EnvGuard::unset(SPOOF);
         let _g_unset = EnvGuard::unset(CVD);
         let physical = detect_gpus_physical();

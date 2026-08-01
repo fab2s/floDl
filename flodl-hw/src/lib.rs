@@ -81,6 +81,7 @@
 //! malformed [`ENV_TESTING_GPU_JSON`], which is a developer error in a
 //! deliberately-set variable.
 
+mod amd;
 mod gpu;
 mod mem;
 mod nvidia;
