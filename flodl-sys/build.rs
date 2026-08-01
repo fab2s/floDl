@@ -114,55 +114,74 @@ fn main() {
     // The same rationale as the guard above, one layer out. libtorch
     // bundles each vendor's runtime LIBRARIES -- every lib linked below
     // ships inside `libtorch/lib`, `libamdhip64` included -- but not the
-    // toolkit HEADERS. Those are the one thing that must come from a
-    // vendor install, and without them the failure is a C++ "no such
-    // file" naming something the user cannot apt-install by that name.
+    // toolkit HEADERS.
     //
-    // Note `libtorch/include/hip/` exists in a ROCm build and does NOT
-    // satisfy this: it holds torch's own hipified c10 wrappers
-    // (HIPGuard.h and friends), not the HIP runtime.
-    if want_rocm && !Path::new(&rocm_path).join("include/hip/hip_runtime.h").exists() {
-        eprintln!(
-            "\nflodl-sys: `--features rocm` needs the ROCm toolkit headers, but\n\
-             `{rocm_path}/include/hip/hip_runtime.h` does not exist.\n\n\
-             libtorch ships the HIP runtime libraries but not its headers, so\n\
-             this piece has to come from a ROCm install:\n\n\
-             \x20 Ubuntu/Debian:  sudo apt install hip-dev rccl-dev\n\
-             \x20                 (repo: https://repo.radeon.com/rocm/apt/)\n\
-             \x20 Other Linux:    install the ROCm HIP SDK\n\
-             \x20 macOS/Windows:  no ROCm build exists; on Windows use WSL2\n\n\
-             Set ROCM_PATH if your install is not at /opt/rocm.\n"
-        );
-        std::process::exit(1);
-    }
-    // Three headers, not one. `cuda_runtime.h` alone is a FALSE PASS:
-    // it exists in cuda-cudart-dev but immediately `#include`s
-    // "crt/host_config.h", which lives in a DIFFERENT package
-    // (cuda-crt-<maj>-<min>). CI hit exactly that -- guard green, C++
-    // compile dead on the very next line.
-    let cuda_missing: Vec<&str> = [
-        "include/cuda_runtime.h",
-        "include/crt/host_config.h",
-        "include/nccl.h",
-    ]
-    .into_iter()
-    .filter(|h| !Path::new(&cuda_home).join(h).exists())
-    .collect();
-    if want_cuda && !cuda_missing.is_empty() {
-        eprintln!(
-            "\nflodl-sys: `--features cuda` needs the CUDA toolkit headers.\n\
-             Missing under `{cuda_home}`: {}\n\n\
-             libtorch bundles the CUDA runtime libraries but not its headers:\n\n\
-             \x20 Ubuntu/Debian:  sudo apt install cuda-toolkit libnccl-dev\n\
-             \x20                 (repo: https://developer.nvidia.com/cuda-downloads)\n\
-             \x20                 headers alone: cuda-cudart-dev-<M>-<m>\n\
-             \x20                 plus cuda-crt-<M>-<m> and libnccl-dev\n\
-             \x20 Other Linux:    install the CUDA Toolkit\n\
-             \x20 macOS:          no CUDA build exists for macOS\n\n\
-             Set CUDA_HOME if your install is not at /usr/local/cuda.\n",
-            cuda_missing.join(", "),
-        );
-        std::process::exit(1);
+    // Each entry is (header, package that owns it), so the message can
+    // name exactly what to install rather than a generic "install the
+    // toolkit". The pairs were read out of the vendor dev images with
+    // `dpkg -S` on the readlink -f'd path, not guessed -- twice now a
+    // plausible guess has been wrong.
+    //
+    // The lists are DEEPER THAN THE SHIM'S OWN INCLUDES on purpose.
+    // Checking only the header the shim names is a false pass: torch's
+    // hipified `ATen/hip` tree reaches for the whole ROCm math stack
+    // (HIPContextLight.h -> hipsparse), and `cuda_runtime.h` line 82
+    // pulls `crt/host_config.h` from a different package. Both shipped
+    // green guards and dead compiles. Derived by grepping libtorch's
+    // ATen/hip + c10/hip trees for external includes.
+    //
+    // Note `libtorch/include/hip/` does NOT satisfy the ROCm side: it
+    // holds torch's own hipified c10 wrappers (HIPGuard.h and friends),
+    // not the HIP runtime.
+    const ROCM_HEADERS: &[(&str, &str)] = &[
+        ("include/hip/hip_runtime.h", "hip-dev"),
+        ("include/rccl/rccl.h", "rccl-dev"),
+        ("include/hipblas/hipblas.h", "hipblas-dev"),
+        ("include/hipblaslt/hipblaslt.h", "hipblaslt-dev"),
+        ("include/hipcub/hipcub.hpp", "hipcub-dev"),
+        ("include/hipsolver/hipsolver.h", "hipsolver-dev"),
+        ("include/hipsparse/hipsparse.h", "hipsparse-dev"),
+        ("include/rocblas/rocblas.h", "rocblas-dev"),
+        ("include/rocm_smi/rocm_smi.h", "rocm-smi-lib"),
+    ];
+    const CUDA_HEADERS: &[(&str, &str)] = &[
+        ("include/cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
+        ("include/crt/host_config.h", "cuda-crt-<M>-<m>"),
+        ("include/nccl.h", "libnccl-dev"),
+    ];
+
+    let toolkit = if want_rocm {
+        Some(("rocm", &rocm_path, "ROCM_PATH", "/opt/rocm", ROCM_HEADERS))
+    } else if want_cuda {
+        Some(("cuda", &cuda_home, "CUDA_HOME", "/usr/local/cuda", CUDA_HEADERS))
+    } else {
+        None
+    };
+    if let Some((feature, root, root_env, root_default, headers)) = toolkit {
+        let missing: Vec<&(&str, &str)> = headers
+            .iter()
+            .filter(|(h, _)| !Path::new(root).join(h).exists())
+            .collect();
+        if !missing.is_empty() {
+            let mut pkgs: Vec<&str> = missing.iter().map(|(_, p)| *p).collect();
+            pkgs.dedup();
+            eprintln!(
+                "\nflodl-sys: `--features {feature}` needs vendor toolkit headers\n\
+                 that are missing under `{root}`:\n\n{}\n\n\
+                 libtorch bundles the runtime libraries but not these headers.\n\n\
+                 \x20 Ubuntu/Debian:  sudo apt install {}\n\
+                 \x20 Other Linux:    install the vendor SDK\n\
+                 \x20 macOS/Windows:  no GPU libtorch exists; on Windows use WSL2\n\n\
+                 Set {root_env} if your install is not at {root_default}.\n",
+                missing
+                    .iter()
+                    .map(|(h, p)| format!("   {h}   ({p})"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                pkgs.join(" "),
+            );
+            std::process::exit(1);
+        }
     }
 
     let mut build = cc::Build::new();

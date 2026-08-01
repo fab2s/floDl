@@ -29,6 +29,7 @@ use crate::cluster::resolve_local_hostname;
 use crate::config::{self, ClusterWorker, DEFAULT_DATA_PATH};
 use crate::context::Context;
 use crate::libtorch::detect::{self, LibtorchInfo};
+use crate::util::requirements;
 use crate::util::system::{self, GpuInfo};
 use flodl_hw::{GpuArch, GpuVendor};
 
@@ -684,6 +685,18 @@ pub fn probe_local(
 
     check_gpu_toolkit(libtorch.info.as_ref(), &mut warnings);
 
+    // Host tools are a hard issue: without them `fdl` cannot download or
+    // unpack anything, whatever the build strategy.
+    let tools = requirements::missing_host_tools();
+    if !tools.is_empty() {
+        issues.push(format!(
+            "missing host tools `fdl` needs: {}. Install with `sudo apt install {}` \
+             (or the equivalent for your distribution).",
+            tools.join(", "),
+            tools.join(" "),
+        ));
+    }
+
     ProbeReport {
         host,
         gpus,
@@ -958,6 +971,9 @@ fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
         warnings.push(w);
     }
 }
+
+
+
 
 /// Pure core of [`check_gpu_toolkit`]: the toolkit root is a parameter,
 /// not an env read, so every arm is testable without mutating

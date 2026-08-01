@@ -4,7 +4,7 @@
 
 use crate::context::Context;
 use crate::libtorch::{build, detect, download};
-use crate::util::{docker, prompt, system};
+use crate::util::{docker, prompt, requirements, system};
 
 #[derive(Default)]
 pub struct SetupOpts {
@@ -81,6 +81,27 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!();
         println!("  Install one or both and run 'fdl setup' again.");
         return Err("no Rust or Docker found".into());
+    }
+
+    // Native prerequisites, reported ONLY when they apply. The Docker
+    // path carries its own toolchain inside the image, so telling a
+    // Docker user about a missing `g++` would be noise -- and noise in
+    // a setup wizard is how people learn to skim it. Cargo present and
+    // Docker absent is the unambiguous native case; when both exist the
+    // user has not chosen yet, so it is phrased as a heads-up rather
+    // than a problem.
+    let tools = requirements::missing_host_tools();
+    if !tools.is_empty() && has_cargo {
+        let owned: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();
+        println!();
+        if has_docker {
+            println!("  Note: building natively would also need: {}", tools.join(", "));
+            println!("        {}", requirements::install_hint(&owned));
+            println!("        (not needed if you build in the dev container)");
+        } else {
+            println!("  Native builds need these first: {}", tools.join(", "));
+            println!("    {}", requirements::install_hint(&owned));
+        }
     }
 
     // ---- Step 2: libtorch ----
