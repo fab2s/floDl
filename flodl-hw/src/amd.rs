@@ -418,6 +418,7 @@ fn device_rw_access(_dev: &Path) -> Option<bool> {
 /// Effective id from a `/proc/self/status` `Uid:`/`Gid:` line, whose
 /// fields are `real effective saved filesystem` -- the EFFECTIVE one
 /// (index 1) is what the kernel checks on open.
+#[cfg(any(unix, test))]
 fn status_id_field(status: &str, label: &str) -> Option<u32> {
     status
         .lines()
@@ -429,6 +430,7 @@ fn status_id_field(status: &str, label: &str) -> Option<u32> {
 }
 
 /// Supplementary gids from the `Groups:` line (may legitimately be empty).
+#[cfg(any(unix, test))]
 fn status_groups(status: &str) -> Option<Vec<u32>> {
     Some(
         status
@@ -446,6 +448,7 @@ fn status_groups(status: &str) -> Option<Vec<u32>> {
 /// Order matters and mirrors the kernel's: root bypasses; otherwise the
 /// OWNER bits apply if we own it (even when they grant *less* than the
 /// group bits), then group, then other.
+#[cfg(any(unix, test))]
 fn mode_grants_rw(
     mode: u32,
     owner_uid: u32,
