@@ -134,20 +134,20 @@ fn main() {
     // holds torch's own hipified c10 wrappers (HIPGuard.h and friends),
     // not the HIP runtime.
     const ROCM_HEADERS: &[(&str, &str)] = &[
-        ("include/hip/hip_runtime.h", "hip-dev"),
-        ("include/rccl/rccl.h", "rccl-dev"),
-        ("include/hipblas/hipblas.h", "hipblas-dev"),
-        ("include/hipblaslt/hipblaslt.h", "hipblaslt-dev"),
-        ("include/hipcub/hipcub.hpp", "hipcub-dev"),
-        ("include/hipsolver/hipsolver.h", "hipsolver-dev"),
-        ("include/hipsparse/hipsparse.h", "hipsparse-dev"),
-        ("include/rocblas/rocblas.h", "rocblas-dev"),
-        ("include/rocm_smi/rocm_smi.h", "rocm-smi-lib"),
+        ("hip/hip_runtime.h", "hip-dev"),
+        ("rccl/rccl.h", "rccl-dev"),
+        ("hipblas/hipblas.h", "hipblas-dev"),
+        ("hipblaslt/hipblaslt.h", "hipblaslt-dev"),
+        ("hipcub/hipcub.hpp", "hipcub-dev"),
+        ("hipsolver/hipsolver.h", "hipsolver-dev"),
+        ("hipsparse/hipsparse.h", "hipsparse-dev"),
+        ("rocblas/rocblas.h", "rocblas-dev"),
+        ("rocm_smi/rocm_smi.h", "rocm-smi-lib"),
     ];
     const CUDA_HEADERS: &[(&str, &str)] = &[
-        ("include/cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
-        ("include/crt/host_config.h", "cuda-crt-<M>-<m>"),
-        ("include/nccl.h", "libnccl-dev"),
+        ("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
+        ("crt/host_config.h", "cuda-crt-<M>-<m>"),
+        ("nccl.h", "libnccl-dev"),
     ];
 
     let toolkit = if want_rocm {
@@ -158,9 +158,19 @@ fn main() {
         None
     };
     if let Some((feature, root, root_env, root_default, headers)) = toolkit {
+        // Present under the toolkit root OR a default system include
+        // dir -- `nccl.h` ships in libnccl-dev at /usr/include/nccl.h,
+        // not under $CUDA_HOME, and checking only the toolkit root
+        // reported it missing on an image that builds fine.
+        // (Kept in sync by hand with flodl-cli's util/requirements.rs;
+        // build.rs cannot depend on that crate.)
+        let sys_dirs = ["/usr/include", "/usr/local/include"];
         let missing: Vec<&(&str, &str)> = headers
             .iter()
-            .filter(|(h, _)| !Path::new(root).join(h).exists())
+            .filter(|(h, _)| {
+                !Path::new(root).join("include").join(h).exists()
+                    && !sys_dirs.iter().any(|d| Path::new(d).join(h).exists())
+            })
             .collect();
         if !missing.is_empty() {
             let mut pkgs: Vec<&str> = missing.iter().map(|(_, p)| *p).collect();

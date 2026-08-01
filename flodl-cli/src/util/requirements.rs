@@ -55,24 +55,24 @@ const HOST_TOOLS: &[(&str, &str)] = &[
 /// No metapackage shortcut exists for ROCm: `rocm-dev` covers only
 /// hip-dev and rocm-smi-lib of these nine.
 pub const ROCM_HEADERS: &[(&str, &str)] = &[
-    ("include/hip/hip_runtime.h", "hip-dev"),
-    ("include/rccl/rccl.h", "rccl-dev"),
-    ("include/hipblas/hipblas.h", "hipblas-dev"),
-    ("include/hipblaslt/hipblaslt.h", "hipblaslt-dev"),
-    ("include/hipcub/hipcub.hpp", "hipcub-dev"),
-    ("include/hipsolver/hipsolver.h", "hipsolver-dev"),
-    ("include/hipsparse/hipsparse.h", "hipsparse-dev"),
-    ("include/rocblas/rocblas.h", "rocblas-dev"),
-    ("include/rocm_smi/rocm_smi.h", "rocm-smi-lib"),
+    ("hip/hip_runtime.h", "hip-dev"),
+    ("rccl/rccl.h", "rccl-dev"),
+    ("hipblas/hipblas.h", "hipblas-dev"),
+    ("hipblaslt/hipblaslt.h", "hipblaslt-dev"),
+    ("hipcub/hipcub.hpp", "hipcub-dev"),
+    ("hipsolver/hipsolver.h", "hipsolver-dev"),
+    ("hipsparse/hipsparse.h", "hipsparse-dev"),
+    ("rocblas/rocblas.h", "rocblas-dev"),
+    ("rocm_smi/rocm_smi.h", "rocm-smi-lib"),
 ];
 
 /// CUDA equivalent. The version placeholders are deliberate: the exact
 /// package name carries the toolkit version and we do not know which
 /// one the user wants.
 pub const CUDA_HEADERS: &[(&str, &str)] = &[
-    ("include/cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
-    ("include/crt/host_config.h", "cuda-crt-<M>-<m>"),
-    ("include/nccl.h", "libnccl-dev"),
+    ("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
+    ("crt/host_config.h", "cuda-crt-<M>-<m>"),
+    ("nccl.h", "libnccl-dev"),
 ];
 
 /// Host tools that are absent, as Debian package names.
@@ -90,7 +90,21 @@ pub fn missing_host_tools() -> Vec<&'static str> {
         .collect()
 }
 
-/// Vendor headers absent under `root`, as (header, package) pairs.
+/// Standard include directories the compiler searches by default.
+///
+/// Load-bearing, not belt-and-braces: `nccl.h` ships in `libnccl-dev`
+/// at **`/usr/include/nccl.h`**, NOT under `$CUDA_HOME`. Checking only
+/// the toolkit root reported it missing on an image where the build
+/// works, which is a false negative -- strictly worse than the gap the
+/// check exists to close, because it breaks a working setup.
+const SYSTEM_INCLUDE_DIRS: &[&str] = &["/usr/include", "/usr/local/include"];
+
+/// Vendor headers that are absent, as (header, package) pairs.
+///
+/// A header counts as present if it is under `<root>/include` OR any
+/// default system include dir, because that is what the compiler will
+/// do. Header paths in the tables are relative to an include dir, with
+/// no `include/` prefix, precisely so both can be searched.
 ///
 /// Pure: the toolkit root is a parameter rather than an env read, so
 /// every arm is testable without mutating process-global state. This
@@ -102,7 +116,14 @@ pub fn missing_headers<'a>(
 ) -> Vec<&'a (&'a str, &'a str)> {
     headers
         .iter()
-        .filter(|(h, _)| !root.join(h).exists())
+        .filter(|(h, _)| {
+            if root.join("include").join(h).exists() {
+                return false;
+            }
+            !SYSTEM_INCLUDE_DIRS
+                .iter()
+                .any(|d| Path::new(d).join(h).exists())
+        })
         .collect()
 }
 
@@ -139,18 +160,53 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A throwaway `<tmp>/include/` tree. Built here rather than
+    /// pointed at a real toolkit: `libtorch/` is a gitignored download,
+    /// so a test that depends on one passes locally and fails in CI.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("flodl-req-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("include/sub")).unwrap();
+        std::fs::write(root.join("include/present.h"), "").unwrap();
+        std::fs::write(root.join("include/sub/nested.h"), "").unwrap();
+        root
+    }
+
     #[test]
     fn missing_headers_lists_only_what_is_absent() {
-        // Point at a root where one entry really exists, so the negative
-        // half is proven rather than vacuously true: a check against a
-        // path that can never exist is green for the wrong reason.
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        assert!(root.join("Cargo.toml").is_file());
-        let table: &[(&str, &str)] =
-            &[("Cargo.toml", "present-pkg"), ("include/nope.h", "absent-pkg")];
+        // One entry really exists, so the negative half is proven rather
+        // than vacuously true: a check against a path that can never
+        // exist is green for the wrong reason.
+        let root = scratch_root("absent");
+        let table: &[(&str, &str)] = &[
+            ("present.h", "present-pkg"),
+            ("sub/nested.h", "nested-pkg"),
+            ("nope.h", "absent-pkg"),
+        ];
         let missing = missing_headers(&root, table);
         assert_eq!(missing.len(), 1, "{missing:?}");
         assert_eq!(missing[0].1, "absent-pkg");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_system_header_counts_as_present() {
+        // The regression that broke a working CUDA image: `nccl.h` ships
+        // at /usr/include/nccl.h, not under $CUDA_HOME, so a toolkit-root
+        // -only check called it missing and failed a build that compiles.
+        let root = scratch_root("sys");
+        let sys_header = SYSTEM_INCLUDE_DIRS
+            .iter()
+            .map(|d| Path::new(d).join("stdio.h"))
+            .find(|p| p.exists());
+        if let Some(h) = sys_header {
+            let name = h.file_name().unwrap().to_str().unwrap();
+            let table: &[(&str, &str)] = &[("stdio.h", "libc6-dev")];
+            assert!(
+                missing_headers(&root, table).is_empty(),
+                "{name} is in a default include dir and must not be reported missing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

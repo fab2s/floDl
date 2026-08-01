@@ -405,12 +405,21 @@ FEATURE=$([ "$LT_DIR" = rocm70 ] && echo rocm || echo cuda)
 OUT=$(cargo build -p flodl-sys --features "$FEATURE" 2>&1) && RC=0 || RC=$?
 if [ "$RC" -eq 0 ]; then
     note "toolkit already present; skipping the missing-case assertion"
-elif echo "$OUT" | grep -q 'needs the .* toolkit headers'; then
-    pass "build.rs named the missing toolkit instead of dying in the C++ compile"
-    echo "$OUT" | grep -A9 'toolkit headers' | head -12
 else
-    fail "$HOST: missing toolkit should produce an actionable message, got:"
-    echo "$OUT" | tail -20
+    # Assert the CONTRACT, not the prose. Matching a sentence has now
+    # broken this check twice, because rewording build.rs's message is a
+    # normal edit and a substring grep turns that into a red CI run for
+    # no defect. What must hold is: the build script identified itself
+    # and handed back a command to run.
+    echo "$OUT" | tail -25
+    if has "$OUT" 'flodl-sys:' && has "$OUT" 'apt install'; then
+        pass "build.rs named the missing toolkit instead of dying in the C++ compile"
+    else
+        # Print BEFORE failing: `fail` exits, so anything after it is
+        # dead code -- which is exactly why the last red run showed an
+        # empty diagnostic.
+        fail "$HOST: a missing toolkit must produce a message naming packages to install"
+    fi
 fi
 
 if [ "${FDL_CI_SKIP_INSTALL:-}" = 1 ]; then
