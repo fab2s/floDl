@@ -122,6 +122,19 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
         (std::env::consts::OS, std::env::consts::ARCH)
     };
 
+    download_url_for(spec, os, arch)
+}
+
+/// Pure core of [`download_url`]: the host is a parameter rather than a
+/// global read.
+///
+/// Every platform arm is reachable from any test runner as a result, which
+/// is the point. The Windows filename pattern differs from Linux's, this
+/// function claimed in a comment that it did not, and the resulting 404
+/// shipped unnoticed because nothing had ever evaluated the Windows arm on
+/// a Windows host. Host-as-parameter is what makes that testable without
+/// one.
+fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, String> {
     match (os, arch) {
         ("linux", "x86_64") => {}
         ("macos", "aarch64") => {
@@ -136,7 +149,17 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
                 arch
             ));
         }
-        ("windows", "x86_64") => {}
+        ("windows", "x86_64") => {
+            // PyTorch publishes no ROCm build for Windows: the `rocm7.0`
+            // bucket carries Linux archives only.
+            if spec.arch_variant.starts_with("rocm") {
+                return Err(format!(
+                    "{} libtorch is not available for Windows.\n\
+                     PyTorch publishes ROCm builds for Linux only.",
+                    spec.label
+                ));
+            }
+        }
         _ => {
             return Err(format!(
                 "Unsupported platform: {} {}.\n\
@@ -154,19 +177,17 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
         ));
     }
 
-    // Linux and Windows use the same URL pattern
-    let filename = match spec.arch_variant {
-        "cpu" => format!(
-            "libtorch-shared-with-deps-{}%2Bcpu.zip",
-            LIBTORCH_VERSION
-        ),
-        variant => format!(
-            "libtorch-shared-with-deps-{}%2B{}.zip",
-            LIBTORCH_VERSION, variant
-        ),
-    };
+    // Linux and Windows share the bucket layout but NOT the filename:
+    // Windows archives carry a `-win-` infix. PyTorch also publishes a
+    // `-debug-` Windows variant (built against the debug CRT); we fetch the
+    // release one, which is what a release-mode consumer must link against.
+    let infix = if os == "windows" { "win-" } else { "" };
+    let filename = format!(
+        "libtorch-{}shared-with-deps-{}%2B{}.zip",
+        infix, LIBTORCH_VERSION, spec.arch_variant
+    );
 
-    let bucket = spec.arch_variant; // "cpu", "cu126", "cu128"
+    let bucket = spec.arch_variant; // "cpu", "cu126", "cu128", "rocm7.0"
     Ok(format!(
         "https://download.pytorch.org/libtorch/{}/{}",
         bucket, filename
@@ -493,4 +514,114 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn libtorch_version() -> &'static str {
     LIBTORCH_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These assert the exact upstream filename grammar, which differs per
+    // OS in ways that are invisible from a Linux dev box. Each expectation
+    // below was confirmed against download.pytorch.org with a bogus-name
+    // control request, not inferred from the neighbouring arms.
+
+    #[test]
+    fn linux_url_has_no_os_infix() {
+        let url = download_url_for(&CU128_SPEC, "linux", "x86_64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cu128/\
+                 libtorch-shared-with-deps-{LIBTORCH_VERSION}%2Bcu128.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_url_carries_the_win_infix() {
+        // Regression: this arm used to build the Linux filename and 404.
+        let url = download_url_for(&CU128_SPEC, "windows", "x86_64").unwrap();
+        assert!(
+            url.contains("libtorch-win-shared-with-deps-"),
+            "windows archives need the `-win-` infix, got {url}"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cu128/\
+                 libtorch-win-shared-with-deps-{LIBTORCH_VERSION}%2Bcu128.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_cpu_url_carries_the_win_infix() {
+        let url = download_url_for(&CPU_SPEC, "windows", "x86_64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cpu/\
+                 libtorch-win-shared-with-deps-{LIBTORCH_VERSION}%2Bcpu.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_rejects_rocm() {
+        // The rocm7.0 bucket is Linux-only upstream; a `-win-` URL there is
+        // a 404, so refuse before downloading rather than after.
+        let err = download_url_for(&ROCM70_SPEC, "windows", "x86_64").unwrap_err();
+        assert!(err.contains("not available for Windows"), "got {err}");
+    }
+
+    #[test]
+    fn linux_accepts_rocm() {
+        let url = download_url_for(&ROCM70_SPEC, "linux", "x86_64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/rocm7.0/\
+                 libtorch-shared-with-deps-{LIBTORCH_VERSION}%2Brocm7.0.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn macos_arm_uses_its_own_filename_and_is_cpu_only() {
+        let url = download_url_for(&CPU_SPEC, "macos", "aarch64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cpu/\
+                 libtorch-macos-arm64-{LIBTORCH_VERSION}.zip"
+            )
+        );
+
+        let err = download_url_for(&CU128_SPEC, "macos", "aarch64").unwrap_err();
+        assert!(err.contains("only supports CPU"), "got {err}");
+    }
+
+    #[test]
+    fn macos_intel_is_rejected_with_a_reason() {
+        let err = download_url_for(&CPU_SPEC, "macos", "x86_64").unwrap_err();
+        assert!(err.contains("Apple Silicon"), "got {err}");
+    }
+
+    #[test]
+    fn unsupported_platform_is_rejected() {
+        // linux-aarch64 has no upstream libtorch archive; `fdl libtorch
+        // build` from source is the path there.
+        let err = download_url_for(&CPU_SPEC, "linux", "aarch64").unwrap_err();
+        assert!(err.contains("Unsupported platform"), "got {err}");
+    }
+
+    #[test]
+    fn force_linux_ignores_the_host() {
+        // The container is Linux whatever the host is, so the docker path
+        // must never pick up a macOS or Windows filename.
+        let url = download_url(&CU128_SPEC, true).unwrap();
+        assert!(url.contains("libtorch-shared-with-deps-"), "got {url}");
+        assert!(!url.contains("-win-"), "got {url}");
+        assert!(!url.contains("macos"), "got {url}");
+    }
 }

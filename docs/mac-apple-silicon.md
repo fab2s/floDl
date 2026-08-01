@@ -216,4 +216,4 @@ be invoking `cargo` directly. This is fine for development, but `fdl build` /
 
 ---
 
-Previous: [Distributed Architecture](distributed/architecture.md) | Next: [Troubleshooting](troubleshooting.md)
+Previous: [Windows / WSL2](windows-wsl.md) | Next: [Troubleshooting](troubleshooting.md)

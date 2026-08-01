@@ -104,7 +104,11 @@ curl -sL https://flodl.dev/fdl -o fdl && chmod +x fdl
 The `fdl` script auto-downloads a pre-compiled CLI binary (~750KB, pure Rust,
 no libtorch dependency). It detects your GPUs, downloads the right libtorch
 variant, and configures Docker or native builds. See the [full CLI
-reference](docs/cli/01-install.md) for all commands.
+reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/01-install.md) for all commands.
+
+**On Windows**, run the above inside WSL2 - a WSL2 distribution is ordinary
+Linux, so it gets full CUDA and multi-GPU NCCL with nothing cut down. See
+[Windows / WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md).
 
 **One-liner with Docker** (no Rust, no setup):
 
@@ -124,14 +128,14 @@ cargo add flodl && cargo build
 
 For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
 
-For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
+For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
 
 > **Using tch-rs or PyTorch C++?** `fdl` also works as a standalone
 > libtorch manager outside of flodl: download any CPU/CUDA variant,
 > switch between installs, compile from source for mixed GPU
 > architectures (e.g. sm_61 + sm_120 in one build), and emit a
 > machine-readable diagnostics report. No flodl buy-in required.
-> See [Setup commands](docs/cli/02-setup-commands.md)
+> See [Setup commands](https://github.com/flodl-labs/flodl/blob/main/docs/cli/02-setup-commands.md)
 > and the [`flodl-cli` crate](https://crates.io/crates/flodl-cli).
 
 Both paths generate an annotated training template. Edit `src/main.rs` to
@@ -817,6 +821,12 @@ Developed and tested from NVIDIA Pascal (GTX 1060 6GB) to Blackwell
 (RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 - floDl
 links libtorch's stable C API, which supports every architecture the driver
 supports. If `nvidia-smi` works, floDl trains on it.
+
+Linux and [Windows via WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md)
+are the trained-on platforms - the benchmarks above were produced under
+Docker on WSL2, so it is a measured path rather than a claimed one. Apple
+Silicon runs CPU-only through Docker
+([guide](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md)).
 
 ## Documentation
 

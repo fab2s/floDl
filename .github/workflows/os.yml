@@ -1,0 +1,414 @@
+name: OS Matrix
+
+# Per-OS coverage for the parts of floDl that are OS-specific.
+#
+# ci.yml proves the framework works; this workflow proves the *tool* works
+# on every host we ship a binary for. The distinction matters because
+# ci.yml never invokes `fdl` at all -- it hand-rolls libtorch acquisition
+# with a hardcoded wget, so `fdl`'s own download path has no coverage there
+# and its non-Linux arms have none anywhere. A Windows URL bug shipped
+# undetected for exactly that reason.
+#
+# Two stages, gated:
+#
+#   1. `cli`     -- no libtorch, no GPU, every supported host. Compiles and
+#                   tests the crates that carry the OS forks, then makes the
+#                   freshly built `fdl` resolve a libtorch URL for its own
+#                   host and checks that URL is live. No download.
+#   2. `libtorch`/`vendor` -- use the binary stage 1 just built to install
+#                   libtorch for real, then compile the framework against
+#                   it. Runs only where libtorch exists for the host.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'GPU variant for the vendor job (rotate = pick by run number)'
+        type: choice
+        default: rotate
+        options: [rotate, cu126, cu128, rocm70]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Git Bash ships on the Windows runners, so every step below is one shell.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Stage 1: the OS-specific bits, with nothing native underneath them.
+  # ---------------------------------------------------------------------
+  cli:
+    name: fdl (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every host reports. A red leg on one OS must not hide the others,
+      # which is the whole point of having a matrix.
+      fail-fast: false
+      matrix:
+        include:
+          # `libtorch`: does upstream publish an archive for this host?
+          # `stage2`:   does a later job compile the framework here?
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            libtorch: true
+            stage2: true
+
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            # No upstream archive for linux-aarch64. `fdl` must say so
+            # rather than build a URL that 404s -- asserted below.
+            libtorch: false
+            stage2: false
+
+          - name: macos-arm64
+            os: macos-latest
+            libtorch: true
+            stage2: true
+
+          - name: windows-x86_64
+            os: windows-latest
+            libtorch: true
+            # Fetching libtorch is all `fdl.exe` claims to do, and stage 1
+            # just proved that resolves. Nothing downstream to hand it to.
+            stage2: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: os-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: os-${{ matrix.name }}-
+
+      # flodl-cli is zero-dep on flodl and flodl-hw is dependency-free, so
+      # this whole stage needs no libtorch, no C++ toolchain and no GPU.
+      # `--all-targets` is load-bearing: the release workflow builds these
+      # crates without it, so test code has never been compiled off Linux.
+      - name: Test
+        run: cargo test -p flodl-cli -p flodl-hw --all-targets
+
+      - name: Clippy
+        run: cargo clippy -p flodl-cli -p flodl-hw --all-targets -- -W clippy::all
+
+      - name: Build fdl
+        run: cargo build --release -p flodl-cli
+
+      # The libtorch URL grammar differs per OS (macOS has its own
+      # filename, Windows carries a `-win-` infix) and unit tests cover the
+      # grammar offline. This step covers what they cannot: that the URL
+      # this host actually resolves is live upstream. `--dry-run` prints
+      # the URL and stops, so nothing is downloaded.
+      - name: libtorch URL resolves and is live
+        if: matrix.libtorch
+        run: |
+          set -euo pipefail
+          BIN=target/release/fdl
+          [ -f "$BIN" ] || BIN=target/release/fdl.exe
+
+          URL=$("$BIN" libtorch download --cpu --dry-run \
+                | sed -n 's/.*URL:[[:space:]]*//p' | head -1)
+          if [ -z "$URL" ]; then
+            echo "FAIL: --dry-run printed no URL"
+            "$BIN" libtorch download --cpu --dry-run
+            exit 1
+          fi
+          echo "resolved: $URL"
+
+          # Range request: headers plus one byte, never the archive.
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 60 \
+                      --retry 3 --retry-delay 5 -r 0-0 "$URL")
+          echo "upstream: HTTP $CODE"
+          case "$CODE" in
+            200|206) echo "PASS: libtorch URL is live for ${{ matrix.name }}" ;;
+            *) echo "FAIL: $URL -> HTTP $CODE"; exit 1 ;;
+          esac
+
+      # The mirror assertion: on a host with no upstream archive, refusing
+      # is the correct behaviour and must stay loud.
+      - name: libtorch is correctly refused
+        if: ${{ !matrix.libtorch }}
+        run: |
+          set -uo pipefail
+          OUT=$(target/release/fdl libtorch download --cpu --dry-run 2>&1) && RC=0 || RC=$?
+          echo "$OUT"
+          if [ "$RC" -eq 0 ]; then
+            echo "FAIL: expected a refusal on ${{ matrix.name }}, got success"
+            exit 1
+          fi
+          echo "$OUT" | grep -q "Unsupported platform" || {
+            echo "FAIL: refused, but not with the platform message"; exit 1; }
+          echo "PASS: ${{ matrix.name }} refuses with a reason"
+
+      # Stage 2 consumes this rather than rebuilding: the binary that gets
+      # tested should be the binary that was validated.
+      - name: Upload fdl
+        if: matrix.stage2
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdl-${{ matrix.name }}
+          path: |
+            target/release/fdl
+            target/release/fdl.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # Stage 2a: install libtorch with the fdl from stage 1, then compile the
+  # framework against it. CPU only -- no GPU on any hosted runner.
+  # ---------------------------------------------------------------------
+  libtorch:
+    name: libtorch CPU (${{ matrix.name }})
+    needs: cli
+    runs-on: ${{ matrix.os }}
+    # macOS is the discovery leg: flodl-sys's C++ shim has never been
+    # compiled by clang-on-macOS, so this reports rather than blocks.
+    # Flip to blocking once it is green.
+    continue-on-error: ${{ matrix.name == 'macos-arm64' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: macos-arm64
+            os: macos-latest
+    # Windows is absent on purpose: flodl-sys has no MSVC support and NCCL
+    # has no Windows port, so there is nothing to compile there. `fdl.exe`
+    # is a libtorch fetcher, which stage 1 already covers.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: os-lt-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: os-lt-${{ matrix.name }}-
+
+      - name: Fetch the fdl built in stage 1
+        uses: actions/download-artifact@v4
+        with:
+          name: fdl-${{ matrix.name }}
+          path: stage1
+
+      # This is the step ci.yml cannot make: libtorch arrives through the
+      # tool's own resolve-download-extract-activate path, not a wget whose
+      # URL is duplicated in YAML.
+      - name: Install libtorch via fdl
+        run: |
+          set -euo pipefail
+          chmod +x stage1/fdl
+          stage1/fdl libtorch download --cpu
+          stage1/fdl libtorch list
+
+      - name: Build
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+        run: cargo build -p flodl-sys -p flodl
+
+      - name: Clippy
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/precompiled/cpu/lib
+        run: cargo clippy -p flodl-sys -p flodl --all-targets -- -W clippy::all
+
+  # ---------------------------------------------------------------------
+  # Stage 2b: the GPU-feature compile, again with libtorch supplied by fdl.
+  # No GPU is present; this is a build+lint gate exactly like ci.yml's
+  # vendor jobs, differing only in how libtorch got here.
+  # ---------------------------------------------------------------------
+  vendor:
+    name: GPU feature (fdl-installed libtorch)
+    needs: cli
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # One vendor per run, rotating, so steady-state cost stays at one
+      # toolchain image instead of three. run_number is deterministic
+      # within a run, so a re-run repeats the same variant rather than
+      # silently testing something else.
+      #
+      # ROCm IS in the rotation, and it is the leg that matters most:
+      # `fdl libtorch download --rocm 7.0` has never been executed
+      # anywhere, and it is exactly the command a rented AMD box will run
+      # to provision itself. ci.yml's rocm job cannot cover it -- that one
+      # sparse-extracts headers plus one .so and never invokes fdl, so it
+      # also cannot catch build.rs reaching for a file outside the subset.
+      # The two are complementary: ci.yml is the cheap every-PR gate,
+      # this is the occasional full-tree, real-install one.
+      #
+      # Use the workflow_dispatch input to force a variant, which is what
+      # you want the day before renting AMD hardware.
+      - name: Pick vendor for this run
+        id: pick
+        run: |
+          set -euo pipefail
+          SEL="${{ github.event.inputs.variant }}"
+          if [ -z "$SEL" ] || [ "$SEL" = "rotate" ]; then
+            case $(( ${{ github.run_number }} % 3 )) in
+              0) SEL=cu128 ;;
+              1) SEL=cu126 ;;
+              2) SEL=rocm70 ;;
+            esac
+          fi
+
+          case "$SEL" in
+            cu126)
+              echo "flag=--cuda 12.6"        >> "$GITHUB_OUTPUT"
+              echo "feature=cuda"            >> "$GITHUB_OUTPUT"
+              echo "dockerfile=Dockerfile.cuda" >> "$GITHUB_OUTPUT" ;;
+            cu128)
+              echo "flag=--cuda 12.8"        >> "$GITHUB_OUTPUT"
+              echo "feature=cuda"            >> "$GITHUB_OUTPUT"
+              echo "dockerfile=Dockerfile.cuda" >> "$GITHUB_OUTPUT" ;;
+            rocm70)
+              echo "flag=--rocm 7.0"         >> "$GITHUB_OUTPUT"
+              echo "feature=rocm"            >> "$GITHUB_OUTPUT"
+              echo "dockerfile=Dockerfile.rocm" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "unknown variant: $SEL"; exit 1 ;;
+          esac
+          echo "variant=$SEL" >> "$GITHUB_OUTPUT"
+          echo "::notice::vendor leg this run: $SEL"
+
+      # Measured sizes, not estimates: the rocm70 tree is 12 GB expanded
+      # and Dockerfile.rocm's image is ~25 GB (cu128 is 6.1 GB / ~18 GB).
+      # Both fit only if libtorch stays off the root volume, hence /mnt
+      # below -- hosted runners carry a much larger scratch volume there.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift
+          sudo apt-get clean
+          echo "--- root volume ---"; df -h /
+          echo "--- scratch volume ---"; df -h /mnt || true
+
+      - name: Fetch the fdl built in stage 1
+        uses: actions/download-artifact@v4
+        with:
+          name: fdl-linux-x86_64
+          path: stage1
+
+      # `--path` puts the tree exactly where told (no precompiled/<v>
+      # suffix), keeping 12 GB off the root volume. `--no-activate`
+      # because .active would otherwise record `precompiled/<variant>`,
+      # a path that does not exist under a custom --path. Activation is
+      # not skipped for convenience -- the CPU job above exercises the
+      # default path *with* activation, so both halves stay covered.
+      - name: Install libtorch via fdl
+        run: |
+          set -euo pipefail
+          chmod +x stage1/fdl
+          sudo mkdir -p /mnt/libtorch
+          sudo chown "$(id -u):$(id -g)" /mnt/libtorch
+
+          stage1/fdl libtorch download ${{ steps.pick.outputs.flag }} \
+            --path /mnt/libtorch --no-activate
+
+          test -f /mnt/libtorch/include/torch/csrc/api/include/torch/torch.h \
+            || { echo "FAIL: headers missing after install"; exit 1; }
+          du -sh /mnt/libtorch
+          echo "--- root volume ---"; df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-os
+          key: buildx-os-${{ steps.pick.outputs.variant }}-${{ hashFiles(steps.pick.outputs.dockerfile) }}
+          restore-keys: buildx-os-${{ steps.pick.outputs.feature }}-
+
+      # The container supplies only the vendor toolkit headers build.rs
+      # reaches for ($CUDA_HOME/include, or $ROCM_PATH/include for HIP).
+      # libtorch comes from the host tree fdl just populated.
+      - name: Build toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.pick.outputs.dockerfile }}
+          load: true
+          tags: flodl-vendor-os-ci
+          cache-from: type=local,src=/tmp/.buildx-cache-os
+          cache-to: type=local,dest=/tmp/.buildx-cache-os-new,mode=max
+
+      - name: Rotate buildx cache
+        run: |
+          rm -rf /tmp/.buildx-cache-os
+          mv /tmp/.buildx-cache-os-new /tmp/.buildx-cache-os
+
+      # cargo directly rather than `fdl gpu-clippy`: that command drives
+      # docker-compose and reads fdl.yml, which is gitignored (only
+      # fdl.yml.example is committed). This runs gpu-clippy's actual
+      # payload -- the same feature-gated lint over all targets.
+      #
+      # Deliberately NOT scoped to -p flodl-sys -p flodl. ci.yml's rocm job
+      # has to scope because its sparse extract cannot satisfy a link; this
+      # job installed the whole tree, so a workspace build links for real.
+      # That makes the rocm leg the first thing anywhere to LINK against a
+      # complete libtorch-rocm -- which is where the force-load and
+      # gpu_compat.h symbol mapping would fail if they are wrong.
+      - name: Build and clippy with the ${{ steps.pick.outputs.feature }} feature
+        run: |
+          set -euo pipefail
+          for cmd in "build" "clippy --all-targets"; do
+            docker run --rm \
+              -v "${{ github.workspace }}:/workspace" \
+              -v "/mnt/libtorch:/usr/local/libtorch:ro" \
+              -w /workspace \
+              flodl-vendor-os-ci \
+              sh -c "cargo $cmd --features ${{ steps.pick.outputs.feature }}"
+          done

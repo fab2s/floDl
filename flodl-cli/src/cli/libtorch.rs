@@ -287,6 +287,10 @@ fn print_libtorch_usage() {
     println!("    download           Download pre-built libtorch");
     println!("        --cpu          Force CPU variant");
     println!("        --cuda <ver>   Specific CUDA version (12.6, 12.8)");
+    println!("        --rocm <ver>   AMD ROCm build instead of CUDA (7.0)");
+    println!("        --path <dir>   Install here (default: project libtorch/)");
+    println!("        --no-activate  Do not activate after download");
+    println!("        --dry-run      Print the resolved URL and stop");
     println!("    build              Build libtorch from source");
     println!("        --docker       Force Docker build (isolated, reproducible)");
     println!("        --native       Force native build (faster, requires host toolchain)");

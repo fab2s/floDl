@@ -51,6 +51,7 @@ material in reading order for browsing the repository directly.
 
 ## Platform & Help
 
+- [Windows / WSL2](windows-wsl.md)
 - [Mac / Apple Silicon](mac-apple-silicon.md)
 - [Troubleshooting](troubleshooting.md)
 

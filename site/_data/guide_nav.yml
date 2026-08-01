@@ -142,6 +142,9 @@ groups:
     open: true
     numbered: false
     members:
+      - stub: "windows-wsl"
+        title: "Windows / WSL2"
+        blurb: "The supported path on Windows hardware: full CUDA and NCCL under WSL2, and what the native fdl.exe is for."
       - stub: "mac-apple-silicon"
         title: "Mac / Apple Silicon"
         blurb: "Running flodl on Apple Silicon through the Docker CPU path."

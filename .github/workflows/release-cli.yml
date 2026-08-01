@@ -34,6 +34,10 @@ jobs:
             os: macos-latest
             artifact: flodl-cli-darwin-arm64
 
+          # Native Windows ships `fdl` as a libtorch fetcher and WSL
+          # signpost, not as a build driver: flodl-sys has never been built
+          # against MSVC and NCCL has no Windows port, so training lives in
+          # WSL2. See docs/windows-wsl.md.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: flodl-cli-windows-x86_64.exe
