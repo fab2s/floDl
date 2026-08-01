@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // docs.rs builds without libtorch — skip C++ compilation entirely.
@@ -100,8 +100,53 @@ fn main() {
             "\nflodl-sys: `--features rocm` needs a ROCm libtorch, but `{}`\n\
              has no `lib/libtorch_hip.so` (so it is a CUDA or CPU build).\n\n\
              Point LIBTORCH_PATH at a ROCm variant -- `fdl libtorch download\n\
-             --rocm 6.3` fetches one -- or build with `--features cuda`.\n",
+             --rocm 7.0` fetches one -- or build with `--features cuda`.\n",
             libtorch.display(),
+        );
+        std::process::exit(1);
+    }
+
+    // Where each vendor's toolkit lives. Read once: both the guard below
+    // and the include setup further down need them.
+    let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+    let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
+
+    // The same rationale as the guard above, one layer out. libtorch
+    // bundles each vendor's runtime LIBRARIES -- every lib linked below
+    // ships inside `libtorch/lib`, `libamdhip64` included -- but not the
+    // toolkit HEADERS. Those are the one thing that must come from a
+    // vendor install, and without them the failure is a C++ "no such
+    // file" naming something the user cannot apt-install by that name.
+    //
+    // Note `libtorch/include/hip/` exists in a ROCm build and does NOT
+    // satisfy this: it holds torch's own hipified c10 wrappers
+    // (HIPGuard.h and friends), not the HIP runtime.
+    if want_rocm && !Path::new(&rocm_path).join("include/hip/hip_runtime.h").exists() {
+        eprintln!(
+            "\nflodl-sys: `--features rocm` needs the ROCm toolkit headers, but\n\
+             `{rocm_path}/include/hip/hip_runtime.h` does not exist.\n\n\
+             libtorch ships the HIP runtime libraries but not its headers, so\n\
+             this piece has to come from a ROCm install:\n\n\
+             \x20 Ubuntu/Debian:  sudo apt install hip-dev rccl-dev\n\
+             \x20                 (repo: https://repo.radeon.com/rocm/apt/)\n\
+             \x20 Other Linux:    install the ROCm HIP SDK\n\
+             \x20 macOS/Windows:  no ROCm build exists; on Windows use WSL2\n\n\
+             Set ROCM_PATH if your install is not at /opt/rocm.\n"
+        );
+        std::process::exit(1);
+    }
+    if want_cuda && !Path::new(&cuda_home).join("include/cuda_runtime.h").exists() {
+        eprintln!(
+            "\nflodl-sys: `--features cuda` needs the CUDA toolkit headers, but\n\
+             `{cuda_home}/include/cuda_runtime.h` does not exist.\n\n\
+             libtorch bundles the CUDA runtime libraries but not its headers:\n\n\
+             \x20 Ubuntu/Debian:  sudo apt install cuda-toolkit libnccl-dev\n\
+             \x20                 (repo: https://developer.nvidia.com/cuda-downloads)\n\
+             \x20                 headers alone: cuda-cudart-dev-<major>-<minor>\n\
+             \x20                 plus libnccl-dev for <nccl.h>\n\
+             \x20 Other Linux:    install the CUDA Toolkit\n\
+             \x20 macOS:          no CUDA build exists for macOS\n\n\
+             Set CUDA_HOME if your install is not at /usr/local/cuda.\n"
         );
         std::process::exit(1);
     }
@@ -125,8 +170,6 @@ fn main() {
     if want_cuda {
         // CUDA toolkit headers (the one genuinely vendor-specific part
         // of the compile step).
-        let cuda_home = env::var("CUDA_HOME")
-            .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         build.include(format!("{}/include", cuda_home));
     }
     if want_rocm {
@@ -140,8 +183,6 @@ fn main() {
         // `c10/hip/*` + `ATen/hip/*` trees instead. There is likewise no
         // `nccl.h` anywhere in ROCm: RCCL exports the nccl symbol names
         // but ships them as `rccl/rccl.h` only.
-        let rocm_path =
-            env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
         build.include(format!("{rocm_path}/include"));
         // `__HIP_PLATFORM_AMD__` is HIP's own "compiling for AMD" macro,
         // which `gpu_compat.h` keys the whole vendor mapping on.
