@@ -171,14 +171,23 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
     use libtorch::download::{DownloadOpts, Variant};
     use std::path::PathBuf;
 
-    // --cpu and --cuda are mutually exclusive.
-    if cli.cpu && cli.cuda.is_some() {
-        cli_error!("--cpu and --cuda are mutually exclusive");
+    // --cpu / --cuda / --rocm each name a different build; at most one.
+    let picked = [cli.cpu, cli.cuda.is_some(), cli.rocm.is_some()]
+        .iter()
+        .filter(|p| **p)
+        .count();
+    if picked > 1 {
+        cli_error!("--cpu, --cuda and --rocm are mutually exclusive");
         return ExitCode::FAILURE;
     }
 
     let variant = if cli.cpu {
         Variant::Cpu
+    } else if cli.rocm.is_some() {
+        match cli.rocm.as_deref() {
+            Some("7.0") => Variant::Rocm70,
+            _ => unreachable!("validated by #[option(choices = ...)]"),
+        }
     } else {
         match cli.cuda.as_deref() {
             Some("12.6") => Variant::Cuda126,

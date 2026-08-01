@@ -279,6 +279,9 @@ pub struct LibtorchDownloadArgs {
     /// Pick a specific CUDA version (instead of auto-detect).
     #[option(choices = &["12.6", "12.8"])]
     pub cuda: Option<String>,
+    /// Pick an AMD ROCm build instead of CUDA.
+    #[option(choices = &["7.0"])]
+    pub rocm: Option<String>,
     /// Install libtorch to this directory (default: project libtorch/).
     #[option]
     pub path: Option<String>,

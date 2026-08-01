@@ -53,6 +53,24 @@ const CU128_SPEC: VariantSpec = VariantSpec {
     arch_variant: "cu128",
 };
 
+const ROCM70_SPEC: VariantSpec = VariantSpec {
+    label: "ROCm 7.0",
+    // `rocm70` (no dot) matches the cu128 style and satisfies
+    // `detect::variant_vendor`'s `rocm<digit>` rule.
+    dir_name: "rocm70",
+    // `.arch` cuda= is the CUDA toolkit version; an AMD build has none.
+    // The vendor is carried by the variant path, which is what
+    // `variant_vendor` and prebuild's feature derivation read.
+    arch_cuda: "none",
+    // gfx targets covered by the bundled rocBLAS Tensile kernels.
+    arch_archs: "gfx906 gfx908 gfx90a gfx942 gfx1030 gfx1100 gfx1101 gfx1102 gfx1200 gfx1201",
+    // Doubles as the URL bucket AND the `+<variant>` filename suffix,
+    // exactly like `cu128` -- PyTorch dropped the `cxx11-abi-` filename
+    // prefix, so the ROCm archives follow the same pattern as CUDA's and
+    // need no special-casing in the URL builder.
+    arch_variant: "rocm7.0",
+};
+
 // ---------------------------------------------------------------------------
 // Download options
 // ---------------------------------------------------------------------------
@@ -61,6 +79,7 @@ pub enum Variant {
     Cpu,
     Cuda126,
     Cuda128,
+    Rocm70,
     Auto,
 }
 
@@ -212,6 +231,7 @@ fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
         Variant::Cpu => &CPU_SPEC,
         Variant::Cuda126 => &CU126_SPEC,
         Variant::Cuda128 => &CU128_SPEC,
+        Variant::Rocm70 => &ROCM70_SPEC,
         Variant::Auto => auto_detect_variant(),
     }
 }
@@ -277,16 +297,34 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
             .map_err(|e| format!("cannot remove {}: {}", install_path.display(), e))?;
     }
 
-    // Download to temp file
-    let tmp_dir = std::env::temp_dir();
-    let tmp_zip = tmp_dir.join(format!("libtorch-{}-{}.zip", spec.dir_name, LIBTORCH_VERSION));
+    // Stage BESIDE the destination, not in the system temp dir.
+    //
+    // `std::env::temp_dir()` is `/tmp`, which on a great many Linux
+    // setups is a small RAM-backed tmpfs -- 16 GiB on the rig this was
+    // found on. Staging there needs the archive AND its expansion at
+    // once: ~20 GiB for a ROCm build, ~7 GiB even for CUDA. Blowing it
+    // does not merely fail the download, it fills a tmpfs that the rest
+    // of the system (and every shell's temp files) depends on.
+    //
+    // The destination's own filesystem is the one the user actually
+    // sized for libtorch, and staging there makes the final move a
+    // same-filesystem rename rather than a cross-device copy.
+    let stage_root = install_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&stage_root)
+        .map_err(|e| format!("cannot create {}: {}", stage_root.display(), e))?;
+    let stage = Staging::new(stage_root.join(format!(".fdl-staging-{}", std::process::id())))?;
+
+    let tmp_zip = stage.path().join(format!("libtorch-{}.zip", spec.dir_name));
 
     println!();
     println!("  Downloading...");
     http::download_file(&url, &tmp_zip)?;
 
-    // Extract to temp directory (zip contains a top-level "libtorch/" dir)
-    let tmp_extract = tmp_dir.join(format!("libtorch-extract-{}", std::process::id()));
+    // Extract (the zip carries a top-level "libtorch/" dir)
+    let tmp_extract = stage.path().join("extract");
     println!("  Extracting...");
     archive::extract_zip(&tmp_zip, &tmp_extract)?;
 
@@ -301,12 +339,16 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
     fs::create_dir_all(&install_path)
         .map_err(|e| format!("cannot create {}: {}", install_path.display(), e))?;
 
-    // Move all files from extracted dir to install path
+    // Move all files from extracted dir to install path. Same
+    // filesystem now, so `move_contents`'s rename path is the one that
+    // fires.
     move_contents(source, &install_path)?;
 
-    // Cleanup temp files
-    let _ = fs::remove_file(&tmp_zip);
-    let _ = fs::remove_dir_all(&tmp_extract);
+    // `stage` cleans itself up on drop, including on the error paths
+    // above -- the predecessor leaked its temp zip and extract dir
+    // whenever anything failed, which on a tmpfs meant a failed
+    // download left gigabytes behind until reboot.
+    drop(stage);
 
     // Verify
     let lib_dir = install_path.join("lib");
@@ -378,6 +420,33 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 /// Move all files and directories from `src` into `dest`.
+/// A staging directory that removes itself on drop, however we leave.
+///
+/// The point is the failure paths: a download or extract that errors
+/// out used to leave its partial archive and expansion behind, which on
+/// a tmpfs is space nothing reclaims until reboot.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        // A leftover from a crashed run would otherwise merge into this
+        // one; start clean.
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path)
+            .map_err(|e| format!("cannot create staging dir {}: {}", path.display(), e))?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn move_contents(src: &Path, dest: &Path) -> Result<(), String> {
     let entries = fs::read_dir(src)
         .map_err(|e| format!("cannot read {}: {}", src.display(), e))?;

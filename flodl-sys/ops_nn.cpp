@@ -8,8 +8,7 @@
 #include "helpers.h"
 
 #ifdef FLODL_BUILD_GPU
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/cuda/CUDACachingAllocator.h>
+#include "gpu_compat.h"
 #include <ATen/detail/CUDAHooksInterface.h>
 #include <ATen/Context.h>
 #include <mutex>
@@ -547,9 +546,11 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
     }
 }
 
-// Keeping the CUDA libraries loaded so their aten-kernel registrations run.
+// Keeping the GPU libraries loaded so their aten-kernel registrations run.
 // Without this, `at::empty`/`randn` on a CUDA device fail with
-// "not available for the CUDA backend" even with a GPU present.
+// "not available for the CUDA backend" even with a GPU present. The whole
+// mechanism is vendor-symmetric: ROCm has exactly the same split, with
+// libc10_hip.so and libtorch_hip.so playing the two roles below.
 //
 // c10_cuda.so is pinned by a real symbol reference (c10::cuda::device_count
 // in flodl_force_cuda_link below), resolved at link time so the lib is a
@@ -567,18 +568,17 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
 // regardless of `--as-needed`. The initializer lives in this always-linked
 // shim TU, so it covers every binary that uses flodl (bins, tests, benches).
 #ifdef FLODL_BUILD_GPU
-#include <cuda_runtime.h>
 #include <dlfcn.h>
 
 namespace {
-struct ForceCudaLibLoad {
-    ForceCudaLibLoad() {
+struct ForceGpuLibLoad {
+    ForceGpuLibLoad() {
         // Non-fatal on failure: a CPU-only deployment that cannot find the
-        // lib simply falls back to reporting CUDA unavailable, honestly.
-        (void)dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL);
+        // lib simply falls back to reporting the GPU unavailable, honestly.
+        (void)dlopen(FLODL_TORCH_GPU_LIB, RTLD_NOW | RTLD_GLOBAL);
     }
 };
-static ForceCudaLibLoad force_cuda_lib_load;
+static ForceGpuLibLoad force_gpu_lib_load;
 }  // namespace
 #endif
 

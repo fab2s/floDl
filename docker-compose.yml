@@ -161,6 +161,60 @@ services:
   #   #       identity_file: /home/me/project/.ssh-cuda-rank/cuda_rank_key
   #   #     arch: precompiled/cu128
   #   # (drop `docker: cuda` -- launcher dispatches via SSH, not via docker)
+  # ROCm counterpart of `cuda`. Same shape: no libtorch baked in, the
+  # matching variant bind-mounted from libtorch/.
+  #
+  # `fdl` resolves `docker: gpu` to this service when the active libtorch
+  # variant is an AMD build, so fdl.yml never names a vendor.
+  #
+  # Device passthrough differs from NVIDIA in kind, not degree: there is
+  # no runtime shim, the kernel interfaces are handed in directly.
+  # /dev/kfd is the compute device, /dev/dri the render nodes, and the
+  # video/render groups gate access to both.
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${ROCM_VERSION:-7.0}
+    image: flodl-rocm:${ROCM_TAG:-7.0}
+    user: "${UID:-1000}:${GID:-1000}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
+      - ${LIBTORCH_ROCM_PATH:-./libtorch/precompiled/rocm70}:/usr/local/libtorch:ro
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: 2gb
+    hostname: ${HOSTNAME}
+    network_mode: host
+    environment:
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path. Lets a `run:` line say
+      # `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+      - FDL_GPU_FEATURE
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FDL_CMD
+      - FDL_ENV
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
+
   cuda-rank:
     image: flodl-cuda:${CUDA_TAG:-12.8}
     build:

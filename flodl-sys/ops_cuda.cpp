@@ -12,9 +12,7 @@
 // --- CUDA Graphs ---
 
 #ifdef FLODL_BUILD_GPU
-#include <ATen/cuda/CUDAGraph.h>
-#include <ATen/cuda/CUDAEvent.h>
-#include <c10/cuda/CUDAStream.h>
+#include "gpu_compat.h"
 
 // Wrapper that owns a CUDAGraph + the side stream used for capture.
 // CUDA graphs must be captured on a non-default stream.
@@ -365,7 +363,21 @@ extern "C" void flodl_cuda_stream_delete(void* stream) {
 
 // --- NCCL Collective Operations ---
 
+// RCCL is NCCL's AMD counterpart and exports the same symbol names, so
+// everything below compiles unchanged for both -- but the HEADER is not
+// named the same. ROCm ships `rccl/rccl.h` and no `nccl.h` at all
+// (verified in a rocm/dev-ubuntu-24.04:7.0-complete container: only
+// rccl.h and nccl_net.h exist, and rccl.h declares ncclCommInitRank,
+// ncclAllReduce, ncclGetUniqueId and the rest).
+//
+// `__HIP_PLATFORM_AMD__` is HIP's own canonical "compiling for AMD"
+// macro, set by build.rs on the rocm feature; keying on it avoids
+// inventing a private define for something the toolchain already says.
+#ifdef __HIP_PLATFORM_AMD__
+#include <rccl/rccl.h>
+#else
 #include <nccl.h>
+#endif
 #include <atomic>
 
 static ncclDataType_t to_nccl_dtype(at::ScalarType dtype) {

@@ -36,33 +36,6 @@ fn main() {
         );
         std::process::exit(1);
     }
-    if want_rocm {
-        // Known-good facts, read off libtorch 2.7.0+rocm6.3's own file
-        // list so P7 does not have to re-derive them:
-        //   link:        torch_hip, c10_hip, amdhip64, rccl  (all four
-        //                ship inside libtorch/lib, RCCL included)
-        //   force-load:  libtorch_hip.so  (the analogue of the
-        //                libtorch_cuda.so dlopen in ops_nn.cpp)
-        //
-        // What is NOT known, and is why this is an error rather than a
-        // blind link: the shim includes <c10/cuda/CUDAFunctions.h>,
-        // <c10/cuda/CUDACachingAllocator.h> and <nccl.h>. PyTorch
-        // hipifies those paths for ROCm builds, and whether they resolve
-        // verbatim against a ROCm libtorch has not been checked on
-        // hardware. Linking blind would fail deep in the C++ compile
-        // with a missing-header error that says nothing about the cause.
-        eprintln!(
-            "\nflodl-sys: the `rocm` feature is declared but the C++ shim's ROCm\n\
-             path is not implemented yet.\n\n\
-             The shim includes <c10/cuda/*> and <nccl.h>, which PyTorch hipifies\n\
-             for ROCm builds; that has not been verified against a real ROCm\n\
-             libtorch, so this build stops here rather than failing later with a\n\
-             missing-header error. Build with `--features cuda`, or with no GPU\n\
-             feature for CPU-only.\n"
-        );
-        std::process::exit(1);
-    }
-
     let libtorch = env::var("LIBTORCH_PATH")
         .unwrap_or_else(|_| "/usr/local/libtorch".to_string());
     let libtorch = PathBuf::from(&libtorch);
@@ -112,6 +85,27 @@ fn main() {
         "ops_cuda.cpp",
     ];
 
+    // --- ROCm: proceed only against a libtorch that actually is one ---
+    //
+    // The refusal is conditional rather than absolute. Compiling and
+    // linking the shim needs headers and .so files, NOT a GPU -- only
+    // *running* needs silicon -- so a ROCm container with a ROCm
+    // libtorch mounted can legitimately build this, and that is how the
+    // remaining unknown gets settled. What cannot work is `--features
+    // rocm` against a CUDA (or absent) libtorch, and that is the case
+    // worth catching early with a message instead of a missing-header
+    // error deep in the C++ compile.
+    if want_rocm && !libtorch.join("lib/libtorch_hip.so").exists() {
+        eprintln!(
+            "\nflodl-sys: `--features rocm` needs a ROCm libtorch, but `{}`\n\
+             has no `lib/libtorch_hip.so` (so it is a CUDA or CPU build).\n\n\
+             Point LIBTORCH_PATH at a ROCm variant -- `fdl libtorch download\n\
+             --rocm 6.3` fetches one -- or build with `--features cuda`.\n",
+            libtorch.display(),
+        );
+        std::process::exit(1);
+    }
+
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -135,6 +129,30 @@ fn main() {
             .unwrap_or_else(|_| "/usr/local/cuda".to_string());
         build.include(format!("{}/include", cuda_home));
     }
+    if want_rocm {
+        // ROCm supplies what libtorch-rocm does NOT bundle: the HIP
+        // runtime headers (`hip/hip_runtime.h`) and RCCL's `rccl/rccl.h`.
+        //
+        // libtorch-rocm DOES ship the `c10/cuda/*` and `ATen/cuda/*`
+        // header trees, but they are dead weight -- the unbuilt CUDA
+        // headers, missing their generated `cuda_cmake_macros.h`, with no
+        // `libc10_cuda.so` to link against. `gpu_compat.h` maps onto the
+        // `c10/hip/*` + `ATen/hip/*` trees instead. There is likewise no
+        // `nccl.h` anywhere in ROCm: RCCL exports the nccl symbol names
+        // but ships them as `rccl/rccl.h` only.
+        let rocm_path =
+            env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+        build.include(format!("{rocm_path}/include"));
+        // `__HIP_PLATFORM_AMD__` is HIP's own "compiling for AMD" macro,
+        // which `gpu_compat.h` keys the whole vendor mapping on.
+        build.define("__HIP_PLATFORM_AMD__", "1");
+        // `USE_ROCM` is torch's own switch inside the hipified headers.
+        // Without it they take their `#else` branch and reach for CUDA
+        // headers that a ROCm install does not have -- e.g.
+        // `ATen/hip/Exceptions.h` includes `<cusolver_common.h>` unless
+        // USE_ROCM is set, and it is reached from `ATen/hip/HIPEvent.h`.
+        build.define("USE_ROCM", "1");
+    }
 
     build.compile("flodl_shim");
 
@@ -143,6 +161,24 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=torch");
     println!("cargo:rustc-link-lib=dylib=torch_cpu");
     println!("cargo:rustc-link-lib=dylib=c10");
+
+    if want_rocm {
+        // Link set read off libtorch 2.7.0+rocm6.3's own file list --
+        // all four ship inside libtorch/lib, RCCL included.
+        println!("cargo:rustc-link-lib=dylib=torch_hip");
+        println!("cargo:rustc-link-lib=dylib=c10_hip");
+        println!("cargo:rustc-link-lib=dylib=amdhip64");
+
+        let rocm_path =
+            env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+        println!("cargo:rustc-link-search=native={rocm_path}/lib");
+
+        // dlopen, for the force-load and the allocator probes.
+        println!("cargo:rustc-link-lib=dylib=dl");
+        // RCCL is NCCL's API-compatible counterpart and exports the same
+        // symbol names, so the shim's collective code is unchanged.
+        println!("cargo:rustc-link-lib=dylib=rccl");
+    }
 
     if want_cuda {
         println!("cargo:rustc-link-lib=dylib=torch_cuda");
@@ -167,4 +203,5 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=LIBTORCH_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
 }

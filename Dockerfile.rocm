@@ -1,0 +1,67 @@
+# flodl ROCm image -- ROCm toolchain only, libtorch mounted at runtime.
+#
+# Mirrors Dockerfile.cuda: no libtorch is baked in, the matching variant
+# is bind-mounted from libtorch/ by docker-compose.
+#
+# Override the ROCm version at build time:
+#   docker build --build-arg ROCM_VERSION=7.1 -f Dockerfile.rocm .
+#
+# Keep the base version aligned with the libtorch variant you mount.
+# libtorch-rocm bundles its own HIP runtime (see the LD_LIBRARY_PATH note
+# below), and a bundle that disagrees with the host driver is exactly the
+# configuration that segfaults at the first GPU op.
+
+ARG ROCM_VERSION=7.0
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    curl \
+    unzip \
+    ca-certificates \
+    git \
+    gcc \
+    g++ \
+    pkg-config \
+    graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Rust ---
+ENV CARGO_HOME="/usr/local/cargo"
+ENV RUSTUP_HOME="/usr/local/rustup"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+# libtorch is bind-mounted at runtime to /usr/local/libtorch
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV ROCM_PATH="/opt/rocm"
+
+# --- D1a: the system ROCm runtime goes FIRST, ahead of libtorch's ---
+#
+# This is the one ordering that differs from Dockerfile.cuda, and it is
+# load-bearing rather than cosmetic. libtorch-rocm ships the ENTIRE
+# userspace ROCm stack inside its own lib/ -- libamdhip64,
+# libhsa-runtime64, libamd_comgr, librocm-core, and the
+# kernel-interface-coupled libdrm / libdrm_amdgpu / libnuma. Verified by
+# reading the published 2.7.0+rocm6.3 archive's file list.
+#
+# With libtorch's lib/ first, that bundle wins over the system runtime,
+# and when it disagrees with the host's amdkfd driver the process
+# segfaults at the FIRST GPU OP -- a failure that looks nothing like a
+# link problem, which is what makes it the lowest-discoverability item
+# in the whole ROCm bring-up.
+#
+# `/opt/rocm/lib` first, libtorch second: libtorch's own torch/c10 libs
+# are still found (nothing else provides them), while anything the
+# system also supplies resolves to the copy that matches the driver.
+#
+# No `lib/llvm/lib` entry: unlike some prebuilt distributions,
+# libtorch-rocm ships no LLVM subtree and no libLLVM.so.* -- ROCm 6.x
+# links LLVM statically into libamd_comgr.
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+
+WORKDIR /workspace
