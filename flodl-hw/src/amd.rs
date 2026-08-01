@@ -604,6 +604,24 @@ mod tests {
         )
     }
 
+    /// Build one `/sys/bus/pci/devices/<slot>/` entry.
+    ///
+    /// `#[cfg(unix)]`, and so are its three callers, for a reason that is
+    /// about the FIXTURE rather than the code under test: a PCI slot is
+    /// spelled `0000:0d:00.0`, and a colon is not a legal character in a
+    /// Windows filename -- `create_dir_all` there fails with
+    /// `ERROR_INVALID_NAME` (os error 123) before any assertion runs.
+    ///
+    /// Substituting a colon-free slot name would keep the tests running
+    /// but stop them testing the thing: `amd_display_devices` puts the
+    /// directory name straight into the user-facing note (a PCI address
+    /// is what makes that message actionable), and these tests assert on
+    /// it. A fake address would assert a fake message.
+    ///
+    /// Nothing is lost by skipping them off-unix. `probe` reads
+    /// `Path::new("/sys")`, so the whole KFD/PCI surface is inert on
+    /// Windows by construction -- there is no behaviour there to protect.
+    #[cfg(unix)]
     fn pci_device(sys: &Path, slot: &str, vendor: &str, class: &str, device: &str) {
         let d = sys.join("bus/pci/devices").join(slot);
         fs::create_dir_all(&d).unwrap();
@@ -796,6 +814,9 @@ mod tests {
         assert!(out.notes[0].message.contains("--device=/dev/kfd"), "{:?}", out.notes);
     }
 
+    // Unix-only: see `pci_device` -- a PCI slot name contains colons,
+    // which Windows rejects as a filename.
+    #[cfg(unix)]
     #[test]
     fn pci_sharpens_the_no_kfd_case() {
         // No KFD node at all, but an AMD display device on the bus:
@@ -811,6 +832,9 @@ mod tests {
         assert!(out.notes[0].message.contains("0000:0d:00.0"), "{:?}", out.notes);
     }
 
+    // Unix-only: see `pci_device` -- a PCI slot name contains colons,
+    // which Windows rejects as a filename.
+    #[cfg(unix)]
     #[test]
     fn a_pure_nvidia_box_says_nothing_about_amd() {
         // The dev rig, minus its iGPU: NVIDIA display devices only. An
@@ -824,6 +848,9 @@ mod tests {
         assert!(out.notes.is_empty(), "silent on a box with no AMD hardware");
     }
 
+    // Unix-only: see `pci_device` -- a PCI slot name contains colons,
+    // which Windows rejects as a filename.
+    #[cfg(unix)]
     #[test]
     fn a_non_display_amd_device_is_not_a_gpu() {
         // Every AMD host has AMD-vendor chipset functions on the bus.

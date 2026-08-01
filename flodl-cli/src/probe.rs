@@ -1293,15 +1293,21 @@ mod tests {
     fn data_path_check_reports_readable_tmp() {
         let mut issues = Vec::new();
         let mut warnings = Vec::new();
+        // `env::temp_dir()`, not a literal "/tmp": the assertion is that a
+        // path which exists is *reported* as existing, and hardcoding a
+        // POSIX path made this fail on Windows for a reason that had
+        // nothing to do with check_data_path (which was right to call a
+        // missing path missing).
         let status = check_data_path(
-            PathBuf::from("/tmp"),
+            std::env::temp_dir(),
             false,
             false,
             &mut issues,
             &mut warnings,
         );
-        // /tmp is virtually always readable on Linux; if not we'd see
-        // it in `issues` and the test would surface the surprise.
+        // The temp dir is readable on any host that can run this test; if
+        // not we'd see it in `issues` and the test would surface the
+        // surprise.
         assert!(status.exists);
         assert!(status.readable);
         assert!(issues.is_empty(), "issues = {:?}", issues);

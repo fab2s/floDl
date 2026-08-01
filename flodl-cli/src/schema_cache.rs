@@ -409,6 +409,16 @@ mod tests {
         // Build a tiny shell script that emits the schema JSON and use it
         // as the "entry". This tests the full probe path end-to-end
         // without pulling in cargo.
+        //
+        // The entry is `sh <name>`, not the script path on its own, and
+        // that is load-bearing on Windows: `probe` shells out through
+        // `cmd /C`, which cannot execute a `.sh` and -- worse -- returns
+        // success with empty stdout when handed one. Naming `sh`
+        // explicitly runs it under Git Bash's sh on every host, and the
+        // relative name keeps backslash paths out of sh's hands (probe
+        // runs in `cmd_dir`). Same shape as the fdl.yml entry in
+        // config::tests::command_tests, which is why that one was
+        // portable already.
         let tmp = TestDir::new("sc");
         let script = tmp.path().join("mock-bin.sh");
         let body = r#"#!/bin/sh
@@ -427,16 +437,8 @@ cat <<'JSON'
 JSON
 "#;
         fs::write(&script, body).unwrap();
-        // chmod +x
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perm = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&script, perm).unwrap();
-        }
 
-        let entry = script.to_string_lossy();
-        let schema = probe(&entry, tmp.path(), None).expect("probe should succeed");
+        let schema = probe("sh mock-bin.sh", tmp.path(), None).expect("probe should succeed");
         let model = schema.options.get("model").expect("model opt");
         assert_eq!(model.ty, "string");
         assert_eq!(model.short.as_deref(), Some("m"));
@@ -447,13 +449,12 @@ JSON
         let tmp = TestDir::new("sc");
         let script = tmp.path().join("junk.sh");
         fs::write(&script, "#!/bin/sh\necho not json\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perm = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&script, perm).unwrap();
-        }
-        let err = probe(&script.to_string_lossy(), tmp.path(), None)
+        // `sh <name>`: see probe_round_trips_with_mock_binary. This test
+        // in particular used to pass on Windows for the wrong reason --
+        // cmd /C on a .sh yields empty stdout, which trips the same "no
+        // JSON" error the test asserts, so it was green without ever
+        // running the script.
+        let err = probe("sh junk.sh", tmp.path(), None)
             .expect_err("non-json must fail");
         assert!(err.contains("no JSON") || err.contains("valid JSON"),
             "err was: {err}");
@@ -470,13 +471,7 @@ cat <<'JSON'
 JSON
 "#;
         fs::write(&script, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perm = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&script, perm).unwrap();
-        }
-        let err = probe(&script.to_string_lossy(), tmp.path(), None)
+        let err = probe("sh bad.sh", tmp.path(), None)
             .expect_err("semantic fail must propagate");
         assert!(err.contains("validation") || err.contains("reserved"),
             "err was: {err}");
