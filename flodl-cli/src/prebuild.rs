@@ -615,7 +615,7 @@ fn prebuild_one_worker(
     // `arch:` basename → cargo --features (`cuda` for GPU variants, none
     // for `cpu`). The compose SERVICE is `controller.docker` (above),
     // not arch-derived — the controller's toolchain builds every host.
-    let (features_arg, _) = features_and_service_from_arch(arch);
+    let features_arg = features_from_arch(arch);
     let cuda_version_for_image = cuda_version_from_arch(arch);
     // Key the target dir by host AND arch. Host alone is not enough: the
     // `arch:` field selects the libtorch variant, but in docker mode that
@@ -774,23 +774,21 @@ fn prebuild_one_worker(
     })
 }
 
-/// Pick cargo features + docker compose service from the host's
-/// libtorch `.arch` metadata. `cuda=12.x` → (`cuda`, `cuda`); anything
-/// else → (`""`, `dev`).
-/// Derive `(cargo --features arg, docker-compose service name)` from
-/// the YAML `arch:` path basename. The yml `arch:` IS the single
-/// source of truth (no `.arch` metadata file required) — `cpu` is the
-/// only non-CUDA convention; everything else is a GPU variant.
-fn features_and_service_from_arch(arch: &str) -> (&'static str, &'static str) {
-    let basename = std::path::Path::new(arch)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if basename == "cpu" {
-        ("", "dev")
-    } else {
-        ("cuda", "cuda")
-    }
+/// The cargo `--features` argument for a host, from its YAML `arch:`
+/// path. `""` for a CPU-only variant, otherwise the vendor's feature.
+///
+/// Delegates to [`crate::libtorch::detect::variant_feature`] so the
+/// naming convention has one home. The predecessor returned `("cuda",
+/// "cuda")` for **every** non-`cpu` basename, which silently derived a
+/// CUDA build for an AMD host the moment a `builds/gfx1030` variant
+/// existed.
+///
+/// It also returned a docker-compose service name that no caller ever
+/// used: the service is `controller.docker` (the controller owns one
+/// build toolchain and compiles every host's binary in it), so the
+/// arch-derived half was dead. Dropped rather than extended.
+fn features_from_arch(arch: &str) -> &'static str {
+    crate::libtorch::detect::variant_feature(arch)
 }
 
 /// Extract a CUDA major.minor string from a `precompiled/cuNN` arch
@@ -798,6 +796,12 @@ fn features_and_service_from_arch(arch: &str) -> (&'static str, &'static str) {
 /// builds (`builds/sm…`) where the arch alone does not encode a CUDA
 /// version — the caller falls back to the `CUDA_VERSION` env var (or
 /// docker-compose's own default) for the toolkit image tag.
+///
+/// Deliberately CUDA-only: it feeds the NVIDIA toolkit image tag. A
+/// `rocm63` or `gfx…` basename returns `None` for free (neither starts
+/// with `cu`), and gains a sibling if a ROCm compose service ever
+/// exists — which it does not, because `--features rocm` does not build
+/// yet.
 fn cuda_version_from_arch(arch: &str) -> Option<String> {
     let basename = std::path::Path::new(arch)
         .file_name()
@@ -895,33 +899,20 @@ mod tests {
     }
 
     #[test]
-    fn features_and_service_precompiled_cuda_picks_cuda() {
-        assert_eq!(
-            features_and_service_from_arch("precompiled/cu128"),
-            ("cuda", "cuda")
-        );
+    fn features_from_arch_picks_the_variant_vendor() {
+        assert_eq!(features_from_arch("precompiled/cu128"), "cuda");
+        assert_eq!(features_from_arch("builds/sm61-sm120"), "cuda");
+        assert_eq!(features_from_arch("builds/sm80"), "cuda");
+        assert_eq!(features_from_arch("precompiled/cpu"), "");
     }
 
     #[test]
-    fn features_and_service_precompiled_cpu_picks_dev() {
-        assert_eq!(
-            features_and_service_from_arch("precompiled/cpu"),
-            ("", "dev")
-        );
-    }
-
-    #[test]
-    fn features_and_service_source_build_picks_cuda() {
-        // Source builds under `builds/<gpu-arch>` are CUDA by
-        // convention; only `cpu` basename is non-CUDA.
-        assert_eq!(
-            features_and_service_from_arch("builds/sm61-sm120"),
-            ("cuda", "cuda")
-        );
-        assert_eq!(
-            features_and_service_from_arch("builds/sm80"),
-            ("cuda", "cuda")
-        );
+    fn features_from_arch_no_longer_calls_an_amd_variant_cuda() {
+        // The regression this replaced: the predecessor returned "cuda"
+        // for EVERY non-`cpu` basename, so the first `builds/gfx1030`
+        // host would have been silently cross-built for NVIDIA.
+        assert_eq!(features_from_arch("builds/gfx1030-gfx1100"), "rocm");
+        assert_eq!(features_from_arch("precompiled/rocm63"), "rocm");
     }
 
     #[test]

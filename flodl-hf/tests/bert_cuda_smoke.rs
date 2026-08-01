@@ -6,7 +6,7 @@
 //! regressions that CPU unit tests can miss.
 //!
 //! All tests are gated `#[cfg(feature = "gpu")]` — compiled-out under
-//! `fdl test` (GitHub CI CPU leg), compiled and run under `fdl cuda-test`.
+//! `fdl test` (GitHub CI CPU leg), compiled and run under `fdl gpu-test`.
 
 #![cfg(feature = "gpu")]
 

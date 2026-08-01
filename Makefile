@@ -6,7 +6,7 @@
 # Quick start:
 #   fdl setup             # detect hardware, download libtorch, build Docker image
 #   fdl test              # run CPU tests
-#   fdl cuda-test-all     # full CUDA suite
+#   fdl gpu-test-all     # full CUDA suite
 
 COMPOSE = docker compose
 

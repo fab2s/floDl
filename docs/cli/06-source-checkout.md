@@ -44,13 +44,13 @@ the pattern within its `cargo test` scope.
 ## CUDA / GPU testing
 
 ```bash
-fdl cuda-build            # build with CUDA feature
-fdl cuda-clippy           # lint with CUDA feature
-fdl cuda-test             # parallel CUDA tests (excludes NCCL / Graph)
-fdl cuda-test-nccl        # NCCL/DDP tests only (isolated processes)
-fdl cuda-test-graph       # CUDA Graph tests (exclusive GPU, single-threaded)
-fdl cuda-test-serial      # remaining serial tests
-fdl cuda-test-all         # full suite: parallel + NCCL isolated + serial
+fdl gpu-build            # build with CUDA feature
+fdl gpu-clippy           # lint with CUDA feature
+fdl gpu-test             # parallel CUDA tests (excludes NCCL / Graph)
+fdl gpu-test-nccl        # NCCL/DDP tests only (isolated processes)
+fdl gpu-test-graph       # CUDA Graph tests (exclusive GPU, single-threaded)
+fdl gpu-test-serial      # remaining serial tests
+fdl gpu-test-all         # full suite: parallel + NCCL isolated + serial
 ```
 
 ## Benchmarks
@@ -138,7 +138,7 @@ recipe, the 30-cell parity matrix).
 
 ```bash
 fdl shell         # dev container (CPU)
-fdl cuda-shell    # CUDA container
+fdl gpu-shell    # CUDA container
 ```
 
 ## Re-building the CLI

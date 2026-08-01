@@ -350,7 +350,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         }
         println!();
         if spec.arch_cuda != "none" {
-            println!("  Run 'fdl cuda-test' to verify.");
+            println!("  Run 'fdl gpu-test' to verify.");
         } else {
             println!("  Run 'fdl test' to verify.");
         }

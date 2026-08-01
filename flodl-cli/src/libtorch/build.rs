@@ -287,7 +287,7 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
     println!("  ================================================");
     println!();
     if ctx.is_project {
-        println!("  Run 'fdl cuda-test' to verify.");
+        println!("  Run 'fdl gpu-test' to verify.");
     } else {
         println!("  To use, add to your shell profile:");
         println!("    export LIBTORCH=\"{}\"", install_path.display());

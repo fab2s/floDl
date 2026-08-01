@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::util::system::GpuInfo;
+use flodl_hw::GpuVendor;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -158,6 +159,66 @@ pub(crate) fn arch_coverage(
     archs_match
 }
 
+/// Which GPU stack a libtorch variant path targets, from its basename.
+///
+/// `None` means a CPU-only variant. The variant path (`precompiled/cu128`,
+/// `builds/sm61-sm120`, `precompiled/cpu`) is the single source of truth
+/// here -- no `.arch` metadata file is required -- because the cluster
+/// `arch:` field names exactly this path and must resolve without
+/// reading the remote host's filesystem.
+///
+/// | Basename starts with | Target |
+/// |---|---|
+/// | `cpu` | CPU-only |
+/// | `cu<digit>` (`cu128`, `cu126-pt27`) or `sm<digit>` (`sm61-sm120`) | NVIDIA |
+/// | `rocm<digit>` or `gfx<digit>` (`gfx1030-gfx1100`) | AMD |
+///
+/// An unrecognised basename **warns and is treated as NVIDIA**. That
+/// preserves the pre-multi-vendor behaviour exactly, which matters
+/// because a user may well have a hand-named CUDA variant
+/// (`builds/mybuild`) that works today; hard-erroring would break a
+/// running setup to guard against a case that cannot yet exist, since
+/// `--features rocm` does not build. The warning is the point: the old
+/// code made the same assumption in silence.
+pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
+    let basename = std::path::Path::new(variant)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // A prefix only counts when a digit follows, so `cpu` cannot be read
+    // as a `cu`-something and a stray directory cannot masquerade.
+    let tagged = |prefix: &str| {
+        basename
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    };
+
+    if basename == "cpu" || basename.starts_with("cpu-") {
+        return None;
+    }
+    if tagged("cu") || tagged("sm") {
+        return Some(GpuVendor::Nvidia);
+    }
+    if tagged("rocm") || tagged("gfx") {
+        return Some(GpuVendor::Amd);
+    }
+    eprintln!(
+        "fdl: libtorch variant {variant:?} does not match a known naming \
+         convention (cpu / cu<N> / sm<N> / rocm<N> / gfx<N>); assuming it is \
+         an NVIDIA build. Rename it to match, or pass the feature explicitly."
+    );
+    Some(GpuVendor::Nvidia)
+}
+
+/// The cargo feature a variant needs, or `""` for a CPU-only variant.
+pub fn variant_feature(variant: &str) -> &'static str {
+    match variant_vendor(variant) {
+        None => "",
+        Some(v) => v.cargo_feature(),
+    }
+}
+
 /// List all installed libtorch variants under `<root>/libtorch/`.
 ///
 /// Scans `precompiled/` and `builds/` subdirectories.
@@ -253,6 +314,41 @@ mod tests {
             "torch=2.0\ncuda=2.0\narchs=1.0\nsource=build\n",
         ).unwrap();
         s
+    }
+
+    #[test]
+    fn variant_vendor_reads_the_naming_convention() {
+        for (path, want) in [
+            ("precompiled/cpu", None),
+            ("precompiled/cu128", Some(GpuVendor::Nvidia)),
+            ("precompiled/cu126-pt27", Some(GpuVendor::Nvidia)),
+            ("builds/sm61-sm120", Some(GpuVendor::Nvidia)),
+            ("builds/sm80", Some(GpuVendor::Nvidia)),
+            ("precompiled/rocm63", Some(GpuVendor::Amd)),
+            ("builds/gfx1030-gfx1100", Some(GpuVendor::Amd)),
+            ("builds/gfx942", Some(GpuVendor::Amd)),
+        ] {
+            assert_eq!(variant_vendor(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn variant_vendor_requires_a_digit_after_the_prefix() {
+        // `cpu` must not read as a `cu`-something, and a bare `gfx`
+        // directory is not an arch.
+        assert_eq!(variant_vendor("precompiled/cpu"), None);
+        assert_eq!(variant_vendor("x/cpu-static"), None);
+        // Unrecognised names warn and fall back to NVIDIA rather than
+        // breaking a hand-named CUDA build that works today.
+        assert_eq!(variant_vendor("builds/mybuild"), Some(GpuVendor::Nvidia));
+        assert_eq!(variant_vendor("builds/gfx"), Some(GpuVendor::Nvidia));
+    }
+
+    #[test]
+    fn variant_feature_maps_to_the_cargo_feature() {
+        assert_eq!(variant_feature("precompiled/cpu"), "");
+        assert_eq!(variant_feature("precompiled/cu128"), "cuda");
+        assert_eq!(variant_feature("builds/gfx1030"), "rocm");
     }
 
     #[test]

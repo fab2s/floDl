@@ -654,7 +654,7 @@
     }
 
     #[test]
-    #[ignore = "GPU probe needs CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU probe needs CUDA; run with: fdl gpu-test-all"]
     fn test_probe_device_cuda() {
         if !test_device().is_cuda() { return; }
         // Device 0 should always work in a CUDA build
@@ -662,7 +662,7 @@
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_cuda_devices_has_compute_capability() {
         if !test_device().is_cuda() { return; }
         let devices = cuda_devices();
@@ -676,7 +676,7 @@
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_usable_cuda_devices() {
         if !test_device().is_cuda() { return; }
         let usable = usable_cuda_devices();
@@ -686,7 +686,7 @@
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_cuda_primary_context_and_nvml_probes() {
         if !test_device().is_cuda() { return; }
         // Force a real CUDA touch on runtime device 0, then the

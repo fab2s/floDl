@@ -587,7 +587,7 @@ for (x, y) in &batches {
 Expect 2-5x speedup for models with many small kernels (RNNs, GRUs).
 All tensors involved in the captured region must have fixed shapes -
 dynamic shapes require a new capture. Tests that use CUDA graphs must
-run single-threaded (`fdl cuda-test-serial`).
+run single-threaded (`fdl gpu-test-serial`).
 
 ## Putting it together
 

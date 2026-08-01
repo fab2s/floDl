@@ -38,7 +38,7 @@ fn test_builder_single_gpu_fallback() {
 // `test_async_ddp_multi_gpu_nccl` drove the in-process multi-GPU engine via
 // the builder entry; that engine was removed (production auto-promotes to
 // process-per-rank). End-to-end multi-GPU training is validated by the
-// `ddp-bench` binary under `fdl cuda-test-nccl`, not a cfg(test) unit test.
+// `ddp-bench` binary under `fdl gpu-test-nccl`, not a cfg(test) unit test.
 
 #[test]
 fn test_ddp_handle_send_sync() {

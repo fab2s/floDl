@@ -65,7 +65,7 @@ the right libtorch variant:
 ### Where the ported code goes
 
 After scaffolding, replace `src/main.rs` with the ported flodl code.
-The `fdl.yml` commands (`./fdl build`, `./fdl test`, `./fdl cuda-test`)
+The `fdl.yml` commands (`./fdl build`, `./fdl test`, `./fdl gpu-test`)
 work immediately. For multi-file projects, add modules under `src/`
 and update `Cargo.toml` if needed.
 

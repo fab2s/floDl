@@ -307,6 +307,14 @@ edition = "2024"
 [dependencies]
 {flodl_dep}
 
+# GPU support is opt-in. `fdl gpu-*` picks the right one for you through
+# $FDL_GPU_FEATURE, derived from the libtorch variant you have active.
+# (Without this section `cargo build --features cuda` fails outright with
+# "does not contain this feature" -- cargo resolves it against THIS
+# package, not the dependency.)
+[features]
+cuda = ["flodl/cuda"]
+
 # Optimize floDl in dev builds -- your code stays fast to compile.
 # After the first build, only your graph code recompiles (~2s).
 [profile.dev.package.flodl]
@@ -749,8 +757,11 @@ fn env_example_template(mode: Mode) -> String {
 
 fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
     let use_docker = matches!(mode, Mode::Mounted | Mode::Docker);
+    // `gpu` is fdl's logical service: it resolves to the container
+    // matching the active libtorch variant (`cuda` / `rocm`), so a
+    // scaffolded project does not hardcode a vendor either.
     let (cpu_svc, cuda_svc) = if use_docker {
-        ("\n    docker: dev", "\n    docker: cuda")
+        ("\n    docker: dev", "\n    docker: gpu")
     } else {
         ("", "")
     };
@@ -818,16 +829,18 @@ commands:
   clippy:
     description: Lint
     run: cargo clippy -- -W clippy::all{cpu_svc}
-{shell_block}  # --- CUDA {cuda_note} ---
-  cuda-build:
-    description: Build with CUDA feature
-    run: cargo build --features cuda{cuda_svc}
-  cuda-test:
-    description: Run CUDA tests
-    run: cargo test --features cuda -- --nocapture{cuda_svc}
-  cuda-run:
-    description: cargo run --features cuda
-    run: cargo run --features cuda{cuda_svc}
+{shell_block}  # --- GPU {cuda_note} ---
+  # $FDL_GPU_FEATURE is exported by fdl from the active libtorch variant,
+  # so these stay correct if you switch variants.
+  gpu-build:
+    description: Build with GPU support
+    run: cargo build --features $FDL_GPU_FEATURE{cuda_svc}
+  gpu-test:
+    description: Run GPU tests
+    run: cargo test --features $FDL_GPU_FEATURE -- --nocapture{cuda_svc}
+  gpu-run:
+    description: cargo run with GPU support
+    run: cargo run --features $FDL_GPU_FEATURE{cuda_svc}
 {cuda_shell_block}"#
     )
 }

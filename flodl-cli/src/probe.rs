@@ -631,6 +631,20 @@ pub fn probe_local(
             warnings.push(note.to_string());
         }
     }
+    // Read the vendor facts before `devices` is moved out.
+    //
+    // The NCCL scan looks for `libnccl.so`, an NVIDIA artifact, so it is
+    // only meaningful when this host actually has an NVIDIA GPU. On an
+    // AMD host the collective library is RCCL, which ships INSIDE
+    // libtorch-rocm's own `lib/`; on a GPU-less host nothing collective
+    // can run at all, and the "no usable GPUs" issue below already says
+    // so. Either way "Install libnccl matching your CUDA version" points
+    // the operator at the wrong thing.
+    //
+    // Note this reads the PHYSICAL sweep, not the masked one, so a rig
+    // whose GPUs are temporarily hidden by CUDA_VISIBLE_DEVICES still
+    // gets its NCCL install checked.
+    let has_nvidia = sweep.has_vendor(GpuVendor::Nvidia);
     let gpus = sweep.devices;
 
     let libtorch = match libtorch_path_override {
@@ -644,13 +658,26 @@ pub fn probe_local(
         &mut issues,
         &mut warnings,
     );
-    let nccl = check_nccl(via_docker, &mut issues);
+    // The NCCL scan looks for `libnccl.so`, which is an NVIDIA artifact.
+    // AMD's collective library is RCCL, and it ships INSIDE
+    // libtorch-rocm's own `lib/` -- so on an AMD-only host there is
+    // nothing to discover and a "libnccl not found" issue would be pure
+    // noise telling the operator to install the wrong thing.
+    let nccl = if !has_nvidia {
+        NcclStatus { library_path: None, all_found: vec![], via_docker: None }
+    } else {
+        check_nccl(via_docker, &mut issues)
+    };
 
     if gpus.is_empty() {
+        // Say what was actually looked for. The old text named
+        // nvidia-smi unconditionally, which is simply false on a host
+        // whose GPU is AMD -- and that host is exactly the one whose
+        // operator most needs an accurate message. Any vendor-specific
+        // reason already rode in as a survey note above.
         issues.push(
-            "no CUDA GPUs detected — nvidia-smi missing or driver \
-             unhealthy. Single-host CPU training will still work; \
-             multi-rank NCCL requires a working GPU stack."
+            "no usable GPUs detected. Single-host CPU training will still \
+             work; multi-rank training requires a working GPU stack."
                 .into(),
         );
     }

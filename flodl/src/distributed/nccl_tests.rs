@@ -36,7 +36,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_init_destroy() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -47,7 +47,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_broadcast() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,7 +74,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_all_reduce_sum() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -101,7 +101,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_all_reduce_avg() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -128,7 +128,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_all_reduce_on_streams() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -186,7 +186,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_premul_sum_weighted_consensus() {
         // PreMulSum: each rank premultiplies by ITS OWN factor inside the
         // collective. With factors 0.75 / 0.25 over values 10 / 20 the
@@ -247,7 +247,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_weighted_allreduce_syncs_buffers_mover_averaged() {
         // The fused weighted sync must produce TWO different consensuses in
         // one call: params work-weighted (nᵢ/Σn), buffers equal-weighted
@@ -339,7 +339,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_init_and_reduce() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,7 +396,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_on_stream() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -448,7 +448,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_multi_tensor_batch() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -508,7 +508,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_broadcast() {
         if !require_multi_gpu() { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -559,7 +559,7 @@
     }
 
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; run with: fdl gpu-test-all"]
     fn test_nccl_rank_comm_broadcast_rejects_oob_root() {
         // The root-vs-world_size check is in Rust (pre-FFI), but constructing
         // a real NcclRankComm needs live NCCL init -- there's no public
@@ -593,7 +593,7 @@
     // ncclCommInitRank from worker threads corrupts CUDA context across
     // heterogeneous architectures.
     #[test]
-    #[ignore = "NCCL init needs exclusive GPU; needs 3 GPUs; run with: fdl cuda-test-all"]
+    #[ignore = "NCCL init needs exclusive GPU; needs 3 GPUs; run with: fdl gpu-test-all"]
     fn test_nccl_three_gpu_all_reduce_sum() {
         if !require_n_gpu(3) { return; }
         let _lock = NCCL_LOCK.lock().unwrap_or_else(|e| e.into_inner());

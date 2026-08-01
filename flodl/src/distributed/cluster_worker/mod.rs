@@ -59,7 +59,7 @@
 //! - `#[ignore = "cuda"]` end-to-end NCCL smoke test: two ranks share a
 //!   NcclRankComm, do real AllReduce(Avg) on their parameters after a
 //!   few batches, verify weights converge to consensus. Runs via
-//!   `fdl cuda-test-nccl` on a multi-GPU rig.
+//!   `fdl gpu-test-nccl` on a multi-GPU rig.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};

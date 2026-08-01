@@ -87,8 +87,8 @@ Every PR should pass the existing test suite on **both CPU and CUDA**:
 
 ```bash
 fdl test            # CPU tests
-fdl cuda-test       # CUDA tests (parallel, excludes NCCL/Graph)
-fdl cuda-test-all   # full CUDA suite (parallel + NCCL isolated + serial)
+fdl gpu-test       # CUDA tests (parallel, excludes NCCL/Graph)
+fdl gpu-test-all   # full CUDA suite (parallel + NCCL isolated + serial)
 ```
 
 All tests use `test_device()` / `test_opts()` from `tensor.rs` so the same

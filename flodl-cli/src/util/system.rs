@@ -291,15 +291,27 @@ pub fn escape_json(s: &str) -> String {
     out
 }
 
-/// Convert a `;`-separated CUDA capability list into a variant directory
-/// name: `"6.1;12.0"` -> `"sm61-sm120"`, `"12.0"` -> `"sm120"`. Shared by
-/// the libtorch and NCCL source builders so their variant paths cannot drift.
+/// Convert a `;`-separated arch list into a variant directory name.
+/// Shared by the libtorch and NCCL source builders so their variant
+/// paths cannot drift.
+///
+/// NVIDIA capabilities take the `sm` prefix and lose their dot:
+/// `"6.1;12.0"` -> `"sm61-sm120"`. AMD tokens are already their own
+/// name and pass through: `"gfx1030;gfx1100"` -> `"gfx1030-gfx1100"`.
+/// Prefixing those would produce `smgfx1030`, which
+/// `detect::variant_vendor` would then fail to recognise as AMD.
 pub fn arch_dir_name(archs: &str) -> String {
     archs
         .split(';')
-        .map(|cap| {
-            let clean = cap.replace('.', "");
-            format!("sm{}", clean)
+        .map(|tok| {
+            let tok = tok.trim();
+            // Only the AMD parse accepts a `gfx…` token, so it doubles
+            // as the discriminator (and normalises case + any
+            // `:sramecc±:xnack±` suffix on the way through).
+            match flodl_hw::GpuArch::parse(flodl_hw::GpuVendor::Amd, tok) {
+                Some(arch) => arch.to_string(),
+                None => format!("sm{}", tok.replace('.', "")),
+            }
         })
         .collect::<Vec<_>>()
         .join("-")

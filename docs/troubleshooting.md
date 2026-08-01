@@ -14,7 +14,7 @@ libtorch directory.
 **Fix (Docker - recommended):** All builds should run in the Docker container.
 ```bash
 fdl build        # CPU
-fdl cuda-build   # CUDA
+fdl gpu-build   # CUDA
 ```
 
 **Fix (host):** Use the download script to install libtorch and set up paths:

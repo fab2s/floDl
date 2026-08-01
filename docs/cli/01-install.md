@@ -20,7 +20,7 @@ them:
    sub-commands, value-aware completions.
 3. **[In the flodl source checkout](06-source-checkout.md)** -
    the cloned repo's `fdl.yml` ships the concrete command set used to
-   develop flodl itself (`fdl test`, `fdl cuda-test`, `fdl ddp-bench …`,
+   develop flodl itself (`fdl test`, `fdl gpu-test`, `fdl ddp-bench …`,
    `fdl self-build`, etc.).
 
 Standalone, libtorch is managed under `~/.flodl/` (override with

@@ -147,7 +147,7 @@ commands:
 
 ```bash
 fdl test                              # runs "test" in the "dev" docker service
-fdl cuda-test                         # runs in the "cuda" service
+fdl gpu-test                         # runs in the "cuda" service
 fdl test -- -p flodl-hf --test foo    # forwards `-p flodl-hf --test foo` to cargo
 fdl shell                             # opens an interactive shell
 fdl ddp-bench --list                  # dispatches into the ddp-bench sub-command

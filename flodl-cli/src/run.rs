@@ -258,6 +258,7 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
 ///                      = <host.path>/libtorch/<host.arch>     (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
+///   FDL_GPU_FEATURE   = the cargo feature the active variant needs
 fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
@@ -269,6 +270,23 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
 
     if let Some((info, host_path)) = resolve_libtorch(project_root)? {
         env.push(("LIBTORCH_HOST_PATH".into(), host_path));
+
+        // The cargo feature this variant needs, so a `run:` line can say
+        // `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+        // Run lines execute under `bash -c` / `sh -c`, so the expansion
+        // is the shell's; this just has to be in the child's env.
+        //
+        // Defaults to `cuda` when no variant resolves, which reproduces
+        // exactly what the hardcoded `--features cuda` did before: a GPU
+        // command with no GPU libtorch fails the same way it always has,
+        // rather than failing differently in a way nobody recognises.
+        env.push((
+            "FDL_GPU_FEATURE".into(),
+            match crate::libtorch::detect::variant_vendor(&info.path) {
+                Some(v) => v.cargo_feature().to_string(),
+                None => "cuda".to_string(),
+            },
+        ));
 
         // CUDA version from .arch metadata.
         if let Some(cuda) = &info.cuda_version {
@@ -614,6 +632,78 @@ fn testing_cluster_env_arg() -> String {
 const TESTING_ENV_VARS: &[&str] =
     &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
 
+/// The logical `docker:` value meaning "whichever GPU container matches
+/// the active libtorch variant".
+pub const LOGICAL_GPU_SERVICE: &str = "gpu";
+
+/// Resolve a `docker:` value to a concrete docker-compose service.
+///
+/// Only `gpu` is logical; every other value passes through untouched, so
+/// `docker: cuda` and `docker: rocm` remain explicit escapes for anyone
+/// who wants to pin a container regardless of the active variant.
+///
+/// Why the container cannot simply BE vendor-neutral the way the cargo
+/// feature is: both vendors build from one source tree, so a feature is
+/// derivable, but a CUDA image (nvidia/cuda base, nvidia runtime,
+/// `/dev/nvidia*`) and a ROCm image (rocm/dev-ubuntu, `/dev/kfd` +
+/// `/dev/dri`, render group) are genuinely different artifacts. A
+/// service that declared both device sets would fail to start on a host
+/// missing either. So the service must be *selected*, and this is where.
+///
+/// The AMD arm falls back to the CUDA container **with a message** when
+/// no `rocm` service is defined. That is deliberate rather than an
+/// error: it is the state the repo is in until the ROCm image lands, and
+/// landing in the CUDA container produces the *better* diagnostic, since
+/// flodl-sys then reports exactly which part of its ROCm path is
+/// missing. Compose's bare "no such service: rocm" would say less.
+pub fn resolve_docker_service(name: &str, project_root: &Path) -> String {
+    if name != LOGICAL_GPU_SERVICE {
+        return name.to_string();
+    }
+    let vendor = resolve_libtorch(project_root)
+        .ok()
+        .flatten()
+        .and_then(|(info, _)| crate::libtorch::detect::variant_vendor(&info.path));
+
+    // CONVENTION: the compose service name IS the cargo feature name
+    // (`cuda`, `rocm`). One table instead of two, and `GpuVendor` is
+    // `#[non_exhaustive]`, so a vendor added upstream resolves to a
+    // sensibly-named service here without touching this function.
+    let Some(vendor) = vendor else {
+        // No GPU variant resolved: nothing to select on. `cuda` is the
+        // historical default and its own failure is the informative one.
+        return "cuda".to_string();
+    };
+    let service = vendor.cargo_feature();
+    if service == "cuda" || compose_has_service(service, project_root) {
+        return service.to_string();
+    }
+    eprintln!(
+        "fdl: the active libtorch variant targets {vendor}, but no `{service}` \
+         docker-compose service is defined; falling back to the `cuda` container. \
+         Define a `{service}` service, or set `docker:` explicitly on the command \
+         to silence this."
+    );
+    "cuda".to_string()
+}
+
+/// Whether the merged compose config defines `service`.
+///
+/// One subprocess, and only on the AMD path -- an NVIDIA host never pays
+/// for it.
+fn compose_has_service(service: &str, project_root: &Path) -> bool {
+    std::process::Command::new("docker")
+        .args(["compose", "config", "--services"])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.trim() == service)
+        })
+}
+
 pub fn exec_script(
     command: &str,
     append: Option<&str>,
@@ -630,6 +720,7 @@ pub fn exec_script(
             // don't escape the inner shell.
             let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
             let testing_env_arg = testing_cluster_env_arg();
+            let service = resolve_docker_service(service, cwd);
             let docker_cmd = format!(
                 "docker compose{overlay} run --rm{testing_env_arg} {service} bash -c {}",
                 posix_quote(&inner_cmd)
@@ -736,7 +827,10 @@ pub fn exec_command(
     let use_docker = cmd_config.docker.is_some() && !inside_docker();
 
     if use_docker {
-        let service = cmd_config.docker.as_deref().unwrap();
+        let service = resolve_docker_service(
+            cmd_config.docker.as_deref().unwrap(),
+            project_root,
+        );
         let workdir = cmd_dir
             .strip_prefix(project_root)
             .unwrap_or(cmd_dir)
@@ -750,7 +844,7 @@ pub fn exec_command(
         // regardless of the service's own `working_dir:`. Falls back
         // to `/workspace` (the fdl init convention) when the compose
         // file is missing or silent on this service.
-        let container_root = container_project_root(project_root, service);
+        let container_root = container_project_root(project_root, &service);
         let args_str = shell_join(&args);
         let inner = if workdir.is_empty() || workdir == "." {
             format!("{entry} {args_str}")
@@ -2107,6 +2201,28 @@ mod tests {
         std::fs::create_dir_all(&bogus).unwrap();
         assert!(resolve_libtorch_at(&bogus).is_none(),
             "dir without lib/, .active, or pointer-shape filename → None");
+    }
+
+    #[test]
+    fn resolve_docker_service_passes_explicit_names_through() {
+        // Only `gpu` is logical. An explicit pin must survive untouched,
+        // including one naming a service that does not exist yet --
+        // resolving it would defeat the point of pinning.
+        let root = Path::new("/nonexistent");
+        for name in ["cuda", "rocm", "dev", "bench", "something-custom"] {
+            assert_eq!(resolve_docker_service(name, root), name, "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_docker_service_falls_back_when_no_variant_resolves() {
+        // No libtorch under this root, so nothing to select on: `cuda`
+        // is the historical default and its own failure is the
+        // informative one.
+        assert_eq!(
+            resolve_docker_service(LOGICAL_GPU_SERVICE, Path::new("/nonexistent")),
+            "cuda",
+        );
     }
 
     #[test]

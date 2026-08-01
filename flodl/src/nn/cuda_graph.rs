@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl cuda-test-graph"]
+    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl gpu-test-graph"]
     fn test_cuda_graph_capture_replay() {
         if !test_device().is_cuda() {
             return;
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl cuda-test-graph"]
+    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl gpu-test-graph"]
     fn test_cuda_graph_with_model() {
         if !test_device().is_cuda() {
             return;
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl cuda-test-graph"]
+    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl gpu-test-graph"]
     fn test_cuda_graph_pool_handle() {
         if !test_device().is_cuda() {
             return;
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl cuda-test-graph"]
+    #[ignore = "CUDA graph capture blocks device-wide RNG; run with: fdl gpu-test-graph"]
     fn test_cuda_graph_reset_recapture() {
         if !test_device().is_cuda() {
             return;

@@ -381,9 +381,9 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         let has_cuda_lt = detect::read_active(root)
             .is_some_and(|i| i.cuda_version.as_deref() != Some("none"));
         if !gpus.is_empty() && has_cuda_lt {
-            println!("    fdl cuda-test        # run GPU tests");
-            println!("    fdl cuda-build       # compile with CUDA");
-            println!("    fdl cuda-shell       # interactive shell");
+            println!("    fdl gpu-test        # run GPU tests");
+            println!("    fdl gpu-build       # compile with CUDA");
+            println!("    fdl gpu-shell       # interactive shell");
         } else {
             println!("    fdl test             # run tests");
             println!("    fdl build            # compile");

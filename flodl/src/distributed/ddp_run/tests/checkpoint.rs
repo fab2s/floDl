@@ -325,4 +325,4 @@ fn shutdown_with_save_no_path_exits_without_write() {
 // 2-GPU end-to-end DDP validation lived here via the in-process engine
 // (`DdpHandle::auto` + thread-per-GPU). That engine was removed; multi-GPU
 // end-to-end training is now validated by the `ddp-bench` binary under
-// `fdl cuda-test-nccl`, and the process-path logic by `cluster_worker_tests`.
+// `fdl gpu-test-nccl`, and the process-path logic by `cluster_worker_tests`.

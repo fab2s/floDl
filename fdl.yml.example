@@ -52,46 +52,52 @@ commands:
     run: bash
     docker: dev
 
-  # --- CUDA targets ---
-  cuda-build:
-    description: Build with CUDA feature
-    run: cargo build --features cuda
-    docker: cuda
+  # --- GPU targets ---
+  #
+  # Both vendor-dependent bits are derived from the active libtorch
+  # variant, so these entries work unchanged on NVIDIA or AMD:
+  #   --features $FDL_GPU_FEATURE   -> cuda / rocm   (fdl exports it)
+  #   docker: gpu                   -> the matching container service
+  # Pin either explicitly (`docker: cuda`) if you want to override.
+  gpu-build:
+    description: Build with GPU support
+    run: cargo build --features $FDL_GPU_FEATURE
+    docker: gpu
   # Scoping: -p flodl -p flodl-hf — only crates that carry the `cuda`
   # feature have CUDA tests. flodl-cli / flodl-cli-macros are config +
   # dispatch (no GPU code, no CUDA tests); flodl-sys has no tests at
   # all. Without `-p` cargo would still compile + invoke their test
   # binaries on every pass, filter everything out, and dump hundreds
   # of `running 0 tests` lines into the output.
-  cuda-test:
-    description: Run CUDA tests (parallel, excludes NCCL/Graph)
-    run: cargo test -p flodl -p flodl-hf --features cuda
+  gpu-test:
+    description: Run GPU tests (parallel, excludes NCCL/Graph)
+    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE
     append: -- --nocapture
-    docker: cuda
-  cuda-test-all:
-    description: Full CUDA suite (parallel + NCCL isolated + serial)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
-    docker: cuda
-  cuda-test-nccl:
+    docker: gpu
+  gpu-test-all:
+    description: Full GPU suite (parallel + NCCL isolated + serial)
+    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    docker: gpu
+  gpu-test-nccl:
     description: NCCL/DDP tests only (isolated processes)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
-    docker: cuda
-  cuda-test-serial:
-    description: Serial CUDA tests (Graphs, manual_seed, probes)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
-    docker: cuda
-  cuda-test-graph:
+    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 graph_distribute
+    docker: gpu
+  gpu-test-serial:
+    description: Serial GPU tests (Graphs, manual_seed, probes)
+    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    docker: gpu
+  gpu-test-graph:
     description: CUDA Graph tests only (exclusive GPU, single-threaded)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
-    docker: cuda
-  cuda-clippy:
-    description: Lint with CUDA feature (all targets incl. tests + examples, workspace + ddp-bench)
-    run: cargo clippy --features cuda --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features cuda -- -W clippy::all
-    docker: cuda
-  cuda-shell:
-    description: Interactive shell in CUDA container
+    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 cuda_graph
+    docker: gpu
+  gpu-clippy:
+    description: Lint with GPU support (all targets incl. tests + examples, workspace + ddp-bench)
+    run: cargo clippy --features $FDL_GPU_FEATURE --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features $FDL_GPU_FEATURE -- -W clippy::all
+    docker: gpu
+  gpu-shell:
+    description: Interactive shell in the GPU container
     run: bash
-    docker: cuda
+    docker: gpu
 
   # --- Benchmarks (see ./benchmarks/fdl.yml) ---
   bench:
