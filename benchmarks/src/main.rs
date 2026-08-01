@@ -23,7 +23,7 @@ mod harness;
 mod tier1;
 mod tier2;
 
-use flodl::{cuda_available, set_cudnn_benchmark, Device};
+use flodl::{gpu_available, set_cudnn_benchmark, Device};
 use harness::{BenchResult, print_result};
 
 fn main() {
@@ -36,9 +36,9 @@ fn main() {
         .and_then(|i| args.get(i + 1).cloned());
 
     // Device selection
-    let device = if cuda_available() {
+    let device = if gpu_available() {
         set_cudnn_benchmark(true);
-        eprintln!("device: CUDA ({})", flodl::cuda_device_name().unwrap_or_default());
+        eprintln!("device: CUDA ({})", flodl::gpu_device_name().unwrap_or_default());
         Device::CUDA(0)
     } else {
         eprintln!("device: CPU");

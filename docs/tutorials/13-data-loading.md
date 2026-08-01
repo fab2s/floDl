@@ -190,7 +190,7 @@ handles batching and transfer:
 
 ```
 Worker thread:  get_batch(indices) -> pin_memory() -> StreamGuard + to_device_async()
-                -> CudaEvent (signals readiness)
+                -> GpuEvent (signals readiness)
 Main thread:    event.synchronize() (typically instant due to prefetch)
                 -> use batch
 ```

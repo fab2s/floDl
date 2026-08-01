@@ -808,18 +808,18 @@ impl Timeline {
                 if !poll_gpus {
                     break;
                 }
-                let compute_util = crate::tensor::cuda_utilization_idx(phys as i32)
+                let compute_util = crate::tensor::gpu_utilization_idx(phys as i32)
                     .map(|u| u as u8)
                     .unwrap_or(0);
                 // Device-wide used/total via NVML (physical index);
                 // fall back to the nvidia-smi total when NVML is out.
                 let (vram_used, vram_total) =
-                    crate::tensor::cuda_nvml_memory_info_idx(phys as i32)
+                    crate::tensor::gpu_smi_memory_info_idx(phys as i32)
                         .unwrap_or((0, total_static));
                 // Allocator reserved bytes: per-process, runtime index,
                 // and only readable where a CUDA context already exists.
-                let vram_alloc = if crate::tensor::cuda_has_primary_context(i as i32) {
-                    crate::tensor::cuda_allocated_bytes_idx(i as i32).unwrap_or(0)
+                let vram_alloc = if crate::tensor::gpu_has_primary_context(i as i32) {
+                    crate::tensor::gpu_allocated_bytes_idx(i as i32).unwrap_or(0)
                 } else {
                     0
                 };

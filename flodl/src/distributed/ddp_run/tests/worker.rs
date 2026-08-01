@@ -65,7 +65,7 @@ fn test_worker_load_averaged() {
     // waits for the event. Here we read directly, so sync the device.
     let dev = test_device();
     if let Device::CUDA(idx) = dev {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 
     // Verify version updated
@@ -108,7 +108,7 @@ fn test_worker_load_averaged_bf16_update() {
     worker.load_averaged(&update).unwrap();
 
     if let Device::CUDA(idx) = test_device() {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 
     // Params stay f32 and carry the bf16-exact consensus values.
@@ -166,7 +166,7 @@ fn test_worker_load_averaged_easgd_blends() {
     worker.load_averaged(&update).unwrap();
 
     if let Device::CUDA(idx) = test_device() {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 
     let post_w = worker.param_vars[0].data().to_f32_vec().unwrap();
@@ -220,7 +220,7 @@ fn test_worker_load_averaged_easgd_blends_bf16_update() {
     worker.load_averaged(&update).unwrap();
 
     if let Device::CUDA(idx) = test_device() {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 
     let post_w = worker.param_vars[0].data().to_f32_vec().unwrap();
@@ -300,7 +300,7 @@ fn test_snapshot_never_aliases_live_params() {
     })
     .unwrap();
     if let Device::CUDA(idx) = test_device() {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 
     let after: f64 = snap.params[0].sum().unwrap().item().unwrap();

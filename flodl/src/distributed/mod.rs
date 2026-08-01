@@ -79,10 +79,10 @@ pub use outer_optimizer::{NesterovMomentum, OuterAvg, OuterOptimizer, SlowMoment
 // CUDA stream/event primitives live in `tensor` (they are device-runtime
 // tools, not DDP machinery — audit D5 moved them so `data/` no longer
 // reaches into `distributed/`). Re-exported here so existing
-// `flodl::distributed::cuda_stream::CudaStream`-style paths keep working.
+// `flodl::distributed::cuda_stream::GpuStream`-style paths keep working.
 pub use crate::tensor::cuda_event;
 pub use crate::tensor::cuda_stream;
-pub use crate::tensor::{CudaEvent, CudaEventFlags, CudaStream, StreamGuard};
+pub use crate::tensor::{GpuEvent, GpuEventFlags, GpuStream, StreamGuard};
 pub use dashboard_sink::{ClusterDashboardSink, DashboardSink};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};

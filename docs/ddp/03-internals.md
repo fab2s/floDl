@@ -305,25 +305,25 @@ After abort, the communicator's `Drop` is a no-op.
 
 ## CUDA synchronization primitives
 
-### `CudaEvent`
+### `GpuEvent`
 
 ```rust
-let event = CudaEvent::new(CudaEventFlags::Default)?;
+let event = GpuEvent::new(GpuEventFlags::Default)?;
 event.record()?;                  // on current stream
 event.record_on(&stream)?;        // on specific stream
 event.synchronize()?;             // CPU blocks until complete
 let done = event.is_complete()?;  // non-blocking poll
 
-let ms = CudaEvent::elapsed_time(&start, &end)?;
+let ms = GpuEvent::elapsed_time(&start, &end)?;
 ```
 
-Use `CudaEventFlags::DisableTiming` for pure synchronization (lower
+Use `GpuEventFlags::DisableTiming` for pure synchronization (lower
 overhead; `elapsed_time` will error).
 
-### `CudaStream`
+### `GpuStream`
 
 ```rust
-let stream = CudaStream::new(Device::CUDA(0), false)?;  // normal priority
+let stream = GpuStream::new(Device::CUDA(0), false)?;  // normal priority
 stream.synchronize()?;
 stream.wait_event(&event)?;        // stream waits for event
 ```

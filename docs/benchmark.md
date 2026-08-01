@@ -34,9 +34,9 @@ confirming identical CUDA kernel dispatch.**
   σ-equivalent for normal data but robust to OS/GC outliers. Lower means
   more predictable. See [Why MAD, not standard deviation?](#why-mad-not-standard-deviation) below.
 - **alloc** - peak active tensor bytes (`torch.cuda.max_memory_allocated` /
-  `cuda_peak_active_bytes`). This is the memory your tensors actually use.
+  `gpu_peak_active_bytes`). This is the memory your tensors actually use.
 - **rsrvd** - peak allocator reservation (`torch.cuda.max_memory_reserved` /
-  `cuda_peak_reserved_bytes`). This is the memory the caching allocator holds.
+  `gpu_peak_reserved_bytes`). This is the memory the caching allocator holds.
 
 ### Where flodl wins and why
 
@@ -171,8 +171,8 @@ The benchmark suite is designed for reproducibility and statistical rigor:
 7. **Docker isolation** - both frameworks run in the same container image with
    identical CUDA toolkit, libtorch, and system libraries.
 
-8. **Peak VRAM tracking** - VRAM measured via `cuda_reset_peak_stats()` /
-   `cuda_peak_active_bytes()`, matching `torch.cuda.max_memory_allocated()`
+8. **Peak VRAM tracking** - VRAM measured via `gpu_reset_peak_stats()` /
+   `gpu_peak_active_bytes()`, matching `torch.cuda.max_memory_allocated()`
    semantics. Not a snapshot - the true high-water mark.
 
 ### Statistical model

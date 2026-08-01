@@ -53,7 +53,7 @@
     #[test]
     fn rejects_local_devices_all_when_cuda_devices_insufficient() {
         // `local_devices: "all"` resolves on the host that receives the
-        // envelope, using cuda_device_count(). With ranks of length > visible
+        // envelope, using gpu_device_count(). With ranks of length > visible
         // CUDA devices (always true in CPU test mode, where count == 0), the
         // resolver must error loudly mentioning the count.
         let mut v = worker_envelope();
@@ -70,9 +70,9 @@
     fn parses_local_devices_all_when_cuda_sufficient() {
         // Success path: only meaningful when CUDA is available with enough
         // devices for the rank count. Self-skip in CPU mode.
-        let avail = crate::tensor::cuda_device_count();
+        let avail = crate::tensor::gpu_device_count();
         if avail < 1 {
-            eprintln!("cuda_device_count() = {avail}; skipping all-shorthand success test");
+            eprintln!("gpu_device_count() = {avail}; skipping all-shorthand success test");
             return;
         }
         // Build an envelope with ranks_len = 1 (always satisfiable when at

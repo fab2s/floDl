@@ -233,10 +233,10 @@ fn node_memory_mb(dir: &Path) -> u64 {
 /// Read one `key value` line out of a KFD `properties` file.
 ///
 /// Matches on the whitespace-separated key, never a substring. The
-/// distinction is load-bearing: unsloth shipped a detector that looked
-/// for a `gpu_id` *line* in this file, but `gpu_id` is a **sibling
-/// file**, so the check never matched and every ROCm-less AMD host
-/// silently reported no GPU.
+/// distinction is load-bearing: a detector that looks for a `gpu_id`
+/// *line* in this file never matches, because `gpu_id` is a **sibling
+/// file** rather than a property. The failure is silent -- it reports
+/// no GPU at all, on every host.
 fn prop(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
@@ -467,10 +467,9 @@ mod tests {
 
     #[test]
     fn prop_does_not_find_gpu_id_which_is_a_sibling_file() {
-        // The exact bug unsloth shipped: `gpu_id` is a file next to
-        // `properties`, never a line inside it. A detector that
-        // required the line silently reported "no GPU" on every
-        // ROCm-less AMD host.
+        // `gpu_id` is a file next to `properties`, never a line inside
+        // it. A detector that required the line would silently report
+        // "no GPU" on every host, so this guards the whole-key match.
         assert_eq!(prop(&gpu_node_props(100306, 4), "gpu_id"), None);
     }
 

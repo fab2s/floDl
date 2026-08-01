@@ -534,7 +534,7 @@ impl DdpHandle {
             }
         }
 
-        let devices = crate::tensor::usable_cuda_devices();
+        let devices = crate::tensor::usable_gpu_devices();
 
         // Single-GPU fallback: run on main thread, no coordinator.
         if devices.len() < 2 {
@@ -711,7 +711,7 @@ impl DdpHandle {
 
         // Single-device fallback: no coordinator, cooperative loop over a bare
         // GpuWorker. Mirrors `launch`'s single-GPU branch.
-        let devices = crate::tensor::usable_cuda_devices();
+        let devices = crate::tensor::usable_gpu_devices();
         if devices.len() < 2 {
             let dev = devices.first().copied().unwrap_or(Device::CPU);
             let scheduler = scheduler_fn.map(|f| f(1));

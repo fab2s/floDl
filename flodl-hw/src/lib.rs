@@ -13,7 +13,7 @@
 //! way:
 //!
 //! - **`flodl`** needs GPU identity *before* libtorch is initialized.
-//!   flodl's CUDA APIs (e.g. `flodl::tensor::cuda_device_count`)
+//!   flodl's CUDA APIs (e.g. `flodl::tensor::gpu_device_count`)
 //!   initialize libtorch on first call, and once libtorch latches onto a
 //!   device list, `CUDA_VISIBLE_DEVICES` is ignored. Critically for
 //!   cluster mode, the launcher's spawned children then inherit a

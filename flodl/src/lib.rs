@@ -25,6 +25,7 @@
 //! optimizer.step()?;
 //! ```
 
+pub mod compat;
 pub mod log;
 pub mod sys;
 pub mod metrics;
@@ -55,7 +56,22 @@ macro_rules! modules {
 }
 
 pub use log::{Verbosity, set_verbosity, verbosity};
-pub use tensor::{cuda_available, cuda_device_count, cuda_memory_info, cuda_memory_info_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_active_bytes, cuda_active_bytes_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_empty_cache, cuda_utilization, cuda_utilization_idx, cuda_device_name, cuda_device_name_idx, cuda_devices, cuda_compute_capability, probe_device, usable_cuda_devices, DeviceInfo, set_current_cuda_device, current_cuda_device, cuda_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, cuda_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions, CudaEvent, CudaEventFlags, CudaStream, StreamGuard};
+// Deprecated `cuda_*` / `Cuda*` spellings, re-exported at the root they
+// used to live at so existing code keeps compiling. See `compat`.
+#[allow(deprecated)]
+pub use compat::{
+    cuda_active_bytes, cuda_active_bytes_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx,
+    cuda_available, cuda_device_count, cuda_device_name, cuda_device_name_idx, cuda_devices,
+    cuda_empty_cache, cuda_graph_capture, cuda_graph_pool_handle, cuda_has_primary_context,
+    cuda_manual_seed_all, cuda_memory_info, cuda_memory_info_idx, cuda_nvml_memory_info_idx,
+    cuda_peak_active_bytes, cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes,
+    cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats, cuda_reset_peak_stats_idx,
+    cuda_synchronize, cuda_utilization, cuda_utilization_idx, current_cuda_device,
+    set_current_cuda_device, usable_cuda_devices, CudaEvent, CudaEventFlags, CudaGraph,
+    CudaStream,
+};
+
+pub use tensor::{gpu_available, gpu_device_count, gpu_memory_info, gpu_memory_info_idx, gpu_allocated_bytes, gpu_allocated_bytes_idx, gpu_active_bytes, gpu_active_bytes_idx, gpu_peak_active_bytes, gpu_peak_active_bytes_idx, gpu_peak_reserved_bytes, gpu_peak_reserved_bytes_idx, gpu_reset_peak_stats, gpu_reset_peak_stats_idx, gpu_empty_cache, gpu_utilization, gpu_utilization_idx, gpu_device_name, gpu_device_name_idx, gpu_devices, gpu_arch_name, cuda_compute_capability, gpu_has_primary_context, gpu_smi_memory_info_idx, probe_device, usable_gpu_devices, DeviceInfo, set_current_gpu_device, current_gpu_device, gpu_synchronize, hardware_summary, set_cudnn_benchmark, manual_seed, gpu_manual_seed_all, malloc_trim, live_tensor_count, rss_kb, Device, DType, Result, Tensor, TensorError, TensorOptions, GpuEvent, GpuEventFlags, GpuStream, StreamGuard};
 #[cfg(feature = "rng")]
 pub use rng::Rng;
 pub use autograd::{Variable, no_grad, is_grad_enabled, NoGradGuard, max_pool2d, adaptive_avg_pool2d, grid_sample, scaled_dot_product_attention, embedding, embedding_bag};
@@ -89,7 +105,7 @@ pub use nn::{
     Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler, ExponentialLR, MultiStepLR, OneCycleLR, CyclicLR,
     xavier_uniform, xavier_normal, kaiming_uniform, kaiming_normal, uniform_bias, uniform, normal, orthogonal, trunc_normal,
     walk_modules, walk_modules_visited,
-    CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle,
+    GpuGraph, MemPoolId, CaptureMode, gpu_graph_capture, gpu_graph_pool_handle,
     GaussianBlur, gaussian_blur_2d,
 };
 pub use distributed::{

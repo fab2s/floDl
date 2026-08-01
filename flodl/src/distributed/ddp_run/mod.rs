@@ -1300,7 +1300,7 @@ pub(crate) enum ControlMsg {
     /// \[CPU path\] Deliver averaged parameters.
     Update(AveragedParams),
     /// \[NCCL path\] Trigger in-place AllReduce on this worker's own params.
-    /// Worker runs AllReduce on comm_stream and records CudaEvent.
+    /// Worker runs AllReduce on comm_stream and records GpuEvent.
     SyncNow,
     /// Begin processing a new epoch with the given partition assignment.
     ///

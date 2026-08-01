@@ -13,7 +13,7 @@
 //! - **Schedulers**: StepDecay, Cosine, Warmup, Plateau, ExponentialLR, MultiStepLR, OneCycleLR, CyclicLR
 //! - **Gradient clipping**: `clip_grad_norm` / `clip_grad_value` -- fused clipping via foreach ops (2 kernels instead of 2N)
 //! - **Mixed precision**: [`AutocastGuard`] / [`autocast`] for automatic dtype casting, [`GradScaler`] for loss scaling, [`cast_parameters`] for dtype conversion
-//! - **CUDA Graphs**: [`CudaGraph`] capture/replay/reset via [`cuda_graph_capture`], memory pool handles, configurable capture modes
+//! - **CUDA Graphs**: [`GpuGraph`] capture/replay/reset via [`gpu_graph_capture`], memory pool handles, configurable capture modes
 //! - **Foreach operations**: 7 multi-tensor ops (`foreach_zero_`, `foreach_add_scalar_`, `foreach_mul_scalar_`, etc.) used internally by optimizers and gradient clipping
 //! - **Checkpointing**: save/load with named parameters, dtype-aware, partial loading
 //! - **Initialization**: Xavier uniform/normal, Kaiming uniform/normal, uniform, normal, orthogonal, truncated normal
@@ -103,7 +103,11 @@ pub use attention::MultiheadAttention;
 pub use rope::RotaryEmbedding;
 pub use init::{xavier_uniform, xavier_normal, kaiming_uniform, kaiming_normal, uniform_bias, uniform, normal, orthogonal, trunc_normal};
 pub use functional::{gaussian_blur_2d, GaussianBlur};
-pub use cuda_graph::{CudaGraph, MemPoolId, CaptureMode, cuda_graph_capture, cuda_graph_pool_handle};
+pub use cuda_graph::{GpuGraph, MemPoolId, CaptureMode, gpu_graph_capture, gpu_graph_pool_handle};
+
+// Deprecated `cuda_graph*` / `CudaGraph` spellings. See `crate::compat`.
+#[allow(deprecated)]
+pub use crate::compat::{cuda_graph_capture, cuda_graph_pool_handle, CudaGraph};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

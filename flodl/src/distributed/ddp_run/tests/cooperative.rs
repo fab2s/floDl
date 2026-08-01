@@ -111,7 +111,7 @@ fn sync_params(dst: &mut GpuWorker<Linear>, src: &mut GpuWorker<Linear>) {
     })
     .unwrap();
     if let Device::CUDA(idx) = test_device() {
-        crate::tensor::cuda_synchronize(idx);
+        crate::tensor::gpu_synchronize(idx);
     }
 }
 
@@ -208,7 +208,7 @@ fn builder_into_worker_single_device_trains() {
     // into_worker would hit the "in-process multi-GPU removed" error (the
     // cluster path needs process-per-rank, not unit-testable). Skip there; the
     // single-device path is device-agnostic and covered on CPU / single GPU.
-    if crate::tensor::usable_cuda_devices().len() >= 2 {
+    if crate::tensor::usable_gpu_devices().len() >= 2 {
         return;
     }
     use crate::distributed::Trainer;

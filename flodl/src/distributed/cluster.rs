@@ -528,7 +528,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
 ///
 /// - An explicit array of CUDA device indices, paired positionally with
 ///   `ranks` (length must match).
-/// - The string `"all"`, resolved here via [`crate::tensor::cuda_device_count`]
+/// - The string `"all"`, resolved here via [`crate::tensor::gpu_device_count`]
 ///   to indices `0..ranks_len`. The host must have at least `ranks_len`
 ///   visible CUDA devices, otherwise loud error.
 ///
@@ -546,11 +546,11 @@ fn parse_local_devices(v: Option<&Value>, host_name: &str, ranks_len: usize) -> 
                 "cluster.worker.local_devices: expected \"all\" or array, got string {s:?}"
             )));
         }
-        let available = crate::tensor::cuda_device_count();
+        let available = crate::tensor::gpu_device_count();
         if available < 0 {
             return Err(TensorError::new(
                 "cluster.worker.local_devices: \"all\" requires CUDA support; \
-                 cuda_device_count() returned a negative value",
+                 gpu_device_count() returned a negative value",
             ));
         }
         let available = available as usize;

@@ -209,7 +209,7 @@ impl<M: Module> GpuWorker<M> {
 
         // ALL CUDA work must avoid the default stream and device-wide sync.
         // The CUDA default stream implicitly synchronizes with every other
-        // stream, and cuda_synchronize waits for ALL streams on the device.
+        // stream, and gpu_synchronize waits for ALL streams on the device.
         // If a SyncNow triggered AllReduce on comm_stream (via the other rank)
         // while this rank touches the default stream or calls device sync,
         // it blocks waiting for comm_stream which waits for this rank -> deadlock.
@@ -220,29 +220,29 @@ impl<M: Module> GpuWorker<M> {
         // current-stream is compute_stream during every op, as before.
         let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
 
-        // NOTE: cuda_empty_cache() was here to defragment VRAM between chunks,
+        // NOTE: gpu_empty_cache() was here to defragment VRAM between chunks,
         // but it internally does a device-wide sync that deadlocks with pending
         // NCCL AllReduce on comm_stream. Removed: the caching allocator handles
         // fragmentation adequately without explicit cache flushes.
 
         // Update activation peak from the previous chunk's high-water mark.
         // Uses max() so the budget never grows beyond the worst observed peak.
-        // Sync compute_stream only (NOT device-wide cuda_synchronize which
+        // Sync compute_stream only (NOT device-wide gpu_synchronize which
         // would block on comm_stream's pending AllReduce -> deadlock).
         if self.device.is_cuda() && self.activation_peak_bytes > 0 {
             let idx = self.device.index() as i32;
             if let Some(ref stream) = self.compute_stream {
                 let _ = stream.synchronize();
             }
-            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
-                if let Ok(baseline) = crate::tensor::cuda_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
+                if let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(baseline as usize);
                     let batch_bytes = self.per_sample_bytes * self.batch_size;
                     let activation = overhead.saturating_sub(batch_bytes);
                     self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
                 }
             }
-            crate::tensor::cuda_reset_peak_stats_idx(idx);
+            crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
         // Sync-path activation-peak calibration marker: captured after the
@@ -324,7 +324,7 @@ impl<M: Module> GpuWorker<M> {
                 // sizing call above already spent one `cudaMemGetInfo`, and a
                 // diagnostic must not add a second to every chunk boundary.
                 let (used, total) = if crate::log::enabled(crate::log::Verbosity::Debug) {
-                    crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+                    crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
                         .unwrap_or((0, 0))
                 } else {
                     (0, 0)
@@ -639,8 +639,8 @@ impl<M: Module> GpuWorker<M> {
                 let _ = stream.synchronize();
             }
             let idx = self.device.index() as i32;
-            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
-                if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
+                if let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(current as usize);
                     // Floor a completed measurement to 1 byte so a degenerate
                     // reading cannot collide with the sentinel and re-arm
@@ -649,7 +649,7 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
             // Reset for ongoing monitoring in subsequent chunks.
-            crate::tensor::cuda_reset_peak_stats_idx(idx);
+            crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
         let norm = if self.steps_since_avg % 10 == 0 {

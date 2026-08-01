@@ -517,7 +517,7 @@ membership only shrinks, rejoin/scale-up is not yet implemented).
 
 > **Invariant - no CUDA before `Trainer::run`.** User binaries must
 > not touch libtorch's CUDA context in `main()` (no
-> `cuda_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
+> `gpu_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
 > tensors). The launcher exits without training; touching CUDA there
 > poisons spawned children's contexts on heterogeneous rigs. Use
 > `flodl::sys::detect_gpus()` (CUDA-free) for pre-run GPU queries.
@@ -739,7 +739,7 @@ path, autograd tracking, and graph execution.
 | `GradScaler` | Dynamic loss scaling for fp16 training |
 | `cast_parameters` | Cast model parameters to any dtype |
 | `CpuWorker` / `ModelSnapshot` | Background checkpoint saving |
-| `CudaGraph` | Capture/replay training steps for fixed-shape models |
+| `GpuGraph` | Capture/replay training steps for fixed-shape models |
 
 </details>
 
@@ -798,7 +798,7 @@ codegen-units = 1
 | `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards - TrendGuard is default. Guard is authoritative over `overhead_target`. |
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
-| `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
+| `GpuEvent` / `GpuStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
 | `Ddp::wrap(&model, device, rank, &rdv)` | Bypass tier - manual thread-based per-rank gradient sync, for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
 
 </details>

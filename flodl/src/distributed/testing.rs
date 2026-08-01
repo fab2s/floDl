@@ -84,7 +84,7 @@ fn parse_env_cluster(raw: &str) -> FullCluster {
 }
 
 fn autodetect_local_gpus() -> Option<usize> {
-    let count = crate::tensor::cuda_device_count();
+    let count = crate::tensor::gpu_device_count();
     if count > 0 {
         Some(count as usize)
     } else {

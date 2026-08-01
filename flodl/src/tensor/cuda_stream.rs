@@ -11,7 +11,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! let copy_stream = CudaStream::new(Device::CUDA(0), false)?;
+//! let copy_stream = GpuStream::new(Device::CUDA(0), false)?;
 //! {
 //!     let _guard = StreamGuard::new(&copy_stream);
 //!     // All CUDA ops here run on copy_stream instead of the default stream.
@@ -26,20 +26,20 @@ use std::ptr;
 use flodl_sys as ffi;
 
 use crate::tensor::{check_err, Device, Result, TensorError};
-use super::cuda_event::CudaEvent;
+use super::cuda_event::GpuEvent;
 
 /// A CUDA stream obtained from the libtorch stream pool.
 ///
 /// RAII: the stream is returned to the pool on drop.
-pub struct CudaStream {
+pub struct GpuStream {
     ptr: *mut c_void,
     device_index: i32,
 }
 
 // cudaStream_t is a device-global handle safe to reference from any thread.
-unsafe impl Send for CudaStream {}
+unsafe impl Send for GpuStream {}
 
-impl CudaStream {
+impl GpuStream {
     /// Create a new CUDA stream from the pool on the given device.
     ///
     /// `high_priority`: if true, uses a high-priority stream that preempts
@@ -49,36 +49,36 @@ impl CudaStream {
             Device::CUDA(idx) => idx as i32,
             Device::CPU => {
                 return Err(TensorError::new(
-                    "CudaStream requires a CUDA device",
+                    "GpuStream requires a CUDA device",
                 ))
             }
         };
         let mut ptr: *mut c_void = ptr::null_mut();
         let err = unsafe {
-            ffi::flodl_cuda_stream_new(device_index, high_priority as i32, &mut ptr)
+            ffi::flodl_gpu_stream_new(device_index, high_priority as i32, &mut ptr)
         };
         check_err(err)?;
-        Ok(CudaStream { ptr, device_index })
+        Ok(GpuStream { ptr, device_index })
     }
 
     /// Block the CPU thread until all work on this stream completes.
     pub fn synchronize(&self) -> Result<()> {
-        let err = unsafe { ffi::flodl_cuda_stream_synchronize(self.ptr) };
+        let err = unsafe { ffi::flodl_gpu_stream_synchronize(self.ptr) };
         check_err(err)
     }
 
     /// Make this stream wait for a recorded event before executing any
     /// further work. Does not block the CPU.
-    pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
+    pub fn wait_event(&self, event: &GpuEvent) -> Result<()> {
         let err = unsafe {
-            ffi::flodl_cuda_stream_wait_event(self.ptr, event.as_ptr())
+            ffi::flodl_gpu_stream_wait_event(self.ptr, event.as_ptr())
         };
         check_err(err)
     }
 
     /// Non-blocking check: has all work on this stream completed?
     pub fn is_complete(&self) -> bool {
-        unsafe { ffi::flodl_cuda_stream_query(self.ptr) != 0 }
+        unsafe { ffi::flodl_gpu_stream_query(self.ptr) != 0 }
     }
 
     /// The calling thread's current stream on `device` (the default
@@ -90,17 +90,17 @@ impl CudaStream {
             Device::CUDA(idx) => idx as i32,
             Device::CPU => {
                 return Err(TensorError::new(
-                    "CudaStream requires a CUDA device",
+                    "GpuStream requires a CUDA device",
                 ))
             }
         };
-        let ptr = unsafe { ffi::flodl_cuda_stream_get_current(device_index) };
+        let ptr = unsafe { ffi::flodl_gpu_stream_get_current(device_index) };
         if ptr.is_null() {
             return Err(TensorError::new(
                 "cuda_stream_get_current returned null (CUDA build required)",
             ));
         }
-        Ok(CudaStream { ptr, device_index })
+        Ok(GpuStream { ptr, device_index })
     }
 
     /// The device this stream belongs to.
@@ -114,10 +114,10 @@ impl CudaStream {
     }
 }
 
-impl Drop for CudaStream {
+impl Drop for GpuStream {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::flodl_cuda_stream_delete(self.ptr) };
+            unsafe { ffi::flodl_gpu_stream_delete(self.ptr) };
             self.ptr = ptr::null_mut();
         }
     }
@@ -131,8 +131,8 @@ impl Drop for CudaStream {
 /// temporarily switches to `comm_stream` inside a `compute_stream` guard.
 ///
 /// ```ignore
-/// let compute = CudaStream::new(Device::CUDA(0), false)?;
-/// let comm = CudaStream::new(Device::CUDA(0), false)?;
+/// let compute = GpuStream::new(Device::CUDA(0), false)?;
+/// let comm = GpuStream::new(Device::CUDA(0), false)?;
 /// {
 ///     let _outer = StreamGuard::new(&compute);
 ///     // All CUDA ops on compute_stream.
@@ -146,7 +146,7 @@ impl Drop for CudaStream {
 /// ```
 pub struct StreamGuard {
     /// Previous stream pointer, restored on drop. Owned (heap-allocated by
-    /// `flodl_cuda_stream_get_current`), freed via `flodl_cuda_stream_delete`.
+    /// `flodl_gpu_stream_get_current`), freed via `flodl_gpu_stream_delete`.
     prev: *mut std::ffi::c_void,
     device_index: i32,
 }
@@ -154,9 +154,9 @@ pub struct StreamGuard {
 impl StreamGuard {
     /// Set `stream` as the current CUDA stream. The previous stream
     /// is saved and restored when this guard is dropped.
-    pub fn new(stream: &CudaStream) -> Self {
-        let prev = unsafe { ffi::flodl_cuda_stream_get_current(stream.device_index) };
-        unsafe { ffi::flodl_cuda_stream_set_current(stream.ptr) };
+    pub fn new(stream: &GpuStream) -> Self {
+        let prev = unsafe { ffi::flodl_gpu_stream_get_current(stream.device_index) };
+        unsafe { ffi::flodl_gpu_stream_set_current(stream.ptr) };
         StreamGuard {
             prev,
             device_index: stream.device_index,
@@ -167,10 +167,10 @@ impl StreamGuard {
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         if !self.prev.is_null() {
-            unsafe { ffi::flodl_cuda_stream_set_current(self.prev) };
-            unsafe { ffi::flodl_cuda_stream_delete(self.prev) };
+            unsafe { ffi::flodl_gpu_stream_set_current(self.prev) };
+            unsafe { ffi::flodl_gpu_stream_delete(self.prev) };
         } else {
-            unsafe { ffi::flodl_cuda_stream_restore_default(self.device_index) };
+            unsafe { ffi::flodl_gpu_stream_restore_default(self.device_index) };
         }
     }
 }
@@ -178,7 +178,7 @@ impl Drop for StreamGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::cuda_event::CudaEventFlags;
+    use super::super::cuda_event::GpuEventFlags;
     use crate::tensor::{Tensor, test_device, test_opts};
 
     use std::sync::Mutex;
@@ -186,8 +186,8 @@ mod tests {
 
     #[test]
     fn test_cuda_stream_requires_cuda_device() {
-        let result = CudaStream::new(Device::CPU, false);
-        assert!(result.is_err(), "CudaStream::new(CPU) should fail");
+        let result = GpuStream::new(Device::CPU, false);
+        assert!(result.is_err(), "GpuStream::new(CPU) should fail");
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         }
         let _lock = STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        let stream = CudaStream::new(test_device(), false).unwrap();
+        let stream = GpuStream::new(test_device(), false).unwrap();
         assert_eq!(stream.device(), test_device());
         stream.synchronize().unwrap();
         assert!(stream.is_complete(), "empty stream should be complete");
@@ -211,7 +211,7 @@ mod tests {
         let _lock = STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let opts = test_opts();
 
-        let stream = CudaStream::new(test_device(), false).unwrap();
+        let stream = GpuStream::new(test_device(), false).unwrap();
         {
             let _guard = StreamGuard::new(&stream);
             // Ops run on the non-default stream
@@ -237,10 +237,10 @@ mod tests {
         let gpu = Tensor::full(&[128], 42.0, opts).unwrap();
 
         // Create a non-default copy stream
-        let copy_stream = CudaStream::new(test_device(), false).unwrap();
+        let copy_stream = GpuStream::new(test_device(), false).unwrap();
 
         // Record event on default stream to capture when gpu tensor is ready
-        let ready = CudaEvent::new(CudaEventFlags::DisableTiming).unwrap();
+        let ready = GpuEvent::new(GpuEventFlags::DisableTiming).unwrap();
         ready.record().unwrap();
 
         // Copy stream waits for the event, then copies
@@ -251,7 +251,7 @@ mod tests {
         };
 
         // Record completion on copy stream
-        let done = CudaEvent::new(CudaEventFlags::DisableTiming).unwrap();
+        let done = GpuEvent::new(GpuEventFlags::DisableTiming).unwrap();
         done.record_on(&copy_stream).unwrap();
         done.synchronize().unwrap();
 
@@ -269,8 +269,8 @@ mod tests {
         let _lock = STREAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let opts = test_opts();
 
-        let stream_a = CudaStream::new(test_device(), false).unwrap();
-        let stream_b = CudaStream::new(test_device(), false).unwrap();
+        let stream_a = GpuStream::new(test_device(), false).unwrap();
+        let stream_b = GpuStream::new(test_device(), false).unwrap();
 
         // On stream A: create a tensor
         let result = {
@@ -279,7 +279,7 @@ mod tests {
         };
 
         // Record event on stream A
-        let event = CudaEvent::new(CudaEventFlags::DisableTiming).unwrap();
+        let event = GpuEvent::new(GpuEventFlags::DisableTiming).unwrap();
         event.record_on(&stream_a).unwrap();
 
         // Stream B waits for stream A, then reads the tensor

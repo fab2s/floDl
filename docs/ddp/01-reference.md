@@ -123,7 +123,7 @@ trampoline; pick whichever shape your call site prefers.
 
 > **Invariant - "no CUDA before `Trainer::run`"**: user binaries must
 > not touch libtorch's CUDA context before reaching `Trainer::run`. That
-> means no `flodl::tensor::cuda_device_count()`, no
+> means no `flodl::tensor::gpu_device_count()`, no
 > `Module::on_device(CUDA(_))`, no CUDA-Tensor construction in `main()`.
 > Cluster fan-out exits the launcher process without running training;
 > touching CUDA there corrupts spawned children's context on
@@ -652,7 +652,7 @@ let world_size = gpus.len();
 ```
 
 This is the canonical pre-`Trainer::run` GPU query. The previous habit
-of calling `flodl::tensor::cuda_device_count()` from `main()`
+of calling `flodl::tensor::gpu_device_count()` from `main()`
 initializes libtorch's CUDA context in the launcher process; that
 context then poisons spawned children on heterogeneous-GPU rigs.
 `detect_gpus` does not touch CUDA.

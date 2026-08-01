@@ -12,7 +12,7 @@ fn test_builder_single_gpu_fallback() {
     // in production and is gated off under cfg(test); the only cfg(test)
     // reachable behavior is the single-device fallback (<2 visible devices).
     // Skip on a multi-GPU box so this stays a deterministic fallback test.
-    if crate::tensor::usable_cuda_devices().len() >= 2 {
+    if crate::tensor::usable_gpu_devices().len() >= 2 {
         return;
     }
     let ddp = crate::distributed::Trainer::builder(

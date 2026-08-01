@@ -63,7 +63,7 @@ Each benchmark consists of multiple **runs**. The first run is a warmup
 
 Each run:
 1. **3 warmup epochs** -- populate caches, trigger cuDNN autotuning
-2. **20 measured epochs** -- timed individually with `cuda_synchronize()`
+2. **20 measured epochs** -- timed individually with `gpu_synchronize()`
    barriers
 
 The **best run** (lowest median across its 20 epochs) is reported. This
@@ -88,9 +88,9 @@ Peak VRAM is reset **after** the warmup run to exclude cuDNN autotuning
 workspace and JIT compilation buffers. Two metrics are reported:
 
 - **alloc** -- peak active tensor bytes (`torch.cuda.max_memory_allocated()` /
-  `cuda_peak_active_bytes()`)
+  `gpu_peak_active_bytes()`)
 - **reserved** -- peak allocator pool reservation
-  (`torch.cuda.max_memory_reserved()` / `cuda_peak_reserved_bytes()`)
+  (`torch.cuda.max_memory_reserved()` / `gpu_peak_reserved_bytes()`)
 
 Both frameworks use the same libtorch caching allocator, so the numbers are
 directly comparable.
@@ -164,7 +164,7 @@ The Rust and Python harnesses are structurally identical:
 - Same best-of-N selection logic
 - Same VRAM reset timing (after warmup run)
 - Same JSON output schema
-- Same `cuda_synchronize()` barriers at measurement boundaries
+- Same `gpu_synchronize()` barriers at measurement boundaries
 - Same cuDNN benchmark mode (`torch.backends.cudnn.benchmark = True` /
   `set_cudnn_benchmark(true)`)
 

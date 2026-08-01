@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::nn::buffer::Buffer;
-use crate::tensor::cuda_event::CudaEvent;
-use crate::tensor::cuda_stream::CudaStream;
+use crate::tensor::cuda_event::GpuEvent;
+use crate::tensor::cuda_stream::GpuStream;
 use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::nn::{Module, Optimizer};
 use crate::tensor::{Device, Tensor};
@@ -77,11 +77,11 @@ pub struct GpuWorker<M: Module> {
     device: Device,
 
     // -- CUDA streams for overlap (None on CPU) --
-    compute_stream: Option<CudaStream>,
-    comm_stream: Option<CudaStream>,
+    compute_stream: Option<GpuStream>,
+    comm_stream: Option<GpuStream>,
     /// Recorded on comm_stream after param copy/AllReduce.
     /// compute_stream waits on this before each forward.
-    copy_done: Option<CudaEvent>,
+    copy_done: Option<GpuEvent>,
     /// Pending H2D wait flag for the cpu-avg path. Set in `load_averaged`
     /// when params are copy_(non_blocking) on `comm_stream`, cleared in
     /// `sync_before_forward` after host-synchronizing the comm stream.

@@ -1599,7 +1599,7 @@ mod spec_prior {
     /// Returns `None` when device-property queries fail (e.g. CUDA absent).
     ///
     /// Uses [`crate::sys::detect_gpus`] (nvidia-smi based) instead of
-    /// libtorch's `cuda_compute_capability` / `cuda_memory_info_idx` so
+    /// libtorch's `cuda_compute_capability` / `gpu_memory_info_idx` so
     /// this can run on the controller's main thread without violating
     /// the "no CUDA touch before fan-out" invariant.
     fn score(device_index: i32, gpus: &[crate::sys::GpuInfo]) -> Option<f64> {

@@ -413,7 +413,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         #[cfg(feature = "gpu")]
         let local_header = {
             let mut h = String::new();
-            for dev in flodl::tensor::cuda_devices() {
+            for dev in flodl::tensor::gpu_devices() {
                 h.push_str(&format!(
                     "# gpu{}: {} ({}GB, sm_{}{})\n",
                     dev.index, dev.name, dev.total_memory / (1024 * 1024 * 1024),
@@ -460,10 +460,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // stale stream state that interferes with the next NCCL init.
     #[cfg(feature = "gpu")]
     {
-        let gpu_count = flodl::tensor::cuda_device_count();
+        let gpu_count = flodl::tensor::gpu_device_count();
         for i in 0..gpu_count {
-            flodl::tensor::cuda_synchronize(i as u8);
-            flodl::tensor::cuda_empty_cache();
+            flodl::tensor::gpu_synchronize(i as u8);
+            flodl::tensor::gpu_empty_cache();
         }
     }
 

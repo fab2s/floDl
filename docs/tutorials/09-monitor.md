@@ -359,15 +359,15 @@ flodl exposes two levels of CUDA memory measurement:
 
 | Function | What it measures | PyTorch equivalent |
 |----------|-----------------|-------------------|
-| `cuda_active_bytes()` | Bytes backing live tensors | `torch.cuda.memory_allocated()` |
-| `cuda_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
+| `gpu_active_bytes()` | Bytes backing live tensors | `torch.cuda.memory_allocated()` |
+| `gpu_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
 
-The monitor tracks `cuda_allocated_bytes` (reserved) because it detects
+The monitor tracks `gpu_allocated_bytes` (reserved) because it detects
 unified-memory spill - when reserved bytes exceed physical VRAM, the
 allocator has spilled to host RAM.
 
 For debugging, compare both: if `active` is small but `reserved` is large,
-the allocator is holding freed blocks. Call `cuda_empty_cache()` to release them.
+the allocator is holding freed blocks. Call `gpu_empty_cache()` to release them.
 
 ### Accessing resource data
 

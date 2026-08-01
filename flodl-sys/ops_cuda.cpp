@@ -38,7 +38,7 @@ struct FlodlCudaGraph {
     }
 };
 
-extern "C" char* flodl_cuda_graph_new(void** graph_out) {
+extern "C" char* flodl_gpu_graph_new(void** graph_out) {
     try {
         auto* g = new FlodlCudaGraph();
         *graph_out = static_cast<void*>(g);
@@ -50,7 +50,7 @@ extern "C" char* flodl_cuda_graph_new(void** graph_out) {
     }
 }
 
-extern "C" char* flodl_cuda_graph_capture_begin(void* graph, uint64_t pool_hi,
+extern "C" char* flodl_gpu_graph_capture_begin(void* graph, uint64_t pool_hi,
                                                   uint64_t pool_lo, int mode) {
     auto* g = static_cast<FlodlCudaGraph*>(graph);
     try {
@@ -84,7 +84,7 @@ extern "C" char* flodl_cuda_graph_capture_begin(void* graph, uint64_t pool_hi,
     }
 }
 
-extern "C" char* flodl_cuda_graph_capture_end(void* graph) {
+extern "C" char* flodl_gpu_graph_capture_end(void* graph) {
     try {
         auto* g = static_cast<FlodlCudaGraph*>(graph);
         g->graph.capture_end();
@@ -107,7 +107,7 @@ extern "C" char* flodl_cuda_graph_capture_end(void* graph) {
     }
 }
 
-extern "C" char* flodl_cuda_graph_replay(void* graph) {
+extern "C" char* flodl_gpu_graph_replay(void* graph) {
     try {
         auto* g = static_cast<FlodlCudaGraph*>(graph);
         g->graph.replay();
@@ -119,7 +119,7 @@ extern "C" char* flodl_cuda_graph_replay(void* graph) {
     }
 }
 
-extern "C" char* flodl_cuda_graph_reset(void* graph) {
+extern "C" char* flodl_gpu_graph_reset(void* graph) {
     try {
         auto* g = static_cast<FlodlCudaGraph*>(graph);
         g->graph.reset();
@@ -131,44 +131,44 @@ extern "C" char* flodl_cuda_graph_reset(void* graph) {
     }
 }
 
-extern "C" void flodl_cuda_graph_delete(void* graph) {
+extern "C" void flodl_gpu_graph_delete(void* graph) {
     try {
     delete static_cast<FlodlCudaGraph*>(graph);
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_graph_delete", e.what());
+        flodl_fatal("flodl_gpu_graph_delete", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_graph_delete", nullptr);
+        flodl_fatal("flodl_gpu_graph_delete", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo) {
+extern "C" void flodl_gpu_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo) {
     try {
     auto* g = static_cast<FlodlCudaGraph*>(graph);
     auto pool = g->graph.pool();
     *pool_hi = pool.first;
     *pool_lo = pool.second;
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_graph_pool", e.what());
+        flodl_fatal("flodl_gpu_graph_pool", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_graph_pool", nullptr);
+        flodl_fatal("flodl_gpu_graph_pool", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo) {
+extern "C" void flodl_gpu_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo) {
     try {
     auto pool = at::cuda::graph_pool_handle();
     *pool_hi = pool.first;
     *pool_lo = pool.second;
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_graph_pool_handle", e.what());
+        flodl_fatal("flodl_gpu_graph_pool_handle", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_graph_pool_handle", nullptr);
+        flodl_fatal("flodl_gpu_graph_pool_handle", nullptr);
     }
 }
 
 // --- CUDA Events ---
 
-extern "C" char* flodl_cuda_event_new(int flags, void** event_out) {
+extern "C" char* flodl_gpu_event_new(int flags, void** event_out) {
     try {
         unsigned int cuda_flags = (flags == 1)
             ? cudaEventDisableTiming
@@ -183,7 +183,7 @@ extern "C" char* flodl_cuda_event_new(int flags, void** event_out) {
     }
 }
 
-extern "C" char* flodl_cuda_event_record(void* event) {
+extern "C" char* flodl_gpu_event_record(void* event) {
     try {
         static_cast<at::cuda::CUDAEvent*>(event)->record();
         return nullptr;
@@ -194,7 +194,7 @@ extern "C" char* flodl_cuda_event_record(void* event) {
     }
 }
 
-extern "C" char* flodl_cuda_event_record_on_stream(void* event, void* stream) {
+extern "C" char* flodl_gpu_event_record_on_stream(void* event, void* stream) {
     try {
         auto* e = static_cast<at::cuda::CUDAEvent*>(event);
         auto* s = static_cast<at::cuda::CUDAStream*>(stream);
@@ -207,7 +207,7 @@ extern "C" char* flodl_cuda_event_record_on_stream(void* event, void* stream) {
     }
 }
 
-extern "C" char* flodl_cuda_event_synchronize(void* event) {
+extern "C" char* flodl_gpu_event_synchronize(void* event) {
     try {
         static_cast<at::cuda::CUDAEvent*>(event)->synchronize();
         return nullptr;
@@ -218,7 +218,7 @@ extern "C" char* flodl_cuda_event_synchronize(void* event) {
     }
 }
 
-extern "C" char* flodl_cuda_event_elapsed_time(void* start, void* end,
+extern "C" char* flodl_gpu_event_elapsed_time(void* start, void* end,
                                                  float* ms_out) {
     try {
         *ms_out = static_cast<at::cuda::CUDAEvent*>(start)->elapsed_time(
@@ -231,29 +231,29 @@ extern "C" char* flodl_cuda_event_elapsed_time(void* start, void* end,
     }
 }
 
-extern "C" int flodl_cuda_event_query(void* event) {
+extern "C" int flodl_gpu_event_query(void* event) {
     try {
     return static_cast<at::cuda::CUDAEvent*>(event)->query() ? 1 : 0;
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_event_query", e.what());
+        flodl_fatal("flodl_gpu_event_query", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_event_query", nullptr);
+        flodl_fatal("flodl_gpu_event_query", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_event_delete(void* event) {
+extern "C" void flodl_gpu_event_delete(void* event) {
     try {
     delete static_cast<at::cuda::CUDAEvent*>(event);
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_event_delete", e.what());
+        flodl_fatal("flodl_gpu_event_delete", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_event_delete", nullptr);
+        flodl_fatal("flodl_gpu_event_delete", nullptr);
     }
 }
 
 // --- CUDA Streams ---
 
-extern "C" char* flodl_cuda_stream_new(int device_index, int high_priority,
+extern "C" char* flodl_gpu_stream_new(int device_index, int high_priority,
                                         void** stream_out) {
     try {
         auto stream = at::cuda::getStreamFromPool(
@@ -268,7 +268,7 @@ extern "C" char* flodl_cuda_stream_new(int device_index, int high_priority,
     }
 }
 
-extern "C" char* flodl_cuda_stream_synchronize(void* stream) {
+extern "C" char* flodl_gpu_stream_synchronize(void* stream) {
     try {
         static_cast<at::cuda::CUDAStream*>(stream)->synchronize();
         return nullptr;
@@ -279,7 +279,7 @@ extern "C" char* flodl_cuda_stream_synchronize(void* stream) {
     }
 }
 
-extern "C" char* flodl_cuda_stream_wait_event(void* stream, void* event) {
+extern "C" char* flodl_gpu_stream_wait_event(void* stream, void* event) {
     try {
         auto* s = static_cast<at::cuda::CUDAStream*>(stream);
         auto* e = static_cast<at::cuda::CUDAEvent*>(event);
@@ -305,59 +305,59 @@ extern "C" char* flodl_tensor_record_stream(void* tensor, void* stream) {
     }
 }
 
-extern "C" int flodl_cuda_stream_query(void* stream) {
+extern "C" int flodl_gpu_stream_query(void* stream) {
     try {
     return static_cast<at::cuda::CUDAStream*>(stream)->query() ? 1 : 0;
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_stream_query", e.what());
+        flodl_fatal("flodl_gpu_stream_query", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_stream_query", nullptr);
+        flodl_fatal("flodl_gpu_stream_query", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_stream_set_current(void* stream) {
+extern "C" void flodl_gpu_stream_set_current(void* stream) {
     try {
     at::cuda::setCurrentCUDAStream(
         *static_cast<at::cuda::CUDAStream*>(stream));
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_stream_set_current", e.what());
+        flodl_fatal("flodl_gpu_stream_set_current", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_stream_set_current", nullptr);
+        flodl_fatal("flodl_gpu_stream_set_current", nullptr);
     }
 }
 
-extern "C" void* flodl_cuda_stream_get_current(int device_index) {
+extern "C" void* flodl_gpu_stream_get_current(int device_index) {
     try {
     auto stream = at::cuda::getCurrentCUDAStream(
         static_cast<c10::DeviceIndex>(device_index));
     auto* heap = new at::cuda::CUDAStream(stream);
     return static_cast<void*>(heap);
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_stream_get_current", e.what());
+        flodl_fatal("flodl_gpu_stream_get_current", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_stream_get_current", nullptr);
+        flodl_fatal("flodl_gpu_stream_get_current", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_stream_restore_default(int device_index) {
+extern "C" void flodl_gpu_stream_restore_default(int device_index) {
     try {
     at::cuda::setCurrentCUDAStream(
         at::cuda::getDefaultCUDAStream(
             static_cast<c10::DeviceIndex>(device_index)));
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_stream_restore_default", e.what());
+        flodl_fatal("flodl_gpu_stream_restore_default", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_stream_restore_default", nullptr);
+        flodl_fatal("flodl_gpu_stream_restore_default", nullptr);
     }
 }
 
-extern "C" void flodl_cuda_stream_delete(void* stream) {
+extern "C" void flodl_gpu_stream_delete(void* stream) {
     try {
     delete static_cast<at::cuda::CUDAStream*>(stream);
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_stream_delete", e.what());
+        flodl_fatal("flodl_gpu_stream_delete", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_stream_delete", nullptr);
+        flodl_fatal("flodl_gpu_stream_delete", nullptr);
     }
 }
 
@@ -826,82 +826,82 @@ extern "C" char* flodl_nccl_split_rank(void* group_handle, int rank,
 
 #else // CPU-only stubs
 
-extern "C" char* flodl_cuda_graph_new(void** graph_out) {
+extern "C" char* flodl_gpu_graph_new(void** graph_out) {
     (void)graph_out;
     return make_error("CUDA Graphs require a CUDA build");
 }
 
-extern "C" char* flodl_cuda_graph_capture_begin(void* graph, uint64_t pool_hi,
+extern "C" char* flodl_gpu_graph_capture_begin(void* graph, uint64_t pool_hi,
                                                   uint64_t pool_lo, int mode) {
     (void)graph; (void)pool_hi; (void)pool_lo; (void)mode;
     return make_error("CUDA Graphs require a CUDA build");
 }
 
-extern "C" char* flodl_cuda_graph_capture_end(void* graph) {
+extern "C" char* flodl_gpu_graph_capture_end(void* graph) {
     (void)graph;
     return make_error("CUDA Graphs require a CUDA build");
 }
 
-extern "C" char* flodl_cuda_graph_replay(void* graph) {
+extern "C" char* flodl_gpu_graph_replay(void* graph) {
     (void)graph;
     return make_error("CUDA Graphs require a CUDA build");
 }
 
-extern "C" char* flodl_cuda_graph_reset(void* graph) {
+extern "C" char* flodl_gpu_graph_reset(void* graph) {
     (void)graph;
     return make_error("CUDA Graphs require a CUDA build");
 }
 
-extern "C" void flodl_cuda_graph_delete(void* graph) { (void)graph; }
+extern "C" void flodl_gpu_graph_delete(void* graph) { (void)graph; }
 
-extern "C" void flodl_cuda_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo) {
+extern "C" void flodl_gpu_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo) {
     (void)graph; *pool_hi = 0; *pool_lo = 0;
 }
 
-extern "C" void flodl_cuda_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo) {
+extern "C" void flodl_gpu_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo) {
     *pool_hi = 0; *pool_lo = 0;
 }
 
 // --- CUDA Events (CPU stubs) ---
 
-extern "C" char* flodl_cuda_event_new(int flags, void** event_out) {
+extern "C" char* flodl_gpu_event_new(int flags, void** event_out) {
     (void)flags; (void)event_out;
     return make_error("CUDA Events require a CUDA build");
 }
-extern "C" char* flodl_cuda_event_record(void* event) {
+extern "C" char* flodl_gpu_event_record(void* event) {
     (void)event;
     return make_error("CUDA Events require a CUDA build");
 }
-extern "C" char* flodl_cuda_event_record_on_stream(void* event, void* stream) {
+extern "C" char* flodl_gpu_event_record_on_stream(void* event, void* stream) {
     (void)event; (void)stream;
     return make_error("CUDA Events require a CUDA build");
 }
-extern "C" char* flodl_cuda_event_synchronize(void* event) {
+extern "C" char* flodl_gpu_event_synchronize(void* event) {
     (void)event;
     return make_error("CUDA Events require a CUDA build");
 }
-extern "C" char* flodl_cuda_event_elapsed_time(void* start, void* end,
+extern "C" char* flodl_gpu_event_elapsed_time(void* start, void* end,
                                                  float* ms_out) {
     (void)start; (void)end; (void)ms_out;
     return make_error("CUDA Events require a CUDA build");
 }
-extern "C" int flodl_cuda_event_query(void* event) {
+extern "C" int flodl_gpu_event_query(void* event) {
     (void)event; return 1;
 }
-extern "C" void flodl_cuda_event_delete(void* event) { (void)event; }
+extern "C" void flodl_gpu_event_delete(void* event) { (void)event; }
 
 // --- CUDA Streams (CPU stubs) ---
 
-extern "C" char* flodl_cuda_stream_new(int device_index, int high_priority,
+extern "C" char* flodl_gpu_stream_new(int device_index, int high_priority,
                                         void** stream_out) {
     (void)device_index; (void)high_priority; (void)stream_out;
     return make_error("CUDA Streams require a CUDA build");
 }
-extern "C" char* flodl_cuda_stream_synchronize(void* stream) {
+extern "C" char* flodl_gpu_stream_synchronize(void* stream) {
     (void)stream;
     return make_error("CUDA Streams require a CUDA build");
 }
-extern "C" char* flodl_cuda_stream_wait_event(void* stream, void* event) {
+extern "C" char* flodl_gpu_stream_wait_event(void* stream, void* event) {
     (void)stream; (void)event;
     return make_error("CUDA Streams require a CUDA build");
 }
@@ -909,17 +909,17 @@ extern "C" char* flodl_tensor_record_stream(void* tensor, void* stream) {
     (void)tensor; (void)stream;
     return make_error("CUDA Streams require a CUDA build");
 }
-extern "C" int flodl_cuda_stream_query(void* stream) {
+extern "C" int flodl_gpu_stream_query(void* stream) {
     (void)stream; return 1;
 }
-extern "C" void flodl_cuda_stream_set_current(void* stream) { (void)stream; }
-extern "C" void* flodl_cuda_stream_get_current(int device_index) {
+extern "C" void flodl_gpu_stream_set_current(void* stream) { (void)stream; }
+extern "C" void* flodl_gpu_stream_get_current(int device_index) {
     (void)device_index; return nullptr;
 }
-extern "C" void flodl_cuda_stream_restore_default(int device_index) {
+extern "C" void flodl_gpu_stream_restore_default(int device_index) {
     (void)device_index;
 }
-extern "C" void flodl_cuda_stream_delete(void* stream) { (void)stream; }
+extern "C" void flodl_gpu_stream_delete(void* stream) { (void)stream; }
 
 // --- NCCL (CPU stubs) ---
 

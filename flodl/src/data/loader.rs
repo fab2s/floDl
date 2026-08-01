@@ -36,7 +36,7 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     let total_bytes = per_sample_bytes as u64 * n as u64;
     let idx = device.index() as i32;
 
-    match crate::tensor::cuda_memory_info_idx(idx) {
+    match crate::tensor::gpu_memory_info_idx(idx) {
         // The probe returns (used, total) — used first, not free.
         Ok((used, total)) => {
             let cap = (total as f64 * VRAM_MAX_USAGE) as u64;
@@ -583,7 +583,7 @@ impl DataLoaderBuilder {
                     } else {
                         Box::new(SequentialSampler::new(picks))
                     };
-                    crate::tensor::cuda_empty_cache();
+                    crate::tensor::gpu_empty_cache();
                     build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
                 }
                 Err(e) => Err(e),
@@ -1363,7 +1363,7 @@ impl StreamingEpochIter<'_> {
                     // flight — freed, the blocks guard only against the
                     // copy stream and the next upload can overwrite them
                     // mid-read.
-                    match crate::tensor::cuda_stream::CudaStream::current(self.device) {
+                    match crate::tensor::cuda_stream::GpuStream::current(self.device) {
                         Ok(cur) => {
                             for t in &batch.tensors {
                                 if let Err(e) = t.record_stream(&cur) {

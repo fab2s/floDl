@@ -1,6 +1,6 @@
 //! System-level detection that does NOT touch libtorch / CUDA.
 //!
-//! flodl's main CUDA APIs (e.g. [`crate::tensor::cuda_device_count`])
+//! flodl's main CUDA APIs (e.g. [`crate::tensor::gpu_device_count`])
 //! initialize libtorch on first call. Once libtorch latches onto a
 //! device list, `CUDA_VISIBLE_DEVICES` is ignored and — critically for
 //! cluster mode — the spawned children inherit a corrupted CUDA

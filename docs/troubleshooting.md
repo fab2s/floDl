@@ -53,7 +53,7 @@ drops CUDA libs with `--as-needed`.
 **Fix:** Make sure your `main.rs` calls the CUDA link anchor:
 ```rust
 fn main() -> flodl::Result<()> {
-    flodl_sys::flodl_force_cuda_link();
+    flodl_sys::flodl_force_gpu_link();
     // ... rest of your code
 }
 ```
@@ -306,9 +306,9 @@ or inference runs without disabling gradients.
 
 **Diagnose first** - check how much VRAM you actually have and how it's used:
 ```rust
-if let Ok((used, total)) = cuda_memory_info() {
-    let active = cuda_active_bytes().unwrap_or(0);
-    let reserved = cuda_allocated_bytes().unwrap_or(0);
+if let Ok((used, total)) = gpu_memory_info() {
+    let active = gpu_active_bytes().unwrap_or(0);
+    let reserved = gpu_allocated_bytes().unwrap_or(0);
     println!("VRAM: {:.0}/{:.0} MB (active: {:.0} MB, reserved: {:.0} MB)",
         used as f64 / 1e6, total as f64 / 1e6,
         active as f64 / 1e6, reserved as f64 / 1e6);
@@ -316,7 +316,7 @@ if let Ok((used, total)) = cuda_memory_info() {
 ```
 
 If `reserved` is much larger than `active`, the allocator is holding freed
-blocks. Call `cuda_empty_cache()` to release them before checking again.
+blocks. Call `gpu_empty_cache()` to release them before checking again.
 
 **Fix:**
 - **Reduce batch size** - the single biggest lever for VRAM usage

@@ -86,7 +86,7 @@ multi-GPU host scope down via `CUDA_VISIBLE_DEVICES=0`.
 > **User binaries must not touch libtorch's CUDA context before
 > reaching `Trainer::run` / `Trainer::builder().run()`.**
 
-That means **no** `flodl::tensor::cuda_device_count()`, **no**
+That means **no** `flodl::tensor::gpu_device_count()`, **no**
 `Module::on_device(CUDA(_))`, **no** CUDA-Tensor construction in
 `main()`. The launcher process exits without running training; any
 CUDA tensors it instantiated would corrupt the spawned children's

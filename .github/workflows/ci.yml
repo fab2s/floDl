@@ -196,3 +196,87 @@ jobs:
             -w /workspace \
             flodl-cuda-ci \
             cargo clippy --features cuda --all-targets -- -W clippy::all
+
+  rocm-build:
+    name: ROCm (build + clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ROCm is the disk-hungry job: the base image is ~25 GB and a full
+      # libtorch-rocm expands to ~12 GB, so free everything possible
+      # before pulling anything.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-rocm
+          key: buildx-rocm-${{ hashFiles('Dockerfile.rocm') }}
+          restore-keys: buildx-rocm-
+
+      - name: Build ROCm Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.rocm
+          load: true
+          tags: flodl-rocm-ci
+          cache-from: type=local,src=/tmp/.buildx-cache-rocm
+          cache-to: type=local,dest=/tmp/.buildx-cache-rocm-new,mode=max
+
+      - name: Rotate buildx cache
+        run: |
+          rm -rf /tmp/.buildx-cache-rocm
+          mv /tmp/.buildx-cache-rocm-new /tmp/.buildx-cache-rocm
+
+      - name: Cache libtorch download (ROCm)
+        id: cache-libtorch-rocm
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libtorch-ci
+          key: libtorch-rocm70-${{ env.LIBTORCH_VERSION }}
+
+      # Only the headers and the one .so that build.rs gates on are
+      # extracted. This job never links a final binary (it builds rlib
+      # targets and clippy stops after analysis), and the full archive is
+      # ~12 GB expanded against ~1 GB for this subset.
+      - name: Download libtorch (ROCm)
+        if: steps.cache-libtorch-rocm.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://download.pytorch.org/libtorch/rocm7.0/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.0.zip"
+          unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip" \
+            'libtorch/include/*' 'libtorch/lib/libtorch_hip.so'
+          mv libtorch libtorch-ci
+          rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip"
+          du -sh libtorch-ci
+
+      # Scoped to the two crates that actually carry the vendor mapping.
+      # A workspace-wide build would link binaries, which needs the full
+      # libtorch this job deliberately does not unpack.
+      - name: Build with ROCm feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo build -p flodl-sys -p flodl --features rocm
+
+      - name: Clippy with ROCm feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo clippy -p flodl-sys -p flodl --features rocm --all-targets -- -W clippy::all

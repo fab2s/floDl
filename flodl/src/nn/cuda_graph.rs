@@ -6,7 +6,7 @@
 //!
 //! **Constraints:**
 //! - All tensor shapes must be identical between capture and replay.
-//! - No CPU-GPU sync during capture (no `.item()`, no `cuda_synchronize()`).
+//! - No CPU-GPU sync during capture (no `.item()`, no `gpu_synchronize()`).
 //! - No conditional control flow during capture.
 //! - Warmup runs needed before capture (cuDNN autotuner, allocator).
 //! - CUDA only — returns error on CPU.
@@ -19,7 +19,7 @@
 //! let static_target = Tensor::zeros(&[B, C], cuda_opts)?;
 //!
 //! // 2. Capture (with 3 warmup runs)
-//! let graph = cuda_graph_capture(3, None, || {
+//! let graph = gpu_graph_capture(3, None, || {
 //!     let inp = Variable::new(static_input.clone(), true);
 //!     let tgt = Variable::new(static_target.clone(), false);
 //!     let pred = model.forward(&inp)?;
@@ -48,7 +48,7 @@ use crate::tensor::{check_err, Result};
 /// Memory pool identifier for sharing allocations between CUDA graphs.
 ///
 /// When multiple graphs share a pool, they can reuse each other's memory
-/// allocations, reducing peak VRAM usage. Use `cuda_graph_pool_handle()`
+/// allocations, reducing peak VRAM usage. Use `gpu_graph_pool_handle()`
 /// to get a shared pool, or `None` for a graph-private pool.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemPoolId {
@@ -74,49 +74,49 @@ pub enum CaptureMode {
 
 /// A captured CUDA graph that can be replayed with minimal dispatch overhead.
 ///
-/// Created via [`cuda_graph_capture`] or manually with `new()` + `capture_begin()`
+/// Created via [`gpu_graph_capture`] or manually with `new()` + `capture_begin()`
 /// / `capture_end()`.
-pub struct CudaGraph {
+pub struct GpuGraph {
     ptr: *mut c_void,
 }
 
-impl CudaGraph {
+impl GpuGraph {
     /// Create a new empty CUDA graph. Errors on CPU-only builds.
     pub fn new() -> Result<Self> {
         let mut ptr: *mut c_void = ptr::null_mut();
-        let err = unsafe { ffi::flodl_cuda_graph_new(&mut ptr) };
+        let err = unsafe { ffi::flodl_gpu_graph_new(&mut ptr) };
         check_err(err)?;
-        Ok(CudaGraph { ptr })
+        Ok(GpuGraph { ptr })
     }
 
     /// Begin capturing GPU operations into this graph.
     ///
     /// All CUDA kernel launches on the current stream after this call
-    /// will be recorded until [`capture_end`](CudaGraph::capture_end).
+    /// will be recorded until [`capture_end`](GpuGraph::capture_end).
     pub fn capture_begin(&mut self, pool: Option<MemPoolId>, mode: CaptureMode) -> Result<()> {
         let (hi, lo) = pool.map_or((0, 0), |p| (p.hi, p.lo));
         let err = unsafe {
-            ffi::flodl_cuda_graph_capture_begin(self.ptr, hi, lo, mode as i32)
+            ffi::flodl_gpu_graph_capture_begin(self.ptr, hi, lo, mode as i32)
         };
         check_err(err)
     }
 
     /// End capture and finalize the graph.
     pub fn capture_end(&mut self) -> Result<()> {
-        let err = unsafe { ffi::flodl_cuda_graph_capture_end(self.ptr) };
+        let err = unsafe { ffi::flodl_gpu_graph_capture_end(self.ptr) };
         check_err(err)
     }
 
     /// Replay the captured graph. All kernels are launched with a single
     /// CUDA API call, eliminating per-kernel dispatch overhead.
     pub fn replay(&self) -> Result<()> {
-        let err = unsafe { ffi::flodl_cuda_graph_replay(self.ptr) };
+        let err = unsafe { ffi::flodl_gpu_graph_replay(self.ptr) };
         check_err(err)
     }
 
     /// Reset the graph, allowing recapture.
     pub fn reset(&mut self) -> Result<()> {
-        let err = unsafe { ffi::flodl_cuda_graph_reset(self.ptr) };
+        let err = unsafe { ffi::flodl_gpu_graph_reset(self.ptr) };
         check_err(err)
     }
 
@@ -124,15 +124,15 @@ impl CudaGraph {
     pub fn pool(&self) -> MemPoolId {
         let mut hi: u64 = 0;
         let mut lo: u64 = 0;
-        unsafe { ffi::flodl_cuda_graph_pool(self.ptr, &mut hi, &mut lo) };
+        unsafe { ffi::flodl_gpu_graph_pool(self.ptr, &mut hi, &mut lo) };
         MemPoolId { hi, lo }
     }
 }
 
-impl Drop for CudaGraph {
+impl Drop for GpuGraph {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::flodl_cuda_graph_delete(self.ptr) };
+            unsafe { ffi::flodl_gpu_graph_delete(self.ptr) };
             self.ptr = ptr::null_mut();
         }
     }
@@ -142,10 +142,10 @@ impl Drop for CudaGraph {
 ///
 /// Graphs captured with the same pool can reuse each other's allocations,
 /// reducing peak VRAM usage when replaying multiple graphs.
-pub fn cuda_graph_pool_handle() -> MemPoolId {
+pub fn gpu_graph_pool_handle() -> MemPoolId {
     let mut hi: u64 = 0;
     let mut lo: u64 = 0;
-    unsafe { ffi::flodl_cuda_graph_pool_handle(&mut hi, &mut lo) };
+    unsafe { ffi::flodl_gpu_graph_pool_handle(&mut hi, &mut lo) };
     MemPoolId { hi, lo }
 }
 
@@ -155,7 +155,7 @@ pub fn cuda_graph_pool_handle() -> MemPoolId {
 /// allocator warmup), synchronizes, then captures one run into a graph.
 ///
 /// ```ignore
-/// let graph = cuda_graph_capture(3, None, || {
+/// let graph = gpu_graph_capture(3, None, || {
 ///     optimizer.zero_grad();
 ///     let pred = model.forward(&input)?;
 ///     let loss = mse_loss(&pred, &target)?;
@@ -163,11 +163,11 @@ pub fn cuda_graph_pool_handle() -> MemPoolId {
 ///     optimizer.step()
 /// })?;
 /// ```
-pub fn cuda_graph_capture<F>(
+pub fn gpu_graph_capture<F>(
     warmup_runs: usize,
     pool: Option<MemPoolId>,
     mut f: F,
-) -> Result<CudaGraph>
+) -> Result<GpuGraph>
 where
     F: FnMut() -> Result<()>,
 {
@@ -181,11 +181,11 @@ where
     // device 0. Capture runs `f` on whatever device is current (the model's);
     // syncing device 0 on a multi-GPU rig would let capture start before the
     // real capture device's warmup work has drained.
-    crate::tensor::cuda_synchronize(crate::tensor::current_cuda_device());
+    crate::tensor::gpu_synchronize(crate::tensor::current_gpu_device());
 
     // Capture: capture_begin switches to a side stream internally,
     // and capture_end restores the default stream.
-    let mut graph = CudaGraph::new()?;
+    let mut graph = GpuGraph::new()?;
     graph.capture_begin(pool, CaptureMode::default())?;
     f()?;
     graph.capture_end()?;
@@ -220,8 +220,8 @@ mod tests {
         if test_device().is_cuda() {
             return; // skip on GPU — it should succeed there
         }
-        let result = CudaGraph::new();
-        assert!(result.is_err(), "CudaGraph::new() should fail on CPU");
+        let result = GpuGraph::new();
+        assert!(result.is_err(), "GpuGraph::new() should fail on CPU");
     }
 
     #[test]
@@ -239,7 +239,7 @@ mod tests {
         let c = Tensor::zeros(&[4, 4], opts).unwrap();
 
         // Capture: c = a + b
-        let graph = cuda_graph_capture(1, None, || {
+        let graph = gpu_graph_capture(1, None, || {
             let sum = a.add(&b)?;
             c.copy_(&sum, false)?;
             Ok(())
@@ -247,7 +247,7 @@ mod tests {
 
         // Replay
         graph.replay().unwrap();
-        crate::tensor::cuda_synchronize(0);
+        crate::tensor::gpu_synchronize(0);
 
         let buf = c.to_f32_vec().unwrap();
         assert!(buf.iter().all(|&v| (v - 2.0).abs() < 1e-5),
@@ -277,7 +277,7 @@ mod tests {
         let static_input = Tensor::randn(&[8, 4], opts).unwrap();
         let static_target = Tensor::randn(&[8, 2], opts).unwrap();
 
-        let graph = cuda_graph_capture(3, None, || {
+        let graph = gpu_graph_capture(3, None, || {
             let inp = Variable::new(static_input.clone(), true);
             let tgt = Variable::new(static_target.clone(), false);
             optimizer.zero_grad();
@@ -291,7 +291,7 @@ mod tests {
         for _ in 0..5 {
             graph.replay().unwrap();
         }
-        crate::tensor::cuda_synchronize(0);
+        crate::tensor::gpu_synchronize(0);
 
         // Params should have changed
         let final_data = params[0].variable.data().to_f32_vec().unwrap();
@@ -305,7 +305,7 @@ mod tests {
             return;
         }
         let _lock = GRAPH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let pool = cuda_graph_pool_handle();
+        let pool = gpu_graph_pool_handle();
         assert!(pool.hi != 0 || pool.lo != 0, "pool handle should be nonzero");
     }
 
@@ -323,14 +323,14 @@ mod tests {
         let c = Tensor::zeros(&[4], opts).unwrap();
 
         // First capture: c = a + b (= 2.0)
-        let mut graph = cuda_graph_capture(1, None, || {
+        let mut graph = gpu_graph_capture(1, None, || {
             let sum = a.add(&b)?;
             c.copy_(&sum, false)?;
             Ok(())
         }).unwrap();
 
         graph.replay().unwrap();
-        crate::tensor::cuda_synchronize(0);
+        crate::tensor::gpu_synchronize(0);
         let buf = c.to_f32_vec().unwrap();
         assert!(buf.iter().all(|&v| (v - 2.0).abs() < 1e-5));
 
@@ -344,7 +344,7 @@ mod tests {
         graph.capture_end().unwrap();
 
         graph.replay().unwrap();
-        crate::tensor::cuda_synchronize(0);
+        crate::tensor::gpu_synchronize(0);
         let buf = c.to_f32_vec().unwrap();
         assert!(buf.iter().all(|&v| (v - 3.0).abs() < 1e-5),
             "after recapture, c should be 3.0, got {:?}", &buf[..4]);

@@ -7,120 +7,120 @@ use flodl_sys as ffi;
 use super::{check_err, Device, DType, Result, Tensor, TensorError, TensorOptions, LIVE_TENSOR_COUNT};
 use std::sync::atomic::Ordering;
 
-/// Returns true if CUDA is available.
+/// Returns true if a GPU is available.
 ///
 /// On Linux, this also ensures CUDA libraries are loaded (they can be
 /// dropped by the linker's `--as-needed` flag since no Rust code
 /// directly references symbols in `libtorch_cuda.so`).
-pub fn cuda_available() -> bool {
-    // flodl_force_cuda_link references c10::cuda::device_count(),
+pub fn gpu_available() -> bool {
+    // flodl_force_gpu_link references c10::cuda::device_count(),
     // creating a real symbol dependency on c10_cuda.so. This prevents
     // --as-needed from dropping CUDA libs. The call is cheap (no-op on
     // non-CUDA builds since the symbol resolves to a stub returning 0).
-    unsafe { let _ = ffi::flodl_force_cuda_link(); }
-    unsafe { ffi::flodl_cuda_is_available() != 0 }
+    unsafe { let _ = ffi::flodl_force_gpu_link(); }
+    unsafe { ffi::flodl_gpu_is_available() != 0 }
 }
 
-/// Returns the number of CUDA devices.
-pub fn cuda_device_count() -> i32 {
-    unsafe { ffi::flodl_cuda_device_count() }
+/// Returns the number of GPU devices.
+pub fn gpu_device_count() -> i32 {
+    unsafe { ffi::flodl_gpu_device_count() }
 }
 
-/// Query CUDA memory usage for a specific device.
-/// Returns `(used_bytes, total_bytes)` or an error if CUDA is not available.
-pub fn cuda_memory_info_idx(device_index: i32) -> Result<(u64, u64)> {
+/// Query GPU memory usage for a specific device.
+/// Returns `(used_bytes, total_bytes)` or an error if no GPU is available.
+pub fn gpu_memory_info_idx(device_index: i32) -> Result<(u64, u64)> {
     let mut used: u64 = 0;
     let mut total: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_mem_info(device_index, &mut used, &mut total) })?;
+    check_err(unsafe { ffi::flodl_gpu_mem_info(device_index, &mut used, &mut total) })?;
     Ok((used, total))
 }
 
-/// Query CUDA memory usage for device 0.
-/// Returns `(used_bytes, total_bytes)` or an error if CUDA is not available.
-pub fn cuda_memory_info() -> Result<(u64, u64)> {
-    cuda_memory_info_idx(0)
+/// Query GPU memory usage for device 0.
+/// Returns `(used_bytes, total_bytes)` or an error if no GPU is available.
+pub fn gpu_memory_info() -> Result<(u64, u64)> {
+    gpu_memory_info_idx(0)
 }
 
-/// Query bytes reserved by the CUDA caching allocator on a specific device.
+/// Query bytes reserved by the GPU caching allocator on a specific device.
 ///
 /// This is the Rust equivalent of `torch.cuda.memory_reserved()`. It can exceed
 /// physical VRAM when unified memory spills to host RAM.
-pub fn cuda_allocated_bytes_idx(device_index: i32) -> Result<u64> {
+pub fn gpu_allocated_bytes_idx(device_index: i32) -> Result<u64> {
     let mut allocated: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_alloc_bytes(device_index, &mut allocated) })?;
+    check_err(unsafe { ffi::flodl_gpu_alloc_bytes(device_index, &mut allocated) })?;
     Ok(allocated)
 }
 
-/// Query bytes reserved by the CUDA caching allocator on device 0.
-pub fn cuda_allocated_bytes() -> Result<u64> {
-    cuda_allocated_bytes_idx(0)
+/// Query bytes reserved by the GPU caching allocator on device 0.
+pub fn gpu_allocated_bytes() -> Result<u64> {
+    gpu_allocated_bytes_idx(0)
 }
 
 /// Query bytes actively used by tensors on a specific device.
 ///
 /// This is the Rust equivalent of `torch.cuda.memory_allocated()`. Unlike
-/// `cuda_allocated_bytes` (which reports the allocator's total reservation),
+/// `gpu_allocated_bytes` (which reports the allocator's total reservation),
 /// this only counts sub-blocks currently backing live tensors.
-pub fn cuda_active_bytes_idx(device_index: i32) -> Result<u64> {
+pub fn gpu_active_bytes_idx(device_index: i32) -> Result<u64> {
     let mut active: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_active_bytes(device_index, &mut active) })?;
+    check_err(unsafe { ffi::flodl_gpu_active_bytes(device_index, &mut active) })?;
     Ok(active)
 }
 
 /// Query bytes actively used by tensors on device 0.
-pub fn cuda_active_bytes() -> Result<u64> {
-    cuda_active_bytes_idx(0)
+pub fn gpu_active_bytes() -> Result<u64> {
+    gpu_active_bytes_idx(0)
 }
 
-/// Peak bytes allocated to tensors since last `cuda_reset_peak_stats()` on a specific device.
+/// Peak bytes allocated to tensors since last `gpu_reset_peak_stats()` on a specific device.
 ///
 /// This is the Rust equivalent of `torch.cuda.max_memory_allocated()`.
-pub fn cuda_peak_active_bytes_idx(device_index: i32) -> Result<u64> {
+pub fn gpu_peak_active_bytes_idx(device_index: i32) -> Result<u64> {
     let mut peak: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_peak_active_bytes(device_index, &mut peak) })?;
+    check_err(unsafe { ffi::flodl_gpu_peak_active_bytes(device_index, &mut peak) })?;
     Ok(peak)
 }
 
-/// Peak bytes allocated to tensors since last `cuda_reset_peak_stats()` on device 0.
-pub fn cuda_peak_active_bytes() -> Result<u64> {
-    cuda_peak_active_bytes_idx(0)
+/// Peak bytes allocated to tensors since last `gpu_reset_peak_stats()` on device 0.
+pub fn gpu_peak_active_bytes() -> Result<u64> {
+    gpu_peak_active_bytes_idx(0)
 }
 
-/// Peak bytes reserved by the CUDA caching allocator since last `cuda_reset_peak_stats()` on a specific device.
+/// Peak bytes reserved by the GPU caching allocator since last `gpu_reset_peak_stats()` on a specific device.
 ///
 /// This is the Rust equivalent of `torch.cuda.max_memory_reserved()`.
-pub fn cuda_peak_reserved_bytes_idx(device_index: i32) -> Result<u64> {
+pub fn gpu_peak_reserved_bytes_idx(device_index: i32) -> Result<u64> {
     let mut peak: u64 = 0;
-    check_err(unsafe { ffi::flodl_cuda_peak_reserved_bytes(device_index, &mut peak) })?;
+    check_err(unsafe { ffi::flodl_gpu_peak_reserved_bytes(device_index, &mut peak) })?;
     Ok(peak)
 }
 
-/// Peak bytes reserved by the CUDA caching allocator since last `cuda_reset_peak_stats()` on device 0.
-pub fn cuda_peak_reserved_bytes() -> Result<u64> {
-    cuda_peak_reserved_bytes_idx(0)
+/// Peak bytes reserved by the GPU caching allocator since last `gpu_reset_peak_stats()` on device 0.
+pub fn gpu_peak_reserved_bytes() -> Result<u64> {
+    gpu_peak_reserved_bytes_idx(0)
 }
 
 /// Reset peak memory statistics for a specific device.
 /// Equivalent to `torch.cuda.reset_peak_memory_stats()`.
-pub fn cuda_reset_peak_stats_idx(device_index: i32) {
-    unsafe { ffi::flodl_cuda_reset_peak_stats(device_index) }
+pub fn gpu_reset_peak_stats_idx(device_index: i32) {
+    unsafe { ffi::flodl_gpu_reset_peak_stats(device_index) }
 }
 
 /// Reset peak memory statistics for device 0.
-pub fn cuda_reset_peak_stats() {
-    cuda_reset_peak_stats_idx(0)
+pub fn gpu_reset_peak_stats() {
+    gpu_reset_peak_stats_idx(0)
 }
 
-/// Release all unused cached memory from the CUDA caching allocator.
+/// Release all unused cached memory from the GPU caching allocator.
 /// Equivalent to `torch.cuda.empty_cache()`.
-pub fn cuda_empty_cache() {
-    unsafe { ffi::flodl_cuda_empty_cache() }
+pub fn gpu_empty_cache() {
+    unsafe { ffi::flodl_gpu_empty_cache() }
 }
 
 /// Query GPU utilization percentage (0-100) via NVML.
 /// Returns `None` if NVML is not available or the query fails.
-pub fn cuda_utilization() -> Option<u32> {
-    cuda_utilization_idx(0)
+pub fn gpu_utilization() -> Option<u32> {
+    gpu_utilization_idx(0)
 }
 
 /// Query GPU utilization percentage for a specific device (0-100) via NVML.
@@ -132,14 +132,14 @@ pub fn cuda_utilization() -> Option<u32> {
 ///
 /// Never initializes the CUDA runtime in the calling process; safe to
 /// call before `Trainer::run`.
-pub fn cuda_utilization_idx(device_index: i32) -> Option<u32> {
-    let val = unsafe { ffi::flodl_cuda_utilization(device_index) };
+pub fn gpu_utilization_idx(device_index: i32) -> Option<u32> {
+    let val = unsafe { ffi::flodl_gpu_utilization(device_index) };
     if val >= 0 { Some(val as u32) } else { None }
 }
 
 /// Query device-wide VRAM usage `(used_bytes, total_bytes)` via NVML.
 ///
-/// Reports the same device-global numbers as [`cuda_memory_info_idx`]
+/// Reports the same device-global numbers as [`gpu_memory_info_idx`]
 /// but WITHOUT creating a CUDA context in the calling process
 /// (`cudaMemGetInfo` initializes a primary context on the queried
 /// device, pinning VRAM for the life of the process; NVML does not).
@@ -151,10 +151,10 @@ pub fn cuda_utilization_idx(device_index: i32) -> Option<u32> {
 /// [`crate::sys::GpuInfo::index`].
 ///
 /// Returns `None` if NVML is unavailable or the index is invalid.
-pub fn cuda_nvml_memory_info_idx(physical_index: i32) -> Option<(u64, u64)> {
+pub fn gpu_smi_memory_info_idx(physical_index: i32) -> Option<(u64, u64)> {
     let mut used: u64 = 0;
     let mut total: u64 = 0;
-    let rc = unsafe { ffi::flodl_cuda_nvml_mem_info(physical_index, &mut used, &mut total) };
+    let rc = unsafe { ffi::flodl_gpu_smi_mem_info(physical_index, &mut used, &mut total) };
     if rc == 0 { Some((used, total)) } else { None }
 }
 
@@ -162,36 +162,36 @@ pub fn cuda_nvml_memory_info_idx(physical_index: i32) -> Option<(u64, u64)> {
 /// device (CUDA runtime index).
 ///
 /// Queries driver context state without creating one. Context-dependent
-/// reads (caching-allocator stats such as [`cuda_allocated_bytes_idx`])
+/// reads (caching-allocator stats such as [`gpu_allocated_bytes_idx`])
 /// are only meaningful in a process that has actually used the device;
 /// gate them on this so a monitoring call never initializes CUDA as a
 /// side effect. Always `false` on CPU-only builds and before the first
 /// CUDA operation on the device.
-pub fn cuda_has_primary_context(device_index: i32) -> bool {
-    unsafe { ffi::flodl_cuda_has_primary_context(device_index) != 0 }
+pub fn gpu_has_primary_context(device_index: i32) -> bool {
+    unsafe { ffi::flodl_gpu_has_primary_context(device_index) != 0 }
 }
 
-/// Set the current CUDA device.
-pub fn set_current_cuda_device(device_index: u8) {
+/// Set the current GPU device.
+pub fn set_current_gpu_device(device_index: u8) {
     unsafe { ffi::flodl_set_current_device(device_index as i32) };
 }
 
-/// Get the current CUDA device index.
-pub fn current_cuda_device() -> u8 {
+/// Get the current GPU device index.
+pub fn current_gpu_device() -> u8 {
     unsafe { ffi::flodl_get_current_device() as u8 }
 }
 
-/// Synchronize a CUDA device (wait for all pending work to complete).
-pub fn cuda_synchronize(device_index: u8) {
-    unsafe { ffi::flodl_cuda_synchronize(device_index as i32) };
+/// Synchronize a GPU device (wait for all pending work to complete).
+pub fn gpu_synchronize(device_index: u8) {
+    unsafe { ffi::flodl_gpu_synchronize(device_index as i32) };
 }
 
 /// Returns the GPU device name for the given index (e.g. "NVIDIA GeForce GTX 1060 6GB").
-pub fn cuda_device_name_idx(device: i32) -> Option<String> {
+pub fn gpu_device_name_idx(device: i32) -> Option<String> {
     // `c_char` (i8 on x86_64, u8 on Linux aarch64) so the FFI buffer
     // type matches on every platform.
     let mut buf = [0 as std::ffi::c_char; 256];
-    let err = unsafe { ffi::flodl_cuda_device_name(device, buf.as_mut_ptr(), 256) };
+    let err = unsafe { ffi::flodl_gpu_device_name(device, buf.as_mut_ptr(), 256) };
     if err.is_null() {
         let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
@@ -204,8 +204,8 @@ pub fn cuda_device_name_idx(device: i32) -> Option<String> {
 }
 
 /// Returns the GPU device name for device 0 (e.g. "NVIDIA GeForce GTX 1060 6GB").
-pub fn cuda_device_name() -> Option<String> {
-    cuda_device_name_idx(0)
+pub fn gpu_device_name() -> Option<String> {
+    gpu_device_name_idx(0)
 }
 
 /// Information about a CUDA device.
@@ -230,6 +230,39 @@ impl DeviceInfo {
     }
 }
 
+/// Architecture of a GPU device, as the vendor names it: `"sm_120"` on
+/// NVIDIA, `"gfx1100"` (possibly with feature qualifiers, e.g.
+/// `"gfx90a:sramecc+:xnack-"`) on AMD.
+///
+/// Read from the GPU runtime, so it describes the device *libtorch*
+/// sees. [`crate::sys::GpuInfo::arch_label`] answers the same question
+/// without initializing the runtime, which is the right call before
+/// `Trainer::run`; the two can disagree under visibility masks and index
+/// remapping, so prefer this one when the question is "why did a kernel
+/// launch fail on this device".
+///
+/// Returns `None` if no GPU is available or the index is invalid.
+///
+/// This is the portable replacement for [`cuda_compute_capability`],
+/// which stays NVIDIA-only on purpose: a gfx target is major/minor/step
+/// with the step in hex, and only major+minor survive a numeric pair, so
+/// gfx906/gfx908/gfx90a (and gfx1100/1101/1102, and gfx1200/1201) all
+/// collapse together despite needing different code objects.
+pub fn gpu_arch_name(device_index: i32) -> Option<String> {
+    let mut buf = [0 as std::ffi::c_char; 256];
+    let err = unsafe { ffi::flodl_gpu_arch_name(device_index, buf.as_mut_ptr(), 256) };
+    if err.is_null() {
+        Some(
+            unsafe { CStr::from_ptr(buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        unsafe { ffi::flodl_free_string(err) };
+        None
+    }
+}
+
 /// Query compute capability (major, minor) for a CUDA device.
 ///
 /// Returns `None` if CUDA is unavailable or the device index is invalid.
@@ -247,12 +280,12 @@ pub fn cuda_compute_capability(device_index: i32) -> Option<(u32, u32)> {
     }
 }
 
-/// Enumerate all available CUDA devices.
-pub fn cuda_devices() -> Vec<DeviceInfo> {
-    let n = cuda_device_count();
+/// Enumerate all available GPU devices.
+pub fn gpu_devices() -> Vec<DeviceInfo> {
+    let n = gpu_device_count();
     (0..n).filter_map(|i| {
-        let name = cuda_device_name_idx(i)?;
-        let total_memory = cuda_memory_info_idx(i).map(|(_, t)| t).unwrap_or(0);
+        let name = gpu_device_name_idx(i)?;
+        let total_memory = gpu_memory_info_idx(i).map(|(_, t)| t).unwrap_or(0);
         let (sm_major, sm_minor) = cuda_compute_capability(i).unwrap_or((0, 0));
         Some(DeviceInfo { index: i as u8, name, total_memory, sm_major, sm_minor })
     }).collect()
@@ -276,17 +309,33 @@ pub fn probe_device(device: Device) -> Result<()> {
         Err(e) => {
             let msg = format!("{}", e);
             if msg.contains("no kernel image") {
-                let (sm_maj, sm_min) = cuda_compute_capability(idx as i32)
-                    .unwrap_or((0, 0));
-                let name = cuda_device_name_idx(idx as i32)
+                let name = gpu_device_name_idx(idx as i32)
                     .unwrap_or_else(|| format!("CUDA({})", idx));
-                let variant = recommended_cuda_variant(sm_maj);
-                Err(TensorError::new(&format!(
-                    "CUDA({}) {} (sm_{}{}) cannot run kernels in this libtorch build. \
-                     Recommended: switch to libtorch {} \
-                     (in Dockerfile, change the cu### variant)",
-                    idx, name, sm_maj, sm_min, variant
-                )))
+                // `cuda_compute_capability` is NVIDIA-only and returns
+                // `None` on a ROCm build, so the sm_/cu### advice below
+                // is emitted only where it actually means something.
+                // Claiming "sm_00 ... switch to cu0" on an AMD card would
+                // send the reader after the wrong fix entirely.
+                match cuda_compute_capability(idx as i32) {
+                    Some((sm_maj, sm_min)) => Err(TensorError::new(&format!(
+                        "CUDA({}) {} (sm_{}{}) cannot run kernels in this libtorch build. \
+                         Recommended: switch to libtorch {} \
+                         (in Dockerfile, change the cu### variant)",
+                        idx, name, sm_maj, sm_min, recommended_cuda_variant(sm_maj)
+                    ))),
+                    // No compute capability means a non-NVIDIA build, so
+                    // name the architecture the vendor's own way instead
+                    // of leaving the reader to go find it.
+                    None => Err(TensorError::new(&format!(
+                        "CUDA({}) {} ({}) cannot run kernels in this libtorch build. \
+                         Recommended: install or rebuild a libtorch carrying kernels \
+                         for this architecture (`fdl probe` reports it, and \
+                         libtorch/<variant>/.arch lists what the build covers)",
+                        idx,
+                        name,
+                        gpu_arch_name(idx as i32).unwrap_or_else(|| "unknown arch".into())
+                    ))),
+                }
             } else {
                 Err(e)
             }
@@ -294,17 +343,17 @@ pub fn probe_device(device: Device) -> Result<()> {
     }
 }
 
-/// Return all CUDA devices that can run compute kernels, with warnings
+/// Return all GPU devices that can run compute kernels, with warnings
 /// for any excluded devices printed to stderr.
 ///
 /// This is the primary entry point for multi-GPU setup. It probes each
 /// GPU and returns only the working ones, giving actionable diagnostics
 /// for any that fail.
-pub fn usable_cuda_devices() -> Vec<Device> {
-    if !cuda_available() {
+pub fn usable_gpu_devices() -> Vec<Device> {
+    if !gpu_available() {
         return vec![];
     }
-    let devices = cuda_devices();
+    let devices = gpu_devices();
     let mut usable = Vec::new();
 
     for info in &devices {
@@ -421,8 +470,8 @@ pub fn manual_seed(seed: u64) {
 ///
 /// Usually you want `manual_seed()` instead, which seeds both CPU
 /// and CUDA. Use this only when you need to re-seed CUDA independently.
-pub fn cuda_manual_seed_all(seed: u64) {
-    unsafe { ffi::flodl_cuda_manual_seed_all(seed) }
+pub fn gpu_manual_seed_all(seed: u64) {
+    unsafe { ffi::flodl_gpu_manual_seed_all(seed) }
 }
 
 /// Ask glibc to return free memory to the OS (Linux only).

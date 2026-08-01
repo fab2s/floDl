@@ -267,7 +267,7 @@ pub struct WorkerJoin {
 /// the `"all"` shorthand (auto-detect at startup on that host).
 ///
 /// `local_devices: all` defers device-index resolution to startup on
-/// whichever host the value lives on. The host uses `cuda_device_count()`
+/// whichever host the value lives on. The host uses `gpu_device_count()`
 /// and binds devices `0..ranks.len()` (sequential from index 0). The
 /// detected count must be at least as large as `ranks.len()`, otherwise
 /// rendezvous errors loudly.

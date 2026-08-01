@@ -1,5 +1,5 @@
     use super::*;
-    use crate::tensor::{test_device, cuda_device_count, cuda_synchronize, TensorOptions, DType};
+    use crate::tensor::{test_device, gpu_device_count, gpu_synchronize, TensorOptions, DType};
     use crate::distributed::ddp::NCCL_LOCK;
 
     fn require_multi_gpu() -> bool {
@@ -7,7 +7,7 @@
     }
 
     fn require_n_gpu(n: i32) -> bool {
-        if !test_device().is_cuda() || cuda_device_count() < n {
+        if !test_device().is_cuda() || gpu_device_count() < n {
             return false;
         }
         // Verify all required devices can run compute kernels (e.g., GTX 1060
@@ -62,8 +62,8 @@
 
         // Broadcast from device 0
         comms.broadcast(&[&t0, &t1], 0).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
 
         let vals0 = t0.to_f32_vec().unwrap();
         let vals1 = t1.to_f32_vec().unwrap();
@@ -88,8 +88,8 @@
         let t1 = Tensor::full(&[128], 2.0, opts1).unwrap();
 
         comms.all_reduce(&[&t0, &t1], ReduceOp::Sum).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
 
         // Sum: 1.0 + 2.0 = 3.0 on both devices
         let vals0 = t0.to_f32_vec().unwrap();
@@ -115,8 +115,8 @@
         let t1 = Tensor::full(&[64], 20.0, opts1).unwrap();
 
         comms.all_reduce(&[&t0, &t1], ReduceOp::Avg).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
 
         // Avg: (10.0 + 20.0) / 2 = 15.0
         let vals0 = t0.to_f32_vec().unwrap();
@@ -137,8 +137,8 @@
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
         let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
 
-        let stream0 = CudaStream::new(Device::CUDA(0), false).unwrap();
-        let stream1 = CudaStream::new(Device::CUDA(1), false).unwrap();
+        let stream0 = GpuStream::new(Device::CUDA(0), false).unwrap();
+        let stream1 = GpuStream::new(Device::CUDA(1), false).unwrap();
 
         let t0 = Tensor::full(&[32], 5.0, opts0).unwrap();
         let t1 = Tensor::full(&[32], 7.0, opts1).unwrap();
@@ -203,11 +203,11 @@
         let uid0 = uid.clone();
         let uid1 = uid;
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -228,17 +228,17 @@
         let t0c = t0.clone();
         let t1c = t1.clone();
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             comm0.all_reduce_premul_sum(&[&t0c], 0.75, None).unwrap();
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             comm1.all_reduce_premul_sum(&[&t1c], 0.25, None).unwrap();
         });
         h0.join().unwrap();
         h1.join().unwrap();
-        crate::tensor::cuda_synchronize(0);
-        crate::tensor::cuda_synchronize(1);
+        crate::tensor::gpu_synchronize(0);
+        crate::tensor::gpu_synchronize(1);
 
         let v0: f64 = t0.mean().unwrap().item().unwrap();
         let v1: f64 = t1.mean().unwrap().item().unwrap();
@@ -268,11 +268,11 @@
         let uid0 = uid.clone();
         let uid1 = uid;
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -291,7 +291,7 @@
                    b: Tensor,
                    n_i: f64| {
             std::thread::spawn(move || {
-                crate::tensor::set_current_cuda_device(dev);
+                crate::tensor::set_current_gpu_device(dev);
                 weighted_allreduce_nccl(
                     &comm, None, &[&p], &[&b], n_i, 1.0,
                     Device::CUDA(dev), dev as usize, 0,
@@ -306,8 +306,8 @@
         let h1 = run(comm1, 1, p1.clone(), b1.clone(), 1.0);
         let comm0 = h0.join().unwrap();
         let comm1 = h1.join().unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
         for (t, want, what) in [
             (&p0, 12.5, "rank0 params"), (&p1, 12.5, "rank1 params"),
             (&b0, 150.0, "rank0 buffers"), (&b1, 150.0, "rank1 buffers"),
@@ -327,8 +327,8 @@
         let h1 = run(comm1, 1, p1.clone(), b1.clone(), 0.0);
         h0.join().unwrap();
         h1.join().unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
         for (t, want, what) in [
             (&p0, 1.0, "rank0 params"), (&p1, 1.0, "rank1 params (adopted)"),
             (&b0, 5.0, "rank0 buffers"), (&b1, 5.0, "rank1 buffers (adopted)"),
@@ -350,11 +350,11 @@
 
         // Each rank must call init_rank concurrently. Use two threads.
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -375,14 +375,14 @@
         let t1_clone = t1.clone();
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             comm0.all_reduce(&[&t0_clone], ReduceOp::Avg).unwrap();
-            cuda_synchronize(0);
+            gpu_synchronize(0);
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             comm1.all_reduce(&[&t1_clone], ReduceOp::Avg).unwrap();
-            cuda_synchronize(1);
+            gpu_synchronize(1);
         });
         h0.join().unwrap();
         h1.join().unwrap();
@@ -406,11 +406,11 @@
         let uid1 = uid;
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -418,8 +418,8 @@
 
         let opts0 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(0) };
         let opts1 = TensorOptions { dtype: DType::Float32, device: Device::CUDA(1) };
-        let stream0 = CudaStream::new(Device::CUDA(0), false).unwrap();
-        let stream1 = CudaStream::new(Device::CUDA(1), false).unwrap();
+        let stream0 = GpuStream::new(Device::CUDA(0), false).unwrap();
+        let stream1 = GpuStream::new(Device::CUDA(1), false).unwrap();
 
         let t0 = Tensor::full(&[32], 3.0, opts0).unwrap();
         let t1 = Tensor::full(&[32], 7.0, opts1).unwrap();
@@ -427,12 +427,12 @@
         let t1c = t1.clone();
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             comm0.all_reduce_on_stream(&[&t0c], ReduceOp::Sum, &stream0).unwrap();
             stream0.synchronize().unwrap();
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             comm1.all_reduce_on_stream(&[&t1c], ReduceOp::Sum, &stream1).unwrap();
             stream1.synchronize().unwrap();
         });
@@ -458,11 +458,11 @@
         let uid1 = uid;
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -483,14 +483,14 @@
         let b1c = b1.clone();
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             comm0.all_reduce(&[&a0c, &b0c], ReduceOp::Avg).unwrap();
-            cuda_synchronize(0);
+            gpu_synchronize(0);
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             comm1.all_reduce(&[&a1c, &b1c], ReduceOp::Avg).unwrap();
-            cuda_synchronize(1);
+            gpu_synchronize(1);
         });
         h0.join().unwrap();
         h1.join().unwrap();
@@ -518,11 +518,11 @@
         let uid1 = uid;
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -538,14 +538,14 @@
         let t1c = t1.clone();
 
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             comm0.broadcast(&[&t0c], 0).unwrap();
-            cuda_synchronize(0);
+            gpu_synchronize(0);
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             comm1.broadcast(&[&t1c], 0).unwrap();
-            cuda_synchronize(1);
+            gpu_synchronize(1);
         });
         h0.join().unwrap();
         h1.join().unwrap();
@@ -571,11 +571,11 @@
         let uid0 = uid.clone();
         let uid1 = uid;
         let h0 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(0);
+            crate::tensor::set_current_gpu_device(0);
             NcclRankComm::init_rank(0, 2, &uid0).unwrap()
         });
         let h1 = std::thread::spawn(move || {
-            crate::tensor::set_current_cuda_device(1);
+            crate::tensor::set_current_gpu_device(1);
             NcclRankComm::init_rank(1, 2, &uid1).unwrap()
         });
         let comm0 = h0.join().unwrap();
@@ -611,9 +611,9 @@
         let t2 = Tensor::full(&[64], 3.0, opts2).unwrap();
 
         comms.all_reduce(&[&t0, &t1, &t2], ReduceOp::Sum).unwrap();
-        cuda_synchronize(0);
-        cuda_synchronize(1);
-        cuda_synchronize(2);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
+        gpu_synchronize(2);
 
         // Sum: 1 + 2 + 3 = 6 on every device.
         for (i, t) in [&t0, &t1, &t2].iter().enumerate() {

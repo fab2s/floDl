@@ -71,7 +71,7 @@ torch.cuda.manual_seed_all(42)
 ```rust
 // flodl
 flodl::manual_seed(42);
-flodl::cuda_manual_seed_all(42);  // no-op without CUDA feature
+flodl::gpu_manual_seed_all(42);  // no-op without CUDA feature
 ```
 
 `manual_seed` controls all libtorch random operations: `Tensor::rand`, `Tensor::randn`, dropout masks, weight initialization. Call it before model creation for full reproducibility.
@@ -1069,7 +1069,7 @@ x = x.to(device)
 
 ```rust
 // flodl
-let device = if cuda_available() { Device::CUDA(0) } else { Device::CPU };
+let device = if gpu_available() { Device::CUDA(0) } else { Device::CPU };
 
 // Move model parameters
 module.move_to_device(device);
@@ -1088,9 +1088,9 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
-| Device check | `torch.cuda.is_available()` | `cuda_available()` |
+| Device check | `torch.cuda.is_available()` | `gpu_available()` |
 | Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` - CUDA-free, no libtorch init |
-| Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `cuda_device_count()` - safe inside training; touches libtorch |
+| Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `gpu_device_count()` - safe inside training; touches libtorch |
 | Model move | `model.to(device)` | `module.move_to_device(device)` |
 | Tensor move | `x.to(device)` | `x.to_device(device)?` |
 | cuDNN benchmark | `torch.backends.cudnn.benchmark = True` | `set_cudnn_benchmark(true)` |
@@ -1570,29 +1570,29 @@ torch.cuda.max_memory_allocated()  # peak allocated
 
 ```rust
 // flodl - hardware-level via cudaMemGetInfo
-let (used, total) = cuda_memory_info()?;   // (bytes_used, bytes_total)
-let util = cuda_utilization();              // Option<u32> - GPU % via NVML
+let (used, total) = gpu_memory_info()?;   // (bytes_used, bytes_total)
+let util = gpu_utilization();              // Option<u32> - GPU % via NVML
 
 // Allocator-level queries
-let active = cuda_active_bytes()?;             // bytes backing live tensors
-let peak = cuda_peak_active_bytes()?;          // max since last reset
-let peak_reserved = cuda_peak_reserved_bytes()?;  // max allocator reservation
+let active = gpu_active_bytes()?;             // bytes backing live tensors
+let peak = gpu_peak_active_bytes()?;          // max since last reset
+let peak_reserved = gpu_peak_reserved_bytes()?;  // max allocator reservation
 
 // Reset peak tracking (e.g., between profiling phases)
-cuda_empty_cache();
-cuda_reset_peak_stats();
+gpu_empty_cache();
+gpu_reset_peak_stats();
 ```
 
 | PyTorch | flodl | What it reports |
 |---------|-------|----------------|
-| `torch.cuda.mem_get_info()` | `cuda_memory_info()?` | `(used, total)` bytes via `cudaMemGetInfo` |
-| `torch.cuda.memory_allocated()` | `cuda_active_bytes()?` | Bytes currently backing live tensors |
-| `torch.cuda.memory_reserved()` | `cuda_allocated_bytes()?` | Bytes reserved by caching allocator (includes spill) |
-| `torch.cuda.max_memory_allocated()` | `cuda_peak_active_bytes()?` | Peak allocated since last reset |
-| `torch.cuda.max_memory_reserved()` | `cuda_peak_reserved_bytes()?` | Peak reserved since last reset |
-| `torch.cuda.reset_peak_memory_stats()` | `cuda_reset_peak_stats()` | Reset peak counters |
-| `torch.cuda.empty_cache()` | `cuda_empty_cache()` | Release unused cached blocks |
-| *(no built-in)* | `cuda_utilization()` | GPU compute % via NVML |
+| `torch.cuda.mem_get_info()` | `gpu_memory_info()?` | `(used, total)` bytes via `cudaMemGetInfo` |
+| `torch.cuda.memory_allocated()` | `gpu_active_bytes()?` | Bytes currently backing live tensors |
+| `torch.cuda.memory_reserved()` | `gpu_allocated_bytes()?` | Bytes reserved by caching allocator (includes spill) |
+| `torch.cuda.max_memory_allocated()` | `gpu_peak_active_bytes()?` | Peak allocated since last reset |
+| `torch.cuda.max_memory_reserved()` | `gpu_peak_reserved_bytes()?` | Peak reserved since last reset |
+| `torch.cuda.reset_peak_memory_stats()` | `gpu_reset_peak_stats()` | Reset peak counters |
+| `torch.cuda.empty_cache()` | `gpu_empty_cache()` | Release unused cached blocks |
+| *(no built-in)* | `gpu_utilization()` | GPU compute % via NVML |
 
 The monitor samples these automatically on every `log()` call - you don't need
 to query them manually during training.
@@ -1699,7 +1699,7 @@ See the [DDP Reference](ddp/01-reference.md) for complete API documentation.
 | *(no built-in)* | `checkpoint_version(path)?` | Peek at checkpoint version (1=0.1.x, 2=0.2.0+) |
 | `param.requires_grad = False` | `param.freeze()?` | Also: `unfreeze()`, `is_frozen()` |
 | `Adam([{"params":..., "lr":...}])` | `Adam::with_groups().group(&p, lr).build()` | Per-group LR |
-| `torch.cuda.memory_reserved()` | `cuda_allocated_bytes()?` | Bytes reserved by caching allocator |
+| `torch.cuda.memory_reserved()` | `gpu_allocated_bytes()?` | Bytes reserved by caching allocator |
 | `x.pin_memory()` | `x.pin_memory()?` | Page-locked CPU memory for async transfers |
 | `x.is_pinned()` | `x.is_pinned()` | Check if tensor is in pinned memory |
 | `x.to(device, non_blocking=True)` | `x.to_device_async(device)?` | Non-blocking transfer (pair with `pin_memory`) |
@@ -1707,8 +1707,8 @@ See the [DDP Reference](ddp/01-reference.md) for complete API documentation.
 | `x.is_contiguous(channels_last)` | `x.is_channels_last()` | Check memory format |
 | `torch.cuda.amp.autocast()` | `autocast(DType::Float16, \|\| { })` | Automatic mixed precision dispatch |
 | `torch.cuda.amp.GradScaler()` | `GradScaler::new()` | Dynamic loss scaling for AMP |
-| `torch.cuda.CUDAGraph()` | `CudaGraph::new()?` | CUDA graph capture/replay |
-| `torch.cuda.graph(g)` | `cuda_graph_capture(warmup, pool, \|\| { })` | Convenience capture helper |
+| `torch.cuda.CUDAGraph()` | `GpuGraph::new()?` | CUDA graph capture/replay |
+| `torch.cuda.graph(g)` | `gpu_graph_capture(warmup, pool, \|\| { })` | Convenience capture helper |
 | `SummaryWriter` + TensorBoard | `Monitor::new(n).serve(3000)?` | Built-in live dashboard |
 
 ## See also

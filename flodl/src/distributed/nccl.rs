@@ -26,10 +26,10 @@ use std::sync::Arc;
 use flodl_sys::{self as ffi, FlodlTensor};
 
 use crate::tensor::{
-    check_err, current_cuda_device, set_current_cuda_device,
+    check_err, current_gpu_device, set_current_gpu_device,
     Device, Result, Tensor, TensorError,
 };
-use crate::tensor::cuda_stream::CudaStream;
+use crate::tensor::cuda_stream::GpuStream;
 
 /// NCCL reduction operation.
 #[derive(Clone, Copy, Debug)]
@@ -88,7 +88,7 @@ impl NcclComms {
         let mut handle: *mut c_void = ptr::null_mut();
         // NCCL init calls cudaSetDevice internally. Save/restore so we
         // don't corrupt the caller's device context.
-        let saved = current_cuda_device();
+        let saved = current_gpu_device();
         let err = unsafe {
             ffi::flodl_nccl_init(
                 devlist.len() as i32,
@@ -96,7 +96,7 @@ impl NcclComms {
                 &mut handle,
             )
         };
-        set_current_cuda_device(saved);
+        set_current_gpu_device(saved);
         check_err(err)?;
         Ok(NcclComms {
             handle,
@@ -117,7 +117,7 @@ impl NcclComms {
     pub fn all_reduce(&self, tensors: &[&Tensor], op: ReduceOp) -> Result<()> {
         self.validate_tensors(tensors, "all_reduce")?;
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
-        let saved = current_cuda_device();
+        let saved = current_gpu_device();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce(
                 self.handle,
@@ -126,7 +126,7 @@ impl NcclComms {
                 op as i32,
             )
         };
-        set_current_cuda_device(saved);
+        set_current_gpu_device(saved);
         check_err(err)
     }
 
@@ -144,7 +144,7 @@ impl NcclComms {
         &self,
         tensors: &[&Tensor],
         op: ReduceOp,
-        streams: &[&CudaStream],
+        streams: &[&GpuStream],
     ) -> Result<()> {
         self.validate_tensors(tensors, "all_reduce_on_streams")?;
         if streams.len() != self.devices.len() {
@@ -155,7 +155,7 @@ impl NcclComms {
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut stream_ptrs: Vec<*mut c_void> = streams.iter().map(|s| s.as_ptr()).collect();
-        let saved = current_cuda_device();
+        let saved = current_gpu_device();
         let err = unsafe {
             ffi::flodl_nccl_all_reduce(
                 self.handle,
@@ -164,7 +164,7 @@ impl NcclComms {
                 op as i32,
             )
         };
-        set_current_cuda_device(saved);
+        set_current_gpu_device(saved);
         check_err(err)
     }
 
@@ -186,7 +186,7 @@ impl NcclComms {
             )));
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
-        let saved = current_cuda_device();
+        let saved = current_gpu_device();
         let err = unsafe {
             ffi::flodl_nccl_broadcast(
                 self.handle,
@@ -195,7 +195,7 @@ impl NcclComms {
                 root as i32,
             )
         };
-        set_current_cuda_device(saved);
+        set_current_gpu_device(saved);
         check_err(err)
     }
 
@@ -213,7 +213,7 @@ impl NcclComms {
         &self,
         tensors: &[&Tensor],
         root: usize,
-        streams: &[&CudaStream],
+        streams: &[&GpuStream],
     ) -> Result<()> {
         self.validate_tensors(tensors, "broadcast_on_streams")?;
         if root >= self.devices.len() {
@@ -229,7 +229,7 @@ impl NcclComms {
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut stream_ptrs: Vec<*mut c_void> = streams.iter().map(|s| s.as_ptr()).collect();
-        let saved = current_cuda_device();
+        let saved = current_gpu_device();
         let err = unsafe {
             ffi::flodl_nccl_broadcast(
                 self.handle,
@@ -238,7 +238,7 @@ impl NcclComms {
                 root as i32,
             )
         };
-        set_current_cuda_device(saved);
+        set_current_gpu_device(saved);
         check_err(err)
     }
 
@@ -491,7 +491,7 @@ impl NcclRankComm {
     /// Initialize this rank's communicator for multi-process DDP.
     ///
     /// The caller must set the CUDA device for this rank before calling
-    /// (via `set_current_cuda_device`). All ranks must call this concurrently.
+    /// (via `set_current_gpu_device`). All ranks must call this concurrently.
     ///
     /// For single-process multi-GPU, prefer [`NcclComms::new`] + [`NcclComms::split`]
     /// to avoid CUDA context corruption on heterogeneous GPU setups.
@@ -600,7 +600,7 @@ impl NcclRankComm {
         &self,
         tensors: &[&Tensor],
         factor: f32,
-        stream: Option<&CudaStream>,
+        stream: Option<&GpuStream>,
     ) -> Result<()> {
         for (i, t) in tensors.iter().enumerate() {
             if t.dtype() != crate::tensor::DType::Float32 {
@@ -654,7 +654,7 @@ impl NcclRankComm {
         &self,
         tensors: &[&Tensor],
         op: ReduceOp,
-        stream: &CudaStream,
+        stream: &GpuStream,
     ) -> Result<()> {
         let _guard = self.abort_handle.lock_for_issue()?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
@@ -712,7 +712,7 @@ impl NcclRankComm {
         &self,
         tensors: &[&Tensor],
         root: usize,
-        stream: &CudaStream,
+        stream: &GpuStream,
     ) -> Result<()> {
         if root >= self.world_size {
             return Err(crate::TensorError::new(&format!(

@@ -197,7 +197,7 @@ impl VramSamplePool {
 
         // The probe returns (used, total) — used first, not free.
         let Ok((used, total)) =
-            crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+            crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
         else {
             return; // no probe, no budget: stay dormant
         };
@@ -410,7 +410,7 @@ impl VramSamplePool {
             self.budget >> 20,
         );
         drop(slab);
-        crate::tensor::cuda_empty_cache();
+        crate::tensor::gpu_empty_cache();
         true
     }
 

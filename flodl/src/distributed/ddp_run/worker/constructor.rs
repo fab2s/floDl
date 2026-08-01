@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::autograd::{NoGradGuard, Variable};
 use crate::data::BatchDataSet;
-use crate::tensor::cuda_event::{CudaEvent, CudaEventFlags};
-use crate::tensor::cuda_stream::{CudaStream, StreamGuard};
+use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
+use crate::tensor::cuda_stream::{GpuStream, StreamGuard};
 use crate::distributed::nccl::NcclRankComm;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -87,9 +87,9 @@ impl<M: Module> GpuWorker<M> {
         // triggering libtorch's "stream does not match" warning and breaking
         // CUDA graph capture.
         let (compute_stream, comm_stream, copy_done) = if config.device.is_cuda() {
-            let cs = CudaStream::new(config.device, false)?;
-            let ms = CudaStream::new(config.device, false)?;
-            let ev = CudaEvent::new(CudaEventFlags::DisableTiming)?;
+            let cs = GpuStream::new(config.device, false)?;
+            let ms = GpuStream::new(config.device, false)?;
+            let ev = GpuEvent::new(GpuEventFlags::DisableTiming)?;
             // Record initial event so first wait_event is a no-op
             ev.record_on(&ms)?;
             (Some(cs), Some(ms), Some(ev))
@@ -262,10 +262,10 @@ impl<M: Module> GpuWorker<M> {
             crate::debug!(
                 "  ddp-worker: rank {} constructor prefetch sizing: psb={} depth={} (used, total)={:?}",
                 config.rank, psb, depth,
-                crate::tensor::cuda_memory_info_idx(config.device.index() as i32)
+                crate::tensor::gpu_memory_info_idx(config.device.index() as i32)
             );
             // Reset peak stats so first run_epoch_plan gets a clean baseline.
-            crate::tensor::cuda_reset_peak_stats_idx(config.device.index() as i32);
+            crate::tensor::gpu_reset_peak_stats_idx(config.device.index() as i32);
             if depth > 0 {
                 // Device sample pool: coordinator-paced epochs have no
                 // governor, so the worker signals the pool's budget

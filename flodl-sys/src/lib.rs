@@ -549,48 +549,52 @@ unsafe extern "C" {
         result: *mut FlodlTensor,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_is_available() -> i32;
-    pub fn flodl_cuda_device_count() -> i32;
-    pub fn flodl_force_cuda_link() -> i32;
+    pub fn flodl_gpu_is_available() -> i32;
+    pub fn flodl_gpu_device_count() -> i32;
+    pub fn flodl_force_gpu_link() -> i32;
     pub fn flodl_set_current_device(device_index: i32);
     pub fn flodl_get_current_device() -> i32;
-    pub fn flodl_cuda_synchronize(device_index: i32);
+    pub fn flodl_gpu_synchronize(device_index: i32);
 
     // --- CUDA memory/utilization (monitor support) ---
 
-    pub fn flodl_cuda_mem_info(
+    pub fn flodl_gpu_mem_info(
         device_index: i32, used_bytes: *mut u64, total_bytes: *mut u64,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_alloc_bytes(
+    pub fn flodl_gpu_alloc_bytes(
         device_index: i32, allocated_bytes: *mut u64,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_active_bytes(
+    pub fn flodl_gpu_active_bytes(
         device_index: i32, active_bytes: *mut u64,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_peak_active_bytes(
+    pub fn flodl_gpu_peak_active_bytes(
         device_index: i32, peak_bytes: *mut u64,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_peak_reserved_bytes(
+    pub fn flodl_gpu_peak_reserved_bytes(
         device_index: i32, peak_bytes: *mut u64,
     ) -> *mut c_char;
 
-    pub fn flodl_cuda_reset_peak_stats(device_index: i32);
+    pub fn flodl_gpu_reset_peak_stats(device_index: i32);
 
-    pub fn flodl_cuda_empty_cache();
+    pub fn flodl_gpu_empty_cache();
 
-    pub fn flodl_cuda_utilization(device_index: i32) -> i32;
+    pub fn flodl_gpu_utilization(device_index: i32) -> i32;
 
-    pub fn flodl_cuda_nvml_mem_info(
+    pub fn flodl_gpu_smi_mem_info(
         device_index: i32, used_bytes: *mut u64, total_bytes: *mut u64,
     ) -> i32;
 
-    pub fn flodl_cuda_has_primary_context(device_index: i32) -> i32;
+    pub fn flodl_gpu_has_primary_context(device_index: i32) -> i32;
 
-    pub fn flodl_cuda_device_name(
+    pub fn flodl_gpu_device_name(
+        device_index: i32, buf: *mut c_char, buf_len: i32,
+    ) -> *mut c_char;
+
+    pub fn flodl_gpu_arch_name(
         device_index: i32, buf: *mut c_char, buf_len: i32,
     ) -> *mut c_char;
 
@@ -1002,7 +1006,7 @@ unsafe extern "C" {
     // --- RNG seed ---
 
     pub fn flodl_manual_seed(seed: u64);
-    pub fn flodl_cuda_manual_seed_all(seed: u64);
+    pub fn flodl_gpu_manual_seed_all(seed: u64);
 
     // --- In-place operations ---
 
@@ -1214,50 +1218,50 @@ unsafe extern "C" {
 
     // --- CUDA Graphs ---
 
-    pub fn flodl_cuda_graph_new(graph_out: *mut *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_graph_capture_begin(
+    pub fn flodl_gpu_graph_new(graph_out: *mut *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_graph_capture_begin(
         graph: *mut c_void, pool_hi: u64, pool_lo: u64, mode: i32,
     ) -> *mut c_char;
-    pub fn flodl_cuda_graph_capture_end(graph: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_graph_replay(graph: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_graph_reset(graph: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_graph_delete(graph: *mut c_void);
-    pub fn flodl_cuda_graph_pool(
+    pub fn flodl_gpu_graph_capture_end(graph: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_graph_replay(graph: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_graph_reset(graph: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_graph_delete(graph: *mut c_void);
+    pub fn flodl_gpu_graph_pool(
         graph: *mut c_void, pool_hi: *mut u64, pool_lo: *mut u64,
     );
-    pub fn flodl_cuda_graph_pool_handle(pool_hi: *mut u64, pool_lo: *mut u64);
+    pub fn flodl_gpu_graph_pool_handle(pool_hi: *mut u64, pool_lo: *mut u64);
 
     // --- CUDA Events ---
 
-    pub fn flodl_cuda_event_new(flags: i32, event_out: *mut *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_event_record(event: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_event_record_on_stream(
+    pub fn flodl_gpu_event_new(flags: i32, event_out: *mut *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_event_record(event: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_event_record_on_stream(
         event: *mut c_void, stream: *mut c_void,
     ) -> *mut c_char;
-    pub fn flodl_cuda_event_synchronize(event: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_event_elapsed_time(
+    pub fn flodl_gpu_event_synchronize(event: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_event_elapsed_time(
         start: *mut c_void, end: *mut c_void, ms_out: *mut f32,
     ) -> *mut c_char;
-    pub fn flodl_cuda_event_query(event: *mut c_void) -> i32;
-    pub fn flodl_cuda_event_delete(event: *mut c_void);
+    pub fn flodl_gpu_event_query(event: *mut c_void) -> i32;
+    pub fn flodl_gpu_event_delete(event: *mut c_void);
 
     // --- CUDA Streams ---
 
-    pub fn flodl_cuda_stream_new(
+    pub fn flodl_gpu_stream_new(
         device_index: i32, high_priority: i32, stream_out: *mut *mut c_void,
     ) -> *mut c_char;
-    pub fn flodl_cuda_stream_synchronize(stream: *mut c_void) -> *mut c_char;
-    pub fn flodl_cuda_stream_wait_event(
+    pub fn flodl_gpu_stream_synchronize(stream: *mut c_void) -> *mut c_char;
+    pub fn flodl_gpu_stream_wait_event(
         stream: *mut c_void, event: *mut c_void,
     ) -> *mut c_char;
     pub fn flodl_tensor_record_stream(
         tensor: *mut c_void, stream: *mut c_void,
     ) -> *mut c_char;
-    pub fn flodl_cuda_stream_query(stream: *mut c_void) -> i32;
-    pub fn flodl_cuda_stream_set_current(stream: *mut c_void);
-    pub fn flodl_cuda_stream_get_current(device_index: i32) -> *mut c_void;
-    pub fn flodl_cuda_stream_restore_default(device_index: i32);
-    pub fn flodl_cuda_stream_delete(stream: *mut c_void);
+    pub fn flodl_gpu_stream_query(stream: *mut c_void) -> i32;
+    pub fn flodl_gpu_stream_set_current(stream: *mut c_void);
+    pub fn flodl_gpu_stream_get_current(device_index: i32) -> *mut c_void;
+    pub fn flodl_gpu_stream_restore_default(device_index: i32);
+    pub fn flodl_gpu_stream_delete(stream: *mut c_void);
 
     // --- NCCL Collective Operations ---
 

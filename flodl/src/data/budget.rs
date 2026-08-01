@@ -166,14 +166,14 @@ pub(crate) fn prefetch_depth_from_vram(
 
     let idx = device.index() as i32;
     // The probe returns (used, total) — used first, not free.
-    let (used, total) = crate::tensor::cuda_memory_info_idx(idx)
+    let (used, total) = crate::tensor::gpu_memory_info_idx(idx)
         .unwrap_or((u64::MAX, 0));
 
     depth_from_probe(used, total, max_usage, activation_reserve, batch_bytes)
 }
 
 /// The sizing policy, split from the probe so it is testable at the exact
-/// numbers a rig produced. `used` / `total` are as [`crate::tensor::cuda_memory_info_idx`]
+/// numbers a rig produced. `used` / `total` are as [`crate::tensor::gpu_memory_info_idx`]
 /// reports them (used first, driver-level, counting everything the caching
 /// allocator has reserved).
 fn depth_from_probe(
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_failed_probe_declines_the_floor() {
-        // `cuda_memory_info_idx` failure surfaces as (u64::MAX, 0). Free
+        // `gpu_memory_info_idx` failure surfaces as (u64::MAX, 0). Free
         // saturates to 0, so the floor must not be handed out on no data.
         let depth = depth_from_probe(u64::MAX, 0, 0.90, 0, OLMO_BATCH_BYTES);
         assert_eq!(depth, 0);

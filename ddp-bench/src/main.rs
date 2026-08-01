@@ -633,7 +633,7 @@ fn run() -> flodl::tensor::Result<()> {
     let cli: Cli = parse_or_schema();
 
     // GPU selection MUST be applied before any libtorch / CUDA init
-    // (cuda_device_count() at line ~260 is the first such call). Once
+    // (gpu_device_count() at line ~260 is the first such call). Once
     // libtorch latches onto a device list, CUDA_VISIBLE_DEVICES is ignored.
     if let Some(spec) = cli.gpus.as_deref() {
         apply_gpu_selection(spec)?;

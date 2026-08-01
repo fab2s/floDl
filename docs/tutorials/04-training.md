@@ -159,7 +159,7 @@ By default, all tensors and parameters live on CPU. To train on CUDA, use
 ```rust
 let model = build_model()?;
 
-if flodl::cuda_available() {
+if flodl::gpu_available() {
     model.move_to_device(Device::CUDA(0));
 }
 
