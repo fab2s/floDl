@@ -120,6 +120,7 @@ pub struct DataLoaderBuilder {
     names: Option<Vec<String>>,
     vram_max_usage: f64,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     activation_reserve: Option<usize>,
     /// Read-through sample cache created by `from_dataset` (None for
     /// opaque `BatchDataSet` loaders). The adapter inside `dataset`
@@ -148,6 +149,7 @@ impl DataLoaderBuilder {
             names: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            gpu_ram_share: None,
             activation_reserve: None,
             sample_cache: None,
             sample_cache_enabled: true,
@@ -300,6 +302,32 @@ impl DataLoaderBuilder {
     /// Clamped to `[0.0, 0.90]`.
     pub fn ram_max_usage(mut self, max_usage: f64) -> Self {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Fraction of **physical** host RAM (`MemTotal`) to hand the GPU on
+    /// an **integrated (APU) target**, where device memory is carved out
+    /// of system RAM rather than being a pool of its own.
+    ///
+    /// Ignored on discrete GPUs: there the two pools are genuinely
+    /// separate and there is nothing to divide.
+    ///
+    /// Default: unset — flodl reserves whatever aperture the device
+    /// reports. Set this when you know better, typically to claw back
+    /// host RAM on a box whose aperture is far larger than the model and
+    /// data plane will ever use.
+    ///
+    /// The base is `MemTotal` deliberately: on an APU "the GPU's memory"
+    /// and "the host's memory" are the same silicon, so every other
+    /// candidate base is the ambiguity this knob exists to resolve.
+    /// Values above `1.0` are allowed and meaningful — if a platform
+    /// under-reports `MemTotal` relative to what the APU can address, a
+    /// share above 1.0 is how you still express the true reservation.
+    ///
+    /// Also the way past the hard error on a multi-package APU, where
+    /// host budgets cannot be sized from system-wide totals.
+    pub fn gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share.max(0.0));
         self
     }
 
@@ -469,6 +497,7 @@ impl DataLoaderBuilder {
             names,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             activation_reserve,
             sample_cache,
             sample_cache_enabled,
@@ -584,12 +613,12 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(picks))
                     };
                     crate::tensor::gpu_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
         }
     }
 }
@@ -649,6 +678,7 @@ fn build_streaming(
     per_sample_bytes: usize,
     vram_max_usage: f64,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     user_set_depth: bool,
     activation_reserve: Option<usize>,
     sample_cache: Option<Arc<SampleCache>>,
@@ -698,6 +728,7 @@ fn build_streaming(
             per_sample_bytes,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             sample_cache,
             user_set_depth,
             activation_reserve: reserve,
@@ -1042,6 +1073,10 @@ pub(crate) struct StreamingLoader {
     /// Host RAM ceiling for the reader-stage ring (see
     /// [`DataLoaderBuilder::ram_max_usage`]). `0.0` = single-stage.
     ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target (see
+    /// [`DataLoaderBuilder::gpu_ram_share`]). `None` = the device's
+    /// reported aperture.
+    gpu_ram_share: Option<f64>,
     /// Read-through sample cache shared with the adapter inside the
     /// worker's dataset. `None` = opaque `BatchDataSet` loader or
     /// `.sample_cache(false)`. Budgeted at each `epoch()`.
@@ -1115,7 +1150,18 @@ impl StreamingLoader {
         };
 
         // One RAM probe per epoch serves both RAM consumers below.
-        let mem = crate::sys::mem_info().map(|m| m.available_bytes);
+        //
+        // Corrected once, here, for a unified-memory (APU) target: there
+        // the VRAM pool is carved out of this same DRAM, so pricing the
+        // host tiers against the raw figure counts one pool twice. Both
+        // consumers below inherit the corrected number.
+        let mem = crate::sys::mem_info().map(|m| {
+            crate::data::budget::unified_adjusted_available(
+                m.available_bytes,
+                self.device,
+                self.gpu_ram_share,
+            )
+        });
 
         // Reader-ring sizing: CUDA targets only. On CPU targets the
         // batch channel itself is the read-ahead buffer (no transfer

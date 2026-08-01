@@ -93,7 +93,7 @@ pub use gpu::{
     detect_gpus, detect_gpus_for, detect_gpus_physical, survey, survey_visible, survey_visible_for,
     GpuInfo,
 };
-pub use mem::{mem_info, MemInfo};
+pub use mem::{mem_info, numa_node_count, MemInfo};
 pub use nvidia::nvidia_driver_version;
 pub use report::{GpuSurvey, NoteKind, SurveyNote};
 pub use testing::ENV_TESTING_GPU_JSON;

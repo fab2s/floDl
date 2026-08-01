@@ -560,6 +560,11 @@ char* flodl_gpu_device_name(int device_index, char* buf, int buf_len);
 // why compute capability could not simply be generalised.
 char* flodl_gpu_arch_name(int device_index, char* buf, int buf_len);
 
+// 1 when the device is an APU (memory carved out of system RAM), 0 when
+// discrete. Both vendors spell this property the same. Load-bearing for
+// memory budgeting: see the note at the definition.
+char* flodl_gpu_is_integrated(int device_index, int* out);
+
 // Query GPU compute capability (e.g. major=6, minor=1 for sm_61).
 // Returns error string on failure, NULL on success.
 char* flodl_cuda_compute_capability(int device_index, int* major, int* minor);

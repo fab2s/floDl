@@ -936,6 +936,45 @@ extern "C" char* flodl_gpu_device_name(int device_index, char* buf, int buf_len)
     }
 }
 
+// Is this an APU -- a device whose memory is carved out of system RAM
+// rather than being its own pool?
+//
+// `integrated` is one of the very few properties both vendors spell the
+// same: HIP documents the field as literally "APU vs dGPU", and CUDA as
+// "device is integrated as opposed to discrete". So no vendor branch.
+//
+// This is load-bearing for memory budgeting, not informational. On an
+// integrated part the host-RAM budget and the VRAM pool are pricing the
+// SAME DRAM, and sizing them independently over-commits: measured on a
+// gfx1036 box, a 15 GiB aperture plus a MemAvailable-derived host share
+// came to ~33 GiB of claims against 30 GiB of physical memory.
+//
+// Returns 1 / 0 through `out`. A caller that gets an error should treat
+// the answer as unknown and budget conservatively, NOT assume discrete.
+extern "C" char* flodl_gpu_is_integrated(int device_index, int* out) {
+    try {
+#ifdef FLODL_BUILD_GPU
+    if (!torch::cuda::is_available()) {
+        return make_error("no GPU available");
+    }
+    cudaDeviceProp prop;
+    auto err = cudaGetDeviceProperties(&prop, device_index);
+    if (err != cudaSuccess) {
+        return make_error(cudaGetErrorString(err));
+    }
+    *out = prop.integrated ? 1 : 0;
+    return nullptr;
+#else
+    (void)device_index; (void)out;
+    return make_error("no GPU available (built without a gpu feature)");
+#endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
 // The vendor-neutral "which architecture is this device" query, read from
 // the GPU RUNTIME (so it describes the device libtorch actually sees, not
 // the provisioning view flodl-hw builds from nvidia-smi / KFD sysfs --

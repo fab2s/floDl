@@ -700,6 +700,29 @@
 
     #[test]
     #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
+    fn test_discrete_gpu_reports_not_integrated_and_budgets_unchanged() {
+        if !test_device().is_cuda() { return; }
+        for i in 0..gpu_device_count() {
+            let integrated = gpu_is_integrated(i)
+                .expect("integrated flag should resolve on a live device");
+            eprintln!("  device {i}: integrated={integrated}");
+            // Every card this suite runs on is discrete. The unified
+            // budget path must therefore be a strict no-op here: it is
+            // new machinery on the hot path for every existing user, and
+            // a regression would silently shrink their host RAM budget.
+            assert!(!integrated, "expected a discrete GPU in CI/dev");
+        }
+        let available = crate::sys::mem_info().unwrap().available_bytes;
+        let adjusted = crate::data::budget::unified_adjusted_available(
+            available,
+            test_device(),
+            None,
+        );
+        assert_eq!(adjusted, available, "discrete must not lose host RAM");
+    }
+
+    #[test]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_usable_cuda_devices() {
         if !test_device().is_cuda() { return; }
         let usable = usable_gpu_devices();

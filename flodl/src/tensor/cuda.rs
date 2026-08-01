@@ -263,6 +263,29 @@ pub fn gpu_arch_name(device_index: i32) -> Option<String> {
     }
 }
 
+/// Whether the device is an APU — its memory carved out of system RAM
+/// rather than being a pool of its own.
+///
+/// One of the few properties both vendors spell identically (HIP: "APU
+/// vs dGPU"; CUDA: "integrated as opposed to discrete"), so there is no
+/// vendor branch behind this.
+///
+/// `None` means the question could not be answered (no GPU, bad index).
+/// Treat that as *unknown* and budget conservatively rather than
+/// assuming discrete: guessing "discrete" on an APU over-commits memory,
+/// while guessing "integrated" on a discrete card only under-uses it.
+/// See [`crate::data`]'s budget policy for why that asymmetry decides it.
+pub fn gpu_is_integrated(device_index: i32) -> Option<bool> {
+    let mut out: i32 = 0;
+    let err = unsafe { ffi::flodl_gpu_is_integrated(device_index, &mut out) };
+    if err.is_null() {
+        Some(out != 0)
+    } else {
+        unsafe { ffi::flodl_free_string(err) };
+        None
+    }
+}
+
 /// Query compute capability (major, minor) for a CUDA device.
 ///
 /// Returns `None` if CUDA is unavailable or the device index is invalid.

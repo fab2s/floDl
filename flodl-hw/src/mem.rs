@@ -56,6 +56,39 @@ fn parse_meminfo_kb(rest: &str) -> Option<u64> {
     rest.trim().strip_suffix("kB")?.trim().parse().ok()
 }
 
+/// How many NUMA nodes the kernel reports, or `None` off Linux / when
+/// the topology is not exposed.
+///
+/// Matters for one specific case: a **multi-package APU**. Each package
+/// carries its own memory and appears as its own NUMA node, while
+/// [`mem_info`] reads `/proc/meminfo`, which is SYSTEM-WIDE. So on such
+/// a machine "subtract this GPU's memory from host RAM" is wrong in both
+/// directions — every rank would either subtract its own package's share
+/// from the whole-system total (collapsing the budget to nothing) or
+/// treat the whole-system total as its own (over-committing per package).
+///
+/// There is no per-node `MemAvailable` to fall back on: the kernel only
+/// computes that estimate system-wide, so `/sys/devices/system/node/N/`
+/// offers `MemFree` and nothing equivalent. Hence detect-and-refuse
+/// rather than detect-and-approximate.
+///
+/// A count of 1 (the overwhelmingly common case, including every
+/// consumer APU) means the system-wide figures ARE the per-node figures
+/// and the budget math is sound.
+pub fn numa_node_count() -> Option<usize> {
+    let dir = std::fs::read_dir("/sys/devices/system/node").ok()?;
+    let n = dir
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix("node"))
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
+    (n > 0).then_some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

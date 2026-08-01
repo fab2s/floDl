@@ -376,6 +376,25 @@ fn stager_ram_budget(
     let Some(m) = crate::sys::mem_info() else {
         return 0;
     };
+    // Correct the probe for a unified-memory (APU) target, where the
+    // VRAM pool is carved out of this same DRAM and pricing the staging
+    // tier against the raw figure counts one pool twice.
+    //
+    // The device is read ambiently rather than threaded through
+    // `stager_loop`: staging only runs inside a rank that has already
+    // bound its device, so the current device IS this rank's device, and
+    // plumbing it down would touch the whole call chain for one lookup.
+    //
+    // `None` for the share: the operator override currently lives on
+    // `DataLoaderBuilder::gpu_ram_share`, so the DDP path takes the
+    // device's reported aperture. The double-count is fixed either way;
+    // only the override is missing here.
+    let available = if crate::tensor::gpu_available() {
+        let device = crate::tensor::Device::CUDA(crate::tensor::current_gpu_device());
+        crate::data::budget::unified_adjusted_available(m.available_bytes, device, None)
+    } else {
+        m.available_bytes
+    };
     let local_ranks: Vec<usize> = crate::distributed::cluster::LocalCluster::from_env()
         .ok()
         .flatten()
@@ -383,7 +402,7 @@ fn stager_ram_budget(
         .unwrap_or_else(|| (0..world_size).collect());
     let share = host_share(rank, &local_ranks, counts);
     usize::try_from(crate::data::budget::stager_ram_budget(
-        m.available_bytes,
+        available,
         held_bytes,
         ram_max_usage,
         share,

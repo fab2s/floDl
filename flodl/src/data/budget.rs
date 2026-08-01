@@ -32,6 +32,188 @@ pub(crate) fn anchored_ram_budget(available: u64, held_bytes: u64, ram_max_usage
     (total as f64 * ram_max_usage.min(RAM_SHARE_CEILING)) as u64
 }
 
+/// Host RAM the budget may price, once the GPU's claim on the SAME DRAM
+/// is accounted for. Identity on a discrete part (`gpu_reservation` 0).
+///
+/// On a unified-memory part (an APU) the GPU's memory is carved out of
+/// system RAM, so the host tiers and the VRAM pool are pricing one pool
+/// twice. Measured on a gfx1036 box: a 15 GiB aperture (exactly half of
+/// `MemTotal`) plus a `MemAvailable`-derived host share came to ~33 GiB
+/// of claims against 30 GiB of physical memory. That is an OOM, not an
+/// inefficiency, which is why this is subtracted before any share is
+/// taken rather than trimmed afterwards.
+///
+/// # Why the `gpu_in_use` term
+///
+/// Reserve the GPU's **unrealized** headroom, not its whole aperture:
+/// bytes the GPU has already taken are *already missing from*
+/// `available`, so subtracting the full aperture charges them twice and
+/// the host budget collapses to zero as the pool fills — the same
+/// self-starvation [`anchored_ram_budget`] documents for held bytes, and
+/// the same double-charge [`prefetch_depth_from_vram`] avoids by passing
+/// `activation_reserve = 0` past the first step. The invariant is
+/// `reservation + in_use == aperture` at every instant: exactly one
+/// aperture is held aside, never zero, never two.
+///
+/// Worked, on the box above (`ram_max_usage` 0.5, ~8.3 GiB held by the
+/// OS and other processes):
+///
+/// | | `available` | `in_use` | result |
+/// |---|---|---|---|
+/// | nothing allocated | 21.7 | 0 | 6.7 |
+/// | GPU 7.5, host 1.5 | 12.7 | 7.5 | 6.7 |
+/// | GPU full 15 | 3.35 | 15 | 6.7 |
+///
+/// Invariant across the run. Subtracting the bare aperture instead gives
+/// 6.7, then 0, then 0.
+///
+/// Only valid where the aperture genuinely overlaps host RAM. On a BIOS
+/// carve-out `available` never drops when the GPU allocates, so adding
+/// `in_use` back would inflate — [`unified_overlap_confirmed`] is the
+/// gate that establishes overlap before any of this runs.
+pub(crate) fn unified_host_available(
+    available: u64,
+    gpu_reservation: u64,
+    gpu_in_use: u64,
+) -> u64 {
+    available.saturating_sub(gpu_reservation.saturating_sub(gpu_in_use))
+}
+
+/// Bytes to reserve for an integrated GPU, from the operator's knob when
+/// set, else the device's own reported aperture.
+///
+/// `gpu_ram_share` is a fraction of `mem_total` — of physical host RAM,
+/// the one figure that is unambiguous on a machine where "the GPU's
+/// memory" and "the host's memory" are the same silicon. It may exceed
+/// 1.0 deliberately: if a platform under-reports `MemTotal` relative to
+/// what the APU can actually address, a share above 1.0 is how an
+/// operator still expresses the true absolute reservation.
+///
+/// Returns 0 for a discrete part, where the knob is meaningless and the
+/// two pools are genuinely separate.
+pub(crate) fn gpu_ram_reservation(
+    integrated: bool,
+    aperture_bytes: u64,
+    mem_total: u64,
+    gpu_ram_share: Option<f64>,
+) -> u64 {
+    if !integrated {
+        return 0;
+    }
+    match gpu_ram_share {
+        Some(share) if share >= 0.0 => (mem_total as f64 * share) as u64,
+        _ => aperture_bytes,
+    }
+}
+
+/// Bytes allocated for the overlap probe. Big enough to clear
+/// `MemAvailable` noise from other processes, small enough that a tight
+/// card can spare it for the microseconds it is held.
+const OVERLAP_PROBE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Does device memory actually come out of host RAM on this machine?
+///
+/// `integrated` says the GPU is an APU; it does NOT say how the platform
+/// carved the memory. A BIOS carve-out is reserved away from the OS
+/// entirely — it never appears in `MemTotal`, so it does not double-count
+/// and must not be subtracted — while a shared aperture is ordinary
+/// system RAM the GPU borrows. The two are indistinguishable from device
+/// properties and would need physical RAM size to tell apart, which is
+/// not portably available.
+///
+/// So measure instead of infer: allocate on the device, and see whether
+/// `MemAvailable` moves. Shared aperture → it drops. Carve-out or
+/// discrete → it does not.
+///
+/// Probed once per process and cached; only reached when `integrated` is
+/// already true, so discrete parts never pay for it. On any failure the
+/// answer is `true` — the asymmetry is deliberate: wrongly assuming
+/// overlap under-uses host RAM, wrongly denying it over-commits and the
+/// process dies.
+pub(crate) fn unified_overlap_confirmed(device: Device) -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| probe_overlap(device).unwrap_or(true))
+}
+
+fn probe_overlap(device: Device) -> Result<bool> {
+    let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device };
+    // Warm up first: the CUDA context and the caching allocator's first
+    // segment are themselves large allocations, and folding them into
+    // the measurement would read as "overlap" on any machine.
+    let warm = Tensor::zeros(&[1024], opts)?;
+    crate::tensor::gpu_synchronize(device.index());
+
+    let before = crate::sys::mem_info().map(|m| m.available_bytes);
+    let n = (OVERLAP_PROBE_BYTES / 4) as i64;
+    let probe = Tensor::zeros(&[n], opts)?;
+    crate::tensor::gpu_synchronize(device.index());
+    let after = crate::sys::mem_info().map(|m| m.available_bytes);
+
+    drop(probe);
+    drop(warm);
+
+    match (before, after) {
+        // Half the probe is a generous margin against other processes
+        // moving MemAvailable underneath us.
+        (Some(b), Some(a)) => Ok(b.saturating_sub(a) > OVERLAP_PROBE_BYTES / 2),
+        _ => Ok(true),
+    }
+}
+
+/// Host RAM this process may budget, with the GPU's claim on the same
+/// DRAM removed. Identity on every discrete part.
+///
+/// The impure companion to [`unified_host_available`]: it applies each
+/// gate (discrete → nothing, carve-out → nothing) and reads the aperture
+/// and current usage from the driver, then defers the arithmetic (and
+/// the `in_use` reasoning) to that pure function.
+///
+/// Callers pass the ONE per-epoch `MemAvailable` probe through here
+/// before pricing anything, so every host consumer downstream sees the
+/// same corrected figure.
+///
+/// # Panics
+///
+/// On a **multi-package APU** with no explicit `gpu_ram_share`. Each
+/// package carries its own memory and its own NUMA node, while
+/// [`crate::sys::mem_info`] is system-wide, so every rank would either
+/// subtract its own package's aperture from the whole-system total or
+/// claim that total as its own — over-committing by the package count.
+/// There is no per-node `MemAvailable` to compute the right answer from.
+/// Guessing buys a mid-run OOM on one arbitrary rank; refusing costs one
+/// clear message naming the knob that resolves it.
+pub(crate) fn unified_adjusted_available(
+    available: u64,
+    device: Device,
+    gpu_ram_share: Option<f64>,
+) -> u64 {
+    if !device.is_cuda() {
+        return available;
+    }
+    let idx = device.index() as i32;
+    // A device we cannot query is a device we are not training on, and
+    // it has no VRAM pool to double-count against.
+    if crate::tensor::gpu_is_integrated(idx) != Some(true) {
+        return available;
+    }
+    if gpu_ram_share.is_none() && crate::sys::numa_node_count().is_some_and(|n| n > 1) {
+        panic!(
+            "flodl: this is an integrated (APU) GPU on a machine with multiple NUMA \
+             nodes, where each package carries its own memory pool. Host-RAM budgets \
+             read system-wide totals, so flodl cannot size them correctly here and \
+             would over-commit memory. Set an explicit GPU RAM share (a fraction of \
+             MemTotal) to proceed."
+        );
+    }
+    if !unified_overlap_confirmed(device) {
+        return available; // carve-out: genuinely separate, nothing to subtract
+    }
+    let (in_use, aperture) = crate::tensor::gpu_memory_info_idx(idx).unwrap_or((0, 0));
+    let mem_total = crate::sys::mem_info().map(|m| m.total_bytes).unwrap_or(0);
+    let reservation = gpu_ram_reservation(true, aperture, mem_total, gpu_ram_share);
+    unified_host_available(available, reservation, in_use)
+}
+
 /// Sample-cache RAM budget: the anchored share with the reader ring's
 /// slice off the top (both consumers draw on the same `ram_max_usage`
 /// budget; the ring is a flow buffer and gets its fixed cut first).
@@ -278,6 +460,71 @@ pub(crate) fn retain_rows(rows: &[Tensor]) -> Result<(Vec<Tensor>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    // --- unified memory (APU) -------------------------------------
+    //
+    // Numbers are the measured gfx1036 box: 30720 MiB physical, 15360
+    // MiB aperture (exactly half), ~21770 MiB MemAvailable at rest.
+    const MIB: u64 = 1024 * 1024;
+    const APERTURE: u64 = 15360 * MIB;
+    const MEM_TOTAL: u64 = 30720 * MIB;
+
+    #[test]
+    fn unified_reserves_exactly_one_aperture_at_every_point_in_the_run() {
+        // The invariant: reservation + in_use == aperture, so the host
+        // figure is INVARIANT as the GPU pool fills. Subtracting the
+        // bare aperture instead collapses it to zero (the bug).
+        let others = 8950 * MIB; // OS + other processes, constant
+        for (gpu, host) in [(0u64, 0u64), (7500 * MIB, 1500 * MIB), (APERTURE, 3350 * MIB)] {
+            let available = MEM_TOTAL - others - gpu - host;
+            let got = unified_host_available(available, APERTURE, gpu) + host;
+            let want = MEM_TOTAL - others - APERTURE;
+            assert_eq!(
+                got, want,
+                "host base must not drift as the GPU fills (gpu={gpu}, host={host})"
+            );
+        }
+    }
+
+    #[test]
+    fn unified_is_identity_when_nothing_is_reserved() {
+        assert_eq!(unified_host_available(1234, 0, 0), 1234);
+    }
+
+    #[test]
+    fn unified_saturates_rather_than_underflowing() {
+        // Aperture bigger than what is free: floor at zero, never wrap.
+        assert_eq!(unified_host_available(MIB, APERTURE, 0), 0);
+    }
+
+    #[test]
+    fn reservation_is_zero_on_a_discrete_part_even_with_a_knob_set() {
+        assert_eq!(gpu_ram_reservation(false, APERTURE, MEM_TOTAL, None), 0);
+        assert_eq!(gpu_ram_reservation(false, APERTURE, MEM_TOTAL, Some(0.5)), 0);
+    }
+
+    #[test]
+    fn reservation_defaults_to_the_reported_aperture() {
+        assert_eq!(gpu_ram_reservation(true, APERTURE, MEM_TOTAL, None), APERTURE);
+    }
+
+    #[test]
+    fn knob_overrides_the_aperture_as_a_share_of_mem_total() {
+        // A quarter of physical, not of the aperture.
+        assert_eq!(
+            gpu_ram_reservation(true, APERTURE, MEM_TOTAL, Some(0.25)),
+            MEM_TOTAL / 4
+        );
+        // Above 1.0 is deliberately allowed: it is how an operator
+        // expresses a true reservation on a platform that under-reports
+        // MemTotal relative to what the APU can address.
+        assert_eq!(
+            gpu_ram_reservation(true, APERTURE, MEM_TOTAL, Some(1.5)),
+            MEM_TOTAL + MEM_TOTAL / 2
+        );
+        // Zero is a real answer (give the GPU nothing), not "unset".
+        assert_eq!(gpu_ram_reservation(true, APERTURE, MEM_TOTAL, Some(0.0)), 0);
+    }
+
     use super::*;
 
     // The numbers a 3-rank olmo/cpu-cadence rig run reported at a plan

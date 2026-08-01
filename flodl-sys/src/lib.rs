@@ -598,6 +598,8 @@ unsafe extern "C" {
         device_index: i32, buf: *mut c_char, buf_len: i32,
     ) -> *mut c_char;
 
+    pub fn flodl_gpu_is_integrated(device_index: i32, out: *mut i32) -> *mut c_char;
+
     pub fn flodl_cuda_compute_capability(
         device_index: i32, major: *mut i32, minor: *mut i32,
     ) -> *mut c_char;
