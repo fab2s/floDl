@@ -428,8 +428,24 @@ if [ "${FDL_CI_SKIP_INSTALL:-}" = 1 ]; then
     # on purpose is not a failure; only CI leaves this unset.
     [ "$RC" -ne 0 ] && COMPILE=0
 elif [ "$RC" -ne 0 ]; then
-    # Exactly the packages the message names. If these drift, the
-    # message is wrong and this step is what says so.
+    # THE PACKAGE LIST IS NOT WRITTEN HERE -- it is parsed out of the
+    # message build.rs just printed. That is the point of the phase: we
+    # install exactly what the tool told a user to install, so what gets
+    # tested is "the advice works", not "a list I maintained in parallel
+    # works".
+    #
+    # It is also the only thing that stops the drift. The list already
+    # lives in flodl-sys/build.rs and flodl-cli's util/requirements.rs
+    # (forced -- build.rs cannot depend on flodl-cli). A third hardcoded
+    # copy here went stale immediately: CI installed hip-dev + rccl-dev
+    # while the guard had grown to nine packages.
+    PKGS=$(printf '%s\n' "$OUT" | sed -n 's/.*sudo apt install //p' | head -1)
+    # build.rs cannot know which CUDA release is wanted, so its message
+    # carries <M>-<m> placeholders. The version this run installed is the
+    # one thing the script legitimately knows and the tool does not.
+    PKGS=$(printf '%s' "$PKGS" | sed 's/<M>-<m>/12-8/g')
+    [ -n "$PKGS" ] || fail "$HOST: no package list in build.rs's message"
+    note "installing exactly what fdl asked for: $PKGS"
     if [ "$FEATURE" = rocm ]; then
         sudo mkdir -p --mode=0755 /etc/apt/keyrings
         curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
@@ -437,14 +453,16 @@ elif [ "$RC" -ne 0 ]; then
         echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0 noble main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends hip-dev rccl-dev || fail "rocm toolkit install"
     else
         curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends cuda-cudart-dev-12-8 cuda-crt-12-8 libnccl-dev \
-            || fail "cuda toolkit install"
     fi
+    # No --no-install-recommends: these -dev packages hard-Depend on
+    # their runtimes (hipblaslt alone is ~4 GB of Tensile kernels), and
+    # dodging that would validate a configuration no user has.
+    # shellcheck disable=SC2086
+    sudo apt-get install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
 fi
 endgroup
 fi
