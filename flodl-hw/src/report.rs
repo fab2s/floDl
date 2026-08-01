@@ -22,6 +22,32 @@ pub enum NoteKind {
 }
 
 impl NoteKind {
+    /// Every name [`NoteKind::parse`] accepts, comma-separated. For
+    /// error messages, so the list cannot drift from the parser.
+    pub const ALL_NAMES: &'static str =
+        "hardware_unusable, tool_failed, unparsable, mask_applied";
+
+    /// Stable snake_case token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoteKind::HardwareUnusable => "hardware_unusable",
+            NoteKind::ToolFailed => "tool_failed",
+            NoteKind::Unparsable => "unparsable",
+            NoteKind::MaskApplied => "mask_applied",
+        }
+    }
+
+    /// Parse the token produced by [`NoteKind::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hardware_unusable" => Some(NoteKind::HardwareUnusable),
+            "tool_failed" => Some(NoteKind::ToolFailed),
+            "unparsable" => Some(NoteKind::Unparsable),
+            "mask_applied" => Some(NoteKind::MaskApplied),
+            _ => None,
+        }
+    }
+
     /// Whether this note explains an *absence* of usable devices, as
     /// opposed to merely annotating the ones found. Drives whether
     /// [`GpuSurvey::require_devices`] quotes it.

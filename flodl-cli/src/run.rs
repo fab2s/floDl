@@ -590,11 +590,29 @@ pub(crate) fn compose_run_command(
 /// here as a literal because flodl-cli is decoupled from the flodl
 /// library crate by policy (it must build without libtorch).
 fn testing_cluster_env_arg() -> String {
-    match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
-        Ok(_) => " -e FLODL_TESTING_CLUSTER_JSON".to_string(),
-        Err(_) => String::new(),
+    let mut out = String::new();
+    for name in TESTING_ENV_VARS {
+        if std::env::var(name).is_ok() {
+            out.push_str(" -e ");
+            out.push_str(name);
+        }
     }
+    out
 }
+
+/// Testing env vars forwarded into a docker-compose run when present.
+///
+/// `FLODL_TESTING_CLUSTER_JSON` injects a cluster topology;
+/// `FLODL_TESTING_GPU_JSON` injects a spoofed GPU survey (source of
+/// truth: `flodl_hw::ENV_TESTING_GPU_JSON`). Both die at the docker
+/// boundary without an explicit `-e`, and both fail *silently* when
+/// they do -- the container falls back to real detection and the test
+/// quietly measures the host's actual hardware instead of the described
+/// one. Names are literals here because flodl-cli is decoupled from the
+/// flodl library crate by policy; `flodl-hw` is a dependency, so the GPU
+/// one is asserted against its constant in the tests below.
+const TESTING_ENV_VARS: &[&str] =
+    &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
 
 pub fn exec_script(
     command: &str,
@@ -2089,5 +2107,21 @@ mod tests {
         std::fs::create_dir_all(&bogus).unwrap();
         assert!(resolve_libtorch_at(&bogus).is_none(),
             "dir without lib/, .active, or pointer-shape filename → None");
+    }
+
+    #[test]
+    fn testing_env_var_names_match_their_source_of_truth() {
+        // The names are literals here (flodl-cli is decoupled from the
+        // flodl library by policy). flodl-hw IS a dependency, so at
+        // least that one can be pinned to its constant rather than
+        // trusted. A rename there would otherwise silently stop the
+        // forward, and the container would fall back to real hardware
+        // while the test still passed.
+        assert!(
+            TESTING_ENV_VARS.contains(&flodl_hw::ENV_TESTING_GPU_JSON),
+            "flodl_hw::ENV_TESTING_GPU_JSON = {:?} is not forwarded into docker; \
+             TESTING_ENV_VARS = {TESTING_ENV_VARS:?}",
+            flodl_hw::ENV_TESTING_GPU_JSON,
+        );
     }
 }

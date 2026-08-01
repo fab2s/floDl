@@ -86,7 +86,16 @@ impl GpuInfo {
 /// Probes are ordered cheap-first: each vendor is gated behind
 /// subprocess-free filesystem checks, so a pure-NVIDIA box never spawns
 /// an AMD tool and a CPU-only box spawns nothing at all.
+///
+/// [`crate::ENV_TESTING_GPU_JSON`] replaces the whole sweep when set,
+/// which is how a second vendor's detection and routing get tested on a
+/// machine that has none of that hardware.
 pub fn survey() -> GpuSurvey {
+    // Checked before any probe so a spoofed run never touches the real
+    // hardware it is standing in for.
+    if let Some(spoofed) = crate::testing::spoofed_survey() {
+        return spoofed;
+    }
     let mut out = GpuSurvey::default();
     crate::nvidia::probe(&mut out);
     out
@@ -197,39 +206,44 @@ mod tests {
     // `CUDA_VISIBLE_DEVICES` is process-global.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// RAII helper that snapshots `CUDA_VISIBLE_DEVICES` on construction
-    /// and restores it on drop. Pair with `ENV_LOCK`.
-    struct CudaVisibleGuard {
+    /// RAII helper that snapshots an env var on construction and
+    /// restores it on drop. Pair with `ENV_LOCK`.
+    struct EnvGuard {
+        key: &'static str,
         prev: Option<String>,
     }
 
-    impl CudaVisibleGuard {
-        fn set(value: &str) -> Self {
-            let prev = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
             // SAFETY: `ENV_LOCK` serializes env mutations across tests
-            // in this module, and nothing else in this crate reads it.
-            unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", value) };
-            Self { prev }
+            // in this module, and nothing else in this crate reads
+            // these vars concurrently.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
         }
-        fn unset() -> Self {
-            let prev = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
             // SAFETY: as above.
-            unsafe { std::env::remove_var("CUDA_VISIBLE_DEVICES") };
-            Self { prev }
+            unsafe { std::env::remove_var(key) };
+            Self { key, prev }
         }
     }
 
-    impl Drop for CudaVisibleGuard {
+    impl Drop for EnvGuard {
         fn drop(&mut self) {
             // SAFETY: as above.
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("CUDA_VISIBLE_DEVICES", v),
-                    None => std::env::remove_var("CUDA_VISIBLE_DEVICES"),
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
                 }
             }
         }
     }
+
+    const CVD: &str = "CUDA_VISIBLE_DEVICES";
+    const SPOOF: &str = crate::ENV_TESTING_GPU_JSON;
 
     fn gpu(index: u8, major: u32, minor: u32) -> GpuInfo {
         GpuInfo {
@@ -250,7 +264,8 @@ mod tests {
     #[test]
     fn survey_never_panics_and_agrees_with_itself() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _g = CudaVisibleGuard::unset();
+        let _g = EnvGuard::unset(CVD);
+        let _s = EnvGuard::unset(SPOOF);
         // On CI without GPUs: empty. On a GPU box: parseable info.
         // Either is fine. Must NOT panic and must NOT touch libtorch.
         let s = survey();
@@ -344,14 +359,15 @@ mod tests {
     #[test]
     fn detect_gpus_honors_the_live_mask() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _g_unset = CudaVisibleGuard::unset();
+        let _s = EnvGuard::unset(SPOOF);
+        let _g_unset = EnvGuard::unset(CVD);
         let physical = detect_gpus();
         if physical.is_empty() {
             return; // No GPUs on this box: nothing to filter.
         }
         let pick = physical[0].index;
         drop(_g_unset);
-        let _g_set = CudaVisibleGuard::set(&pick.to_string());
+        let _g_set = EnvGuard::set(CVD, &pick.to_string());
         let filtered = detect_gpus();
         assert_eq!(filtered.len(), 1, "single-index filter narrows to one");
         assert_eq!(filtered[0].index, pick);
@@ -360,12 +376,13 @@ mod tests {
     #[test]
     fn detect_gpus_physical_ignores_the_mask() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _g_unset = CudaVisibleGuard::unset();
+        let _s = EnvGuard::unset(SPOOF);
+        let _g_unset = EnvGuard::unset(CVD);
         let physical = detect_gpus_physical();
         drop(_g_unset);
         // An empty mask zeroes the runtime view but must not touch the
         // physical one: the whole reason the two are named apart.
-        let _g_set = CudaVisibleGuard::set("");
+        let _g_set = EnvGuard::set(CVD, "");
         assert!(detect_gpus().is_empty());
         assert_eq!(detect_gpus_physical().len(), physical.len());
     }

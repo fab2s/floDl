@@ -134,9 +134,8 @@ container can fail there.
 make docs-rs    # simulates docs.rs build for every publishable crate
 ```
 
-This covers every published crate (`flodl-hw`, `flodl-sys`, `flodl`,
-`flodl-cli`, `flodl-cli-macros`, `flodl-hf`) in one disposable container.
-It catches:
+This covers every publishable crate in the workspace, in one disposable
+container. It catches:
 - Broken intra-doc links (`rustdoc::broken_intra_doc_links`)
 - Dependencies that don't compile on nightly with `--cfg docsrs`
 - Example scraping failures (examples need libtorch)

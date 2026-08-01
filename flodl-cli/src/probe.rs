@@ -614,9 +614,24 @@ pub fn probe_local(
     data_path_explicit: bool,
 ) -> ProbeReport {
     let host = resolve_local_hostname();
-    let gpus = system::detect_gpus();
     let mut issues: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+
+    // The full sweep, not just its device list. A survey's findings are
+    // the part a device list cannot express, and the case that matters
+    // most for a second vendor has NO device at all: a card physically
+    // present whose stack is not installed. `probe` exists to tell an
+    // operator why a host is not ready, so it is the one command that
+    // must never drop them.
+    let sweep = flodl_hw::survey();
+    for note in &sweep.notes {
+        if note.kind.explains_absence() {
+            issues.push(note.to_string());
+        } else {
+            warnings.push(note.to_string());
+        }
+    }
+    let gpus = sweep.devices;
 
     let libtorch = match libtorch_path_override {
         Some(p) => check_libtorch_at(&p, &gpus, &mut issues),

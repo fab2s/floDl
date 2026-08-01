@@ -11,8 +11,17 @@ readme = "README.md"
 keywords = ["gpu", "detection", "nvidia", "hardware", "flodl"]
 categories = ["hardware-support", "science"]
 
-# Deliberately dependency-free. This crate sits on the `cargo install
-# flodl-cli` path AND inside `flodl`, and it must build on a host that
-# has no libtorch, no CUDA toolkit and no GPU. Every probe is a
-# std-only filesystem read or a bounded subprocess.
+# No libtorch, no CUDA toolkit, no build script: this crate must build
+# and run on a host that has none of that. Every probe is a std-only
+# filesystem read or a bounded subprocess.
+#
+# serde_json is the single dependency, and it is free in practice: it is
+# already a direct dependency of `flodl`, `flodl-cli` and `flodl-hf`, so
+# a workspace build and a `cargo install flodl-cli` both compile exactly
+# zero extra crates for it. It is also the dependency family flodl-cli's
+# otherwise-zero-external-crate policy already carves out. Used only to
+# read FLODL_TESTING_GPU_JSON (see src/testing.rs); hand-rolling a JSON
+# reader here would mean owning ~275 lines of parser forever to avoid a
+# crate every consumer already builds.
 [dependencies]
+serde_json = "1"

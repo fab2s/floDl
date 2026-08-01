@@ -49,8 +49,11 @@ if [ -n "$ACTIVE" ]; then
 fi
 
 # Workspace members are exactly the published crates (benchmarks,
-# ddp-bench, hf-ddp are workspace-excluded), so --workspace covers
-# flodl-hw, flodl-sys, flodl-cli-macros, flodl, flodl-cli, flodl-hf.
+# ddp-bench, hf-ddp are workspace-excluded), so --workspace covers every
+# publishable member automatically. That is also this check's blind spot:
+# it can never notice that a hand-maintained crate list went stale.
+# 10-crate-coverage.sh gates those lists. No crate names here on purpose
+# -- an enumeration in a comment is one more copy to drift.
 echo "=== cargo publish --dry-run --workspace (in docker dev) ==="
 if ! docker compose run --rm -T dev cargo publish --dry-run --workspace ${RELEASE_PREP:+--allow-dirty}; then
     echo "FAIL: cargo publish --dry-run --workspace failed (see output above)"

@@ -28,5 +28,24 @@
 //! of this struct and this parser. This module is a re-export of the
 //! single source, kept as `flodl::sys` because that is the published
 //! path.
+//!
+//! # Spoofing hardware in tests
+//!
+//! [`ENV_TESTING_GPU_JSON`] replaces the whole sweep with a described
+//! one, the sibling of `FLODL_TESTING_CLUSTER_JSON` for hardware rather
+//! than topology. It is how a second GPU vendor's detection and routing
+//! get tested on a machine that has none of that hardware:
+//!
+//! ```text
+//! FLODL_TESTING_GPU_JSON='[{"vendor":"amd","arch":"gfx1030","vram_mb":16384}]' fdl test
+//! ```
+//!
+//! `fdl` forwards it across the docker boundary. Visibility masks still
+//! apply on top, and a malformed value panics rather than quietly
+//! falling back to the real hardware. Full format in
+//! [`flodl_hw::testing`].
 
-pub use flodl_hw::{detect_gpus, detect_gpus_physical, GpuInfo, MemInfo, mem_info};
+pub use flodl_hw::{
+    detect_gpus, detect_gpus_physical, mem_info, survey, survey_visible, GpuArch, GpuInfo,
+    GpuSurvey, GpuVendor, MemInfo, NoteKind, SurveyNote, ENV_TESTING_GPU_JSON,
+};

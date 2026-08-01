@@ -1,7 +1,8 @@
 # flodl-hw
 
 Hardware detection for [flodl](https://flodl.dev): GPUs and host RAM,
-with **no libtorch, no CUDA runtime and no dependencies**.
+with **no libtorch and no CUDA runtime**. One dependency, `serde_json`,
+used only to read the test-spoofing env var below.
 
 ```rust
 for gpu in flodl_hw::detect_gpus() {
@@ -38,8 +39,22 @@ physical set. Runtime decisions (does DDP auto-promote) want the visible
 set. Conflating them is a real bug in both directions, so they are named
 apart rather than distinguished by a boolean.
 
-Never panics, never initializes a GPU runtime. An absent `nvidia-smi` is
-"no GPUs", not an error.
+Never initializes a GPU runtime. An absent `nvidia-smi` is "no GPUs",
+not an error.
+
+## Spoofing hardware
+
+`FLODL_TESTING_GPU_JSON` replaces the whole sweep, so detection and
+downstream routing can be tested on a machine without the hardware:
+
+```bash
+FLODL_TESTING_GPU_JSON='[{"vendor":"amd","arch":"gfx1030","vram_mb":16384}]' \
+  cargo test
+```
+
+Visibility masks still apply on top. A malformed value panics rather
+than falling back to real hardware, so a typo cannot silently make a
+test report on the wrong machine.
 
 ## License
 

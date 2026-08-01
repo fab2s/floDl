@@ -1,5 +1,11 @@
-//! Hardware detection for flodl: GPUs and host RAM, with **no libtorch,
-//! no CUDA runtime, and no dependencies**.
+//! Hardware detection for flodl: GPUs and host RAM, with **no libtorch
+//! and no CUDA runtime**.
+//!
+//! One dependency, `serde_json`, and only to read
+//! [`ENV_TESTING_GPU_JSON`]. It is free in practice: every consumer
+//! (`flodl`, `flodl-cli`, `flodl-hf`) already depends on it directly,
+//! so a workspace build and a `cargo install flodl-cli` compile exactly
+//! zero extra crates for it.
 //!
 //! # Why this is its own crate
 //!
@@ -58,21 +64,33 @@
 //! axis, and assuming they are the same one does not survive contact
 //! with Intel (whose libtorch device type genuinely differs).
 //!
+//! # Spoofing hardware for tests
+//!
+//! [`ENV_TESTING_GPU_JSON`] replaces the whole sweep with a described
+//! one, so a second vendor's detection, libtorch variant selection and
+//! per-host build routing are testable on a machine that has none of
+//! that hardware. See [`testing`] for the format.
+//!
 //! # Contract
 //!
-//! Nothing here panics, spawns a thread, or initializes a GPU runtime.
-//! Every probe is a std-only filesystem read or a bounded subprocess,
-//! and each vendor's subprocess is gated behind cheap filesystem checks,
-//! so a CPU-only box spawns nothing at all.
+//! No thread is spawned and no GPU runtime is initialized. Every probe
+//! is a filesystem read or a bounded subprocess, and each vendor's
+//! subprocess is gated behind cheap filesystem checks, so a CPU-only
+//! box spawns nothing at all. Absent hardware is never an error, so
+//! callers need no "did we have a driver" branch. The one panic is a
+//! malformed [`ENV_TESTING_GPU_JSON`], which is a developer error in a
+//! deliberately-set variable.
 
 mod gpu;
 mod mem;
 mod nvidia;
 mod report;
+pub mod testing;
 mod vendor;
 
 pub use gpu::{detect_gpus, detect_gpus_physical, survey, survey_visible, GpuInfo};
 pub use mem::{mem_info, MemInfo};
 pub use nvidia::nvidia_driver_version;
 pub use report::{GpuSurvey, NoteKind, SurveyNote};
+pub use testing::ENV_TESTING_GPU_JSON;
 pub use vendor::{GpuArch, GpuVendor};
