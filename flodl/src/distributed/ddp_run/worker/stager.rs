@@ -371,6 +371,7 @@ fn stager_ram_budget(
     world_size: usize,
     counts: &[usize],
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     held_bytes: u64,
 ) -> usize {
     let Some(m) = crate::sys::mem_info() else {
@@ -385,13 +386,13 @@ fn stager_ram_budget(
     // bound its device, so the current device IS this rank's device, and
     // plumbing it down would touch the whole call chain for one lookup.
     //
-    // `None` for the share: the operator override currently lives on
-    // `DataLoaderBuilder::gpu_ram_share`, so the DDP path takes the
-    // device's reported aperture. The double-count is fixed either way;
-    // only the override is missing here.
     let available = if crate::tensor::gpu_available() {
         let device = crate::tensor::Device::CUDA(crate::tensor::current_gpu_device());
-        crate::data::budget::unified_adjusted_available(m.available_bytes, device, None)
+        crate::data::budget::unified_adjusted_available(
+            m.available_bytes,
+            device,
+            gpu_ram_share,
+        )
     } else {
         m.available_bytes
     };
@@ -450,6 +451,7 @@ pub(crate) fn spawn_stager(
     world_size: usize,
     augment: usize,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     sample_cache: bool,
 ) -> StagerHandle {
     let (tx, rx) = mpsc::channel::<StageAdvisory>();
@@ -467,6 +469,7 @@ pub(crate) fn spawn_stager(
             world_size,
             augment,
             ram_max_usage,
+            gpu_ram_share,
             sample_cache,
             &staged_in_thread,
         );
@@ -540,6 +543,7 @@ fn stager_loop(
     world_size: usize,
     augment: usize,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     sample_cache: bool,
     staged: &AtomicUsize,
 ) {
@@ -590,7 +594,7 @@ fn stager_loop(
             let held =
                 cache.bytes() as u64 + stream.lock().map(|p| p.bytes() as u64).unwrap_or(0);
             let share =
-                stager_ram_budget(rank, world_size, &a.counts, ram_max_usage, held);
+                stager_ram_budget(rank, world_size, &a.counts, ram_max_usage, gpu_ram_share, held);
             // `sample_cache=false` pins the retained tier at zero and
             // hands the whole staging share to the flow window (the
             // TrainerConfig/DdpBuilder knob mirroring the solo
@@ -941,7 +945,7 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5, true);
+        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5, None, true);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.

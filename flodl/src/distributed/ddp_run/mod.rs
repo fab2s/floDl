@@ -518,6 +518,20 @@ pub struct DdpRunConfig {
     /// stage fetch). Default: `0.50` (the solo loader's
     /// `ram_max_usage` default).
     pub ram_max_usage: f64,
+    /// Fraction of **physical** host RAM (`MemTotal`) to hand the GPU on
+    /// an **integrated (APU) target**, where device memory is carved out
+    /// of system RAM rather than being a pool of its own — so the host
+    /// staging tiers and the VRAM pool otherwise price the same DRAM
+    /// twice and over-commit it.
+    ///
+    /// `None` (default) reserves whatever aperture the device reports.
+    /// Ignored on discrete GPUs, where the two pools are genuinely
+    /// separate. Values above `1.0` are allowed and meaningful: if a
+    /// platform under-reports `MemTotal` relative to what the APU can
+    /// address, a share above 1.0 is how you still express the true
+    /// reservation. Same knob as `DataLoaderBuilder::gpu_ram_share` on
+    /// the solo path.
+    pub gpu_ram_share: Option<f64>,
     /// Pinned RAM sample retention in each rank's staging tier (see
     /// [`crate::distributed::TrainerConfig::sample_cache`]). `false`
     /// pins the read-through cache's budget to zero; the flow window
@@ -688,6 +702,7 @@ impl DdpRunConfig {
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            gpu_ram_share: None,
             sample_cache: true,
             disk_stage_gb: 0,
             disk_stage_dir: None,
@@ -960,6 +975,15 @@ impl DdpRunConfig {
     /// [`Self::ram_max_usage`]).
     pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Fraction of physical host RAM (`MemTotal`) reserved for the GPU on
+    /// an integrated (APU) target (see [`Self::gpu_ram_share`]). Ignored
+    /// on discrete GPUs. Same knob as `DataLoaderBuilder::gpu_ram_share`
+    /// on the solo path.
+    pub fn with_gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share.max(0.0));
         self
     }
 
@@ -1529,6 +1553,9 @@ pub struct WorkerConfig {
     /// Host-RAM share for this worker's staging tiers (see
     /// [`DdpRunConfig::ram_max_usage`]).
     pub ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target (see
+    /// [`DdpRunConfig::gpu_ram_share`]).
+    pub gpu_ram_share: Option<f64>,
     /// Pinned RAM sample retention in this worker's staging tier (see
     /// [`DdpRunConfig::sample_cache`]).
     pub sample_cache: bool,

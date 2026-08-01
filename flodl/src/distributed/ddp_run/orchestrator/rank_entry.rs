@@ -654,6 +654,7 @@ impl DdpHandle {
             vram_pool: config.vram_pool,
             vram_max_usage: config.vram_max_usage,
             ram_max_usage: config.ram_max_usage,
+            gpu_ram_share: config.gpu_ram_share,
             sample_cache: config.sample_cache,
             disk_stage_gb: config.disk_stage_gb,
             disk_stage_dir: config.disk_stage_dir.clone(),

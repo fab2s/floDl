@@ -314,6 +314,10 @@ pub struct GpuWorker<M: Module> {
     /// Host-RAM share for this worker's data plane; feeds the per-plan
     /// reader-ring sizing (same knob the stager budgets from).
     ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target; corrects the
+    /// staging budget for a unified-memory part (see
+    /// [`super::DdpRunConfig::gpu_ram_share`]).
+    gpu_ram_share: Option<f64>,
     /// Measured activation peak (activations + gradients) from training.
     /// Used as a reserve in the VRAM gauge so prefetch doesn't fill
     /// memory that forward/backward will need. Zero = not yet measured;

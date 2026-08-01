@@ -59,6 +59,7 @@ fn make_det_worker(total: usize) -> (GpuWorker<Linear>, WorkerChannels) {
         transform: None,
         vram_max_usage: 0.90,
         ram_max_usage: 0.50,
+        gpu_ram_share: None,
         sample_cache: true,
         disk_stage_gb: 0,
         disk_stage_dir: None,

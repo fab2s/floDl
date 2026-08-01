@@ -267,7 +267,18 @@ impl<M: Module> GpuWorker<M> {
                 self.per_sample_bytes,
                 self.batch_size,
                 self.ram_max_usage,
-                crate::sys::mem_info().map(|m| m.available_bytes),
+                // Corrected for a unified-memory (APU) target: the VRAM
+                // pool is carved out of this same DRAM, so the raw probe
+                // would let the ring claim memory the device already
+                // owns. Same correction the stager applies to its own
+                // share.
+                crate::sys::mem_info().map(|m| {
+                    crate::data::budget::unified_adjusted_available(
+                        m.available_bytes,
+                        self.device,
+                        self.gpu_ram_share,
+                    )
+                }),
                 num_batches,
             )
             .min(crate::data::budget::RING_SLOTS_WITH_CACHE)

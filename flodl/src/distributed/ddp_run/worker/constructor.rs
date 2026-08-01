@@ -239,6 +239,7 @@ impl<M: Module> GpuWorker<M> {
                 config.world_size,
                 config.augment,
                 config.ram_max_usage,
+                config.gpu_ram_share,
                 config.sample_cache,
             );
             (dataset, Some(stager))
@@ -412,6 +413,7 @@ impl<M: Module> GpuWorker<M> {
             per_sample_bytes,
             vram_max_usage: config.vram_max_usage,
             ram_max_usage: config.ram_max_usage,
+            gpu_ram_share: config.gpu_ram_share,
             activation_peak_bytes: 0,
             // Nothing to signal when the pool is off: pre-latch so the
             // install boundary (and its flow-reserve depth collapse)
