@@ -19,13 +19,19 @@ pub enum NoteKind {
     Unparsable,
     /// A visibility mask changed the answer, or could not be resolved.
     MaskApplied,
+    /// A device was dropped because this build cannot address its
+    /// vendor. libtorch is built for exactly one GPU backend, so on a
+    /// mixed box the devices of the *other* vendor are present, healthy,
+    /// and unusable -- counting them would hand a rank a device the
+    /// build cannot talk to.
+    VendorMismatch,
 }
 
 impl NoteKind {
     /// Every name [`NoteKind::parse`] accepts, comma-separated. For
     /// error messages, so the list cannot drift from the parser.
     pub const ALL_NAMES: &'static str =
-        "hardware_unusable, tool_failed, unparsable, mask_applied";
+        "hardware_unusable, tool_failed, unparsable, mask_applied, vendor_mismatch";
 
     /// Stable snake_case token.
     pub fn as_str(self) -> &'static str {
@@ -34,6 +40,7 @@ impl NoteKind {
             NoteKind::ToolFailed => "tool_failed",
             NoteKind::Unparsable => "unparsable",
             NoteKind::MaskApplied => "mask_applied",
+            NoteKind::VendorMismatch => "vendor_mismatch",
         }
     }
 
@@ -44,6 +51,7 @@ impl NoteKind {
             "tool_failed" => Some(NoteKind::ToolFailed),
             "unparsable" => Some(NoteKind::Unparsable),
             "mask_applied" => Some(NoteKind::MaskApplied),
+            "vendor_mismatch" => Some(NoteKind::VendorMismatch),
             _ => None,
         }
     }
@@ -54,7 +62,10 @@ impl NoteKind {
     pub fn explains_absence(self) -> bool {
         matches!(
             self,
-            NoteKind::HardwareUnusable | NoteKind::ToolFailed | NoteKind::Unparsable
+            NoteKind::HardwareUnusable
+                | NoteKind::ToolFailed
+                | NoteKind::Unparsable
+                | NoteKind::VendorMismatch
         )
     }
 }

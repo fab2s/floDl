@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::report::{GpuSurvey, NoteKind};
+use crate::report::{GpuSurvey, NoteKind, SurveyNote};
 use crate::vendor::{GpuArch, GpuVendor};
 
 /// One GPU's identity, capability and VRAM.
@@ -139,6 +139,59 @@ pub fn survey_visible() -> GpuSurvey {
     let mut out = survey();
     apply_visibility_masks(&mut out);
     out
+}
+
+/// [`survey_visible`], narrowed to the one vendor a caller can actually
+/// address.
+///
+/// The masks answer "what will the runtime see"; this answers the
+/// separate question "which of those can *this build* talk to". libtorch
+/// is built for exactly one GPU backend and both claim
+/// `DeviceType::CUDA`, so on a mixed box the other vendor's devices are
+/// present, healthy, and unusable. Counting them is not cosmetic: it
+/// feeds the `>= 2` DDP auto-promote decision, which would then hand a
+/// rank a device the build cannot talk to.
+///
+/// Filtering also disambiguates the index space. [`GpuInfo::index`] is
+/// the *vendor tool's* ordinal, so an unfiltered survey of a box with
+/// two NVIDIA cards and one AMD card carries indices `0, 1, 0` -- only
+/// meaningful once split by vendor.
+///
+/// Dropped devices leave a [`NoteKind::VendorMismatch`] note, and it
+/// counts as explaining an absence: a ROCm build on an NVIDIA-only box
+/// reports zero devices, and the note is what turns that into "you built
+/// for ROCm and this machine has NVIDIA hardware" instead of a bare
+/// "no GPUs found".
+pub fn survey_visible_for(vendor: GpuVendor) -> GpuSurvey {
+    let mut out = survey_visible();
+    retain_vendor(&mut out, vendor);
+    out
+}
+
+/// Enumerate the visible devices this build can address. Shorthand for
+/// [`survey_visible_for`] when the caller does not need the findings.
+pub fn detect_gpus_for(vendor: GpuVendor) -> Vec<GpuInfo> {
+    survey_visible_for(vendor).devices
+}
+
+/// Drop every device that is not `vendor`, in place. Split out so the
+/// semantics are testable without hardware of either vendor.
+fn retain_vendor(out: &mut GpuSurvey, vendor: GpuVendor) {
+    let before = out.devices.len();
+    out.devices.retain(|g| g.vendor == vendor);
+    let dropped = before - out.devices.len();
+    if dropped == 0 {
+        return;
+    }
+    out.notes.push(SurveyNote {
+        vendor,
+        kind: NoteKind::VendorMismatch,
+        message: format!(
+            "{dropped} device(s) of another vendor are installed and ignored: \
+             this build targets {vendor} and libtorch can only address one \
+             GPU backend per process."
+        ),
+    });
 }
 
 /// The mask variable a vendor actually reads, and its value.
@@ -318,6 +371,87 @@ mod tests {
             arch: GpuArch::Sm { major, minor },
             total_memory_mb: 8192,
         }
+    }
+
+    // --- vendor filtering -------------------------------------------
+
+    #[test]
+    fn retain_vendor_keeps_only_that_vendors_devices() {
+        let mut sur = GpuSurvey {
+            devices: vec![gpu(0, 12, 0), amd(0, "gfx1036"), gpu(1, 12, 0)],
+            ..Default::default()
+        };
+        retain_vendor(&mut sur, GpuVendor::Nvidia);
+        assert_eq!(sur.devices.len(), 2);
+        assert!(sur.devices.iter().all(|g| g.vendor == GpuVendor::Nvidia));
+    }
+
+    #[test]
+    fn retain_vendor_notes_what_it_dropped_and_explains_absence() {
+        // The case that matters: a ROCm build on an NVIDIA-only box.
+        // Zero devices must not read as "no GPU installed".
+        let mut sur = GpuSurvey {
+            devices: vec![gpu(0, 12, 0)],
+            ..Default::default()
+        };
+        retain_vendor(&mut sur, GpuVendor::Amd);
+        assert!(sur.devices.is_empty());
+        let note = sur
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::VendorMismatch)
+            .expect("a dropped device must leave a note");
+        assert!(note.kind.explains_absence());
+        assert!(note.message.contains('1'), "note should say how many");
+    }
+
+    #[test]
+    fn retain_vendor_is_silent_when_nothing_is_dropped() {
+        let mut sur = GpuSurvey {
+            devices: vec![gpu(0, 12, 0)],
+            ..Default::default()
+        };
+        retain_vendor(&mut sur, GpuVendor::Nvidia);
+        assert_eq!(sur.devices.len(), 1);
+        assert!(!sur.notes.iter().any(|n| n.kind == NoteKind::VendorMismatch));
+    }
+
+    #[test]
+    fn vendor_filter_resolves_the_duplicate_index_space() {
+        // Per-vendor ordinals mean an unfiltered mixed box carries
+        // indices 0, 1, 0 -- ambiguous until split by vendor.
+        let mut sur = GpuSurvey {
+            devices: vec![gpu(0, 12, 0), gpu(1, 12, 0), amd(0, "gfx1036")],
+            ..Default::default()
+        };
+        let all: Vec<u8> = sur.devices.iter().map(|g| g.index).collect();
+        assert_eq!(all, vec![0, 1, 0], "precondition: indices collide");
+        retain_vendor(&mut sur, GpuVendor::Amd);
+        assert_eq!(
+            sur.devices.iter().map(|g| g.index).collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn detect_gpus_for_filters_a_spoofed_mixed_host() {
+        let _lock = env_lock();
+        let _cvd = EnvGuard::unset(CVD);
+        // A real shape: AMD APU alongside a discrete NVIDIA card.
+        let _spoof = EnvGuard::set(
+            SPOOF,
+            r#"[{"vendor":"nvidia","arch":"sm_120","vram_mb":16384},
+                {"vendor":"amd","arch":"gfx1036","vram_mb":512}]"#,
+        );
+        assert_eq!(detect_gpus().len(), 2, "unfiltered sees both vendors");
+        assert_eq!(detect_gpus_for(GpuVendor::Nvidia).len(), 1);
+        assert_eq!(detect_gpus_for(GpuVendor::Amd).len(), 1);
+        // The bug this guards: a CUDA build must not count the APU
+        // toward the >= 2 auto-promote threshold.
+        assert!(
+            detect_gpus_for(GpuVendor::Nvidia).len() < 2,
+            "a CUDA build must not see 2 GPUs on this box"
+        );
     }
 
     fn amd(index: u8, gfx: &str) -> GpuInfo {

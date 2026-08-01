@@ -89,7 +89,10 @@ mod report;
 pub mod testing;
 mod vendor;
 
-pub use gpu::{detect_gpus, detect_gpus_physical, survey, survey_visible, GpuInfo};
+pub use gpu::{
+    detect_gpus, detect_gpus_for, detect_gpus_physical, survey, survey_visible, survey_visible_for,
+    GpuInfo,
+};
 pub use mem::{mem_info, MemInfo};
 pub use nvidia::nvidia_driver_version;
 pub use report::{GpuSurvey, NoteKind, SurveyNote};

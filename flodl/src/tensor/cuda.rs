@@ -351,6 +351,21 @@ pub fn probe_device(device: Device) -> Result<()> {
 /// for any that fail.
 pub fn usable_gpu_devices() -> Vec<Device> {
     if !gpu_available() {
+        // "No GPU" on a box that visibly HAS one is the confusing case,
+        // and a vendor mismatch is the way to get there: libtorch is
+        // built for one backend, so a ROCm build on an NVIDIA machine
+        // (or the reverse) sees nothing while `nvidia-smi` happily
+        // lists cards. Say which build this is rather than leaving the
+        // reader to guess.
+        if let Some(vendor) = crate::sys::build_vendor() {
+            for note in crate::sys::survey_visible_for(vendor)
+                .notes
+                .iter()
+                .filter(|n| n.kind.explains_absence())
+            {
+                eprintln!("[flodl] WARNING: {}", note);
+            }
+        }
         return vec![];
     }
     let devices = gpu_devices();
