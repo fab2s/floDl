@@ -36,6 +36,25 @@ const HOST_TOOLS: &[(&str, &str)] = &[
     ("c++", "g++"),
 ];
 
+// DERIVED BY THE COMPILER, not by reading includes. Four CI rounds were
+// lost to hand-derived lists: each guessed set was missing a header that
+// torch's own vendor tree pulls in transitively (crt/host_config.h, then
+// hipsparse, then cusparse). The authoritative method, and the one to
+// repeat whenever libtorch is bumped:
+//
+//   docker run -v $PWD:/w -v $PWD/libtorch/precompiled/<v>:/lt:ro \
+//     -w /w/flodl-sys <image> c++ -std=c++17 -M -I . -I /lt/include \
+//     -I /lt/include/torch/csrc/api/include -I <toolkit>/include \
+//     <the -D flags build.rs sets> shim.cpp | grep <toolkit-or-/usr/include>
+//
+// Use -M and NOT -MM: -MM omits SYSTEM headers by definition, which
+// silently drops `nccl.h` (it lives at /usr/include/nccl.h, not under
+// $CUDA_HOME) and would recreate the exact hole this replaces.
+//
+// The sets are also SMALLER than a tree-wide grep suggests: grepping
+// ATen/cuda wholesale pulls cudnn.h, cudss.h and nvml.h, none of which
+// this shim's include chain reaches -- and cudss.h is absent from an
+// image that builds fine, so requiring it would be a false negative.
 /// Vendor toolkit headers, as (header relative to the toolkit root,
 /// package that owns it).
 ///
@@ -58,12 +77,10 @@ pub const ROCM_HEADERS: &[(&str, &str)] = &[
     ("hip/hip_runtime.h", "hip-dev"),
     ("rccl/rccl.h", "rccl-dev"),
     ("hipblas/hipblas.h", "hipblas-dev"),
+    ("hipblas-common/hipblas-common.h", "hipblas-common-dev"),
     ("hipblaslt/hipblaslt.h", "hipblaslt-dev"),
-    ("hipcub/hipcub.hpp", "hipcub-dev"),
     ("hipsolver/hipsolver.h", "hipsolver-dev"),
     ("hipsparse/hipsparse.h", "hipsparse-dev"),
-    ("rocblas/rocblas.h", "rocblas-dev"),
-    ("rocm_smi/rocm_smi.h", "rocm-smi-lib"),
 ];
 
 /// CUDA equivalent. The version placeholders are deliberate: the exact
@@ -72,6 +89,9 @@ pub const ROCM_HEADERS: &[(&str, &str)] = &[
 pub const CUDA_HEADERS: &[(&str, &str)] = &[
     ("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
     ("crt/host_config.h", "cuda-crt-<M>-<m>"),
+    ("cublas_v2.h", "libcublas-dev-<M>-<m>"),
+    ("cusolverDn.h", "libcusolver-dev-<M>-<m>"),
+    ("cusparse.h", "libcusparse-dev-<M>-<m>"),
     ("nccl.h", "libnccl-dev"),
 ];
 
@@ -220,7 +240,7 @@ mod tests {
     fn every_rocm_header_names_a_package() {
         // Nine headers, nine owners -- if a pair ever loses its package
         // the message would tell a user to install "".
-        assert_eq!(ROCM_HEADERS.len(), 9);
+        assert_eq!(ROCM_HEADERS.len(), 7);
         for (h, p) in ROCM_HEADERS {
             assert!(!h.is_empty() && !p.is_empty(), "{h} -> {p}");
         }
