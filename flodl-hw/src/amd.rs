@@ -143,6 +143,57 @@ fn probe_at(sys: &Path, kfd_dev: &Path, rocm: Option<&Path>, out: &mut GpuSurvey
     };
     let _ = rocm; // presence is the signal; the path itself matters to P5's loader ordering
 
+    // The device node exists but this process cannot open it. On a
+    // cloud host with ROCm installed natively, this is THE common
+    // stumble: `/dev/kfd` is `crw-rw---- root render`, the sysfs
+    // topology is world-readable, and cloud images routinely leave the
+    // default user outside `render`. Everything else then looks
+    // healthy -- the kernel lists the GPU, the runtime is installed --
+    // and libtorch dies at device init with a permission error that
+    // never mentions groups.
+    //
+    // Docker hides this (our compose service sets `group_add: video,
+    // render`), which is exactly why it only surfaces on the native
+    // path.
+    //
+    // Checked AFTER the ROCm gate on purpose. A box with neither ROCm
+    // nor group membership should be told to install ROCm first: that
+    // is the larger prerequisite, and the ROCm installer commonly adds
+    // the render group itself. Reporting groups first would send the
+    // operator down the wrong path and cost an extra round trip.
+    //
+    // `/dev/kfd` stands in for a PAIR: ROCm also needs the DRM render
+    // node (`/dev/dri/renderD*`), which is why the compose service maps
+    // `/dev/dri` as well. Both are `root:render`, so one membership
+    // decides both and checking either answers the PERMISSION question
+    // for both.
+    //
+    // It does NOT answer the render node's PRESENCE question: a
+    // container given `--device=/dev/kfd` but not `--device=/dev/dri`
+    // passes this check and still cannot run. Deliberately not checked
+    // yet -- writing it safely needs a real container-vs-host device
+    // layout to test against, the same "no capture, no parser" rule
+    // this module applies to `amd-smi`. It is on the rental-capture
+    // list.
+    if device_rw_access(kfd_dev) == Some(false) {
+        let archs: Vec<String> = gpus.iter().map(|g| g.arch.to_string()).collect();
+        out.note(
+            GpuVendor::Amd,
+            NoteKind::HardwareUnusable,
+            format!(
+                "{} AMD GPU(s) present ({}) and {} exists, but this process cannot \
+                 open it -- almost always missing `render`/`video` group membership. \
+                 Fix with `sudo usermod -aG render,video $USER` then log out and back \
+                 in (group changes do not apply to existing sessions). In a container, \
+                 add `--group-add video --group-add render`.",
+                gpus.len(),
+                archs.join(", "),
+                kfd_dev.display(),
+            ),
+        );
+        return;
+    }
+
     out.devices.extend(gpus);
 }
 
@@ -330,8 +381,161 @@ fn rocm_runtime_root_from(candidates: &[PathBuf]) -> Option<PathBuf> {
         .cloned()
 }
 
+/// Whether this process could open `dev` for read/write, decided from
+/// the node's mode and our own credentials rather than by opening it.
+///
+/// Deliberately does NOT open the device: `/dev/kfd` is the handle the
+/// ROCm runtime attaches through, and hardware *detection* should stay
+/// side-effect-free. Credentials come from `/proc/self/status`, which
+/// keeps this crate dependency-free (no libc for `geteuid`/`getgroups`).
+///
+/// `None` = cannot tell (no `/proc`, unreadable node, non-unix). Callers
+/// must treat that as "no opinion" and stay quiet: a false "your groups
+/// are wrong" on a working box is worse than silence.
+#[cfg(unix)]
+fn device_rw_access(dev: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(dev).ok()?;
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let euid = status_id_field(&status, "Uid:")?;
+    let egid = status_id_field(&status, "Gid:")?;
+    let groups = status_groups(&status)?;
+    Some(mode_grants_rw(
+        md.mode(),
+        md.uid(),
+        md.gid(),
+        euid,
+        egid,
+        &groups,
+    ))
+}
+
+#[cfg(not(unix))]
+fn device_rw_access(_dev: &Path) -> Option<bool> {
+    None
+}
+
+/// Effective id from a `/proc/self/status` `Uid:`/`Gid:` line, whose
+/// fields are `real effective saved filesystem` -- the EFFECTIVE one
+/// (index 1) is what the kernel checks on open.
+fn status_id_field(status: &str, label: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(label))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Supplementary gids from the `Groups:` line (may legitimately be empty).
+fn status_groups(status: &str) -> Option<Vec<u32>> {
+    Some(
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))?
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .collect(),
+    )
+}
+
+/// The kernel's permission check for opening a node read/write, as a
+/// pure function so every branch is testable without a device node.
+///
+/// Order matters and mirrors the kernel's: root bypasses; otherwise the
+/// OWNER bits apply if we own it (even when they grant *less* than the
+/// group bits), then group, then other.
+fn mode_grants_rw(
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    euid: u32,
+    egid: u32,
+    groups: &[u32],
+) -> bool {
+    const RW: u32 = 0o6;
+    if euid == 0 {
+        return true; // CAP_DAC_OVERRIDE in practice
+    }
+    if euid == owner_uid {
+        return (mode >> 6) & RW == RW;
+    }
+    if egid == owner_gid || groups.contains(&owner_gid) {
+        return (mode >> 3) & RW == RW;
+    }
+    mode & RW == RW
+}
+
 #[cfg(test)]
 mod tests {
+    // --- /dev/kfd accessibility --------------------------------------
+
+    // The real shape on a Linux host: crw-rw---- root:render.
+    const KFD_MODE: u32 = 0o660;
+    const ROOT: u32 = 0;
+    const RENDER_GID: u32 = 104;
+
+    #[test]
+    fn kfd_is_open_to_a_member_of_the_render_group() {
+        assert!(mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, 1000, &[44, RENDER_GID]));
+    }
+
+    #[test]
+    fn kfd_is_closed_to_a_user_outside_the_render_group() {
+        // THE cloud-host case: everything else looks healthy, this is
+        // the only thing wrong, and the resulting libtorch error never
+        // mentions groups.
+        assert!(!mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, 1000, &[44, 100]));
+    }
+
+    #[test]
+    fn root_opens_it_regardless_of_groups() {
+        assert!(mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 0, 0, &[]));
+    }
+
+    #[test]
+    fn the_effective_gid_counts_as_membership() {
+        // Supplementary list empty, but our primary group IS render.
+        assert!(mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, RENDER_GID, &[]));
+    }
+
+    #[test]
+    fn owner_bits_apply_to_the_owner_even_when_group_bits_grant_more() {
+        // Kernel order, not "most permissive wins": we own it, so the
+        // OWNER bits decide, and here they grant nothing.
+        assert!(!mode_grants_rw(0o060, 1000, RENDER_GID, 1000, 1000, &[RENDER_GID]));
+    }
+
+    #[test]
+    fn world_writable_node_is_open_to_anyone() {
+        assert!(mode_grants_rw(0o666, ROOT, ROOT, 1000, 1000, &[]));
+    }
+
+    #[test]
+    fn read_only_group_access_is_not_enough() {
+        // KFD needs read/write; r-- would fail at open.
+        assert!(!mode_grants_rw(0o440, ROOT, RENDER_GID, 1000, 1000, &[RENDER_GID]));
+    }
+
+    #[test]
+    fn parses_effective_ids_and_groups_from_proc_status() {
+        // Fields are `real effective saved filesystem`; the EFFECTIVE
+        // one is what the kernel checks, so index 1 not 0.
+        let status = "Name:\tx\nUid:\t1000\t1001\t1000\t1000\nGid:\t1000\t1002\t1000\t1000\nGroups:\t4 24 104 \n";
+        assert_eq!(status_id_field(status, "Uid:"), Some(1001));
+        assert_eq!(status_id_field(status, "Gid:"), Some(1002));
+        assert_eq!(status_groups(status), Some(vec![4, 24, 104]));
+    }
+
+    #[test]
+    fn an_empty_groups_line_is_empty_not_missing() {
+        // A process with no supplementary groups is normal; it must not
+        // read as "cannot tell" and silence the check.
+        assert_eq!(status_groups("Groups:\t\n"), Some(vec![]));
+        assert_eq!(status_groups("Name:\tx\n"), None);
+    }
+
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
