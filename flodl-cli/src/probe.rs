@@ -934,7 +934,14 @@ fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
         GpuVendor::Nvidia => Some((
             "CUDA_HOME",
             "/usr/local/cuda",
-            vec!["include/cuda_runtime.h", "include/nccl.h"],
+            // crt/host_config.h is a separate package from cudart-dev
+            // and cuda_runtime.h includes it on line 82 -- checking only
+            // the obvious header is a false pass.
+            vec![
+                "include/cuda_runtime.h",
+                "include/crt/host_config.h",
+                "include/nccl.h",
+            ],
             "cuda-toolkit libnccl-dev",
             "cuda",
         )),

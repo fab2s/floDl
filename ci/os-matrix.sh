@@ -37,9 +37,23 @@ cd "$(git rev-parse --show-toplevel)"
 # ::group:: collapses in the Actions UI and is inert in a local shell,
 # so the same output is readable in both places.
 IN_CI="${GITHUB_ACTIONS:-}"
-group()    { if [ -n "$IN_CI" ]; then echo "::group::$*"; else echo; echo "===== $* ====="; fi; }
-endgroup() { if [ -n "$IN_CI" ]; then echo "::endgroup::"; fi; }
-pass()     { echo "PASS: $*"; }
+
+# Actions renders ANSI, so the same codes serve the log and a terminal.
+# Suppressed when NO_COLOR is set or stdout is not a tty and we are not
+# in CI, so piping the output somewhere stays clean.
+if [ -n "${NO_COLOR:-}" ] || { [ -z "$IN_CI" ] && [ ! -t 1 ]; }; then
+    C_GREEN=""; C_RED=""; C_YELLOW=""; C_OFF=""
+else
+    C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_OFF=$'\033[0m'
+fi
+
+# GROUP_OPEN tracks whether a ::group:: fold is currently open. A failure
+# printed inside one is HIDDEN behind the toggle, which is exactly what
+# made the last red run hard to read -- so `fail` closes the fold first.
+GROUP_OPEN=0
+group()    { if [ -n "$IN_CI" ]; then echo "::group::$*"; GROUP_OPEN=1; else echo; echo "===== $* ====="; fi; }
+endgroup() { if [ -n "$IN_CI" ] && [ "$GROUP_OPEN" = 1 ]; then echo "::endgroup::"; GROUP_OPEN=0; fi; }
+pass()     { echo "${C_GREEN}PASS${C_OFF}: $*"; }
 note()     { if [ -n "$IN_CI" ]; then echo "::notice::$*"; else echo "NOTE: $*"; fi; }
 
 # `fdl probe` exits 1 whenever it reports ANY issue, and a CI host always
@@ -51,13 +65,30 @@ probe_json() { "$FDL" probe --json 2>/dev/null || true; }
 probe_text() { "$FDL" probe 2>&1 || true; }
 has()        { printf '%s' "$1" | grep -qF "$2"; }
 
-HARD_FAIL=0
 SOFT_FAIL=0
-fail()     { HARD_FAIL=1; if [ -n "$IN_CI" ]; then echo "::error::$*"; else echo "FAIL: $*"; fi; }
+# FAIL EARLY, and out in the open. Collecting every failure sounded
+# useful but buried the real one: Actions folds each ::group::, so the
+# first error scrolled away inside a closed toggle while the run ended on
+# unrelated output. Stopping at the first hard failure makes it the LAST
+# thing in the log, every time. Per-host coverage is unaffected --
+# `fail-fast: false` on the matrix means the other hosts still run.
+fail() {
+    endgroup
+    echo "${C_RED}FAIL${C_OFF}: $*"
+    [ -n "$IN_CI" ] && echo "::error::$*"
+    echo
+    echo "${C_RED}RESULT: $HOST FAILED${C_OFF} (stopped at the first failure)"
+    exit 1
+}
 # Advisory: report, keep going, do not fail the job. For steps running
 # code no host has ever run, so that a red one does not gate the merge
 # queue on day one. Promote to `fail` once green.
-soft()     { SOFT_FAIL=1; if [ -n "$IN_CI" ]; then echo "::warning::(advisory) $*"; else echo "ADVISORY: $*"; fi; }
+soft() {
+    SOFT_FAIL=1
+    echo "${C_YELLOW}ADVISORY${C_OFF}: $*"
+    [ -n "$IN_CI" ] && echo "::warning::(advisory) $*"
+    return 0
+}
 
 # --- host identification --------------------------------------------
 # Derived, not passed in from the matrix: the script should see the host
@@ -402,7 +433,7 @@ elif [ "$RC" -ne 0 ]; then
         curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends cuda-cudart-dev-12-8 libnccl-dev \
+        sudo apt-get install -y --no-install-recommends cuda-cudart-dev-12-8 cuda-crt-12-8 libnccl-dev \
             || fail "cuda toolkit install"
     fi
 fi
@@ -442,12 +473,8 @@ fi
 
 # =====================================================================
 echo
-if [ "$HARD_FAIL" != 0 ]; then
-    echo "RESULT: $HOST FAILED"
-    exit 1
-fi
 if [ "$SOFT_FAIL" != 0 ]; then
-    echo "RESULT: $HOST ok, with advisories (see ::warning:: above)"
+    echo "${C_YELLOW}RESULT: $HOST ok, with advisories${C_OFF} (see the warnings above)"
     exit 0
 fi
-echo "RESULT: $HOST ok"
+echo "${C_GREEN}RESULT: $HOST ok${C_OFF}"

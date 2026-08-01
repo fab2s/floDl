@@ -135,18 +135,32 @@ fn main() {
         );
         std::process::exit(1);
     }
-    if want_cuda && !Path::new(&cuda_home).join("include/cuda_runtime.h").exists() {
+    // Three headers, not one. `cuda_runtime.h` alone is a FALSE PASS:
+    // it exists in cuda-cudart-dev but immediately `#include`s
+    // "crt/host_config.h", which lives in a DIFFERENT package
+    // (cuda-crt-<maj>-<min>). CI hit exactly that -- guard green, C++
+    // compile dead on the very next line.
+    let cuda_missing: Vec<&str> = [
+        "include/cuda_runtime.h",
+        "include/crt/host_config.h",
+        "include/nccl.h",
+    ]
+    .into_iter()
+    .filter(|h| !Path::new(&cuda_home).join(h).exists())
+    .collect();
+    if want_cuda && !cuda_missing.is_empty() {
         eprintln!(
-            "\nflodl-sys: `--features cuda` needs the CUDA toolkit headers, but\n\
-             `{cuda_home}/include/cuda_runtime.h` does not exist.\n\n\
+            "\nflodl-sys: `--features cuda` needs the CUDA toolkit headers.\n\
+             Missing under `{cuda_home}`: {}\n\n\
              libtorch bundles the CUDA runtime libraries but not its headers:\n\n\
              \x20 Ubuntu/Debian:  sudo apt install cuda-toolkit libnccl-dev\n\
              \x20                 (repo: https://developer.nvidia.com/cuda-downloads)\n\
-             \x20                 headers alone: cuda-cudart-dev-<major>-<minor>\n\
-             \x20                 plus libnccl-dev for <nccl.h>\n\
+             \x20                 headers alone: cuda-cudart-dev-<M>-<m>\n\
+             \x20                 plus cuda-crt-<M>-<m> and libnccl-dev\n\
              \x20 Other Linux:    install the CUDA Toolkit\n\
              \x20 macOS:          no CUDA build exists for macOS\n\n\
-             Set CUDA_HOME if your install is not at /usr/local/cuda.\n"
+             Set CUDA_HOME if your install is not at /usr/local/cuda.\n",
+            cuda_missing.join(", "),
         );
         std::process::exit(1);
     }
