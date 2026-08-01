@@ -682,6 +682,8 @@ pub fn probe_local(
         );
     }
 
+    check_gpu_toolkit(libtorch.info.as_ref(), &mut warnings);
+
     ProbeReport {
         host,
         gpus,
@@ -888,6 +890,100 @@ fn check_data_path(
     }
 
     DataPathStatus { path, exists, readable, fs_type, skipped: false }
+}
+
+/// Report a missing vendor toolkit for the ACTIVE libtorch variant.
+///
+/// The active variant is what declares intent: `precompiled/rocm70` says
+/// this project builds ROCm, so it will need HIP headers. That is the
+/// same signal `$FDL_GPU_FEATURE` is derived from, so the two cannot
+/// disagree about which vendor is in play.
+///
+/// Only the HEADERS are checked, and that is not an approximation:
+/// libtorch bundles every library the link needs (`libamdhip64` and the
+/// CUDA runtime libs both ship inside `libtorch/lib`), so headers are
+/// the entire gap between an installed libtorch and a compiling one.
+///
+/// A WARNING, not an issue. floDl's default workflow builds inside the
+/// dev container, where host headers are irrelevant -- making this an
+/// error would put a permanent red mark on the most common setup. It
+/// matters for native builds, which is what a cloud host does, so the
+/// text says which case it applies to.
+///
+/// `flodl-sys/build.rs` guards the same thing at compile time. This is
+/// the earlier, friendlier half: `fdl probe` is what an operator runs on
+/// a fresh box, and it should not take a failed build to learn this.
+fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
+    let Some(info) = info else { return };
+    let Some(vendor) = detect::variant_vendor(&info.path) else {
+        return; // CPU variant: no toolkit to want.
+    };
+
+    // `GpuVendor` is #[non_exhaustive] on purpose -- Intel is the planned
+    // third. A vendor with no entry here has no known toolkit layout, and
+    // guessing one would produce a confidently wrong apt command. Say
+    // nothing until someone adds real facts.
+    let plan = match vendor {
+        GpuVendor::Amd => Some((
+            "ROCM_PATH",
+            "/opt/rocm",
+            vec!["include/hip/hip_runtime.h", "include/rccl/rccl.h"],
+            "hip-dev rccl-dev",
+            "rocm",
+        )),
+        GpuVendor::Nvidia => Some((
+            "CUDA_HOME",
+            "/usr/local/cuda",
+            vec!["include/cuda_runtime.h", "include/nccl.h"],
+            "cuda-toolkit libnccl-dev",
+            "cuda",
+        )),
+        _ => None,
+    };
+    let Some((root_env, root_default, headers, packages, feature)) = plan else {
+        return;
+    };
+
+    let root = std::env::var(root_env).unwrap_or_else(|_| root_default.to_string());
+    if let Some(w) = gpu_toolkit_warning(
+        &info.path, Path::new(&root), root_env, &headers, packages, feature,
+    ) {
+        warnings.push(w);
+    }
+}
+
+/// Pure core of [`check_gpu_toolkit`]: the toolkit root is a parameter,
+/// not an env read, so every arm is testable without mutating
+/// process-global state. That matters more than usual here -- this
+/// crate's test binary runs in parallel, and an env-mutating test only
+/// works if every reader takes the same lock, which they do not.
+#[allow(clippy::too_many_arguments)]
+fn gpu_toolkit_warning(
+    variant: &str,
+    root: &Path,
+    root_env: &str,
+    headers: &[&str],
+    packages: &str,
+    feature: &str,
+) -> Option<String> {
+    let missing: Vec<&str> = headers
+        .iter()
+        .copied()
+        .filter(|h| !root.join(h).exists())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let root = root.display();
+    Some(format!(
+        "active libtorch is `{}` but its toolkit headers are missing under \
+         `{root}` ({}). Native builds with `--features {feature}` will fail; \
+         building in the dev container is unaffected. Install them with \
+         `sudo apt install {packages}`, or set {root_env} if your install is \
+         elsewhere.",
+        variant,
+        missing.join(", "),
+    ))
 }
 
 fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatus {
@@ -1239,6 +1335,84 @@ fn report_to_json_object(r: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- GPU toolkit headers -------------------------------------------
+
+    const ROCM_HEADERS: &[&str] =
+        &["include/hip/hip_runtime.h", "include/rccl/rccl.h"];
+
+    #[test]
+    fn toolkit_warning_names_every_missing_header() {
+        let root = PathBuf::from("/nonexistent/flodl-probe-test/rocm");
+        let w = gpu_toolkit_warning(
+            "precompiled/rocm70", &root, "ROCM_PATH",
+            ROCM_HEADERS, "hip-dev rccl-dev", "rocm",
+        )
+        .expect("absent toolkit must warn");
+        // Both headers, the variant that implied the vendor, the package
+        // to install, and the override -- the four things that make the
+        // message actionable rather than merely true.
+        assert!(w.contains("hip/hip_runtime.h"), "{w}");
+        assert!(w.contains("rccl/rccl.h"), "{w}");
+        assert!(w.contains("precompiled/rocm70"), "{w}");
+        assert!(w.contains("sudo apt install hip-dev rccl-dev"), "{w}");
+        assert!(w.contains("ROCM_PATH"), "{w}");
+    }
+
+    #[test]
+    fn toolkit_warning_says_the_container_path_is_unaffected() {
+        // Severity rationale, pinned: flodl's default workflow builds in
+        // the dev container, where host headers are irrelevant. If this
+        // sentence goes, the warning starts reading like a broken host.
+        let root = PathBuf::from("/nonexistent/flodl-probe-test/cuda");
+        let w = gpu_toolkit_warning(
+            "precompiled/cu128", &root, "CUDA_HOME",
+            &["include/cuda_runtime.h"], "cuda-toolkit", "cuda",
+        )
+        .unwrap();
+        assert!(w.contains("dev container is unaffected"), "{w}");
+        assert!(w.contains("--features cuda"), "{w}");
+    }
+
+    #[test]
+    fn toolkit_present_warns_nothing() {
+        // The repo root has no `include/` at all, so point the check at
+        // a header that does exist to prove the negative case is real
+        // rather than vacuously passing.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(root.join("Cargo.toml").is_file());
+        assert!(
+            gpu_toolkit_warning(
+                "precompiled/rocm70", &root, "ROCM_PATH",
+                &["Cargo.toml"], "hip-dev", "rocm",
+            )
+            .is_none(),
+            "a present header must not warn"
+        );
+    }
+
+    #[test]
+    fn partial_toolkit_reports_only_what_is_missing() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let w = gpu_toolkit_warning(
+            "precompiled/rocm70", &root, "ROCM_PATH",
+            &["Cargo.toml", "include/rccl/rccl.h"], "rccl-dev", "rocm",
+        )
+        .expect("one missing header is still a warning");
+        assert!(w.contains("rccl/rccl.h"), "{w}");
+        assert!(!w.contains("Cargo.toml"), "must not list the header it found: {w}");
+    }
+
+    #[test]
+    fn cpu_variant_wants_no_toolkit() {
+        // `variant_vendor` returns None for a CPU build, which is the
+        // gate that keeps this whole check silent on CPU-only hosts.
+        assert!(detect::variant_vendor("precompiled/cpu").is_none());
+        assert!(detect::variant_vendor("precompiled/cpu-linux-aarch64").is_none());
+        // And the vendors that DO imply a toolkit still resolve.
+        assert_eq!(detect::variant_vendor("precompiled/rocm70"), Some(GpuVendor::Amd));
+        assert_eq!(detect::variant_vendor("precompiled/cu128"), Some(GpuVendor::Nvidia));
+    }
 
     #[test]
     fn data_path_check_skipped_when_flag_set() {

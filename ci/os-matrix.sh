@@ -42,6 +42,15 @@ endgroup() { if [ -n "$IN_CI" ]; then echo "::endgroup::"; fi; }
 pass()     { echo "PASS: $*"; }
 note()     { if [ -n "$IN_CI" ]; then echo "::notice::$*"; else echo "NOTE: $*"; fi; }
 
+# `fdl probe` exits 1 whenever it reports ANY issue, and a CI host always
+# has some (no GPU, no NCCL). Under `set -o pipefail` that makes
+# `probe | grep -q` return non-zero EVEN WHEN GREP MATCHES -- which
+# silently inverted every probe assertion in this script and turned four
+# green hosts red. Capture the output first, then match against the text.
+probe_json() { "$FDL" probe --json 2>/dev/null || true; }
+probe_text() { "$FDL" probe 2>&1 || true; }
+has()        { printf '%s' "$1" | grep -qF "$2"; }
+
 HARD_FAIL=0
 SOFT_FAIL=0
 fail()     { HARD_FAIL=1; if [ -n "$IN_CI" ]; then echo "::error::$*"; else echo "FAIL: $*"; fi; }
@@ -186,12 +195,13 @@ group "fdl probe -- bare host"
 if [ -e libtorch/.active ]; then
     note "libtorch already provisioned here; skipping the bare-host assertions"
 else
-    if "$FDL" probe --json 2>/dev/null | grep -q '"libtorch":null'; then
+    BARE_JSON=$(probe_json)
+    if has "$BARE_JSON" '"libtorch":null'; then
         pass "probe reports libtorch unconfigured on a bare host"
     else
         fail "$HOST: probe should report libtorch:null before any install"
     fi
-    if "$FDL" probe --json 2>/dev/null | grep -q 'libtorch not configured'; then
+    if has "$BARE_JSON" 'libtorch not configured'; then
         pass "probe names the fix"
     else
         fail "$HOST: probe should tell the user to run 'fdl libtorch download'"
@@ -308,12 +318,26 @@ group "fdl probe -- configured host"
 # The other half of the pair: same command, and now it reports a variant
 # instead of telling you to install one.
 "$FDL" probe || true
-if "$FDL" probe --json 2>/dev/null | grep -q "\"path\":\"precompiled/$LT_DIR\""; then
+if has "$(probe_json)" "\"path\":\"precompiled/$LT_DIR\""; then
     pass "probe now reports precompiled/$LT_DIR"
 elif [ "$INSTALL_ADVISORY" = 1 ]; then
     soft "$HOST: probe does not report the variant (install was advisory)"
 else
     fail "$HOST: probe should report precompiled/$LT_DIR after install"
+fi
+
+# On a vendor variant the toolkit is still absent at this point, and
+# probe is supposed to say so BEFORE a build fails. This is the earlier
+# half of the pair build.rs guards at compile time.
+if [ "$GPU" = 1 ] && ! has "$(probe_text)" 'toolkit headers are missing'; then
+    if [ -e "${ROCM_PATH:-/opt/rocm}/include/hip/hip_runtime.h" ] \
+       || [ -e "${CUDA_HOME:-/usr/local/cuda}/include/cuda_runtime.h" ]; then
+        note "toolkit already installed; nothing for probe to warn about"
+    else
+        fail "$HOST: probe should warn that the $LT_DIR toolkit headers are missing"
+    fi
+elif [ "$GPU" = 1 ]; then
+    pass "probe warns about the missing vendor toolkit before any build"
 fi
 endgroup
 fi
