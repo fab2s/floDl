@@ -751,13 +751,7 @@ fn prebuild_one_worker(
             feat = if features_arg.is_empty() { "(none)" } else { features_arg },
         ));
     }
-    // Runtime LD_LIBRARY_PATH uses the REMOTE-side view: the rank
-    // exec's the binary on the remote, where libtorch is at
-    // `<worker.path>/libtorch/<arch>/lib` per the convention.
-    let runtime_lib = format!(
-        "{path}/libtorch/{arch}/lib",
-        path = worker.path.trim_end_matches('/'),
-    );
+    let runtime_lib = runtime_ld_library_path(&worker.path, arch);
     let _ = host_path; // controller-side path used only for the build above
     // cwd_subpath: the cmd's filesystem cwd relative to project_root.
     // For `fdl ddp-bench` invoked from the repo, cmd_cwd is
@@ -791,6 +785,39 @@ fn features_from_arch(arch: &str) -> &'static str {
     crate::libtorch::detect::variant_feature(arch)
 }
 
+/// Runtime `LD_LIBRARY_PATH` for a remote rank, in the REMOTE-side view:
+/// the rank execs the binary on the remote, where libtorch lives at
+/// `<worker.path>/libtorch/<arch>/lib` per the convention.
+///
+/// **D1a: on ROCm the SYSTEM runtime must come FIRST**, ahead of
+/// libtorch's own lib dir. libtorch-rocm bundles the ENTIRE userspace
+/// ROCm stack (libamdhip64, libhsa-runtime64, libamd_comgr, librocm-core,
+/// and the kernel-interface-coupled libdrm / libdrm_amdgpu / libnuma), so
+/// with libtorch first that bundle wins over the host's — and when it
+/// disagrees with the host's amdkfd driver the rank segfaults at its
+/// FIRST GPU OP, a failure that looks nothing like a library-path
+/// problem. Same ordering as `Dockerfile.rocm`, whose comment carries the
+/// full derivation.
+///
+/// A path that does not exist is skipped by the loader, so prefixing is
+/// harmless on a host without ROCm there. `/opt/rocm` is the convention;
+/// a host installing elsewhere overrides via
+/// `worker.env: { LD_LIBRARY_PATH: ... }`.
+///
+/// Split out from the build path so the ordering is testable without a
+/// cluster — it is exactly the kind of load-bearing detail that rots
+/// silently when only an integration path exercises it.
+fn runtime_ld_library_path(worker_path: &str, arch: &str) -> String {
+    let libtorch_lib = format!(
+        "{path}/libtorch/{arch}/lib",
+        path = worker_path.trim_end_matches('/'),
+    );
+    match crate::libtorch::detect::variant_vendor(arch) {
+        Some(flodl_hw::GpuVendor::Amd) => format!("/opt/rocm/lib:{libtorch_lib}"),
+        _ => libtorch_lib,
+    }
+}
+
 /// Extract a CUDA major.minor string from a `precompiled/cuNN` arch
 /// path basename (e.g. `cu128` → `"12.8"`). Returns `None` for source
 /// builds (`builds/sm…`) where the arch alone does not encode a CUDA
@@ -798,10 +825,10 @@ fn features_from_arch(arch: &str) -> &'static str {
 /// docker-compose's own default) for the toolkit image tag.
 ///
 /// Deliberately CUDA-only: it feeds the NVIDIA toolkit image tag. A
-/// `rocm63` or `gfx…` basename returns `None` for free (neither starts
-/// with `cu`), and gains a sibling if a ROCm compose service ever
-/// exists — which it does not, because `--features rocm` does not build
-/// yet.
+/// `rocm70` or `gfx…` basename returns `None` for free (neither starts
+/// with `cu`). ROCm needs no sibling: its compose service pins the
+/// runtime version in the image itself (`ROCM_VERSION` build arg),
+/// rather than deriving a toolkit tag from the libtorch variant.
 fn cuda_version_from_arch(arch: &str) -> Option<String> {
     let basename = std::path::Path::new(arch)
         .file_name()
@@ -904,6 +931,45 @@ mod tests {
         assert_eq!(features_from_arch("builds/sm61-sm120"), "cuda");
         assert_eq!(features_from_arch("builds/sm80"), "cuda");
         assert_eq!(features_from_arch("precompiled/cpu"), "");
+    }
+
+    #[test]
+    fn runtime_ld_path_is_libtorch_only_on_nvidia_and_cpu() {
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl", "precompiled/cu128"),
+            "/home/me/rdl/libtorch/precompiled/cu128/lib"
+        );
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl", "builds/sm61-sm120"),
+            "/home/me/rdl/libtorch/builds/sm61-sm120/lib"
+        );
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl", "precompiled/cpu"),
+            "/home/me/rdl/libtorch/precompiled/cpu/lib"
+        );
+    }
+
+    #[test]
+    fn runtime_ld_path_puts_system_rocm_first_on_amd() {
+        // D1a. The ORDER is the whole point: libtorch-rocm ships its own
+        // copy of the userspace ROCm stack, and letting it win over the
+        // host's segfaults at the first GPU op.
+        for arch in ["precompiled/rocm70", "builds/gfx1030-gfx1100"] {
+            let p = runtime_ld_library_path("/home/me/rdl", arch);
+            assert!(
+                p.starts_with("/opt/rocm/lib:"),
+                "system ROCm must come first, got {p}"
+            );
+            assert!(p.ends_with(&format!("/libtorch/{arch}/lib")), "got {p}");
+        }
+    }
+
+    #[test]
+    fn runtime_ld_path_normalizes_a_trailing_slash_in_worker_path() {
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl/", "precompiled/cu128"),
+            "/home/me/rdl/libtorch/precompiled/cu128/lib"
+        );
     }
 
     #[test]

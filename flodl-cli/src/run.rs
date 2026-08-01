@@ -651,11 +651,13 @@ pub const LOGICAL_GPU_SERVICE: &str = "gpu";
 /// missing either. So the service must be *selected*, and this is where.
 ///
 /// The AMD arm falls back to the CUDA container **with a message** when
-/// no `rocm` service is defined. That is deliberate rather than an
-/// error: it is the state the repo is in until the ROCm image lands, and
-/// landing in the CUDA container produces the *better* diagnostic, since
-/// flodl-sys then reports exactly which part of its ROCm path is
-/// missing. Compose's bare "no such service: rocm" would say less.
+/// no `rocm` service is defined. This repo and `fdl init`'s scaffolds
+/// both define one now, so the fallback is for a project whose
+/// `docker-compose.yml` predates it (or was hand-trimmed). It stays a
+/// message rather than an error because landing in the CUDA container
+/// produces the *better* diagnostic: flodl-sys then reports exactly
+/// which part of its ROCm path is missing, where compose's bare "no such
+/// service: rocm" would say less.
 pub fn resolve_docker_service(name: &str, project_root: &Path) -> String {
     if name != LOGICAL_GPU_SERVICE {
         return name.to_string();

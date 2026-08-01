@@ -177,9 +177,10 @@ pub(crate) fn arch_coverage(
 /// preserves the pre-multi-vendor behaviour exactly, which matters
 /// because a user may well have a hand-named CUDA variant
 /// (`builds/mybuild`) that works today; hard-erroring would break a
-/// running setup to guard against a case that cannot yet exist, since
-/// `--features rocm` does not build. The warning is the point: the old
-/// code made the same assumption in silence.
+/// running setup for the sake of a naming convention. The warning is
+/// the point: the old code made the same assumption in silence, and an
+/// unrecognised basename on an AMD box would otherwise be cross-built
+/// for NVIDIA without a word.
 pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
     let basename = std::path::Path::new(variant)
         .file_name()

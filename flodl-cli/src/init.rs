@@ -249,6 +249,10 @@ fn scaffold_docker(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(), 
         DOCKERFILE_CUDA,
     )?;
     write_file(
+        &format!("{}/Dockerfile.rocm", name),
+        DOCKERFILE_ROCM,
+    )?;
+    write_file(
         &format!("{}/docker-compose.yml", name),
         &docker_compose_template(crate_name, true),
     )?;
@@ -271,6 +275,10 @@ fn scaffold_mounted(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(),
     write_file(
         &format!("{}/Dockerfile.cuda", name),
         DOCKERFILE_CUDA_MOUNTED,
+    )?;
+    write_file(
+        &format!("{}/Dockerfile.rocm", name),
+        DOCKERFILE_ROCM_MOUNTED,
     )?;
     write_file(
         &format!("{}/docker-compose.yml", name),
@@ -509,6 +517,39 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${{ROCM_VERSION:-7.0}}
+    image: {crate_name}-rocm
+    user: "${{UID:-1000}}:${{GID:-1000}}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
 "#
         )
     } else {
@@ -569,6 +610,37 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${{ROCM_VERSION:-7.0}}
+    image: {crate_name}-rocm
+    user: "${{UID:-1000}}:${{GID:-1000}}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ${{LIBTORCH_ROCM_PATH:-./libtorch/precompiled/rocm70}}:/usr/local/libtorch:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
 "#
         )
     }
@@ -685,6 +757,75 @@ ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
 ENV LIBRARY_PATH="${LIBTORCH_PATH}/lib:/usr/local/cuda/lib64"
 ENV CUDA_HOME="/usr/local/cuda"
+
+WORKDIR /workspace
+"#;
+
+// ROCm images. The `/opt/rocm/lib` FIRST ordering below is load-bearing,
+// not cosmetic: libtorch-rocm bundles the ENTIRE userspace ROCm stack in
+// its own lib/ (libamdhip64, libhsa-runtime64, libamd_comgr, librocm-core,
+// and the kernel-interface-coupled libdrm / libdrm_amdgpu / libnuma). With
+// libtorch's lib/ first that bundle wins over the system runtime, and when
+// it disagrees with the host's amdkfd driver the process segfaults at the
+// FIRST GPU OP -- a failure that looks nothing like a link problem, which
+// is what makes it the lowest-discoverability item in a ROCm bring-up.
+
+const DOCKERFILE_ROCM: &str = r#"# ROCm dev image for floDl projects.
+# Requires: docker run --device /dev/kfd --device /dev/dri ...
+ARG ROCM_VERSION=7.0
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl unzip ca-certificates git gcc g++ pkg-config graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+ENV CARGO_HOME="/usr/local/cargo"
+ENV RUSTUP_HOME="/usr/local/rustup"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+# libtorch (ROCm 7.0)
+ARG LIBTORCH_VERSION=2.10.0
+RUN wget -q "https://download.pytorch.org/libtorch/rocm7.0/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.0.zip" \
+    && unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip" -d /usr/local \
+    && rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip"
+
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV ROCM_PATH="/opt/rocm"
+# System ROCm FIRST -- see the note above this template.
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+
+WORKDIR /workspace
+"#;
+
+const DOCKERFILE_ROCM_MOUNTED: &str = r#"# ROCm dev image for floDl projects (libtorch mounted at runtime).
+# Requires: docker run --device /dev/kfd --device /dev/dri ...
+ARG ROCM_VERSION=7.0
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl unzip ca-certificates git gcc g++ pkg-config graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+ENV CARGO_HOME="/usr/local/cargo"
+ENV RUSTUP_HOME="/usr/local/rustup"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV ROCM_PATH="/opt/rocm"
+# System ROCm FIRST -- see the note above this template.
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
 
 WORKDIR /workspace
 "#;
