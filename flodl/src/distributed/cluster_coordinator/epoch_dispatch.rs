@@ -679,6 +679,16 @@ impl ClusterCoordinator {
                 coverage.seed, self.seed,
             )));
         }
+        if coverage.epoch_splits != self.epoch_splits {
+            return Err(TensorError::new(&format!(
+                "cluster_coordinator: resume coverage epoch_splits {} != run \
+                 epoch_splits {} — an epoch covers a different slice of the pass, so \
+                 the recorded uncovered offsets map to different samples exactly as a \
+                 changed seed would (resume would repeat covered data and skip \
+                 uncovered data). Resume with the same epoch_splits.",
+                coverage.epoch_splits, self.epoch_splits,
+            )));
+        }
         if coverage.per_epoch.is_empty() {
             // Nothing was in progress at the snapshot (saved exactly on a clean
             // epoch boundary): fall back to fresh dispatch of `start_epoch`.
@@ -744,6 +754,7 @@ impl ClusterCoordinator {
             .collect();
         CoverageBlock {
             seed: self.seed,
+            epoch_splits: self.epoch_splits,
             batch_size: self.batch_size,
             per_epoch,
         }

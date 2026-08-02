@@ -248,6 +248,7 @@ fn resume_from_coverage_rejects_seed_mismatch() {
     let mut coord = ClusterCoordinator::for_test(cfg);
     coord.start_coverage = Some(CoverageBlock {
         seed: 999, // recorded with a DIFFERENT seed
+        epoch_splits: 1,
         batch_size: 1,
         per_epoch: vec![EpochCoverage {
             epoch: 0,
@@ -1261,4 +1262,82 @@ fn an_uneven_split_spreads_the_remainder_and_still_tiles() {
             coord.plans_for_epoch(event).iter().map(|p| p.partition_size).sum();
         assert_eq!(covered as usize, want, "event {event}");
     }
+}
+
+// A changed `epoch_splits` corrupts resume exactly as a changed seed does:
+// the pool totals restore from the recorded EpochCoverage, but ranks map
+// those offsets back to picks through the LIVE value, so the run would
+// repeat covered data and skip uncovered data — silently. Refuse instead.
+#[test]
+fn resume_from_coverage_rejects_epoch_splits_mismatch() {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+    use crate::distributed::{CoverageBlock, EpochCoverage};
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .progressive(true)
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(5)
+    .epoch_splits(4)
+    .seed(7);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.start_coverage = Some(CoverageBlock {
+        seed: 7, // same seed, so only the splits differ
+        epoch_splits: 2, // recorded under a DIFFERENT slicing
+        batch_size: 1,
+        per_epoch: vec![EpochCoverage {
+            epoch: 0,
+            total_samples: 50,
+            uncovered_ranges: vec![(0, 50)],
+        }],
+    });
+    let err = coord.resume_progressive_from_coverage().unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("epoch_splits 2"), "must name both values: {msg}");
+    assert!(msg.contains("epoch_splits 4"), "must name both values: {msg}");
+}
+
+// Matching splits resume normally — the guard must not fire on the
+// everyday case, including the unsplit default.
+#[test]
+fn resume_from_coverage_accepts_matching_epoch_splits() {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+    use crate::distributed::{CoverageBlock, EpochCoverage};
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .progressive(true)
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(5)
+    .epoch_splits(4)
+    .seed(7);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.start_coverage = Some(CoverageBlock {
+        seed: 7,
+        epoch_splits: 4,
+        batch_size: 1,
+        per_epoch: vec![EpochCoverage {
+            epoch: 0,
+            total_samples: 25,
+            uncovered_ranges: vec![(0, 25)],
+        }],
+    });
+    assert!(
+        coord.resume_progressive_from_coverage().expect("matching splits resume"),
+        "a matching coverage block must reconstruct the pool",
+    );
 }
