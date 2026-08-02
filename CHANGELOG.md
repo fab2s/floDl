@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **`fdl libtorch download` built an invalid URL on Windows.** Windows archives carry a `-win-` infix that the Linux ones do not. ROCm, which upstream publishes for Linux only, is now refused there rather than fetched.
+- **`fdl setup` fetched an x86_64 libtorch on Apple Silicon.** A Docker-mounted project needs the container's libtorch, which upstream publishes for Linux x86_64 but not for Linux aarch64. Intel Macs still force the Linux build; Apple Silicon gets the host build and a pointer to the wheel-extraction steps, instead of one that cannot load in a linux/arm64 container.
 - **Auto-detect routed AMD GPUs to the CPU variant.** A card the ROCm build ships kernels for now selects that build; one outside its gfx list stays on CPU and names the covered targets. On a box with both vendors the NVIDIA cards are picked, since one libtorch build serves one vendor. `fdl setup` skipped its GPU step entirely on an AMD-only host and now shares the download command's coverage check.
 - **A `/dev/kfd` that the current user cannot open is no longer counted as a usable GPU.** ROCm needs read/write on it and on the DRM render node, both `root:render`.
 - **`flodl-sys` names the packages to install when vendor toolkit headers are missing**, instead of failing inside the C++ compile. libtorch bundles the runtime libraries, so headers are the only gap.

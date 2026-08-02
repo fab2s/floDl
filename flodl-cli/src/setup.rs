@@ -14,6 +14,38 @@ pub struct SetupOpts {
     pub force: bool,
 }
 
+/// Which libtorch a macOS host in a Docker-mounted project should get.
+///
+/// The libtorch is bind-mounted into a Linux container, so the host's
+/// Mach-O build cannot load there. What to fetch instead depends on the
+/// host arch, and only one of the two cases has an answer upstream.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum MacDockerPlan {
+    /// Not macOS, or not a Docker-mounted project: fetch for the host.
+    HostBuild,
+    /// Intel Mac. The container is linux/amd64 and upstream publishes
+    /// Linux x86_64 libtorch, so the container's build can be fetched.
+    ForceLinuxX86,
+    /// Apple Silicon. The container is linux/arm64 and upstream
+    /// publishes no Linux aarch64 libtorch in any variant, so no forced
+    /// download is correct. Fetch the host build (what the guide's
+    /// symlink step expects at `precompiled/cpu`) and name the gap.
+    HostBuildThenManualArm64,
+}
+
+/// Pure so both macOS arms are checkable from any host: the branch is
+/// unreachable on the machine most of this is developed on, and picking
+/// the wrong one installs a libtorch that cannot load in the container.
+fn macos_docker_plan(os: &str, arch: &str, docker_project: bool) -> MacDockerPlan {
+    if os != "macos" || !docker_project {
+        return MacDockerPlan::HostBuild;
+    }
+    match arch {
+        "aarch64" => MacDockerPlan::HostBuildThenManualArm64,
+        _ => MacDockerPlan::ForceLinuxX86,
+    }
+}
+
 pub fn run(opts: SetupOpts) -> Result<(), String> {
     println!();
     println!("  floDl Setup");
@@ -143,16 +175,17 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     if !skip_download {
         // Always download CPU variant (useful as fallback).
-        //
-        // Special case: on macOS in a Docker-Mounted project the libtorch
-        // ends up bind-mounted into a Linux container, so the host's
-        // macOS arm64 (Mach-O) build is useless. Force Linux x86_64 in
-        // that combination so the mount works as expected.
         let mounted_docker_project =
             ctx.is_project && ctx.root.join("Dockerfile").exists();
-        let force_linux = cfg!(target_os = "macos") && mounted_docker_project;
+        let plan = macos_docker_plan(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            mounted_docker_project,
+        );
+        let force_linux = plan == MacDockerPlan::ForceLinuxX86;
+        let apple_silicon_docker = plan == MacDockerPlan::HostBuildThenManualArm64;
         if force_linux {
-            println!("  macOS + Docker-Mounted project: fetching Linux libtorch");
+            println!("  macOS + Docker-mounted project: fetching Linux libtorch");
             println!("  for the container (host arch would not load inside Linux).");
         }
         println!("  Downloading CPU libtorch...");
@@ -163,6 +196,16 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
             ..Default::default()
         };
         download::run_with_context(cpu_opts, &ctx)?;
+
+        if apple_silicon_docker {
+            println!();
+            println!("  That is the macOS build, for the host. The dev container is");
+            println!("  linux/arm64 and needs Linux aarch64 libtorch, which PyTorch");
+            println!("  does not publish; it has to be extracted from the PyPI wheel.");
+            println!("  Steps 1 and 2 of the Apple Silicon guide do this:");
+            println!("    https://flodl.dev/guide/mac-apple-silicon");
+            println!("  Until then `fdl build` / `fdl test` will not link.");
+        }
 
         // The variant table below is CUDA-only, so the capability span
         // is taken over NVIDIA devices; a non-NVIDIA card contributes
@@ -487,4 +530,53 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The macOS arms never execute on the Linux dev box or on the Linux
+    // CI legs, and the Apple Silicon one is the case where a wrong answer
+    // installs a libtorch that cannot load inside the container.
+
+    #[test]
+    fn apple_silicon_docker_never_forces_an_x86_download() {
+        // Upstream publishes no Linux aarch64 libtorch, so forcing Linux
+        // here fetches x86_64 into a linux/arm64 container's bind-mount.
+        assert_eq!(
+            macos_docker_plan("macos", "aarch64", true),
+            MacDockerPlan::HostBuildThenManualArm64
+        );
+    }
+
+    #[test]
+    fn intel_mac_docker_forces_the_linux_build() {
+        assert_eq!(
+            macos_docker_plan("macos", "x86_64", true),
+            MacDockerPlan::ForceLinuxX86
+        );
+    }
+
+    #[test]
+    fn a_mac_without_a_docker_project_builds_for_the_host() {
+        for arch in ["aarch64", "x86_64"] {
+            assert_eq!(
+                macos_docker_plan("macos", arch, false),
+                MacDockerPlan::HostBuild,
+                "{arch} native"
+            );
+        }
+    }
+
+    #[test]
+    fn non_macos_hosts_are_unaffected() {
+        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64")] {
+            assert_eq!(
+                macos_docker_plan(os, arch, true),
+                MacDockerPlan::HostBuild,
+                "{os}/{arch}"
+            );
+        }
+    }
 }

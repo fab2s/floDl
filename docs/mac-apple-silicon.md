@@ -34,7 +34,8 @@ own toolchain. A native `fdl` binary on the host is convenient for
 ### 1. Fetch the libtorch Linux arm64 build
 
 This is the one step `fdl` cannot do for you, and the reason is worth
-stating so the workaround does not look arbitrary.
+stating so the workaround does not look arbitrary. `fdl setup` names this
+gap on Apple Silicon rather than trying to fill it.
 
 The container needs **Linux arm64** `.so` files. `fdl libtorch download`
 on a Mac gets **macOS arm64** `.dylib` files: correct for the host, and
@@ -171,24 +172,26 @@ docker compose run --rm dev env | grep CARGO_BUILD_JOBS
 If empty, confirm that `docker-compose.yml` includes `- CARGO_BUILD_JOBS` in
 the `dev` service's `environment:` list.
 
-### `fdl setup` downloaded an x86_64 libtorch on an M-series Mac
+### `fdl setup` finished but `fdl build` still will not link
 
-Known gap, and the reason this page walks through libtorch by hand instead
-of telling you to run `fdl setup`. In a project that has a `Dockerfile`,
-`fdl setup` on macOS reports:
+Expected on Apple Silicon, and `fdl setup` says so on the way out:
 
 ```
-macOS + Docker-Mounted project: fetching Linux libtorch
-for the container (host arch would not load inside Linux).
+  That is the macOS build, for the host. The dev container is
+  linux/arm64 and needs Linux aarch64 libtorch, which PyTorch
+  does not publish; it has to be extracted from the PyPI wheel.
 ```
 
-The intent is right, but the variant it picks is Linux **x86_64**, while
-Docker on Apple Silicon runs **linux/arm64** containers. The `.so` files
-land in the bind-mount and fail to load, surfacing as `cannot find -ltorch`
-or the missing-shared-object error below. `fdl` has no correct artifact to
-fetch here (see step 1: upstream publishes no Linux aarch64 libtorch), so
-follow the manual steps on this page and skip `fdl setup` for libtorch on
-a Mac. Everything else it does is fine.
+Setup installs the host's macOS build, which is the right artifact for
+`fdl libtorch info` and for step 2's `mv cpu cpu-macos-arm64`, but it is
+not what the container loads. Steps 1 and 2 on this page are still
+required. Run them, then `fdl build`.
+
+Older versions forced a Linux **x86_64** download here on the reasoning
+that the container wants Linux libtorch. That is true on an Intel Mac and
+wrong on Apple Silicon, where the container is linux/arm64; the `.so`
+files landed in the bind-mount and failed to load as `cannot find -ltorch`
+or the missing-shared-object error below.
 
 ### `libtorch_cpu.so: cannot open shared object file`
 
