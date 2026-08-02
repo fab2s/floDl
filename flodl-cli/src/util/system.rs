@@ -21,7 +21,9 @@ use std::process::Command;
 // is therefore `detect_gpus_physical` upstream. `flodl_hw::detect_gpus` is the
 // mask-honoring runtime view, used by `flodl`.
 
-pub use flodl_hw::{detect_gpus_physical as detect_gpus, nvidia_driver_version, GpuInfo};
+pub use flodl_hw::{
+    detect_gpus_physical as detect_gpus, nvidia_driver_version, GpuInfo, GpuVendor,
+};
 
 // ---------------------------------------------------------------------------
 // CPU

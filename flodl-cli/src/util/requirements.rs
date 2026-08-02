@@ -129,11 +129,19 @@ pub fn missing_headers<'a>(
         .collect()
 }
 
-/// De-duplicated package list for a set of missing headers.
+/// De-duplicated package list for a set of missing headers, in table
+/// order.
+///
+/// `Vec::dedup` is not enough: it only collapses *adjacent* duplicates,
+/// so two headers owned by one package would list it twice unless they
+/// happened to sit next to each other in the table.
 pub fn packages_for(missing: &[&(&str, &str)]) -> Vec<String> {
-    let mut pkgs: Vec<String> = missing.iter().map(|(_, p)| (*p).to_string()).collect();
-    pkgs.dedup();
-    pkgs
+    let mut seen = std::collections::HashSet::new();
+    missing
+        .iter()
+        .filter(|(_, p)| seen.insert(*p))
+        .map(|(_, p)| (*p).to_string())
+        .collect()
 }
 
 /// The install line for a package list, contextual to the platform.
@@ -192,9 +200,9 @@ mod tests {
 
     #[test]
     fn a_system_header_counts_as_present() {
-        // The regression that broke a working CUDA image: `nccl.h` ships
-        // at /usr/include/nccl.h, not under $CUDA_HOME, so a toolkit-root
-        // -only check called it missing and failed a build that compiles.
+        // A toolkit-root-only check reports headers that install outside
+        // it as missing, failing a build that in fact compiles: `nccl.h`
+        // ships at /usr/include/nccl.h, not under $CUDA_HOME.
         let root = scratch_root("sys");
         let sys_header = SYSTEM_INCLUDE_DIRS
             .iter()
@@ -213,15 +221,19 @@ mod tests {
 
     #[test]
     fn packages_are_deduplicated() {
-        let a = ("h1", "pkg"); let b = ("h2", "pkg"); let c = ("h3", "other");
+        // The duplicates are deliberately non-adjacent: adjacent ones
+        // pass under a plain `Vec::dedup`, which does not dedup a table
+        // where one package owns two headers listed apart.
+        let a = ("h1", "pkg");
+        let b = ("h2", "other");
+        let c = ("h3", "pkg");
         let missing = vec![&a, &b, &c];
         assert_eq!(packages_for(&missing), vec!["pkg", "other"]);
     }
 
     #[test]
-    fn every_rocm_header_names_a_package() {
-        // Nine headers, nine owners -- if a pair ever loses its package
-        // the message would tell a user to install "".
+    fn every_header_names_a_package() {
+        // A pair that loses its package would tell the user to install "".
         assert_eq!(ROCM_HEADERS.len(), 7);
         for (h, p) in ROCM_HEADERS {
             assert!(!h.is_empty() && !p.is_empty(), "{h} -> {p}");

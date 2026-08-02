@@ -122,11 +122,13 @@ cd my-project
 **Native** - [Rust](https://rustup.rs/) 1.85+ and libtorch:
 
 ```bash
-./fdl libtorch download    # auto-detects CPU or CUDA
+./fdl libtorch download    # auto-detects CPU, CUDA or ROCm
 cargo add flodl && cargo build
 ```
 
 For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
+
+For AMD: `cargo add flodl --features rocm` + [ROCm](https://rocm.docs.amd.com/) (Linux only). `fdl probe` lists any missing toolkit packages with the command to install them.
 
 For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
 
@@ -821,6 +823,13 @@ Developed and tested from NVIDIA Pascal (GTX 1060 6GB) to Blackwell
 (RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 - floDl
 links libtorch's stable C API, which supports every architecture the driver
 supports. If `nvidia-smi` works, floDl trains on it.
+
+**AMD (ROCm)** builds, links and detects: `fdl libtorch download --rocm 7.0`
+installs the ROCm build, `--features rocm` compiles against it, and GPUs are
+enumerated from the kernel's KFD topology. Training on AMD is **not yet
+validated on hardware** - the vendor axis is in place, the runtime numbers
+are not. A libtorch build serves one vendor, so a host picks CUDA or ROCm,
+never both in one process.
 
 Linux and [Windows via WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md)
 are the trained-on platforms - the benchmarks above were produced under

@@ -164,11 +164,46 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         };
         download::run_with_context(cpu_opts, &ctx)?;
 
-        // CUDA libtorch
         // The variant table below is CUDA-only, so the capability span
         // is taken over NVIDIA devices; a non-NVIDIA card contributes
         // none and leaves this branch inert rather than skewing it.
         let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
+
+        // AMD libtorch. One build serves one vendor, so ROCm is chosen
+        // only where there is no NVIDIA card to prefer; on a mixed box
+        // the CUDA branch below runs instead.
+        let amd: Vec<_> = gpus
+            .iter()
+            .filter(|g| g.vendor == system::GpuVendor::Amd)
+            .collect();
+        if !amd.is_empty() {
+            let covered = download::rocm_covered(&gpus);
+            if !majors.is_empty() {
+                println!();
+                println!("  AMD GPU(s) detected alongside NVIDIA. One libtorch build");
+                println!("  serves one vendor, so the NVIDIA cards are set up here.");
+                println!("  For the AMD cards: fdl libtorch download --rocm 7.0");
+            } else if covered.is_empty() {
+                let names: Vec<String> = amd
+                    .iter()
+                    .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+                    .collect();
+                println!();
+                println!("  AMD GPU(s) detected ({}) outside the ROCm 7.0", names.join(", "));
+                println!("  build's targets, so only CPU libtorch is installed.");
+                println!("  Covered targets: {}", download::rocm_archs());
+            } else {
+                println!();
+                println!("  Downloading ROCm libtorch (rocm7.0 for your AMD GPU)...");
+                let rocm_opts = download::DownloadOpts {
+                    variant: download::Variant::Rocm70,
+                    ..Default::default()
+                };
+                download::run_with_context(rocm_opts, &ctx)?;
+            }
+        }
+
+        // CUDA libtorch
         if !majors.is_empty() {
             let lo_major = majors.iter().copied().min().unwrap_or(0);
             let hi_major = majors.iter().copied().max().unwrap_or(0);

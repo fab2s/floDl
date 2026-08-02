@@ -7,6 +7,7 @@ use crate::context::Context;
 use crate::util::http;
 use crate::util::archive;
 use crate::util::system;
+use crate::util::system::GpuVendor;
 use super::detect;
 
 // ---------------------------------------------------------------------------
@@ -199,27 +200,51 @@ fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, 
 // ---------------------------------------------------------------------------
 
 fn auto_detect_variant() -> &'static VariantSpec {
-    let gpus = system::detect_gpus();
+    variant_for_gpus(&system::detect_gpus())
+}
+
+/// Route a detected GPU set to a libtorch variant.
+///
+/// Pure: the device list is a parameter rather than a probe, so every
+/// vendor and coverage arm is testable without hardware and without the
+/// process-global detection spoof.
+fn variant_for_gpus(gpus: &[system::GpuInfo]) -> &'static VariantSpec {
     if gpus.is_empty() {
         println!("  No GPU detected. Using CPU variant.");
         return &CPU_SPEC;
     }
 
-    // Every variant below is an NVIDIA CUDA build, so the capability
-    // span is computed over NVIDIA devices only.
+    // A libtorch build serves exactly one vendor, so a mixed box has to
+    // pick. NVIDIA wins: in a box holding both, the AMD part is usually
+    // an APU's integrated GPU and the NVIDIA one the training card.
+    let amd: Vec<_> = gpus
+        .iter()
+        .filter(|g| g.vendor == GpuVendor::Amd)
+        .collect();
+    let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
+    if !amd.is_empty() {
+        if has_nvidia {
+            println!(
+                "  Both NVIDIA and AMD GPUs detected. One libtorch build serves\n  \
+                 one vendor, so the NVIDIA cards are used and the AMD ones stay\n  \
+                 idle. For the AMD cards instead: fdl libtorch download --rocm 7.0",
+            );
+        } else {
+            return rocm_variant_for(&amd);
+        }
+    }
+
+    // The CUDA variants below are selected on compute capability, which
+    // only NVIDIA devices carry.
     let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
     if majors.is_empty() {
-        // A GPU box with no NVIDIA card. Falling through to CPU is the
-        // right variant, but say WHY, or this reads as "no GPU found"
-        // on a machine the user can see has one.
         let other: Vec<String> = gpus
             .iter()
             .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
             .collect();
         println!(
-            "  Detected a non-NVIDIA GPU ({}). `fdl libtorch download` only \n\
-             publishes CUDA and CPU variants today, so the CPU variant is \n\
-             selected. Use `--variant` to override.",
+            "  Detected a GPU with no known libtorch variant ({}).\n  \
+             Using the CPU variant.",
             other.join(", "),
         );
         return &CPU_SPEC;
@@ -245,6 +270,61 @@ fn auto_detect_variant() -> &'static VariantSpec {
         println!("  Detected pre-Volta GPU(s). Using cu126.");
         &CU126_SPEC
     }
+}
+
+/// AMD devices the ROCm variant ships kernels for.
+///
+/// Exposed so the setup wizard routes on the same coverage list this
+/// module downloads against: two independently-maintained copies is how
+/// the wizard came to skip AMD boxes in silence.
+pub fn rocm_covered(gpus: &[system::GpuInfo]) -> Vec<&system::GpuInfo> {
+    gpus.iter()
+        .filter(|g| g.vendor == GpuVendor::Amd && g.covered_by(ROCM70_SPEC.arch_archs))
+        .collect()
+}
+
+/// The gfx targets the ROCm variant covers, for diagnostics.
+pub fn rocm_archs() -> &'static str {
+    ROCM70_SPEC.arch_archs
+}
+
+/// Pick between the ROCm variant and CPU for a set of AMD devices.
+///
+/// The ROCm archive carries pre-built rocBLAS Tensile kernels for a
+/// fixed gfx list; a target outside it has no kernels, so the variant is
+/// only worth downloading when it covers at least one device present.
+fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
+    let (covered, uncovered): (Vec<_>, Vec<_>) = amd
+        .iter()
+        .partition(|g| g.covered_by(ROCM70_SPEC.arch_archs));
+
+    let describe = |gs: &[&&system::GpuInfo]| {
+        gs.iter()
+            .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if covered.is_empty() {
+        println!(
+            "  Detected AMD GPU(s) ({}) outside the ROCm 7.0 build's gfx\n  \
+             targets, so the CPU variant is selected.\n  \
+             Covered targets: {}.",
+            describe(&uncovered),
+            ROCM70_SPEC.arch_archs,
+        );
+        return &CPU_SPEC;
+    }
+    if !uncovered.is_empty() {
+        println!(
+            "  Note: {} is not covered by the ROCm 7.0 build and will be\n  \
+             unusable. Covered targets: {}.",
+            describe(&uncovered),
+            ROCM70_SPEC.arch_archs,
+        );
+    }
+    println!("  Detected AMD GPU(s) ({}). Using ROCm 7.0.", describe(&covered));
+    &ROCM70_SPEC
 }
 
 fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
@@ -623,5 +703,88 @@ mod tests {
         assert!(url.contains("libtorch-shared-with-deps-"), "got {url}");
         assert!(!url.contains("-win-"), "got {url}");
         assert!(!url.contains("macos"), "got {url}");
+    }
+
+    // Variant routing. Asserted through the pure `variant_for_gpus` so no
+    // arm depends on the host's own hardware.
+
+    fn gpu(vendor: GpuVendor, arch: &str) -> system::GpuInfo {
+        system::GpuInfo {
+            index: 0,
+            vendor,
+            name: format!("test {arch}"),
+            arch: flodl_hw::GpuArch::parse(vendor, arch)
+                .unwrap_or_else(|| panic!("unparsable arch {arch}")),
+            total_memory_mb: 8192,
+        }
+    }
+
+    #[test]
+    fn no_gpu_routes_to_cpu() {
+        assert_eq!(variant_for_gpus(&[]).arch_variant, "cpu");
+    }
+
+    #[test]
+    fn a_covered_amd_gpu_routes_to_rocm() {
+        // The bug this guards: a gfx target the ROCm archive ships kernels
+        // for was routed to the CPU variant, so an AMD box trained on CPU.
+        for arch in ["gfx906", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1201"] {
+            let v = variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]);
+            assert_eq!(v.arch_variant, "rocm7.0", "{arch} should route to ROCm");
+        }
+    }
+
+    #[test]
+    fn an_uncovered_amd_gpu_routes_to_cpu() {
+        // No bundled Tensile kernels for this target, so ROCm would build
+        // but not run. Proves the previous test is not vacuously green.
+        let v = variant_for_gpus(&[gpu(GpuVendor::Amd, "gfx803")]);
+        assert_eq!(v.arch_variant, "cpu");
+    }
+
+    #[test]
+    fn a_partly_covered_amd_set_still_routes_to_rocm() {
+        let v = variant_for_gpus(&[
+            gpu(GpuVendor::Amd, "gfx942"),
+            gpu(GpuVendor::Amd, "gfx803"),
+        ]);
+        assert_eq!(v.arch_variant, "rocm7.0");
+    }
+
+    #[test]
+    fn a_mixed_vendor_box_routes_to_cuda() {
+        // One libtorch build serves one vendor; NVIDIA is the pick, and
+        // the AMD device must not drag the result to ROCm or to CPU.
+        let v = variant_for_gpus(&[
+            gpu(GpuVendor::Nvidia, "sm_120"),
+            gpu(GpuVendor::Amd, "gfx1100"),
+        ]);
+        assert_eq!(v.arch_variant, "cu128");
+    }
+
+    #[test]
+    fn rocm_covered_selects_only_supported_amd_devices() {
+        // The setup wizard routes on this, so it must not count an NVIDIA
+        // card nor an AMD target the archive ships no kernels for.
+        let gpus = vec![
+            gpu(GpuVendor::Nvidia, "sm_120"),
+            gpu(GpuVendor::Amd, "gfx942"),
+            gpu(GpuVendor::Amd, "gfx803"),
+        ];
+        let covered = rocm_covered(&gpus);
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].arch_label(), "gfx942");
+    }
+
+    #[test]
+    fn nvidia_routing_is_unchanged() {
+        assert_eq!(
+            variant_for_gpus(&[gpu(GpuVendor::Nvidia, "sm_120")]).arch_variant,
+            "cu128"
+        );
+        assert_eq!(
+            variant_for_gpus(&[gpu(GpuVendor::Nvidia, "sm_61")]).arch_variant,
+            "cu126"
+        );
     }
 }
