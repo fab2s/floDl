@@ -17,7 +17,9 @@ services:
     # Container hostname inherits the host's hostname so the cluster
     # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
     # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     environment:
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
@@ -80,7 +82,9 @@ services:
     # Container hostname inherits the host's hostname so the cluster
     # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
     # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     # Share the host's network namespace so the cluster controller +
     # coord (bound on exa-side ports) are reachable from remote rank
     # VMs. Docker's default bridge isolates the container from the
@@ -201,7 +205,12 @@ services:
     stdin_open: true
     tty: true
     shm_size: 2gb
-    hostname: ${HOSTNAME}
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
+    # the container ID is used and the host is "not in cluster.hosts").
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     network_mode: host
     environment:
       - FLODL_VERBOSITY
@@ -320,7 +329,9 @@ services:
     # Container hostname inherits the host's hostname so the cluster
     # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
     # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     # Share the host's network namespace so the cluster controller +
     # coord (bound on exa-side ports) are reachable from remote rank
     # VMs. Docker's default bridge isolates the container from the

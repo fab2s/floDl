@@ -10,6 +10,15 @@
 
 COMPOSE = docker compose
 
+# docker-compose.yml sets each service's `hostname:` from HOSTNAME so the
+# cluster launcher's `cluster.hosts[i].name == hostname()` match works from
+# inside the container. bash keeps HOSTNAME as a shell variable but never
+# exports it, so make doesn't inherit it and every COMPOSE target below
+# would otherwise run with a blank one. `fdl` fills it the same way
+# (flodl-cli/src/main.rs). `?=` leaves an already-exported value alone.
+HOSTNAME ?= $(shell hostname)
+export HOSTNAME
+
 .PHONY: docs-rs site site-stop sync-skills test-init release-check clean
 
 # --- docs.rs validation (host-side mkdir + nightly toolchain) ---

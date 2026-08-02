@@ -28,6 +28,11 @@
 set -u
 cd "$(git rev-parse --show-toplevel)"
 
+# Mirror flodl-cli/src/main.rs -- docker-compose.yml sets each service's
+# `hostname:` from HOSTNAME. sh keeps it as a shell variable at best and
+# never exports it, so compose would see a blank one here.
+export HOSTNAME="${HOSTNAME:-$(hostname)}"
+
 # Mirror flodl-cli/src/run.rs::libtorch_env -- docker-compose.yml uses
 # LIBTORCH_CPU_PATH (always) and LIBTORCH_HOST_PATH / CUDA_VERSION /
 # CUDA_TAG (when an active CUDA variant exists) to pick mount points
