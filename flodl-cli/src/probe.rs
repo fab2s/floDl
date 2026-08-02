@@ -1128,7 +1128,17 @@ fn print_report(r: &ProbeReport) {
             if let Some(t) = &info.torch_version {
                 println!("  torch : {}", t);
             }
-            if let Some(c) = &info.cuda_version {
+            // Same reason as `fdl diagnose`: `cuda=` is a CUDA toolkit
+            // version, absent (`none`) on both ROCm and CPU builds, so
+            // the vendor comes from the variant path instead. The JSON
+            // arm below keeps emitting the raw `cuda` field -- it is
+            // cluster wire format that remote hosts are parsed back out
+            // of, so its shape is not a display decision.
+            match detect::variant_vendor(&info.path) {
+                Some(v) => println!("  vendor: {}", v),
+                None => println!("  vendor: CPU-only"),
+            }
+            if let Some(c) = info.cuda_version.as_deref().filter(|c| *c != "none") {
                 println!("  cuda  : {}", c);
             }
             if let Some(a) = &info.archs {

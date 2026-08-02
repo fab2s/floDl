@@ -492,7 +492,11 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
             println!("  .active: libtorch/.active -> {}", variant_id);
         }
         println!();
-        if spec.arch_cuda != "none" {
+        // From the variant PATH, not `.arch`'s `cuda=`: a ROCm build has
+        // no CUDA toolkit version and writes `cuda=none` there exactly
+        // like a CPU build, so reading that field told anyone who had
+        // just installed ROCm libtorch to run the CPU test suite.
+        if detect::variant_vendor(&variant_id).is_some() {
             println!("  Run 'fdl gpu-test' to verify.");
         } else {
             println!("  Run 'fdl test' to verify.");
@@ -504,10 +508,13 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         println!("  To use with tch-rs or flodl, add to your shell profile:");
         println!();
         println!("    export LIBTORCH=\"{}\"", install_path.display());
-        println!(
-            "    export LD_LIBRARY_PATH=\"{}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"",
-            install_path.display()
-        );
+        // Shared recipe: on a ROCm variant the system runtime has to come
+        // first, and a recipe the user pastes is exactly where getting
+        // that backwards costs a segfault at the first GPU op.
+        let lib = format!("{}/lib", install_path.display());
+        for line in detect::ld_library_path_lines(detect::variant_vendor(&variant_id), &lib) {
+            println!("    {line}");
+        }
         println!();
         println!("  Or start a new floDl project:");
         println!("    fdl init my-project");

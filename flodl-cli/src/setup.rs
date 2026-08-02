@@ -6,6 +6,9 @@ use crate::context::Context;
 use crate::libtorch::{build, detect, download};
 use crate::util::{docker, prompt, requirements, system};
 
+/// The CPU variant's pointer value, as `download` installs it.
+const CPU_VARIANT: &str = "precompiled/cpu";
+
 #[derive(Default)]
 pub struct SetupOpts {
     /// Skip all prompts, use auto-detected defaults.
@@ -157,18 +160,23 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     if !opts.force {
         if let Some(ref info) = existing {
-            let is_cuda = info.cuda_version.as_deref() != Some("none");
-            if is_cuda {
-                println!("  Found existing CUDA libtorch: {}", info.path);
-                if opts.non_interactive {
-                    println!("  Keeping existing installation.");
-                    skip_download = true;
-                } else if !prompt::ask_yn("  Download fresh?", false) {
-                    skip_download = true;
+            // The variant PATH carries the vendor, not `.arch`'s `cuda=`
+            // field: a ROCm build has no CUDA toolkit version and writes
+            // `cuda=none` there, exactly like a CPU build. Reading that
+            // field as "is this a GPU install" labelled every existing
+            // ROCm install CPU-only and re-downloaded over it.
+            match detect::variant_vendor(&info.path) {
+                Some(vendor) => {
+                    println!("  Found existing {vendor} libtorch: {}", info.path);
+                    if opts.non_interactive {
+                        println!("  Keeping existing installation.");
+                        skip_download = true;
+                    } else if !prompt::ask_yn("  Download fresh?", false) {
+                        skip_download = true;
+                    }
+                    println!();
                 }
-                println!();
-            } else {
-                println!("  Found existing CPU libtorch.");
+                None => println!("  Found existing CPU libtorch."),
             }
         }
     }
@@ -335,7 +343,35 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
                 download::run_with_context(cuda_opts, &ctx)?;
             }
         }
+
+        // The CPU download above deliberately does not activate, so a
+        // GPU variant fetched after it wins the pointer. When no GPU
+        // variant follows -- a CPU-only box, or an AMD card outside the
+        // ROCm build's gfx list -- nothing ever writes `.active` and
+        // setup finishes with libtorch on disk that `fdl diagnose` then
+        // reports as "no active variant". Claim the pointer for CPU
+        // only if it is still unclaimed, so this can never demote a GPU
+        // variant.
+        if detect::read_active(root).is_none()
+            && detect::is_valid_variant(root, CPU_VARIANT)
+        {
+            detect::set_active(root, CPU_VARIANT)?;
+        }
     }
+
+    // The active variant, resolved ONCE for every consumer below. Both
+    // the vendor and the warning `variant_vendor` emits on an
+    // unrecognised basename belong to the variant, not to each question
+    // asked about it -- re-deriving per call-site printed the warning
+    // four times.
+    let active = detect::read_active(root);
+    let active_vendor = active
+        .as_ref()
+        .and_then(|info| detect::variant_vendor(&info.path));
+    let active_label = |v: Option<system::GpuVendor>| match v {
+        Some(vendor) => vendor.to_string(),
+        None => "CPU".to_string(),
+    };
 
     // ---- Step 3: Build environment (project-only) ----
 
@@ -345,9 +381,8 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  Setup complete!");
         println!("  ===============");
         println!();
-        if let Some(info) = detect::read_active(root) {
-            let cuda_str = if info.cuda_version.as_deref() != Some("none") { "CUDA" } else { "CPU" };
-            println!("  libtorch:  {} ({})", info.path, cuda_str);
+        if let Some(info) = &active {
+            println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
             println!("  Location:  {}", ctx.libtorch_dir().display());
         }
         println!();
@@ -436,17 +471,20 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
             println!("  Warning: CPU Docker image build failed.");
         }
 
-        // CUDA image if we have GPUs and CUDA libtorch
-        let has_cuda_lt = detect::read_active(root)
-            .is_some_and(|i| i.cuda_version.as_deref() != Some("none"));
+        // GPU image, when there is hardware AND a GPU libtorch to link
+        // against. The compose service is SELECTED from the variant's
+        // vendor rather than hardcoded: a CUDA image and a ROCm image are
+        // genuinely different artifacts (different base, different device
+        // nodes), so building `cuda` on an AMD box builds the wrong one.
+        if let Some(vendor) = active_vendor.filter(|_| !gpus.is_empty()) {
+            let service =
+                crate::run::resolve_docker_service(crate::run::LOGICAL_GPU_SERVICE, root);
+            let _ = std::fs::create_dir_all(format!(".cargo-cache-{service}"));
+            let _ = std::fs::create_dir_all(format!(".cargo-git-{service}"));
 
-        if !gpus.is_empty() && has_cuda_lt {
-            let _ = std::fs::create_dir_all(".cargo-cache-cuda");
-            let _ = std::fs::create_dir_all(".cargo-git-cuda");
-
-            let status = docker::compose_run(".", &["build", "cuda"])?;
+            let status = docker::compose_run(".", &["build", &service])?;
             if !status.success() {
-                println!("  Warning: CUDA Docker image build failed.");
+                println!("  Warning: {vendor} Docker image build failed.");
             }
         }
 
@@ -461,24 +499,19 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     println!();
 
     // Show active libtorch
-    if let Some(info) = detect::read_active(root) {
-        let cuda_str = if info.cuda_version.as_deref() != Some("none") {
-            "CUDA"
-        } else {
-            "CPU"
-        };
-        println!("  libtorch:  {} ({})", info.path, cuda_str);
+    if let Some(info) = &active {
+        println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
     }
+
+    let gpu_ready = !gpus.is_empty() && active_vendor.is_some();
 
     // Docker instructions
     if build_mode == "docker" || build_mode == "both" {
         println!();
         println!("  Build with Docker:");
-        let has_cuda_lt = detect::read_active(root)
-            .is_some_and(|i| i.cuda_version.as_deref() != Some("none"));
-        if !gpus.is_empty() && has_cuda_lt {
+        if gpu_ready {
             println!("    fdl gpu-test        # run GPU tests");
-            println!("    fdl gpu-build       # compile with CUDA");
+            println!("    fdl gpu-build       # compile for the GPU");
             println!("    fdl gpu-shell       # interactive shell");
         } else {
             println!("    fdl test             # run tests");
@@ -489,19 +522,17 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     // Native instructions
     if build_mode == "native" || build_mode == "both" {
-        if let Some(info) = detect::read_active(root) {
+        if let Some(info) = &active {
             let lt_path = format!("libtorch/{}", info.path);
             println!();
             println!("  Build natively:");
             println!("    export LIBTORCH_PATH=\"{}\"", lt_path);
-            println!(
-                "    export LD_LIBRARY_PATH=\"$LIBTORCH_PATH/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\""
-            );
-            let has_cuda_lt = info.cuda_version.as_deref() != Some("none");
-            if !gpus.is_empty() && has_cuda_lt {
-                println!("    cargo test --features cuda");
-            } else {
-                println!("    cargo test");
+            for line in detect::ld_library_path_lines(active_vendor, "$LIBTORCH_PATH/lib") {
+                println!("    {line}");
+            }
+            match active_vendor.filter(|_| gpu_ready) {
+                Some(vendor) => println!("    cargo test --features {}", vendor.cargo_feature()),
+                None => println!("    cargo test"),
             }
         }
     }

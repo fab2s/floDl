@@ -504,12 +504,42 @@ implement the trait and pass it.
 | `.disk_stage(gb)` | 0 = off | Local-disk overflow tier under the sample cache |
 | `.disk_stage_dir(path)` | temp dir | Where the disk stage's pack file lives |
 | `.vram_pool(bool)` | true | Device-resident sample pool in leftover VRAM |
+| `.gpu_ram_share(f64)` | Auto | Integrated (APU) GPUs only: fraction of `MemTotal` the GPU aperture claims |
 | `.activation_reserve(bytes)` | Auto | Declared first-step VRAM reserve for prefetch sizing |
 | `.augment(usize)` | 1 | Views per sample per epoch (pick-space schedule) |
 | `.transform(fn)` | - | Deterministic delivery transform, keyed per `PickKey` |
 | `.streaming()` | Auto | Force streaming mode |
 | `.names(&[&str])` | Positional | Name batch tensor positions |
 | `.drop_last(bool)` | true | Drop incomplete final batch |
+
+### Integrated GPUs (APUs): `gpu_ram_share`
+
+On a discrete card, VRAM and host RAM are separate pools and the budgets
+above are independent. On an integrated GPU they are the same DRAM, so
+sizing the host tiers against raw `MemAvailable` prices one pool twice.
+flodl detects this (it allocates on the device and checks whether
+`MemAvailable` moves, which distinguishes a shared aperture from a BIOS
+carve-out) and subtracts the aperture's unrealized headroom before taking
+any share. Nothing to configure in the normal case.
+
+Two cases need the knob:
+
+- **The platform under-reports the aperture.** `.gpu_ram_share(f)` states
+  the reservation as a fraction of `MemTotal` instead. Values above `1.0`
+  are legal, for a platform whose `MemTotal` under-states what the APU can
+  address.
+- **A multi-socket APU.** Each package carries its own memory and its own
+  aperture while `/proc/meminfo` is system-wide, and the kernel exposes no
+  per-package `MemAvailable` to correct with. flodl refuses to guess there
+  and asks for an explicit share rather than over-committing by the socket
+  count. The refusal is an ordinary error out of `.build()` (or rank-worker
+  construction under DDP) naming the knob, not a mid-run failure: nothing
+  in the verdict changes between epochs, so it is decided once up front.
+  NPS / Sub-NUMA Clustering on a *single* socket is not this case and needs
+  nothing.
+
+The same knob is on the DDP path: `TrainerConfig::with_gpu_ram_share` and
+`DdpRunConfig::with_gpu_ram_share`.
 
 Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vram_max_usage` / `with_ram_max_usage` / `with_sample_cache` / `with_disk_stage` / `with_disk_stage_dir` (or the chained `DdpBuilder` twins) — and govern each rank's prefetch channel, device sample pool, and staging tiers with the same defaults and clamps. One sizing policy serves both paths; co-hosted ranks split the host-RAM share in proportion to their schedule, each rank's disk stage writes its own pid-unique pack file, and `FLODL_VRAM_POOL=off` now disables the device sample pool on the solo loader path too (previously DDP-only).
 

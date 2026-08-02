@@ -447,22 +447,46 @@ fi
 if [ "$COMPILE" = 1 ]; then
 group "Build and clippy flodl"
 if [ "$GPU" = 1 ]; then
-    # Unscoped on purpose. ci.yml's rocm job must scope to
-    # -p flodl-sys -p flodl because its sparse extract cannot satisfy a
-    # link; this installed the whole tree, so a workspace build links
-    # for real -- which is where the libtorch_cuda/hip force-load and
-    # gpu_compat.h's symbol mapping fail if they are wrong.
+    # Unscoped on purpose: this leg installed the whole tree, so it can
+    # build every member against the vendor libtorch it just fetched.
+    #
+    # LINK_CMD is separate, and it is the one that matters. Neither of the
+    # other two reaches ld: the workspace's only `[[bin]]` is `fdl`, which
+    # is zero-dep on flodl by policy, so BUILD_CMD emits exactly one
+    # executable referencing no libtorch; clippy runs in check mode
+    # (--emit=metadata) whatever `--all-targets` selects. This comment
+    # used to claim the workspace build "links for real" -- measured, it
+    # produces 1 executable and links no libtorch at all.
+    #
+    # One integration-test binary, not `--tests`: it must be a SEPARATE
+    # test binary (flodl has no tests/ dir, so its lib test is the case
+    # the force-load invariant says keeps passing), and one is enough for
+    # a link check while 60-odd would add ~8 GB beside a libtorch that is
+    # 11 GB on the rocm rotation. Linked, never run -- no GPU here.
     FEATURE=$([ "$LT_DIR" = rocm70 ] && echo rocm || echo cuda)
     BUILD_CMD="cargo build --features $FEATURE"
-    LINT_CMD="cargo clippy --features $FEATURE --all-targets -- -W clippy::all"
+    CLIPPY_CMD="cargo clippy --features $FEATURE --all-targets -- -W clippy::all"
+    LINK_CMD="cargo build --features $FEATURE -p flodl-hf --test bert_cuda_smoke"
 else
     BUILD_CMD="cargo build -p flodl-sys -p flodl"
-    LINT_CMD="cargo clippy -p flodl-sys -p flodl --all-targets -- -W clippy::all"
+    CLIPPY_CMD="cargo clippy -p flodl-sys -p flodl --all-targets -- -W clippy::all"
+    # KNOWN GAP: the CPU legs still do not link libtorch either. The
+    # `cargo test` near the top of this script covers flodl-cli and
+    # flodl-hw, both of which are libtorch-free by design, and the two
+    # commands above stop at rlib and at metadata. So the OS-specific
+    # link step -- Mach-O on macOS, MSVC .lib on Windows, the exact place
+    # a per-OS build is most likely to break -- is unvalidated on the
+    # legs whose whole purpose is per-OS validation. Left as-is rather
+    # than fixed blind: unlike the GPU leg above, nobody has yet
+    # confirmed these hosts can link at all, and turning an untested
+    # capability into a gate belongs in its own change.
+    LINK_CMD=":"
 fi
 
 OK=1
 $BUILD_CMD || OK=0
-[ "$OK" = 1 ] && { $LINT_CMD || OK=0; }
+[ "$OK" = 1 ] && { $CLIPPY_CMD || OK=0; }
+[ "$OK" = 1 ] && { $LINK_CMD || OK=0; }
 
 if [ "$OK" = 1 ]; then
     pass "$HOST built and linted flodl"

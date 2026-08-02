@@ -51,26 +51,39 @@ fn print_report(root: &Path, ctx: &Context) {
     }
     println!();
 
-    // CUDA / GPU
-    println!("CUDA");
-    let devices = system::detect_gpus();
+    // GPU
+    //
+    // The full sweep, not just its device list: an empty list has
+    // several causes needing different answers, and the one that matters
+    // most here has NO device at all -- an AMD card physically present
+    // with no ROCm userspace installed. `fdl probe` already prints the
+    // sweep's findings; diagnose is the command users reach for first.
+    println!("GPU");
+    let sweep = flodl_hw::survey();
+    let devices = &sweep.devices;
     if !devices.is_empty() {
-        if let Some(driver) = system::nvidia_driver_version() {
-            println!("  Driver:      {}", driver);
+        if sweep.has_vendor(system::GpuVendor::Nvidia) {
+            if let Some(driver) = system::nvidia_driver_version() {
+                println!("  NVIDIA driver: {}", driver);
+            }
         }
         println!("  Devices:     {}", devices.len());
-        for d in &devices {
+        for d in devices {
             let vram_gb = d.total_memory_mb / 1024;
             println!(
-                "  [{}] {} -- {}, {}GB VRAM",
+                "  [{}] {} -- {}, {}, {}GB VRAM",
                 d.index,
                 d.name,
+                d.vendor,
                 d.arch_label(),
                 vram_gb
             );
         }
     } else {
-        println!("  No CUDA devices available");
+        println!("  No GPU devices available");
+    }
+    for note in &sweep.notes {
+        println!("  Note:        {}", note);
     }
     println!();
 
@@ -82,7 +95,16 @@ fn print_report(root: &Path, ctx: &Context) {
             if let Some(v) = &info.torch_version {
                 println!("  Version:     {}", v);
             }
-            if let Some(c) = &info.cuda_version {
+            // Which stack this build targets is the variant path's to
+            // tell. `.arch`'s `cuda=` is a CUDA TOOLKIT version, which a
+            // ROCm build does not have and writes as `none` exactly like
+            // a CPU build -- and "CUDA: none" under a working AMD install
+            // reads as a broken CUDA rather than a healthy ROCm.
+            match detect::variant_vendor(&info.path) {
+                Some(v) => println!("  Vendor:      {}", v),
+                None => println!("  Vendor:      CPU-only"),
+            }
+            if let Some(c) = info.cuda_version.as_deref().filter(|c| *c != "none") {
                 println!("  CUDA:        {}", c);
             }
             if let Some(a) = &info.archs {
@@ -109,7 +131,7 @@ fn print_report(root: &Path, ctx: &Context) {
         if let Some(info) = detect::read_active(root) {
             let archs = info.archs.as_deref().unwrap_or("");
             let mut all_ok = true;
-            for d in &devices {
+            for d in devices {
                 if d.covered_by(archs) {
                     println!(
                         "  GPU {} ({}, {}):  OK",
@@ -177,8 +199,12 @@ fn print_json(root: &Path, ctx: &Context) {
     }
     b.push('}');
 
-    // GPUs
-    let devices = system::detect_gpus();
+    // GPUs. From the full sweep, like the human report: a scripted
+    // consumer needs the findings more than a human does, since it has
+    // no other way to tell "no GPU here" from "an AMD card is present
+    // and its userspace is missing".
+    let sweep = flodl_hw::survey();
+    let devices = &sweep.devices;
     let archs = detect::read_active(root)
         .and_then(|info| info.archs)
         .unwrap_or_default();
@@ -205,6 +231,23 @@ fn print_json(root: &Path, ctx: &Context) {
     }
     b.push(']');
 
+    // What the sweep learned that the device list cannot express. Empty
+    // array on a healthy rig, so a consumer can read it unconditionally.
+    b.push_str(",\"gpu_notes\":[");
+    for (i, note) in sweep.notes.iter().enumerate() {
+        if i > 0 {
+            b.push(',');
+        }
+        let _ = write!(
+            b,
+            "{{\"vendor\":\"{}\",\"kind\":\"{}\",\"message\":\"{}\"}}",
+            note.vendor.as_str(),
+            note.kind.as_str(),
+            system::escape_json(&note.message),
+        );
+    }
+    b.push(']');
+
     // libtorch
     b.push_str(",\"libtorch\":");
     match detect::read_active(root) {
@@ -213,6 +256,18 @@ fn print_json(root: &Path, ctx: &Context) {
             if let Some(v) = &info.torch_version {
                 let _ = write!(b, ",\"version\":\"{}\"", system::escape_json(v));
             }
+            // `vendor` is the field to read; `cuda` stays raw, `none` and
+            // all, because it is the verbatim `.arch` value and `fdl
+            // probe` parses that same field back out of remote hosts.
+            // Adding a key is compatible, changing one is not.
+            let _ = write!(
+                b,
+                ",\"vendor\":\"{}\"",
+                match detect::variant_vendor(&info.path) {
+                    Some(v) => v.as_str(),
+                    None => "cpu",
+                }
+            );
             if let Some(c) = &info.cuda_version {
                 let _ = write!(b, ",\"cuda\":\"{}\"", system::escape_json(c));
             }

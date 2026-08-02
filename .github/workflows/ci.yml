@@ -179,14 +179,25 @@ jobs:
           mv libtorch libtorch-ci
           rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip"
 
-      - name: Build with CUDA feature
+      # `--tests` is what makes this a LINK, not just a compile. The
+      # workspace's only `[[bin]]` is `fdl`, which is zero-dep on flodl by
+      # policy, so a plain `cargo build` produces exactly one executable
+      # and it references no libtorch at all; clippy below runs in check
+      # mode and never invokes the linker either. Test targets are the
+      # only thing here that reaches ld -- and reaching it is the point:
+      # the libtorch_cuda force-load and gpu_compat.h's symbol mapping
+      # fail at link or at first kernel, neither of which a metadata-only
+      # pass can see. This job already unzips the full cu128 archive, so
+      # the flag costs a download of nothing.
+      - name: Build with CUDA feature (links test binaries)
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
-            cargo build --features cuda
+            cargo build --features cuda --tests
+          df -h /
 
       - name: Clippy with CUDA feature
         run: |
@@ -239,30 +250,67 @@ jobs:
           rm -rf /tmp/.buildx-cache-rocm
           mv /tmp/.buildx-cache-rocm-new /tmp/.buildx-cache-rocm
 
+      # The `-so` token encodes the extract SHAPE, not just the libtorch
+      # version. actions/cache restores by key alone: without it, an entry
+      # saved by the older headers-and-one-.so extract restores under the
+      # same key, the download step is skipped, and the tree that comes
+      # back cannot link. Any future change to the unzip list below must
+      # bump this token too -- the step after the download asserts it.
       - name: Cache libtorch download (ROCm)
         id: cache-libtorch-rocm
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/libtorch-ci
-          key: libtorch-rocm70-${{ env.LIBTORCH_VERSION }}
+          key: libtorch-rocm70-so-${{ env.LIBTORCH_VERSION }}
 
-      # Only the headers and the one .so that build.rs gates on are
-      # extracted. This job never links a final binary (it builds rlib
-      # targets and clippy stops after analysis), and the full archive is
-      # ~12 GB expanded against ~1 GB for this subset.
+      # Headers plus every shared object -- enough to LINK, which the
+      # predecessor's headers-and-one-.so subset could not do at any
+      # price. `libtorch_hip.so` alone is not a link set: it pulls
+      # libMIOpen, libmagma, librocsolver and ~30 others through
+      # DT_NEEDED, and ld resolves those recursively.
+      #
+      # Measured on the 2.10.0+rocm7.0 tree: lib/*.so* is 5.0 GB against
+      # 11 GB for all of lib/. The 6 GB left behind is Tensile and kernel
+      # data (hipblaslt 3.8 GB, aotriton.images 889 MB, rocblas 650 MB) --
+      # needed to RUN a kernel, not to link one, and this runner has no
+      # AMD GPU to run on.
       - name: Download libtorch (ROCm)
         if: steps.cache-libtorch-rocm.outputs.cache-hit != 'true'
         run: |
           wget -q "https://download.pytorch.org/libtorch/rocm7.0/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.0.zip"
           unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip" \
-            'libtorch/include/*' 'libtorch/lib/libtorch_hip.so'
+            'libtorch/include/*' 'libtorch/lib/*.so*'
           mv libtorch libtorch-ci
           rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip"
           du -sh libtorch-ci
+          df -h /
+
+      # Runs on BOTH paths -- fresh extract and cache restore -- because a
+      # stale entry never self-corrects: a hit skips the post-job save, so
+      # the wrong tree would persist and re-break every future run.
+      #
+      # It has to sit AHEAD of the build steps. With the old sparse tree
+      # they both pass (build.rs gates only on a header and
+      # lib/libtorch_hip.so, and clippy never links), so the failure would
+      # land on the link step and read as "the link step is broken"
+      # instead of "the cache is stale". The library list is the ROCm arm
+      # of flodl-sys/build.rs's `rustc-link-lib` block.
+      - name: Verify the tree can satisfy a link
+        run: |
+          missing=
+          for lib in torch torch_cpu c10 torch_hip c10_hip amdhip64 rccl; do
+            [ -e "libtorch-ci/lib/lib$lib.so" ] || missing="$missing lib$lib.so"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::libtorch-ci cannot satisfy a link, missing:$missing"
+            echo "The extract list and the cache key have drifted apart."
+            echo "Bump the -so token in the 'Cache libtorch download (ROCm)'"
+            echo "key so the restore misses and the download runs again."
+            exit 1
+          fi
+          echo "link set present"
 
       # Scoped to the two crates that actually carry the vendor mapping.
-      # A workspace-wide build would link binaries, which needs the full
-      # libtorch this job deliberately does not unpack.
       - name: Build with ROCm feature
         run: |
           docker run --rm \
@@ -271,6 +319,27 @@ jobs:
             -w /workspace \
             flodl-rocm-ci \
             cargo build -p flodl-sys -p flodl --features rocm
+
+      # ONE separate integration-test binary, linked but never run (no AMD
+      # GPU on this runner). This is the only place in CI where ld sees the
+      # HIP link set, so it is where a wrong `FLODL_TORCH_GPU_LIB`
+      # force-load target or a bad gpu_compat.h mapping surfaces.
+      #
+      # It must be an INTEGRATION test, not flodl's lib test: `flodl` has
+      # no tests/ dir, so its whole suite is one lib-test binary -- exactly
+      # the case the force-load invariant says keeps passing while a
+      # separate test binary fails. And one, not `--tests`: unlike the CUDA
+      # job this leg carries a ~25 GB base image plus 5 GB of libtorch, and
+      # 60-odd linked debug binaries (~8 GB) would not fit beside them.
+      - name: Link a GPU test binary (ROCm)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo build --features rocm -p flodl-hf --test bert_cuda_smoke
+          df -h /
 
       - name: Clippy with ROCm feature
         run: |

@@ -72,6 +72,16 @@ impl<M: Module> GpuWorker<M> {
         // in-process logger never sees. Setting the same prefix in-process
         // would double it on flodl-log-macro lines, so skip it there,
         // detected by the launcher's per-rank env marker.
+        // Whether this rank's device can be budgeted at all. Static for
+        // the process, so it is answered once here rather than per epoch
+        // inside the arithmetic, which has no way to report it. Before
+        // any stream, model or dataset work: a refusal is a
+        // configuration verdict and costs nothing to reach.
+        crate::data::budget::check_apu_sizing(config.device, config.gpu_ram_share)
+            .map_err(|e| {
+                TensorError::new(&format!("GpuWorker rank {}: {e}", config.rank))
+            })?;
+
         let local_dev = match config.device {
             Device::CUDA(d) => d,
             _ => 0,

@@ -116,8 +116,12 @@ impl GpuArch {
     /// the concatenated forms: the LAST digit is the minor, because the
     /// major grew past one digit at Blackwell (`sm_120` is 12.0, not
     /// 1.20).
+    ///
+    /// A `+PTX` suffix is dropped: `TORCH_CUDA_ARCH_LIST` accepts
+    /// `"8.6+PTX"`, `fdl libtorch build --archs` passes that list through
+    /// verbatim, and the resulting `.arch` line has to keep matching.
     fn parse_sm(t: &str) -> Option<Self> {
-        let t = t.trim();
+        let t = t.trim().split('+').next()?.trim();
         if let Some((maj, min)) = t.split_once('.') {
             return Some(GpuArch::Sm {
                 major: maj.trim().parse().ok()?,
@@ -213,21 +217,31 @@ impl GpuArch {
     /// is vendor-specific: `"6.1;12.0"` for NVIDIA (the CMake
     /// `TORCH_CUDA_ARCH_LIST` form), `"gfx1030;gfx1100"` for AMD.
     ///
-    /// NVIDIA matches exact capability first, then major-only, because
-    /// PTX from a lower minor of the same major is forward-compatible.
-    /// AMD requires an **exact** gfx match: there is no PTX-equivalent
+    /// NVIDIA matches any listed capability of the same major, because
+    /// PTX from another minor of that major is forward-compatible. AMD
+    /// requires an **exact** gfx match: there is no PTX-equivalent
     /// fallback, and a near-miss fails at the first BLAS call rather
     /// than running slowly.
+    ///
+    /// **Both arms tokenize first.** The NVIDIA arm used to substring-
+    /// search the raw list, and a bare digit is a substring of half the
+    /// entries in a real one: a Maxwell `sm_50` device tested its major
+    /// `"5"` against cu128's `"7.0 7.5 8.0 8.6 8.9 9.0 12.0"`, matched
+    /// the `5` inside `7.5`, and was reported covered by a build that
+    /// ships no kernel for it. `fdl diagnose` said OK and the first
+    /// kernel launch said `no kernel image is available for execution
+    /// on the device`. An unparsable token contributes nothing rather
+    /// than matching loosely, which is also how `cpu` and a mixed-vendor
+    /// list fall out for free.
     pub fn covered_by(&self, archs: &str) -> bool {
-        match self {
-            GpuArch::Sm { major, minor } => {
-                let exact = format!("{major}.{minor}");
-                archs.contains(&exact) || archs.contains(&major.to_string())
+        archs.split([';', ',', ' ']).any(|token| {
+            match (self, GpuArch::parse(self.vendor(), token)) {
+                // Same major: exact capability, or another minor of it.
+                (GpuArch::Sm { major, .. }, Some(GpuArch::Sm { major: m, .. })) => m == *major,
+                (GpuArch::Gfx(gfx), Some(GpuArch::Gfx(g))) => g == *gfx,
+                _ => false,
             }
-            GpuArch::Gfx(gfx) => archs
-                .split([';', ',', ' '])
-                .any(|a| a.trim().eq_ignore_ascii_case(gfx)),
-        }
+        })
     }
 }
 
@@ -350,6 +364,47 @@ mod tests {
         assert!(sm86.covered_by("6.1;8.6"));
         assert!(sm86.covered_by("8.0"), "same major is forward-compatible via PTX");
         assert!(!sm86.covered_by("6.1;12.0"));
+    }
+
+    #[test]
+    fn nvidia_coverage_does_not_match_a_digit_inside_another_token() {
+        // The regression: a substring search let a major match the minor
+        // of an unrelated entry, so `fdl diagnose` reported OK and the
+        // first kernel launch failed with "no kernel image".
+        let cu128 = "7.0 7.5 8.0 8.6 8.9 9.0 12.0";
+        for (maj, min) in [(5u32, 0u32), (5, 2)] {
+            let dev = GpuArch::Sm { major: maj, minor: min };
+            assert!(
+                !dev.covered_by(cu128),
+                "sm_{maj}{min} matched the 5 inside 7.5",
+            );
+        }
+        // The mirror: a major that is a substring of a two-digit major.
+        assert!(!GpuArch::Sm { major: 2, minor: 0 }.covered_by("12.0"));
+        // ...while the two-digit major itself still matches.
+        assert!(GpuArch::Sm { major: 12, minor: 0 }.covered_by(cu128));
+        // Real coverage of the rig's own cards is unchanged.
+        assert!(GpuArch::Sm { major: 6, minor: 1 }.covered_by("5.0 5.2 6.0 6.1 7.0"));
+        assert!(!GpuArch::Sm { major: 6, minor: 1 }.covered_by(cu128));
+    }
+
+    #[test]
+    fn a_ptx_suffixed_arch_list_entry_still_matches() {
+        // TORCH_CUDA_ARCH_LIST accepts "8.6+PTX" and `fdl libtorch build`
+        // writes the list through verbatim.
+        let sm86 = GpuArch::Sm { major: 8, minor: 6 };
+        assert!(sm86.covered_by("6.1;8.6+PTX"));
+        assert_eq!(
+            GpuArch::parse(GpuVendor::Nvidia, "8.6+PTX").unwrap(),
+            sm86,
+        );
+    }
+
+    #[test]
+    fn a_cpu_variant_covers_nothing() {
+        // `archs=cpu` is what the CPU download writes.
+        assert!(!GpuArch::Sm { major: 8, minor: 6 }.covered_by("cpu"));
+        assert!(!GpuArch::Gfx("gfx1030".into()).covered_by("cpu"));
     }
 
     #[test]

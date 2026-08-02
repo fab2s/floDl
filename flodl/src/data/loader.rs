@@ -483,6 +483,11 @@ impl DataLoaderBuilder {
         if self.batch_size == 0 {
             return Err(TensorError::new("DataLoader: batch_size must be > 0"));
         }
+        // Whether this target can be budgeted at all. Static for the
+        // process, so it is answered once here rather than per epoch
+        // inside the arithmetic, which has no way to report it.
+        crate::data::budget::check_apu_sizing(self.device, self.gpu_ram_share)
+            .map_err(|e| TensorError::new(&format!("DataLoader: {e}")))?;
 
         // Destructure to avoid partial-move issues
         let DataLoaderBuilder {

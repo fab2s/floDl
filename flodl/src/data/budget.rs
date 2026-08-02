@@ -10,7 +10,7 @@
 //! DDP prefetch hardcoded `0.90` while the loader ran `vram_max_usage`
 //! — two parallel calibration machines for one machine's memory.
 
-use crate::tensor::{Device, Result, Tensor, TensorOptions};
+use crate::tensor::{Device, Result, Tensor, TensorError, TensorOptions};
 
 /// Hard ceiling on any host-RAM share, whatever the knob says: the host
 /// runs the OS, the source readers, and everything else too.
@@ -106,6 +106,73 @@ pub(crate) fn gpu_ram_reservation(
     }
 }
 
+/// Whether a host-RAM budget can be computed at all for this target.
+///
+/// `false` on a **multi-package APU with no explicit `gpu_ram_share`**.
+/// Each package carries its own memory and its own aperture, while
+/// [`crate::sys::mem_info`] reads `/proc/meminfo`, which is system-wide:
+/// every rank would either subtract its own package's aperture from the
+/// whole-system total or claim that total as its own, over-committing by
+/// the package count. The kernel exposes no per-package `MemAvailable`
+/// to compute the right answer from, so the operator's knob is the only
+/// thing that resolves it.
+///
+/// Pure, so both arms are testable on any host: the live probes belong
+/// to the callers.
+///
+/// The gate counts **packages**, not NUMA nodes. NPS and Sub-NUMA
+/// Clustering split one socket's memory into several nodes without
+/// multiplying the aperture, so a node-count gate refused a single-socket
+/// MI300A booted NPS4 whose arithmetic was exact. See
+/// [`crate::sys::cpu_package_count`].
+pub(crate) fn apu_budget_sizeable(
+    integrated: bool,
+    packages: Option<usize>,
+    gpu_ram_share: Option<f64>,
+) -> bool {
+    if !integrated || gpu_ram_share.is_some() {
+        return true; // separate pools, or the operator resolved it
+    }
+    // An unreadable topology reads as one package: the same
+    // absence-is-not-an-error stance the rest of `flodl-hw` takes.
+    packages.is_none_or(|n| n <= 1)
+}
+
+/// The message [`check_apu_sizing`] refuses with. One text, so the
+/// construction-time error and the runtime fallback below cannot drift.
+const UNSIZEABLE_APU: &str =
+    "this is an integrated (APU) GPU on a multi-socket machine, where each package \
+     carries its own memory pool and its own aperture. Host-RAM budgets read \
+     system-wide totals, so flodl cannot size them correctly here and would \
+     over-commit memory. Set an explicit GPU RAM share (a fraction of MemTotal) to \
+     proceed: `gpu_ram_share` on DataLoaderBuilder, TrainerConfig or DdpRunConfig.";
+
+/// Live evaluation of [`apu_budget_sizeable`] for a bound device.
+fn device_budget_sizeable(device: Device, gpu_ram_share: Option<f64>) -> bool {
+    if !device.is_cuda() {
+        return true;
+    }
+    let integrated =
+        crate::tensor::gpu_is_integrated(device.index() as i32) == Some(true);
+    apu_budget_sizeable(integrated, crate::sys::cpu_package_count(), gpu_ram_share)
+}
+
+/// Refuse, at construction, a configuration whose host-RAM budget cannot
+/// be computed. See [`apu_budget_sizeable`] for which one that is.
+///
+/// Checked **once**, where a `Result` already exists, because every
+/// input is static for the process: the knob is configuration, the
+/// package count is a host property, and integrated-ness is a device
+/// property. Nothing here can change between epochs. The predecessor
+/// evaluated it inside [`unified_adjusted_available`] — per epoch, in a
+/// function returning `u64` — where the only available exit was a panic.
+pub(crate) fn check_apu_sizing(device: Device, gpu_ram_share: Option<f64>) -> Result<()> {
+    if device_budget_sizeable(device, gpu_ram_share) {
+        return Ok(());
+    }
+    Err(TensorError::new(UNSIZEABLE_APU))
+}
+
 /// Bytes allocated for the overlap probe. Big enough to clear
 /// `MemAvailable` noise from other processes, small enough that a tight
 /// card can spare it for the microseconds it is held.
@@ -172,16 +239,11 @@ fn probe_overlap(device: Device) -> Result<bool> {
 /// before pricing anything, so every host consumer downstream sees the
 /// same corrected figure.
 ///
-/// # Panics
-///
-/// On a **multi-package APU** with no explicit `gpu_ram_share`. Each
-/// package carries its own memory and its own NUMA node, while
-/// [`crate::sys::mem_info`] is system-wide, so every rank would either
-/// subtract its own package's aperture from the whole-system total or
-/// claim that total as its own — over-committing by the package count.
-/// There is no per-node `MemAvailable` to compute the right answer from.
-/// Guessing buys a mid-run OOM on one arbitrary rank; refusing costs one
-/// clear message naming the knob that resolves it.
+/// Total: an unsizeable target is refused by [`check_apu_sizing`] at
+/// construction rather than here. Should one reach this function anyway
+/// — a hand-built consumer that skipped that check — it falls back to
+/// the pessimistic reading (see below) instead of guessing or dying
+/// mid-epoch.
 pub(crate) fn unified_adjusted_available(
     available: u64,
     device: Device,
@@ -196,22 +258,37 @@ pub(crate) fn unified_adjusted_available(
     if crate::tensor::gpu_is_integrated(idx) != Some(true) {
         return available;
     }
-    if gpu_ram_share.is_none() && crate::sys::numa_node_count().is_some_and(|n| n > 1) {
-        panic!(
-            "flodl: this is an integrated (APU) GPU on a machine with multiple NUMA \
-             nodes, where each package carries its own memory pool. Host-RAM budgets \
-             read system-wide totals, so flodl cannot size them correctly here and \
-             would over-commit memory. Set an explicit GPU RAM share (a fraction of \
-             MemTotal) to proceed."
-        );
-    }
     if !unified_overlap_confirmed(device) {
         return available; // carve-out: genuinely separate, nothing to subtract
     }
     let (in_use, aperture) = crate::tensor::gpu_memory_info_idx(idx).unwrap_or((0, 0));
     let mem_total = crate::sys::mem_info().map(|m| m.total_bytes).unwrap_or(0);
+    let packages = crate::sys::cpu_package_count();
+    if !apu_budget_sizeable(true, packages, gpu_ram_share) {
+        // Reached only when construction-time validation was bypassed.
+        // The right answer is not computable (that is what
+        // `apu_budget_sizeable` says), so take the pessimistic one:
+        // assume every package holds an aperture like this one. Host
+        // staging may then size to zero, which trains — where the panic
+        // this replaced killed the run outright.
+        warn_unsizeable_once();
+        let all = aperture.saturating_mul(packages.unwrap_or(1) as u64);
+        return unified_host_available(available, all, in_use);
+    }
     let reservation = gpu_ram_reservation(true, aperture, mem_total, gpu_ram_share);
     unified_host_available(available, reservation, in_use)
+}
+
+/// Say it once per process: the fallback above runs every epoch, and a
+/// per-epoch repeat of a configuration message is noise.
+fn warn_unsizeable_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::msg!(
+            "flodl: {UNSIZEABLE_APU} Sizing host RAM pessimistically \
+             (one aperture per package) until then."
+        );
+    });
 }
 
 /// Sample-cache RAM budget: the anchored share with the reader ring's
@@ -523,6 +600,32 @@ mod tests {
         );
         // Zero is a real answer (give the GPU nothing), not "unset".
         assert_eq!(gpu_ram_reservation(true, APERTURE, MEM_TOTAL, Some(0.0)), 0);
+    }
+
+    #[test]
+    fn only_a_multi_socket_apu_without_the_knob_is_unsizeable() {
+        // The one refusal, isolated: integrated AND multi-package AND no
+        // explicit share. Drop any one and it sizes.
+        assert!(!apu_budget_sizeable(true, Some(2), None));
+        assert!(apu_budget_sizeable(false, Some(2), None), "discrete part");
+        assert!(apu_budget_sizeable(true, Some(1), None), "single socket");
+        assert!(apu_budget_sizeable(true, Some(2), Some(0.5)), "knob resolves it");
+        // A share of 0.0 is a real answer, not "unset".
+        assert!(apu_budget_sizeable(true, Some(2), Some(0.0)));
+    }
+
+    #[test]
+    fn a_high_numa_count_on_one_socket_still_sizes() {
+        // The regression the package count replaced: NPS / Sub-NUMA
+        // Clustering report several NUMA nodes on ONE socket, which
+        // multiplies neither the memory pool nor the aperture. An
+        // MI300A booted NPS4 was refused despite exact arithmetic.
+        for packages in [Some(1), None] {
+            assert!(
+                apu_budget_sizeable(true, packages, None),
+                "packages={packages:?} must size regardless of NUMA layout"
+            );
+        }
     }
 
     use super::*;

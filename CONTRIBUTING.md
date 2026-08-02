@@ -83,13 +83,16 @@ Open an issue to discuss before investing significant effort on these.
 
 ## Testing
 
-Every PR should pass the existing test suite on **both CPU and CUDA**:
+Every PR should pass the existing test suite on **both CPU and GPU**:
 
 ```bash
 fdl test            # CPU tests
-fdl gpu-test       # CUDA tests (parallel, excludes NCCL/Graph)
-fdl gpu-test-all   # full CUDA suite (parallel + NCCL isolated + serial)
+fdl gpu-test       # GPU tests (parallel, excludes NCCL/Graph)
+fdl gpu-test-all   # full GPU suite (parallel + NCCL isolated + serial)
 ```
+
+The `gpu-*` commands take their cargo feature from the active libtorch
+variant (`cuda` or `rocm`), so the same command line covers either vendor.
 
 All tests use `test_device()` / `test_opts()` from `tensor.rs` so the same
 test code runs on whichever device is available. When writing new tests:

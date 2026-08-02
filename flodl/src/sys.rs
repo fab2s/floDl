@@ -61,7 +61,7 @@
 //! [`flodl_hw::testing`].
 
 pub use flodl_hw::{
-    detect_gpus_for, detect_gpus_physical, mem_info, numa_node_count, survey, survey_visible,
+    cpu_package_count, detect_gpus_for, detect_gpus_physical, mem_info, survey, survey_visible,
     survey_visible_for,
     GpuArch, GpuInfo, GpuSurvey, GpuVendor, MemInfo, NoteKind, SurveyNote, ENV_TESTING_GPU_JSON,
 };

@@ -212,6 +212,46 @@ pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
     Some(GpuVendor::Nvidia)
 }
 
+/// The `export` lines a native-build recipe prints for a variant's
+/// vendor, in order.
+///
+/// **On ROCm the system runtime goes FIRST**, ahead of libtorch's own
+/// `lib/`. Same D1a ordering `Dockerfile.rocm` and the cluster pre-build
+/// carry, and for the same reason: libtorch-rocm bundles the entire
+/// userspace ROCm stack (libamdhip64, libhsa-runtime64, libamd_comgr,
+/// and the kernel-interface-coupled libdrm / libnuma), so with libtorch
+/// first that bundle wins over the host's, and when it disagrees with
+/// the host's amdkfd driver the process segfaults at its FIRST GPU op.
+/// A recipe printed the other way round IS that configuration, handed
+/// to the user to paste.
+///
+/// `$ROCM_PATH` is honored (these recipes run on the LOCAL host, so its
+/// env is the right authority) with `/opt/rocm` as the convention
+/// default. A path that does not exist is skipped by the loader, so the
+/// prefix costs nothing where there is no system ROCm. The cluster
+/// pre-build deliberately does NOT do this: the path it builds names a
+/// REMOTE host, where the controller's `$ROCM_PATH` would be the wrong
+/// machine's answer.
+///
+/// `libtorch_lib` is how the recipe spells the libtorch lib directory:
+/// an absolute path for the standalone installer, `$LIBTORCH_PATH/lib`
+/// where the recipe just exported that variable.
+///
+/// One home on purpose. Three sites print this recipe (`fdl setup`,
+/// `fdl libtorch download`, `fdl libtorch build`) and each grew its own
+/// copy; two of them had the order backwards, which is not a cosmetic
+/// drift but the segfault configuration.
+pub fn ld_library_path_lines(vendor: Option<GpuVendor>, libtorch_lib: &str) -> Vec<String> {
+    let tail = "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}";
+    match vendor {
+        Some(GpuVendor::Amd) => vec![
+            "export ROCM_PATH=\"${ROCM_PATH:-/opt/rocm}\"".to_string(),
+            format!("export LD_LIBRARY_PATH=\"$ROCM_PATH/lib:{libtorch_lib}{tail}\""),
+        ],
+        _ => vec![format!("export LD_LIBRARY_PATH=\"{libtorch_lib}{tail}\"")],
+    }
+}
+
 /// The cargo feature a variant needs, or `""` for a CPU-only variant.
 pub fn variant_feature(variant: &str) -> &'static str {
     match variant_vendor(variant) {
@@ -343,6 +383,51 @@ mod tests {
         // breaking a hand-named CUDA build that works today.
         assert_eq!(variant_vendor("builds/mybuild"), Some(GpuVendor::Nvidia));
         assert_eq!(variant_vendor("builds/gfx"), Some(GpuVendor::Nvidia));
+    }
+
+    #[test]
+    fn ld_recipe_puts_system_rocm_before_libtorch() {
+        // D1a. The ORDER is the whole point: the other way round is the
+        // configuration that segfaults at the first GPU op, and these
+        // lines are pasted verbatim by whoever ran the command.
+        for lib in ["$LIBTORCH_PATH/lib", "/opt/lt/rocm70/lib"] {
+            let lines = ld_library_path_lines(Some(GpuVendor::Amd), lib);
+            let ld = lines
+                .iter()
+                .find(|l| l.contains("LD_LIBRARY_PATH="))
+                .expect("recipe must set LD_LIBRARY_PATH");
+            let rocm = ld.find("$ROCM_PATH/lib").expect("system ROCm must be on the path");
+            let libtorch = ld.find(lib).expect("libtorch must be on the path");
+            assert!(rocm < libtorch, "system ROCm must come first, got {ld}");
+            assert!(
+                lines.iter().any(|l| l.contains("ROCM_PATH:-/opt/rocm")),
+                "an unset ROCM_PATH must fall back to the convention: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ld_recipe_is_libtorch_only_for_nvidia_and_cpu() {
+        for vendor in [Some(GpuVendor::Nvidia), None] {
+            let lines = ld_library_path_lines(vendor, "$LIBTORCH_PATH/lib");
+            assert_eq!(lines.len(), 1, "{vendor:?}");
+            assert!(!lines[0].contains("rocm"), "{vendor:?}: {}", lines[0]);
+            assert!(lines[0].contains("$LIBTORCH_PATH/lib"), "{}", lines[0]);
+        }
+    }
+
+    #[test]
+    fn ld_recipe_preserves_an_existing_ld_library_path() {
+        // The `:+` guard keeps a user's existing value and avoids the
+        // trailing colon that would otherwise put CWD on the loader path.
+        for vendor in [Some(GpuVendor::Amd), Some(GpuVendor::Nvidia), None] {
+            let lines = ld_library_path_lines(vendor, "/opt/lt/lib");
+            let ld = lines.iter().find(|l| l.contains("LD_LIBRARY_PATH=")).unwrap();
+            assert!(
+                ld.contains("${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"),
+                "{vendor:?}: {ld}"
+            );
+        }
     }
 
     #[test]
