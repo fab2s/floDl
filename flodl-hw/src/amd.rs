@@ -606,21 +606,18 @@ mod tests {
 
     /// Build one `/sys/bus/pci/devices/<slot>/` entry.
     ///
-    /// `#[cfg(unix)]`, and so are its three callers, for a reason that is
-    /// about the FIXTURE rather than the code under test: a PCI slot is
-    /// spelled `0000:0d:00.0`, and a colon is not a legal character in a
-    /// Windows filename -- `create_dir_all` there fails with
-    /// `ERROR_INVALID_NAME` (os error 123) before any assertion runs.
+    /// `#[cfg(unix)]`, along with its three callers, because of the
+    /// fixture rather than the code under test: a PCI slot is spelled
+    /// `0000:0d:00.0`, and a colon is not legal in a Windows filename,
+    /// so `create_dir_all` fails with `ERROR_INVALID_NAME` before any
+    /// assertion runs.
     ///
-    /// Substituting a colon-free slot name would keep the tests running
-    /// but stop them testing the thing: `amd_display_devices` puts the
-    /// directory name straight into the user-facing note (a PCI address
-    /// is what makes that message actionable), and these tests assert on
-    /// it. A fake address would assert a fake message.
+    /// A colon-free slot name would keep the tests running without
+    /// testing anything: `amd_display_devices` puts the directory name
+    /// into the user-facing note, and these tests assert on it.
     ///
-    /// Nothing is lost by skipping them off-unix. `probe` reads
-    /// `Path::new("/sys")`, so the whole KFD/PCI surface is inert on
-    /// Windows by construction -- there is no behaviour there to protect.
+    /// Skipping them off-unix loses no coverage. `probe` reads
+    /// `Path::new("/sys")`, so the KFD and PCI paths are inert there.
     #[cfg(unix)]
     fn pci_device(sys: &Path, slot: &str, vendor: &str, class: &str, device: &str) {
         let d = sys.join("bus/pci/devices").join(slot);

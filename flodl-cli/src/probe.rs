@@ -912,20 +912,15 @@ fn check_data_path(
 /// same signal `$FDL_GPU_FEATURE` is derived from, so the two cannot
 /// disagree about which vendor is in play.
 ///
-/// Only the HEADERS are checked, and that is not an approximation:
-/// libtorch bundles every library the link needs (`libamdhip64` and the
-/// CUDA runtime libs both ship inside `libtorch/lib`), so headers are
-/// the entire gap between an installed libtorch and a compiling one.
+/// Only headers are checked: libtorch bundles every library the link
+/// needs, so headers are the whole gap.
 ///
-/// A WARNING, not an issue. floDl's default workflow builds inside the
-/// dev container, where host headers are irrelevant -- making this an
-/// error would put a permanent red mark on the most common setup. It
-/// matters for native builds, which is what a cloud host does, so the
-/// text says which case it applies to.
+/// A warning rather than an issue: the default workflow builds in the
+/// dev container, where host headers are irrelevant. It applies to
+/// native builds, and the text says so.
 ///
-/// `flodl-sys/build.rs` guards the same thing at compile time. This is
-/// the earlier, friendlier half: `fdl probe` is what an operator runs on
-/// a fresh box, and it should not take a failed build to learn this.
+/// `flodl-sys/build.rs` guards the same requirement at compile time;
+/// this reports it before a build is attempted.
 fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
     let Some(info) = info else { return };
     let Some(vendor) = detect::variant_vendor(&info.path) else {

@@ -1,27 +1,17 @@
 #!/usr/bin/env bash
 # Per-OS coverage for the parts of floDl that are OS-specific.
 #
-# WHY A SCRIPT AND NOT YAML STEPS
-#
-# This runs end to end on a developer box. Every CI bug this file replaced
-# was a YAML bug that only a runner could reveal: `libtorch: yes` parsed as
-# a boolean so `== 'yes'` never matched and every gated step silently
-# skipped GREEN; a job-level `needs:` that skipped macOS because Windows
-# was red. Logic that can be executed locally does not fail that way.
-#
-# It also follows the shape ci/release/*.sh already uses, and folds what
-# were twenty conditional steps into one readable sequence:
+# A script rather than YAML steps, so the logic can be run on a developer
+# box before a runner sees it, following the shape ci/release/*.sh uses.
+# One sequence per host:
 #
 #   test -> clippy -> build fdl -> probe(bare) -> URL checks -> refusal
 #        -> install libtorch -> probe(configured) -> toolkit -> build+lint
 #
-# WHAT IT SIMULATES
-#
-# A person on a fresh machine, using `fdl` the documented way. It asks the
-# tool what it sees, follows the tool's own advice when something is
-# missing, and checks the advice worked. Nothing is hand-rolled that `fdl`
-# is supposed to do -- if a step here needs a raw wget or an undocumented
-# path, that is a gap in fdl, not a thing to work around.
+# It exercises `fdl` the documented way: ask the tool what it sees,
+# follow its advice when something is missing, verify the advice worked.
+# Anything here that needs a raw wget or an undocumented path is a gap in
+# fdl rather than something to work around.
 #
 # Local use:  bash ci/os-matrix.sh
 # Env:        FDL_CI_VARIANT=cuda|rocm   force the Linux GPU vendor
@@ -47,31 +37,27 @@ else
     C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_OFF=$'\033[0m'
 fi
 
-# GROUP_OPEN tracks whether a ::group:: fold is currently open. A failure
-# printed inside one is HIDDEN behind the toggle, which is exactly what
-# made the last red run hard to read -- so `fail` closes the fold first.
+# GROUP_OPEN tracks whether a ::group:: fold is open. A failure printed
+# inside one is hidden behind the toggle, so `fail` closes it first.
 GROUP_OPEN=0
 group()    { if [ -n "$IN_CI" ]; then echo "::group::$*"; GROUP_OPEN=1; else echo; echo "===== $* ====="; fi; }
 endgroup() { if [ -n "$IN_CI" ] && [ "$GROUP_OPEN" = 1 ]; then echo "::endgroup::"; GROUP_OPEN=0; fi; }
 pass()     { echo "${C_GREEN}PASS${C_OFF}: $*"; }
 note()     { if [ -n "$IN_CI" ]; then echo "::notice::$*"; else echo "NOTE: $*"; fi; }
 
-# `fdl probe` exits 1 whenever it reports ANY issue, and a CI host always
-# has some (no GPU, no NCCL). Under `set -o pipefail` that makes
-# `probe | grep -q` return non-zero EVEN WHEN GREP MATCHES -- which
-# silently inverted every probe assertion in this script and turned four
-# green hosts red. Capture the output first, then match against the text.
+# `fdl probe` exits 1 whenever it reports any issue, and a CI host always
+# has some (no GPU, no NCCL). Under `set -o pipefail`, `probe | grep -q`
+# then returns non-zero even when grep matches, so capture the output
+# first and match against the text.
 probe_json() { "$FDL" probe --json 2>/dev/null || true; }
 probe_text() { "$FDL" probe 2>&1 || true; }
 has()        { printf '%s' "$1" | grep -qF "$2"; }
 
 SOFT_FAIL=0
-# FAIL EARLY, and out in the open. Collecting every failure sounded
-# useful but buried the real one: Actions folds each ::group::, so the
-# first error scrolled away inside a closed toggle while the run ended on
-# unrelated output. Stopping at the first hard failure makes it the LAST
-# thing in the log, every time. Per-host coverage is unaffected --
-# `fail-fast: false` on the matrix means the other hosts still run.
+# Stop at the first hard failure so it is the last thing in the log:
+# Actions folds each ::group::, so anything after an error scrolls it out
+# of view. Per-host coverage is unaffected, since `fail-fast: false` on
+# the matrix keeps the other hosts running.
 fail() {
     endgroup
     echo "${C_RED}FAIL${C_OFF}: $*"
@@ -406,18 +392,15 @@ OUT=$(cargo build -p flodl-sys --features "$FEATURE" 2>&1) && RC=0 || RC=$?
 if [ "$RC" -eq 0 ]; then
     note "toolkit already present; skipping the missing-case assertion"
 else
-    # Assert the CONTRACT, not the prose. Matching a sentence has now
-    # broken this check twice, because rewording build.rs's message is a
-    # normal edit and a substring grep turns that into a red CI run for
-    # no defect. What must hold is: the build script identified itself
-    # and handed back a command to run.
+    # Assert the contract rather than the wording: the build script
+    # identified itself and handed back a command. Matching a sentence
+    # would turn any rewording of build.rs's message into a failure.
     echo "$OUT" | tail -25
     if has "$OUT" 'flodl-sys:' && has "$OUT" 'apt install'; then
         pass "build.rs named the missing toolkit instead of dying in the C++ compile"
     else
-        # Print BEFORE failing: `fail` exits, so anything after it is
-        # dead code -- which is exactly why the last red run showed an
-        # empty diagnostic.
+        # Printed before failing: `fail` exits, so anything after it
+        # would be dead code.
         fail "$HOST: a missing toolkit must produce a message naming packages to install"
     fi
 fi
@@ -428,17 +411,10 @@ if [ "${FDL_CI_SKIP_INSTALL:-}" = 1 ]; then
     # on purpose is not a failure; only CI leaves this unset.
     [ "$RC" -ne 0 ] && COMPILE=0
 elif [ "$RC" -ne 0 ]; then
-    # THE PACKAGE LIST IS NOT WRITTEN HERE -- it is parsed out of the
-    # message build.rs just printed. That is the point of the phase: we
-    # install exactly what the tool told a user to install, so what gets
-    # tested is "the advice works", not "a list I maintained in parallel
-    # works".
-    #
-    # It is also the only thing that stops the drift. The list already
-    # lives in flodl-sys/build.rs and flodl-cli's util/requirements.rs
-    # (forced -- build.rs cannot depend on flodl-cli). A third hardcoded
-    # copy here went stale immediately: CI installed hip-dev + rccl-dev
-    # while the guard had grown to nine packages.
+    # The package list is parsed from the message build.rs just printed,
+    # not written here: the phase tests that the advice a user is given
+    # works. It also keeps this from drifting, since the list already
+    # exists in flodl-sys/build.rs and flodl-cli's util/requirements.rs.
     PKGS=$(printf '%s\n' "$OUT" | sed -n 's/.*sudo apt install //p' | head -1)
     # build.rs cannot know which CUDA release is wanted, so its message
     # carries <M>-<m> placeholders. The version this run installed is the

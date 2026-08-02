@@ -83,13 +83,10 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         return Err("no Rust or Docker found".into());
     }
 
-    // Native prerequisites, reported ONLY when they apply. The Docker
-    // path carries its own toolchain inside the image, so telling a
-    // Docker user about a missing `g++` would be noise -- and noise in
-    // a setup wizard is how people learn to skim it. Cargo present and
-    // Docker absent is the unambiguous native case; when both exist the
-    // user has not chosen yet, so it is phrased as a heads-up rather
-    // than a problem.
+    // Native prerequisites apply only to a native build: the Docker
+    // path carries its own toolchain in the image. Cargo without Docker
+    // is unambiguously native; with both available the path is not yet
+    // chosen, so it is phrased as a note rather than a blocker.
     let tools = requirements::missing_host_tools();
     if !tools.is_empty() && has_cargo {
         let owned: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();

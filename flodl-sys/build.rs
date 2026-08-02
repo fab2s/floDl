@@ -111,47 +111,19 @@ fn main() {
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
     let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
-    // DERIVED BY THE COMPILER, not by reading includes. Four CI rounds were
-    // lost to hand-derived lists: each guessed set was missing a header that
-    // torch's own vendor tree pulls in transitively (crt/host_config.h, then
-    // hipsparse, then cusparse). The authoritative method, and the one to
-    // repeat whenever libtorch is bumped:
+    // Vendor toolkit headers, as (header relative to an include dir,
+    // package that owns it). Covers the whole include chain rather than
+    // the headers the shim names directly: torch's vendor trees pull in
+    // more, so checking only the direct includes passes while the
+    // compile still fails.
     //
-    //   docker run -v $PWD:/w -v $PWD/libtorch/precompiled/<v>:/lt:ro \
-    //     -w /w/flodl-sys <image> c++ -std=c++17 -M -I . -I /lt/include \
-    //     -I /lt/include/torch/csrc/api/include -I <toolkit>/include \
-    //     <the -D flags build.rs sets> shim.cpp | grep <toolkit-or-/usr/include>
+    // Regenerate after a libtorch bump with `c++ -M` over shim.cpp using
+    // the same -I/-D flags set below. Use -M and not -MM: -MM omits
+    // system headers, which drops nccl.h (it lives in /usr/include, not
+    // under $CUDA_HOME).
     //
-    // Use -M and NOT -MM: -MM omits SYSTEM headers by definition, which
-    // silently drops `nccl.h` (it lives at /usr/include/nccl.h, not under
-    // $CUDA_HOME) and would recreate the exact hole this replaces.
-    //
-    // The sets are also SMALLER than a tree-wide grep suggests: grepping
-    // ATen/cuda wholesale pulls cudnn.h, cudss.h and nvml.h, none of which
-    // this shim's include chain reaches -- and cudss.h is absent from an
-    // image that builds fine, so requiring it would be a false negative.
-    // The same rationale as the guard above, one layer out. libtorch
-    // bundles each vendor's runtime LIBRARIES -- every lib linked below
-    // ships inside `libtorch/lib`, `libamdhip64` included -- but not the
-    // toolkit HEADERS.
-    //
-    // Each entry is (header, package that owns it), so the message can
-    // name exactly what to install rather than a generic "install the
-    // toolkit". The pairs were read out of the vendor dev images with
-    // `dpkg -S` on the readlink -f'd path, not guessed -- twice now a
-    // plausible guess has been wrong.
-    //
-    // The lists are DEEPER THAN THE SHIM'S OWN INCLUDES on purpose.
-    // Checking only the header the shim names is a false pass: torch's
-    // hipified `ATen/hip` tree reaches for the whole ROCm math stack
-    // (HIPContextLight.h -> hipsparse), and `cuda_runtime.h` line 82
-    // pulls `crt/host_config.h` from a different package. Both shipped
-    // green guards and dead compiles. Derived by grepping libtorch's
-    // ATen/hip + c10/hip trees for external includes.
-    //
-    // Note `libtorch/include/hip/` does NOT satisfy the ROCm side: it
-    // holds torch's own hipified c10 wrappers (HIPGuard.h and friends),
-    // not the HIP runtime.
+    // Kept in sync by hand with flodl-cli's util/requirements.rs;
+    // build.rs cannot depend on that crate.
     const ROCM_HEADERS: &[(&str, &str)] = &[
         ("hip/hip_runtime.h", "hip-dev"),
         ("rccl/rccl.h", "rccl-dev"),

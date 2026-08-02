@@ -1,26 +1,16 @@
 //! What a host needs before floDl will build, and the command that
 //! supplies it.
 //!
-//! # Why this is one module and not checks at each point of use
+//! Each requirement is also checked at its point of use (`util/http.rs`
+//! for curl, `util/archive.rs` for unzip, `flodl-sys/build.rs` for the
+//! vendor headers). Those checks report one missing item at a time, at
+//! the moment it is needed. This module exists so `fdl probe` and
+//! `fdl setup` can report the whole set up front instead; the per-site
+//! checks remain as the backstop when neither was run.
 //!
-//! Every requirement here already had a check somewhere, and that was
-//! the problem: they fired one failure at a time. `util/http.rs`
-//! explains curl when a download starts, `util/archive.rs` explains
-//! unzip when an extract starts, `flodl-sys/build.rs` explains the
-//! vendor headers minutes into a compile. A person on a fresh box
-//! discovers the list by hitting it, one round trip each.
-//!
-//! `fdl probe` and `fdl setup` are the commands run FIRST, so they name
-//! the whole list at once and hand back a single command. The per-site
-//! checks stay: they are the backstop for anyone who skipped the tool.
-//!
-//! # Context decides the list
-//!
-//! Requirements are not absolute, they depend on how the user will
-//! build. The Docker path needs none of the native toolchain -- no C++
-//! compiler, no vendor headers -- because all of it lives in the image.
-//! Reporting them as missing to a Docker user would be noise, so callers
-//! ask for the set that matches the path being taken.
+//! The set is not absolute. A Docker build needs no C++ compiler and no
+//! vendor headers, since both live in the image, so callers request the
+//! set matching the build path in use.
 
 use std::path::Path;
 
@@ -28,51 +18,44 @@ use crate::util::system;
 
 /// Host tools `fdl` itself shells out to: (probe name, Debian package).
 ///
-/// `curl` is special-cased by the caller -- wget satisfies the same
-/// need, and `util/http.rs` accepts either.
+/// `curl` is special-cased by the caller: `util/http.rs` accepts wget
+/// as well, so either satisfies the requirement.
 const HOST_TOOLS: &[(&str, &str)] = &[
     ("curl", "curl"),
     ("unzip", "unzip"),
     ("c++", "g++"),
 ];
 
-// DERIVED BY THE COMPILER, not by reading includes. Four CI rounds were
-// lost to hand-derived lists: each guessed set was missing a header that
-// torch's own vendor tree pulls in transitively (crt/host_config.h, then
-// hipsparse, then cusparse). The authoritative method, and the one to
-// repeat whenever libtorch is bumped:
-//
-//   docker run -v $PWD:/w -v $PWD/libtorch/precompiled/<v>:/lt:ro \
-//     -w /w/flodl-sys <image> c++ -std=c++17 -M -I . -I /lt/include \
-//     -I /lt/include/torch/csrc/api/include -I <toolkit>/include \
-//     <the -D flags build.rs sets> shim.cpp | grep <toolkit-or-/usr/include>
-//
-// Use -M and NOT -MM: -MM omits SYSTEM headers by definition, which
-// silently drops `nccl.h` (it lives at /usr/include/nccl.h, not under
-// $CUDA_HOME) and would recreate the exact hole this replaces.
-//
-// The sets are also SMALLER than a tree-wide grep suggests: grepping
-// ATen/cuda wholesale pulls cudnn.h, cudss.h and nvml.h, none of which
-// this shim's include chain reaches -- and cudss.h is absent from an
-// image that builds fine, so requiring it would be a false negative.
-/// Vendor toolkit headers, as (header relative to the toolkit root,
+/// Vendor toolkit headers, as (header relative to an include dir,
 /// package that owns it).
 ///
-/// Each pair was read out of the vendor dev image with `dpkg -S` on the
-/// `readlink -f`'d path, never guessed -- `/opt/rocm` is a versioned
-/// symlink, so the naive lookup reports "not owned" and reads like the
-/// file is unpackaged.
+/// The set covers the shim's whole include chain, not the headers it
+/// names directly: torch's vendor trees pull in more (`cuda_runtime.h`
+/// includes `crt/host_config.h`, which a different package owns;
+/// `ATen/hip` reaches hipsparse and hipblas). Checking only the direct
+/// includes therefore passes while the compile still fails.
 ///
-/// **These lists are deeper than the shim's own includes on purpose.**
-/// Checking only the header flodl names is a false pass, twice proven:
-/// `cuda_runtime.h` line 82 pulls `crt/host_config.h` from a different
-/// package, and torch's hipified `ATen/hip` tree reaches the whole ROCm
-/// math stack (`HIPContextLight.h` -> hipsparse). Both shipped a green
-/// guard and a dead compile. Derived by grepping libtorch's own
-/// `ATen/hip` + `c10/hip` trees for external includes.
+/// Regenerate after a libtorch bump by asking the compiler for the real
+/// dependency set:
 ///
-/// No metapackage shortcut exists for ROCm: `rocm-dev` covers only
-/// hip-dev and rocm-smi-lib of these nine.
+/// ```text
+/// c++ -std=c++17 -M -I . -I <libtorch>/include \
+///     -I <libtorch>/include/torch/csrc/api/include -I <toolkit>/include \
+///     <the -D flags build.rs sets> shim.cpp
+/// ```
+///
+/// Use `-M`, not `-MM`: `-MM` omits system headers, which drops
+/// `nccl.h` (it lives in `/usr/include`, not under `$CUDA_HOME`).
+/// Grepping the vendor tree instead over-reports, listing headers the
+/// chain never reaches.
+///
+/// Map a header to its package inside the vendor dev image. `dpkg -S`
+/// needs a `readlink -f`'d path under ROCm, since `/opt/rocm` is a
+/// versioned symlink; the CUDA image needs the forward lookup
+/// (`dpkg -L` per candidate package) instead.
+///
+/// ROCm has no metapackage covering these: `rocm-dev` supplies only
+/// `hip-dev`.
 pub const ROCM_HEADERS: &[(&str, &str)] = &[
     ("hip/hip_runtime.h", "hip-dev"),
     ("rccl/rccl.h", "rccl-dev"),
@@ -112,11 +95,10 @@ pub fn missing_host_tools() -> Vec<&'static str> {
 
 /// Standard include directories the compiler searches by default.
 ///
-/// Load-bearing, not belt-and-braces: `nccl.h` ships in `libnccl-dev`
-/// at **`/usr/include/nccl.h`**, NOT under `$CUDA_HOME`. Checking only
-/// the toolkit root reported it missing on an image where the build
-/// works, which is a false negative -- strictly worse than the gap the
-/// check exists to close, because it breaks a working setup.
+/// Required, not defensive: some vendor headers install outside the
+/// toolkit root. `nccl.h` ships in `libnccl-dev` at `/usr/include`, so
+/// a toolkit-root-only check reports it missing on hosts where the
+/// build succeeds.
 const SYSTEM_INCLUDE_DIRS: &[&str] = &["/usr/include", "/usr/local/include"];
 
 /// Vendor headers that are absent, as (header, package) pairs.
