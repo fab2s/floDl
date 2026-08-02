@@ -26,7 +26,7 @@ use crate::data::sample_cache::SampleCache;
 use crate::data::BatchDataSet;
 use crate::tensor::{Result, Tensor, TensorOptions};
 
-use super::super::make_partition;
+use super::super::{make_partition, pick_space};
 
 // ---------------------------------------------------------------------------
 // StreamPool (the flow window beyond the pinned tier)
@@ -447,6 +447,7 @@ pub(crate) fn spawn_stager(
     cache: Arc<SampleCache>,
     stream: Arc<Mutex<StreamPool>>,
     base_seed: u64,
+    epoch_splits: usize,
     rank: usize,
     world_size: usize,
     augment: usize,
@@ -465,6 +466,7 @@ pub(crate) fn spawn_stager(
             stream,
             rx,
             base_seed,
+            epoch_splits,
             rank,
             world_size,
             augment,
@@ -539,6 +541,7 @@ fn stager_loop(
     stream: Arc<Mutex<StreamPool>>,
     rx: mpsc::Receiver<StageAdvisory>,
     base_seed: u64,
+    epoch_splits: usize,
     rank: usize,
     world_size: usize,
     augment: usize,
@@ -548,10 +551,10 @@ fn stager_loop(
     staged: &AtomicUsize,
 ) {
     let dataset_len = dataset.len();
-    // Advisory spans live in PICK space (samples × augment); the tiers
-    // key by the decoded sample ids.
+    // Advisory spans live in pick space; the tiers key by the decoded
+    // sample ids.
     let k = augment.max(1);
-    let pick_total = dataset_len * k;
+    let pick_total = pick_space(dataset_len, augment);
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // Stream position of the queue front (the next-use priority key).
     let mut pos: usize = 0;
@@ -641,6 +644,7 @@ fn stager_loop(
                         size,
                         pick_total,
                         epoch,
+                        epoch_splits,
                         base_seed,
                     ));
                 }
@@ -945,7 +949,8 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle = spawn_stager(dataset, Arc::clone(&cache), stream, 42, 0, 1, 1, 0.5, None, true);
+        let handle =
+            spawn_stager(dataset, Arc::clone(&cache), stream, 42, 1, 0, 1, 1, 0.5, None, true);
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.
@@ -966,9 +971,9 @@ mod tests {
         // The training path now hits the warm tier: batches drawn from
         // the advised regions of BOTH epochs make no inner call.
         let before = calls.load(Ordering::Relaxed);
-        let plan_e0 = make_partition(0, 4, 12, 0, 42);
+        let plan_e0 = make_partition(0, 4, 12, 0, 1, 42);
         let _ = staged.get_batch(&plan_e0).unwrap();
-        let plan_e1 = make_partition(0, 2, 12, 1, 42);
+        let plan_e1 = make_partition(0, 2, 12, 1, 1, 42);
         let _ = staged.get_batch(&plan_e1).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), before, "served from the tier");
 

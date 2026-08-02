@@ -163,9 +163,6 @@ pub(crate) fn epoch_split_span(event: usize, splits: usize, picks: usize) -> (us
 ///
 /// # Panics
 /// Panics if `splits == 0`.
-// The split-aware entry point of the scheme, pinned by its tests; the
-// samplers reach it through the epoch-splits knob.
-#[allow(dead_code)]
 pub(crate) fn epoch_split_permutation(
     seed: u64,
     event: usize,

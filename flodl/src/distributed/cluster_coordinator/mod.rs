@@ -599,7 +599,12 @@ pub struct ClusterCoordinator {
     /// ranks regardless of when the StartEpoch frame goes out.
     epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
     /// Total samples in the dataset; basis for partition computation.
+    /// Always the whole pick space — see [`Self::epoch_samples`] for
+    /// what a single epoch covers.
     total_samples: usize,
+    /// Slices per data pass (see
+    /// [`ClusterCoordinatorConfig::epoch_splits`]).
+    epoch_splits: usize,
     /// Batch size; consumed by the progressive chunk-pool dispatch
     /// path to size per-chunk batches.
     batch_size: usize,

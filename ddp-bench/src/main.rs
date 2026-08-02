@@ -31,9 +31,32 @@ struct Cli {
     epochs: Option<usize>,
 
     /// Unsupported (loud error): epoch length is the dataset; use
-    /// --epochs / --batch-size to scale a run.
+    /// --epochs / --batch-size to scale a run, or --train-tokens to size
+    /// the staged corpus on token models.
     #[option]
     batches: Option<usize>,
+
+    /// Slice each data pass into N epochs. `--epochs` keeps counting data
+    /// PASSES, so `--epochs 1 --epoch-splits 20` delivers one pass as 20
+    /// epochs and sees no sample twice, while `--epochs 2 --epoch-splits
+    /// 20` is 40 epochs over two passes.
+    /// Eval, checkpointing and the reduce-window cap all follow the
+    /// finer boundary. The reason to use it is single-pass training (the
+    /// normal regime for LLM pretraining): without it such a run has no
+    /// interior boundary, so no checkpoint and no eval until the end.
+    /// [default: 1]
+    #[option]
+    epoch_splits: Option<usize>,
+
+    /// Tokens of the training shard to stage (token models only: olmo,
+    /// olmo-graph). Accepts K/M/G suffixes, e.g. `20M`. In real-data mode
+    /// the staged corpus IS one data pass, so this is the knob that sizes
+    /// a pass. Expressed in tokens rather than bytes so it does not shift
+    /// when sequence length changes. Snapped up or down to the nearest
+    /// corpus that divides exactly into `--epoch-splits` epochs of whole
+    /// batches — the run reports what it staged. [default: 2M (4 MiB)]
+    #[option]
+    train_tokens: Option<String>,
 
     /// Override batch size.
     #[option]
@@ -713,6 +736,36 @@ fn run() -> flodl::tensor::Result<()> {
              batches. Scale runs with --epochs / --batch-size instead.",
         )));
     }
+    // Nonsense input, caught here. Splitting a pass into more epochs than
+    // it has batches is the other bad case, and flodl refuses that one
+    // centrally (it needs the dataset length, which is not known yet).
+    let epoch_splits = cli.epoch_splits;
+    if epoch_splits == Some(0) {
+        return Err(flodl::tensor::TensorError::new(
+            "--epoch-splits 0 is meaningless: a data pass is sliced into at \
+             least one epoch. Omit the flag for the default of 1.",
+        ));
+    }
+    // Token models only, matching the --batches precedent: silently
+    // ignoring a corpus size would train a different amount of data than
+    // the invocation records.
+    let train_tokens = match cli.train_tokens.as_deref() {
+        None => None,
+        Some(raw) => {
+            let requested = crate::config::parse_token_count(raw)
+                .map_err(|e| flodl::tensor::TensorError::new(&format!("--train-tokens: {e}")))?;
+            let target = cli.model.as_deref().unwrap_or("all");
+            if !matches!(target, "olmo" | "olmo-graph") {
+                return Err(flodl::tensor::TensorError::new(&format!(
+                    "--train-tokens sizes a staged TOKEN corpus and only the token \
+                     models honor it (olmo, olmo-graph); --model {target} would stage \
+                     its own fixed dataset and train a different amount of data than \
+                     this invocation records. Pass --model olmo or --model olmo-graph.",
+                )));
+            }
+            Some(requested)
+        }
+    };
     let batch_size = cli.batch_size;
     let output = cli.output.clone();
     let data_dir = cli.data_dir.clone();
@@ -1023,6 +1076,8 @@ fn run() -> flodl::tensor::Result<()> {
                 bf16_wire: cli.bf16_wire,
                 augment: cli.augment.unwrap_or(1).max(1),
                 augment_noise: cli.augment_noise.unwrap_or(0.0),
+                epoch_splits: epoch_splits.unwrap_or(1).max(1),
+                train_tokens,
                 vram_max_usage: cli.vram_max_usage,
                 ram_max_usage: cli.ram_max_usage,
                 sample_cache: cli.sample_cache,

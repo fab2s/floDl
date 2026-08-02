@@ -225,6 +225,7 @@ impl ClusterCoordinator {
             run_phase: RunPhase::Training,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
+            epoch_splits: config.epoch_splits.max(1),
             batch_size: config.batch_size.max(1),
             num_epochs: config.num_epochs,
             partition_ratios: config.partition_ratios,

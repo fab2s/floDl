@@ -452,6 +452,19 @@ pub struct TrainerConfig<M: Module> {
     /// Pure scheduling — data variation comes exclusively from
     /// [`Self::transform`], keyed per pick. Default: `1`.
     pub augment: usize,
+    /// How finely one data pass is sliced into epochs.
+    ///
+    /// At the default `1`, an epoch is a full pass. Above `1`, an epoch
+    /// becomes a slice of a pass: [`Self::num_epochs`] `* epoch_splits`
+    /// epochs run in total and each sample is still seen exactly
+    /// `num_epochs` times. Eval cadence, checkpointing and the reduce
+    /// window all follow the finer boundary.
+    ///
+    /// The reason to reach for it is single-pass training
+    /// (`num_epochs: 1`, the normal regime for LLM pretraining): such a
+    /// run has no interior epoch boundary, so no checkpoint and no eval
+    /// until it ends. Default: `1`.
+    pub epoch_splits: usize,
     /// Deterministic delivery transform (the augmentation seam), keyed
     /// by [`crate::data::PickKey`] and applied on each rank at its
     /// delivery point, on freshly assembled raw rows. Default: `None`.
@@ -629,6 +642,7 @@ impl<M: Module> TrainerConfig<M> {
             max_grad_norm: None,
             vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
             augment: 1,
+            epoch_splits: 1,
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
@@ -686,6 +700,9 @@ impl<M: Module> TrainerConfig<M> {
 
     /// Augmentation multiplicity (see [`Self::augment`]).
     pub fn with_augment(mut self, k: usize) -> Self { self.augment = k.max(1); self }
+
+    /// Slices per data pass (see [`Self::epoch_splits`]).
+    pub fn with_epoch_splits(mut self, n: usize) -> Self { self.epoch_splits = n.max(1); self }
 
     /// VRAM share for each rank's data plane (see [`Self::vram_max_usage`]).
     pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {

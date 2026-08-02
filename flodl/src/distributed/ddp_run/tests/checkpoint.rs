@@ -237,6 +237,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         disk_stage_dir: None,
         batch_size: 4,
         seed: 42,
+        epoch_splits: 1,
         max_grad_norm: None,
         vram_pool: false,
         easgd_alpha: None,

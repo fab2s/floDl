@@ -181,6 +181,10 @@ pub struct GpuWorker<M: Module> {
     pub(super) partition: Vec<usize>,
     batch_size: usize,
     base_seed: u64,
+    /// Slices per data pass (see [`super::WorkerConfig::epoch_splits`]).
+    /// `1` means an epoch is a full pass; above that, `epoch` counts
+    /// events and this rank resolves its slice of the pass permutation.
+    epoch_splits: usize,
     /// Augmentation multiplicity: the partition is a PICK stream and a
     /// pick decodes as `(pick / augment, pick % augment)`.
     augment: usize,

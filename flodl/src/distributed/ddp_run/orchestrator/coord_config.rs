@@ -47,6 +47,10 @@ pub(crate) fn build_coord_config_from_builder(
     use crate::distributed::cluster_coordinator::ClusterCoordinatorConfig;
     use crate::distributed::ddp::ElChe;
 
+    // Geometry (including a starved-epoch refusal) is validated once per
+    // run at the tier entry points, so it is not re-checked here.
+    let epoch_splits = config.epoch_splits.max(1);
+
     // Resume: read the meta sidecar before anything else so the saved
     // ElChe / TrendGuard / trajectory state can feed the constructors
     // below. Missing file or schema mismatch surfaces loudly here
@@ -88,6 +92,9 @@ pub(crate) fn build_coord_config_from_builder(
         el_che,
     )
     .total_samples(total_samples)
+    // Must be the same value every rank's WorkerConfig carries, or the
+    // ledger and the ranks' expansions land on different slices.
+    .epoch_splits(epoch_splits)
     .batch_size(batch_size)
     .num_epochs(num_epochs)
     .elche_relax_up(config.elche.relax_up)

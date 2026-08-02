@@ -298,8 +298,12 @@ impl ClusterCoordinator {
         // epoch, dropping to ~1 sync/epoch and serializing the cohort).
         // No-op for NCCL (cheap sync → window stays well under) and for
         // any run where the epoch size isn't known yet.
-        if config.batch_size > 0 && config.total_samples >= config.batch_size {
-            el_che.set_max_total_batches(config.total_samples / config.batch_size);
+        if let Some(cap) = crate::distributed::ddp_run::window_cap_batches(
+            config.total_samples,
+            config.epoch_splits,
+            config.batch_size,
+        ) {
+            el_che.set_max_total_batches(cap);
         }
         // `calibrated` mirrors the post-restore ElChe state: true when
         // any rank has a positive smoothed reading. Matches the
@@ -392,6 +396,7 @@ impl ClusterCoordinator {
             run_phase: RunPhase::Training,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
+            epoch_splits: config.epoch_splits.max(1),
             batch_size: config.batch_size.max(1),
             num_epochs: config.num_epochs,
             partition_ratios: config.partition_ratios,

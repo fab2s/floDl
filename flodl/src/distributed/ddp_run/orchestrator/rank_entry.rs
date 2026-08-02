@@ -22,7 +22,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::{
     ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy,
-    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig,
+    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig, pick_space,
 };
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -203,8 +203,7 @@ impl DdpHandle {
         let save_path = config.save_path.clone();
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * config.augment.max(1);
+        let total_samples = pick_space(dataset.len(), config.augment);
 
         let policy_label = match policy {
             ApplyPolicy::Sync => "Sync",
@@ -463,8 +462,7 @@ impl DdpHandle {
             outer_optimizer_factory,
         } = rank_callbacks;
         let save_path = config.save_path.clone();
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * config.augment.max(1);
+        let total_samples = pick_space(dataset.len(), config.augment);
 
         // Controller-driven role assignment: every rank holds the callback
         // closures; the coord's runtime role push gates who fires. Validates
@@ -650,6 +648,7 @@ impl DdpHandle {
             seed: crate::distributed::ddp_run::resolve_shuffle_seed(
                 config.resume_from.as_deref(),
             )?,
+            epoch_splits: config.epoch_splits.max(1),
             max_grad_norm: config.max_grad_norm,
             vram_pool: config.vram_pool,
             vram_max_usage: config.vram_max_usage,

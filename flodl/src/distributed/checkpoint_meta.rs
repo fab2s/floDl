@@ -81,7 +81,15 @@ pub struct EpochCoverage {
 /// recorded uncovered ranges over the SAME index space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoverageBlock {
-    /// Shuffle base seed; the epoch `e` permutation is `Rng::seed(seed + e)`.
+    /// Shuffle base seed; the permutation for data pass `p` is
+    /// `Rng::seed(seed + p)`, and pass `p` is epoch `e` itself unless the
+    /// run splits epochs, in which case `p = e / epoch_splits` and the
+    /// epoch takes a slice of that permutation.
+    ///
+    /// Resume therefore reproduces the recorded ranges only when
+    /// `epoch_splits` matches the saved run: the pool totals restore from
+    /// [`EpochCoverage::total_samples`] as recorded, but the ranks map
+    /// offsets back to picks through the live value.
     pub seed: u64,
     /// Batch size at save time (sanity-check on resume; the pool total is
     /// already batch-aligned in [`EpochCoverage::total_samples`]).

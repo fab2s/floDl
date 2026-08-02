@@ -65,6 +65,7 @@ fn make_det_worker(total: usize) -> (GpuWorker<Linear>, WorkerChannels) {
         disk_stage_dir: None,
         batch_size: 4,
         seed: 42,
+        epoch_splits: 1,
         max_grad_norm: None,
         vram_pool: false,
         easgd_alpha: None,

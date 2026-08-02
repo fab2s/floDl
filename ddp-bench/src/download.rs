@@ -324,11 +324,12 @@ fn download_large_to_file(url: &str, dest: &Path) -> Result<()> {
 /// dump is itself a valid shard.
 const OLMO_TRAIN_URL: &str = "https://olmo-data.org/preprocessed/olmo-mix/v1_6-decontaminated/books/gpt-neox-olmo-dolma-v1_5/part-0-00000.npy";
 
-/// Bytes of the train shard to stage. In real-data mode the dataset
-/// size IS the epoch length, so this is the bench's epoch knob:
-/// 4 MiB = ~2.1M u16 tokens = ~4095 windows at seq 512 (~510 batches
-/// per epoch at batch 8). Bump for longer runs (the full shard is
-/// 1.46 GB).
+/// Default bytes of the train shard to stage, when `--train-tokens` is
+/// not given. In real-data mode the staged slice IS one data pass:
+/// 4 MiB = 2,097,152 u16 tokens = 8191 windows at seq 256 (2047 batches
+/// at batch 4). `--train-tokens` overrides it, and either way the size is
+/// snapped so a pass divides into whole batched events
+/// (`models::olmo::resolve_train_corpus`). The full shard is 1.46 GB.
 pub const OLMO_TRAIN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Held-out C4-English validation shard from OLMo's perplexity suite
@@ -339,15 +340,20 @@ const OLMO_EVAL_URL: &str = "https://olmo-data.org/eval-data/perplexity/v3_small
 /// Bytes of the eval shard to stage: 512 KiB = ~262k tokens.
 pub const OLMO_EVAL_BYTES: u64 = 512 * 1024;
 
-/// Download the leading `OLMO_TRAIN_BYTES` of the olmo-mix books shard
-/// (if not cached) and return its path. Cached in `{data_dir}/olmo/`.
-pub fn ensure_olmo_train(data_dir: &Path) -> Result<std::path::PathBuf> {
+/// Download the leading `bytes` of the olmo-mix books shard (if not
+/// cached at that exact size) and return its path. Cached in
+/// `{data_dir}/olmo/`.
+///
+/// `ensure_olmo_shard` validates the cached file's length against
+/// `bytes`, so changing the staged size re-downloads rather than
+/// silently training on the previous corpus.
+pub fn ensure_olmo_train(data_dir: &Path, bytes: u64) -> Result<std::path::PathBuf> {
     ensure_olmo_shard(
         data_dir,
         OLMO_TRAIN_URL,
         "books-part-0-00000.head.npy",
-        Some(OLMO_TRAIN_BYTES),
-        OLMO_TRAIN_BYTES,
+        Some(bytes),
+        bytes,
     )
 }
 

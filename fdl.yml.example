@@ -16,6 +16,11 @@ commands:
     run: cargo test
     append: -- --nocapture --skip leakcheck
     docker: dev
+  bench-test:
+    description: Run ddp-bench's own unit tests (workspace-excluded, so `test` misses them)
+    run: cd ddp-bench && cargo test
+    append: -- --nocapture
+    docker: dev
   test-release:
     description: Run tests in release mode
     run: cargo test --release

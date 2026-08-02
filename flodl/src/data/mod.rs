@@ -48,7 +48,7 @@ pub(crate) mod prefetch;
 pub(crate) mod sample_cache;
 pub(crate) mod vram_pool;
 
-pub use sampler::{Sampler, RandomSampler, SequentialSampler};
+pub use sampler::{Sampler, RandomSampler, SequentialSampler, SplitSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
 pub use records::FixedStrideRecords;
 pub(crate) use budget::prefetch_depth_from_vram;

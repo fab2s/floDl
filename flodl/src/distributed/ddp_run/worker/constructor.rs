@@ -245,6 +245,7 @@ impl<M: Module> GpuWorker<M> {
                 stage_cache,
                 stream_pool,
                 config.seed,
+                config.epoch_splits.max(1),
                 config.rank,
                 config.world_size,
                 config.augment,
@@ -397,6 +398,7 @@ impl<M: Module> GpuWorker<M> {
             partition: Vec::new(), // filled by first StartEpoch from coordinator
             batch_size: config.batch_size,
             base_seed: config.seed,
+            epoch_splits: config.epoch_splits.max(1),
             augment: config.augment.max(1),
             transform: config.transform.clone(),
             local_step: 0,

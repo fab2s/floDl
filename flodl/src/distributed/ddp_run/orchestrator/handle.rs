@@ -239,6 +239,12 @@ impl DdpHandle {
         // `detect_gpus()` respects `CUDA_VISIBLE_DEVICES`, so production
         // callers that want to scope down also have that lever.
         Self::maybe_auto_promote()?;
+        crate::distributed::ddp_run::check_epoch_geometry(
+            crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),
+            batch_size,
+            config.epoch_splits,
+            num_epochs,
+        )?;
 
         // Launcher trampoline. In launcher mode this process is the
         // fan-out orchestrator — no training body to run here. Build
@@ -375,9 +381,11 @@ impl DdpHandle {
                 // window decides the world size, not the config file),
                 // so everything it needs is captured here and sized
                 // there.
-                // Schedule space: picks (samples × augment views) — the
-                // coordinator's whole ledger runs in this space.
-                let dataset_len = dataset.len() * config.augment.max(1);
+                // The coordinator's whole ledger runs in pick space.
+                let dataset_len = crate::distributed::ddp_run::pick_space(
+                    dataset.len(),
+                    config.augment,
+                );
                 let coord_spec = crate::distributed::launcher::CoordSpec {
                     backend,
                     config_factory: Box::new(move |world_size| {
@@ -560,6 +568,7 @@ impl DdpHandle {
                 config.disk_stage_gb,
                 config.disk_stage_dir.clone(),
                 config.augment,
+                config.epoch_splits,
                 config.transform.clone(),
                 scheduler,
                 eval_fn,
@@ -620,6 +629,12 @@ impl DdpHandle {
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
         Self::maybe_auto_promote()?;
+        crate::distributed::ddp_run::check_epoch_geometry(
+            crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),
+            batch_size,
+            config.epoch_splits,
+            num_epochs,
+        )?;
 
         // Non-training roles (Launcher / Relay / Agent) are handled exactly as
         // the managed `launch` handles them — reuse it. Launcher returns a
@@ -731,6 +746,7 @@ impl DdpHandle {
                 config.disk_stage_gb,
                 config.disk_stage_dir.clone(),
                 config.augment,
+                config.epoch_splits,
                 config.transform.clone(),
                 scheduler,
                 eval_fn,

@@ -16,7 +16,7 @@ use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::worker::GpuWorker;
 use crate::distributed::ddp_run::{
     self, ApplyPolicy, CheckpointFn, EpochFn, EvalFn, EvalResultFn, MetricsFn, TrainedState,
-    Worker, WorkerConfig,
+    Worker, WorkerConfig, pick_space,
 };
 use crate::graph::GraphExt;
 use crate::nn::{Module, Optimizer, Parameter};
@@ -54,6 +54,7 @@ impl DdpHandle {
         disk_stage_gb: u64,
         disk_stage_dir: Option<std::path::PathBuf>,
         augment: usize,
+        epoch_splits: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
         eval_fn: Option<EvalFn<M>>,
@@ -70,8 +71,7 @@ impl DdpHandle {
     {
         crate::verbose!("  ddp: single device ({device:?}) | no coordination");
 
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * augment.max(1);
+        let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
@@ -108,6 +108,7 @@ impl DdpHandle {
             total_samples,
             batch_size,
             augment: augment.max(1),
+            epoch_splits: epoch_splits.max(1),
             transform,
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
@@ -304,6 +305,7 @@ impl DdpHandle {
         disk_stage_gb: u64,
         disk_stage_dir: Option<std::path::PathBuf>,
         augment: usize,
+        epoch_splits: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
         eval_fn: Option<EvalFn<M>>,
@@ -317,8 +319,7 @@ impl DdpHandle {
     {
         crate::verbose!("  ddp: single device ({device:?}) | cooperative | no coordination");
 
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * augment.max(1);
+        let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
@@ -340,6 +341,7 @@ impl DdpHandle {
             total_samples,
             batch_size,
             augment: augment.max(1),
+            epoch_splits: epoch_splits.max(1),
             transform,
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,

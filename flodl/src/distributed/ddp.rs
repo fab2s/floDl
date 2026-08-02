@@ -516,7 +516,8 @@ impl Trainer {
             .ram_max_usage(cfg.ram_max_usage)
             .sample_cache(cfg.sample_cache)
             .disk_stage(cfg.disk_stage_gb)
-            .augment(cfg.augment);
+            .augment(cfg.augment)
+            .epoch_splits(cfg.epoch_splits);
         if let Some(dir) = cfg.disk_stage_dir {
             b = b.disk_stage_dir(dir);
         }

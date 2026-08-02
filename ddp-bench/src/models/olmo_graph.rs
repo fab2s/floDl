@@ -41,7 +41,6 @@ use super::olmo::{
 };
 use super::ModelDef;
 use crate::config::ModelDefaults;
-use crate::download::OLMO_TRAIN_BYTES;
 
 pub fn def() -> ModelDef {
     ModelDef {
@@ -52,7 +51,7 @@ pub fn def() -> ModelDef {
         // two cannot drift on data, loss, or optimisation — only on how the
         // forward pass is expressed, which is the thing under comparison.
         dataset: super::olmo::make_dataset,
-        dataset_size_hint: |_| Ok(((OLMO_TRAIN_BYTES / 2 - 1) / SEQ_LEN as u64) as usize),
+        dataset_size_hint: |cfg| Ok(super::olmo::resolve_train_corpus(cfg).windows),
         train_fn: super::olmo::train_step,
         eval_fn: Some(super::olmo::eval_loss),
         test_dataset: Some(super::olmo::make_eval_dataset),

@@ -473,6 +473,12 @@ where
         self
     }
 
+    /// Slices per data pass (see [`DdpRunConfig::epoch_splits`]).
+    pub fn epoch_splits(mut self, n: usize) -> Self {
+        self.config = self.config.with_epoch_splits(n);
+        self
+    }
+
     /// Delivery transform, keyed per pick (see
     /// [`DdpRunConfig::transform`]).
     pub fn transform(

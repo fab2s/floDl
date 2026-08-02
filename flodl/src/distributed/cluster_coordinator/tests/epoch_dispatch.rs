@@ -1209,3 +1209,56 @@ fn cpu_finalize_records_per_rank_lag_for_diagnostics() {
     coord_handle.join().unwrap().expect("coord captures per-rank lags");
 }
 
+
+// -----------------------------------------------------------------
+// Epoch splits: an epoch is a slice of a pass, not the whole pass
+// -----------------------------------------------------------------
+
+#[test]
+fn one_split_leaves_the_epoch_covering_the_whole_pass() {
+    // The default. Every plan set must still tile all 100 picks.
+    let mut coord =
+        ClusterCoordinator::for_test(cfg_sync_cpu(2).total_samples(100).batch_size(1));
+    assert_eq!(coord.epoch_samples(0), 100);
+    let covered: u64 = coord.plans_for_epoch(0).iter().map(|p| p.partition_size).sum();
+    assert_eq!(covered, 100);
+}
+
+#[test]
+fn split_epochs_size_plans_to_the_slice_and_tile_the_pass() {
+    let mut coord = ClusterCoordinator::for_test(
+        cfg_sync_cpu(2).total_samples(100).epoch_splits(4).batch_size(1),
+    );
+    let mut total = 0u64;
+    for event in 0..4 {
+        assert_eq!(coord.epoch_samples(event), 25, "event {event}");
+        let plans = coord.plans_for_epoch(event);
+        // Offsets are relative to the epoch's own slice, which is what
+        // keeps ChunkPool partitioning [0, epoch_len) unchanged.
+        let mut at = 0u64;
+        for p in &plans {
+            assert_eq!(p.partition_offset, at, "event {event} offsets stay consecutive");
+            at += p.partition_size;
+        }
+        assert_eq!(at, 25, "event {event} plans tile its slice");
+        total += at;
+    }
+    assert_eq!(total, 100, "the four events tile exactly one data pass");
+}
+
+#[test]
+fn an_uneven_split_spreads_the_remainder_and_still_tiles() {
+    // 100 picks over 7 events: 14 r 2, so the first two events carry one
+    // extra pick each. No event may be starved and none may double up.
+    let mut coord = ClusterCoordinator::for_test(
+        cfg_sync_cpu(2).total_samples(100).epoch_splits(7).batch_size(1),
+    );
+    let sizes: Vec<usize> = (0..7).map(|e| coord.epoch_samples(e)).collect();
+    assert_eq!(sizes, vec![15, 15, 14, 14, 14, 14, 14]);
+    assert_eq!(sizes.iter().sum::<usize>(), 100);
+    for (event, &want) in sizes.iter().enumerate() {
+        let covered: u64 =
+            coord.plans_for_epoch(event).iter().map(|p| p.partition_size).sum();
+        assert_eq!(covered as usize, want, "event {event}");
+    }
+}

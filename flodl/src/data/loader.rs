@@ -851,10 +851,14 @@ impl DataLoader {
     }
 
     /// Number of batches per epoch.
+    ///
+    /// Reads the sampler's *epoch* length, not the dataset length: under a
+    /// splitting sampler an epoch covers a slice of a pass, and this count
+    /// is nominal there (balanced slicing gives some epochs one more pick).
     pub fn num_batches(&self) -> usize {
         let (n, bs, dl) = match &self.inner {
-            LoaderInner::Resident(l) => (l.sampler.len(), l.batch_size, l.drop_last),
-            LoaderInner::Streaming(l) => (l.sampler.len(), l.batch_size, l.drop_last),
+            LoaderInner::Resident(l) => (l.sampler.epoch_len(), l.batch_size, l.drop_last),
+            LoaderInner::Streaming(l) => (l.sampler.epoch_len(), l.batch_size, l.drop_last),
         };
         if dl { n / bs } else { n.div_ceil(bs) }
     }

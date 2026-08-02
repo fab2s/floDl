@@ -449,3 +449,41 @@ fn unset_max_overshoot_leaves_auto_tune_defaults() {
     );
     assert_eq!(coord_config.overshoot_ceiling, 15);
 }
+
+// Same failure class as H13 above: `epoch_splits` reaches every rank
+// through WorkerConfig, so a coordinator that kept the default would not
+// error — it would size its ledger over the whole pass while the ranks
+// expanded a slice of it, and the cohort would train on mismatched
+// permutations in silence. The knob only means anything if BOTH sides
+// read the same value.
+#[test]
+fn epoch_splits_plumbs_into_coord_config() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let user_config = DdpRunConfig::new().with_epoch_splits(20);
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &user_config,
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert_eq!(coord_config.epoch_splits, 20);
+}
+
+#[test]
+fn unset_epoch_splits_leaves_the_epoch_a_full_pass() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &DdpRunConfig::new(),
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert_eq!(coord_config.epoch_splits, 1);
+}
+

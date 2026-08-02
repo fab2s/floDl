@@ -9,7 +9,7 @@ use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 
 use super::super::{
-    ControlMsg, EpochPlan, make_partition,
+    ControlMsg, EpochPlan, make_partition, pick_space,
 };
 use super::GpuWorker;
 
@@ -195,11 +195,10 @@ impl<M: Module> GpuWorker<M> {
     /// historical `num_batches == 0` early return).
     pub(crate) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
         self.current_epoch = plan.epoch;
-        // Pick space: the coordinator's offsets/sizes and this
-        // expansion must agree on `dataset.len() * augment` total.
         self.partition = make_partition(
             plan.partition_offset, plan.partition_size,
-            self.dataset.len() * self.augment.max(1), plan.epoch, self.base_seed,
+            pick_space(self.dataset.len(), self.augment), plan.epoch,
+            self.epoch_splits, self.base_seed,
         );
 
         let num_batches = self.partition.len() / self.batch_size;

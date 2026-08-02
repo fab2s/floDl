@@ -20,6 +20,18 @@ pub(super) struct PlannedUpdate {
 }
 
 impl ClusterCoordinator {
+    /// Picks covered by one epoch: the whole pick space when
+    /// `epoch_splits == 1`, otherwise this epoch's slice of a data pass.
+    ///
+    /// The single place the coordinator turns an epoch index into a
+    /// length. Partition sizing, the chunk pool and the staging
+    /// advisories all go through it, which is why the load-bearing
+    /// `window <= epoch` cap keeps holding once an epoch is a slice: the
+    /// bound simply follows the slice down.
+    pub(super) fn epoch_samples(&self, epoch: usize) -> usize {
+        crate::rng::epoch_split_span(epoch, self.epoch_splits.max(1), self.total_samples).1
+    }
+
     /// Compute per-rank partition sizes for one epoch.
     ///
     /// Priority order:
@@ -29,28 +41,26 @@ impl ClusterCoordinator {
     ///    `with_speed_hint` is set in the config).
     /// 3. Equal sizes (fallback at startup before ElChe has
     ///    observations).
-    pub(super) fn compute_partition_sizes(&self) -> Vec<usize> {
+    pub(super) fn compute_partition_sizes(&self, epoch: usize) -> Vec<usize> {
+        let epoch_samples = self.epoch_samples(epoch);
         if let Some(ratios) = &self.partition_ratios {
-            return crate::distributed::ddp_run::ratio_to_sizes(
-                ratios,
-                self.total_samples,
-            );
+            return crate::distributed::ddp_run::ratio_to_sizes(ratios, epoch_samples);
         }
         match self.policy {
             ApplyPolicy::Sync => crate::distributed::ddp_run::equal_sizes(
                 self.world_size,
-                self.total_samples,
+                epoch_samples,
             ),
             ApplyPolicy::Cadence | ApplyPolicy::Async => {
                 if self.el_che.is_calibrated() || self.el_che.has_speed_hint() {
                     crate::distributed::ddp_run::throughput_sizes(
                         &self.el_che,
-                        self.total_samples,
+                        epoch_samples,
                     )
                 } else {
                     crate::distributed::ddp_run::equal_sizes(
                         self.world_size,
-                        self.total_samples,
+                        epoch_samples,
                     )
                 }
             }
@@ -72,7 +82,7 @@ impl ClusterCoordinator {
         if let Some(plans) = self.epoch_plan_cache.get(&epoch) {
             return plans.clone();
         }
-        let sizes = self.compute_partition_sizes();
+        let sizes = self.compute_partition_sizes(epoch);
         let mut plans: Vec<EpochPlanWire> = Vec::with_capacity(self.world_size);
         let mut offset: u64 = 0;
         for &size in &sizes {
@@ -241,7 +251,7 @@ impl ClusterCoordinator {
         &mut self,
         epoch: usize,
     ) -> Result<Vec<crate::distributed::wire::EpochPlanWire>> {
-        let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        let batch_total = (self.epoch_samples(epoch) / self.batch_size) * self.batch_size;
         let span_sizes = self.reservation_span_sizes(batch_total);
         self.chunk_pools.insert(
             epoch,
@@ -265,7 +275,8 @@ impl ClusterCoordinator {
             .map(|r| self.compute_chunk_batches(r, epoch))
             .collect();
         crate::verbose!(
-            "  ddp: epoch {epoch} progressive | initial chunks (batches) {sizes:?}"
+            "  ddp: epoch {} progressive | initial chunks (batches) {sizes:?}",
+            crate::distributed::ddp_run::epoch_label(epoch, self.epoch_splits)
         );
         let mut plans: Vec<crate::distributed::wire::EpochPlanWire> =
             Vec::with_capacity(self.world_size);
@@ -437,7 +448,8 @@ impl ClusterCoordinator {
         }
 
         if !self.chunk_pools.contains_key(&next_epoch) {
-            let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+            let batch_total =
+                (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
             let span_sizes = self.reservation_span_sizes(batch_total);
             self.chunk_pools.insert(
                 next_epoch,
@@ -894,7 +906,8 @@ impl ClusterCoordinator {
         if next_epoch >= self.num_epochs() || self.batch_size == 0 {
             return Vec::new();
         }
-        let batch_total = (self.total_samples / self.batch_size) * self.batch_size;
+        let batch_total =
+            (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
         if batch_total == 0 {
             return Vec::new();
         }
