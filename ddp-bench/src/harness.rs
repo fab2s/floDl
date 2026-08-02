@@ -367,7 +367,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // line: the harness owns a richer `done: loss=…, syncs=…,
     // idle=…` summary below, so emitting both is just duplication.
     // HTML archive + dashboard pushes are unaffected.
-    let mut monitor = Monitor::new(config.epochs);
+    // The monitor counts EPOCHS, and `config.epochs` counts data passes:
+    // under splits an epoch is a slice, so the progress denominator is
+    // passes x splits (otherwise it renders "epoch 4/1").
+    let mut monitor = Monitor::new(config.epochs * config.epoch_splits.max(1));
     monitor.silent_summary();
     if let Some(port) = config.monitor_port {
         monitor

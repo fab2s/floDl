@@ -243,7 +243,10 @@ impl DdpHandle {
             crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),
             batch_size,
             config.epoch_splits,
-            num_epochs,
+            // Back to DATA PASSES: `num_epochs` arrived already multiplied
+            // by the builder, and the tail warning is about how many times
+            // a pass is re-drawn, not how many slices it is served in.
+            num_epochs / config.epoch_splits.max(1),
         )?;
 
         // Launcher trampoline. In launcher mode this process is the
@@ -633,7 +636,10 @@ impl DdpHandle {
             crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),
             batch_size,
             config.epoch_splits,
-            num_epochs,
+            // Back to DATA PASSES: `num_epochs` arrived already multiplied
+            // by the builder, and the tail warning is about how many times
+            // a pass is re-drawn, not how many slices it is served in.
+            num_epochs / config.epoch_splits.max(1),
         )?;
 
         // Non-training roles (Launcher / Relay / Agent) are handled exactly as

@@ -487,3 +487,41 @@ fn unset_epoch_splits_leaves_the_epoch_a_full_pass() {
     assert_eq!(coord_config.epoch_splits, 1);
 }
 
+
+// The bug this pins: `num_epochs` is the user's count of DATA PASSES, so a
+// split run must execute `num_epochs * epoch_splits` epochs. Without the
+// multiplication it ran `num_epochs` slices and silently trained
+// `1/epoch_splits` of the data — geometry all correct, run a quarter as
+// long. Every geometry unit test passed while this was broken, because
+// none of them observed how many epochs actually run.
+#[test]
+fn epoch_splits_multiply_the_epochs_actually_run() {
+    if crate::tensor::usable_gpu_devices().len() >= 2 {
+        return; // auto-promote path; this pins the in-process fallback
+    }
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+
+    let ddp = crate::distributed::Trainer::builder(
+        |dev| Linear::on_device(4, 2, dev),
+        |params| crate::nn::SGD::new(params, 0.01, 0.0),
+        mse_train,
+    )
+    .dataset(Arc::new(TestDataset { n: 64 }))
+    .batch_size(4)
+    .num_epochs(2)      // two passes over the data ...
+    .epoch_splits(4)    // ... delivered as four epochs each
+    .backend(AverageBackend::Cpu)
+    .epoch_fn(move |_epoch, _worker| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })
+    .run()
+    .unwrap();
+    ddp.join().unwrap();
+
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::Relaxed),
+        8,
+        "2 passes x 4 splits must run 8 epochs, not 2",
+    );
+}
