@@ -341,13 +341,19 @@ fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
 // Core download logic
 // ---------------------------------------------------------------------------
 
-pub fn run(opts: DownloadOpts) -> Result<(), String> {
+pub fn run(opts: DownloadOpts) -> Result<String, String> {
     let ctx = Context::resolve();
     run_with_context(opts, &ctx)
 }
 
-/// Run with an explicit context (used by `setup` which has its own context).
-pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String> {
+/// Run with an explicit context (used by `setup` which has its own
+/// context).
+///
+/// Returns the variant id it resolved to (`precompiled/<dir>`), because
+/// `Variant::Auto` only decides here: a caller that needs the path or the
+/// label afterwards would otherwise have to re-run the detection, which
+/// re-prints its reasoning and can only agree by accident.
+pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, String> {
     let spec = resolve_variant(&opts.variant);
     let url = download_url(spec, opts.force_linux)?;
 
@@ -368,7 +374,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
     if opts.dry_run {
         println!();
         println!("  [dry-run] Would download and extract to above path.");
-        return Ok(());
+        return Ok(variant_id);
     }
 
     // Check existing installation
@@ -386,7 +392,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         if ver_matches {
             println!();
             println!("  Already installed (version {}).", LIBTORCH_VERSION);
-            return Ok(());
+            return Ok(variant_id);
         }
 
         println!();
@@ -520,7 +526,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         println!("    fdl init my-project");
     }
 
-    Ok(())
+    Ok(variant_id)
 }
 
 // ---------------------------------------------------------------------------

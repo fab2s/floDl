@@ -139,14 +139,21 @@ pub struct StartArgs {
 /// Before dialing, the box is prepared: the GPU stack is checked, the
 /// dataset source root is put where the ranks will look for it
 /// (`--data-source` mounts it read-only when it is not already there),
-/// and the directories the data plane writes are proven writable.
-/// Preparation re-runs per attempt, so a `--persist` box picks up a
-/// changed source on its next re-dial.
+/// the directories the data plane writes are proven writable, and
+/// anything this box does not have yet is acquired — a libtorch variant
+/// (`--libtorch`) and the training binary itself (`--source`, fetched to
+/// local disk and built here, which is what makes its ABI match the
+/// libtorch it holds). Preparation re-runs per attempt, so a `--persist`
+/// box picks up a changed source on its next re-dial.
 ///
 /// Exit code: the agent's exit code (0 = this host finished cleanly);
-/// 2 for a failure retrying cannot fix (no GPU, an unresolvable source,
-/// a missing binary), which `--persist` does not re-dial; 1 for a
-/// transient one, which it does — the systemd / golden-image mode.
+/// 2 for a failure retrying cannot fix (no GPU, a spec that does not
+/// parse, a missing binary or toolchain), which `--persist` does not
+/// re-dial; 1 for a transient one, which it does — the systemd /
+/// golden-image mode. Source that does not compile counts as transient
+/// on purpose: the fix is a push away at the source, and a box that
+/// stopped permanently over a typo would be powered off by the systemd
+/// recipe.
 #[derive(crate::FdlArgs, Debug)]
 pub struct JoinArgs {
     /// Controller mux address, `host[:port]` (default port 1337).
@@ -166,9 +173,35 @@ pub struct JoinArgs {
     /// `controller.join.token`).
     #[option]
     pub token: Option<String>,
-    /// Training binary to run in agent role.
+    /// Training binary to run in agent role, as a path on this box.
+    /// Mutually exclusive with `--source`.
     #[option]
     pub bin: Option<String>,
+    /// Build the training binary here instead: a source spec, one of
+    /// `file:///abs/path`, `rsync://[user@]host[:port]:/abs/path` or
+    /// `git+https://host/owner/repo#<tag|branch|sha>`. Fetched to local
+    /// disk, then built against this box's libtorch.
+    #[option]
+    pub source: Option<String>,
+    /// Project directory inside the fetched source tree (default: its
+    /// root). Governs the build and the run both.
+    #[option]
+    pub source_cwd: Option<String>,
+    /// Build recipe for the fetched source, a shell line (default:
+    /// `cargo build --release`). Gets `LIBTORCH_PATH`,
+    /// `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`.
+    #[option]
+    pub source_build: Option<String>,
+    /// Built artifact, relative to the project directory, e.g.
+    /// `target/release/train`.
+    #[option]
+    pub source_bin: Option<String>,
+    /// libtorch variant to acquire into `~/.flodl/libtorch/` before
+    /// building or running: `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`.
+    /// `auto` routes on this box's own devices, so one image serves
+    /// both vendors. Default: whatever is already active here.
+    #[option]
+    pub libtorch: Option<String>,
     /// Logical host name in the roster (default: this machine's
     /// hostname).
     #[option]

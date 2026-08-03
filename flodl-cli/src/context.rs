@@ -26,6 +26,19 @@ impl Context {
         }
     }
 
+    /// The global root, whether or not cwd sits inside a project:
+    /// `$FLODL_HOME`, else `~/.flodl`.
+    ///
+    /// [`Context::resolve`] prefers a project root, which is right for a
+    /// developer managing their checkout's libtorch and wrong for a box
+    /// that is only *consuming* artifacts: a dial-in worker's project
+    /// root is frequently a read-only shared mount, so its acquisitions
+    /// (libtorch, the fetched source tree) belong under the root fdl
+    /// manages on that one box. The two are named apart on purpose.
+    pub fn global() -> Self {
+        Context { root: global_root(), is_project: false }
+    }
+
     /// Force a specific root (for --path overrides).
     pub fn with_root(root: PathBuf) -> Self {
         let is_project = root.join("Cargo.toml").exists();

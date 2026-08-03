@@ -252,6 +252,37 @@ pub fn ld_library_path_lines(vendor: Option<GpuVendor>, libtorch_lib: &str) -> V
     }
 }
 
+/// `LD_LIBRARY_PATH` VALUE for running against `libtorch_lib`, in the
+/// order the loader must see it. The sibling of
+/// [`ld_library_path_lines`], which prints the same ordering as a shell
+/// recipe; this one is for setting on a child process.
+///
+/// `rocm_root` is passed rather than read from the environment because
+/// the two callers describe different filesystems: a locally spawned
+/// child gets this box's `$ROCM_PATH`, while a path composed for a
+/// REMOTE host must use the convention (`/opt/rocm`) since our own
+/// environment says nothing about theirs.
+///
+/// **On ROCm the system runtime must come FIRST.** libtorch-rocm bundles
+/// the entire userspace ROCm stack, so with libtorch first that bundle
+/// wins over the host's, and when it disagrees with the host's amdkfd
+/// driver the process segfaults at its FIRST GPU OP — a failure that
+/// looks nothing like a library-path problem. A path that does not exist
+/// is skipped by the loader, so prefixing costs nothing on a box without
+/// ROCm.
+pub fn ld_library_path_value(
+    vendor: Option<GpuVendor>,
+    libtorch_lib: &str,
+    rocm_root: &str,
+) -> String {
+    match vendor {
+        Some(GpuVendor::Amd) => {
+            format!("{}/lib:{libtorch_lib}", rocm_root.trim_end_matches('/'))
+        }
+        _ => libtorch_lib.to_string(),
+    }
+}
+
 /// The cargo feature a variant needs, or `""` for a CPU-only variant.
 pub fn variant_feature(variant: &str) -> &'static str {
     match variant_vendor(variant) {

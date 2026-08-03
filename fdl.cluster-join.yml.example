@@ -19,7 +19,8 @@
 # self-register into the same window.)
 #
 # The worker side is `fdl join` -- see fdl.yml.example's top-level `join:`
-# block and docs/ddp.md "Walking in". Two roads in, both shown below:
+# block and docs/ddp/02-cluster-guide.md "Walking in". Two roads in, both
+# shown below:
 #   - same box / private network:  fdl join <controller>:1337 --token <hex> \
 #                                    --bin <training-binary> -- <its args>
 #   - through a guardrailed sshd:  fdl join --ssh <user>@<sshd-host>:<port> \

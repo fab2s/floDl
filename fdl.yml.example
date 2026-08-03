@@ -118,7 +118,8 @@ commands:
 # workers walking into a controller's join window — the mirror image of
 # a cluster overlay's `controller.join:`). Bake it into a golden image
 # so a boot-time `fdl join` needs no flags; every field is overridable
-# on the command line (flags win). See docs/ddp.md "Walking in".
+# on the command line (flags win). See docs/ddp/02-cluster-guide.md
+# "Walking in".
 # ---------------------------------------------------------------------------
 # join:
 #   controller: 10.0.0.1:1337       # controller mux address, host[:port]
@@ -132,13 +133,59 @@ commands:
 #     # options: ["StrictHostKeyChecking=accept-new"]
 #   token: <hex>                    # pre-shared credential (the run's
 #                                   # controller.join.token); unset = open admission
-#   bin: target/release/train       # training binary run in agent role (required)
+#   bin: target/release/train       # training binary run in agent role: run
+#                                   # this path as given. Exactly one of
+#                                   # bin: / source: is required.
 #   args: ["--model", "resnet"]     # the binary's own arguments (a `--` tail
 #                                   # on the command line replaces this list)
 #   # host: worker-7                # logical roster name (default: hostname)
 #   # devices: [0, 1]               # CUDA ids to offer (default: all GPUs)
 #   # persist: true                 # re-dial with backoff when the agent
 #   #                               # exits — the systemd / fleet mode
+#
+#   # --- build the binary here, instead of naming one -----------------------
+#   # The box fetches the tree to LOCAL disk and compiles it against its OWN
+#   # libtorch, so the ABI matches by construction rather than by manifest
+#   # discipline. Never build from a mount: cargo stats every source file on
+#   # every invocation, and the attribute caching that would hide that
+#   # latency makes it serve a stale binary. The fetch preserves mtimes,
+#   # which is what keeps the loop incremental.
+#   #
+#   # `from` transports, three of them:
+#   #   file:///abs/path                      a directory on this box
+#   #   rsync://[user@]host[:port]:/abs/path  a working tree over ssh
+#   #   git+https://host/owner/repo#<ref>     a pinned checkout (git+ssh:// too)
+#   # rsync is the one that carries UNCOMMITTED work, which a training crate
+#   # living in no repo at all needs; git+ wants a #<tag|branch|sha>, because
+#   # a default branch floats and a floating ref is not a pin. Over ssh the
+#   # key comes from the ssh: block above, and that key's forced command has
+#   # to permit rsync (`rrsync -ro <dir>`; the nologin join key does not).
+#   #
+#   # No toolchain field: the tree carries its own rust-toolchain.toml and
+#   # lockfile if the operator pinned them, and RUSTUP_TOOLCHAIN set here
+#   # would silently override that.
+#   # source:
+#   #   from: rsync://flodl@ctrl.example.com:/home/op/my-train
+#   #   cwd: ddp-bench                # project dir inside the tree (default:
+#   #                                 # its root); governs build AND run
+#   #   build: cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench
+#   #                                 # default: `cargo build --release`. A
+#   #                                 # shell line, so it can be a script in
+#   #                                 # the tree (./ci/node-build.sh). Gets
+#   #                                 # LIBTORCH_PATH, FDL_GPU_FEATURE and
+#   #                                 # LD_LIBRARY_PATH. Re-runs every dial,
+#   #                                 # so it must be cheap when nothing
+#   #                                 # changed (cargo is).
+#   #   bin: target/release/ddp-bench # artifact, relative to cwd. Not guessed:
+#   #                                 # a workspace member's build lands in the
+#   #                                 # WORKSPACE target/, not the member's.
+#
+#   # --- libtorch on THIS box ----------------------------------------------
+#   # Acquire a variant into ~/.flodl/libtorch/ (never the project tree,
+#   # which on a walk-in is often a read-only mount) and make it active.
+#   # `auto` routes on the devices THIS box has, so one golden image serves
+#   # NVIDIA and AMD instances. Unset leaves the box on what it already has.
+#   # libtorch: auto                  # or cpu / cu126 / cu128 / rocm7.0
 #
 #   # --- the dataset source root on THIS box -------------------------------
 #   # data_path is the LOCAL path this box's ranks read their training data
@@ -154,15 +201,24 @@ commands:
 #   # acquired into ~/.flodl/data instead). A source your provisioning
 #   # already mounted needs no scheme at all — name its path in data_path
 #   # and leave data_source unset. Credentials come from the ssh: block
-#   # above: same box, same trust path.
+#   # above: same box, same key — and that key has to permit sftp, which a
+#   # join key guardrailed with command="/usr/sbin/nologin" does not (the
+#   # tunnel still works, the mount says permission denied). Use
+#   # command="internal-sftp -R -d /flodl/data", or mount during
+#   # provisioning and declare a bare data_path. Recipe:
+#   # docs/ddp/02-cluster-guide.md.
 #   # data_path: /flodl/data
 #   # data_source: sshfs://flodl@ctrl.example.com:/flodl/data
 #   #                               # or sshfs://host:2222/flodl/data
 #
-#   # Preparation (GPU stack, source root, writable stage dirs) runs before
-#   # every dial, so a --persist box picks up a changed source on its next
-#   # re-dial. A failure retrying cannot fix exits 2 and does NOT re-dial;
-#   # in a unit file, act on that instead of parsing stderr:
+#   # Preparation (GPU stack, data source root, writable stage dirs, then
+#   # libtorch and the built binary) runs before every dial, so a --persist
+#   # box picks up a changed source on its next re-dial. A failure retrying
+#   # cannot fix exits 2 and does NOT re-dial — no GPU, a spec that does not
+#   # parse, a missing toolchain. Source that does not COMPILE is transient
+#   # instead: the fix is a push away, and a box that stopped permanently
+#   # over a typo would be powered off by the recipe below.
+#   # In a unit file, act on the code instead of parsing stderr:
 #   #   Restart=always
 #   #   RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 #   #   FailureAction=poweroff       # ... and self-deprovision it

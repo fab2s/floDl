@@ -180,7 +180,7 @@
 #
 # The worker side of this window is `fdl join` (its defaults live in a
 # top-level `join:` block of the WORKER's fdl.yml — see fdl.yml.example
-# and docs/ddp.md "Walking in").
+# and docs/ddp/02-cluster-guide.md "Walking in").
 
 cluster:
   controller:

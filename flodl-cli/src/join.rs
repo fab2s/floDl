@@ -31,9 +31,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::builtins::JoinArgs;
-use crate::config::{self, SshConfig, WorkerJoin, DEFAULT_CONTROLLER_PORT};
+use crate::config::{self, SshConfig, WorkerJoin, WorkerSource, DEFAULT_CONTROLLER_PORT};
 use crate::context::Context;
-use crate::prepare::{self, DataSpec, Fail, Prepared};
+use crate::prepare::{self, DataSpec, Fail, Prepared, PrepareSpec, SourceSpec};
 use crate::style;
 
 /// Agent bootstrap env var — must match flodl's
@@ -108,16 +108,19 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         );
     }
 
-    // The binary must exist NOW — a persist loop retrying a missing
-    // path forever helps nobody.
-    let bin = Path::new(&eff.bin);
-    if !bin.is_file() {
-        crate::cli_error!(
-            "training binary not found: {} — build it first, then point \
-             `--bin` (or fdl.yml `join.bin`) at it",
-            eff.bin,
-        );
-        return EXIT_PERMANENT;
+    // A binary named as a path must exist NOW — a persist loop retrying
+    // a missing path forever helps nobody. A binary built from source
+    // cannot be checked here: it does not exist until the attempt has
+    // fetched and compiled the tree.
+    if let BinSource::Given(path) = &eff.bin {
+        if !Path::new(path).is_file() {
+            crate::cli_error!(
+                "training binary not found: {path} — build it first and \
+                 point `--bin` (or fdl.yml `join.bin`) at it, or hand this \
+                 box a `--source` to build",
+            );
+            return EXIT_PERMANENT;
+        }
     }
 
     // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
@@ -192,8 +195,11 @@ struct Effective {
     ssh: Option<SshConfig>,
     /// Pre-shared session credential (hex). `None` = open admission.
     token: Option<String>,
-    /// Training binary path, as given (resolved against cwd at spawn).
-    bin: String,
+    /// How this box gets its training binary: a path to run as given, or
+    /// a source to build. Exactly one, checked at resolution.
+    bin: BinSource,
+    /// libtorch variant to acquire; `None` keeps this box's active one.
+    libtorch_spec: Option<String>,
     /// Logical host name in the join hello.
     host: String,
     /// Explicit CUDA device ids; `None` = all GPUs on this host.
@@ -208,15 +214,46 @@ struct Effective {
     data_source: Option<String>,
 }
 
+/// Where this box's training binary comes from. `source:` and `bin:` are
+/// mutually exclusive because they answer the same question, and keeping
+/// the given-binary case a separate variant rather than a third kind of
+/// source spec is what keeps an artifact-versus-source distinction out of
+/// the source grammar.
+#[derive(Debug, PartialEq, Eq)]
+enum BinSource {
+    /// A path on this box, run as given.
+    Given(String),
+    /// Fetched and built here.
+    Build(WorkerSource),
+}
+
 impl Effective {
-    /// The data half, for [`crate::prepare`]. The tunnel block rides
-    /// along: the data host is the controller box in the shape this
-    /// exists for, so its key and options apply to the mount too.
-    fn data_spec(&self) -> DataSpec<'_> {
-        DataSpec {
-            path: self.data_path.as_deref(),
-            source: self.data_source.as_deref(),
-            ssh: self.ssh.as_ref(),
+    /// Everything [`crate::prepare`] has to settle. The tunnel block
+    /// rides along to both artifact specs: the data host and the source
+    /// host are the controller box in the shape this exists for, so its
+    /// key and options apply to them too.
+    fn prepare_spec<'a>(
+        &'a self,
+        active_libtorch: Option<&'a (PathBuf, String)>,
+    ) -> PrepareSpec<'a> {
+        PrepareSpec {
+            data: DataSpec {
+                path: self.data_path.as_deref(),
+                source: self.data_source.as_deref(),
+                ssh: self.ssh.as_ref(),
+            },
+            libtorch: self.libtorch_spec.as_deref(),
+            active_libtorch,
+            source: match &self.bin {
+                BinSource::Given(_) => None,
+                BinSource::Build(s) => Some(SourceSpec {
+                    from: &s.from,
+                    cwd: s.cwd.as_deref(),
+                    build: s.build.as_deref(),
+                    bin: &s.bin,
+                    ssh: self.ssh.as_ref(),
+                }),
+            },
         }
     }
 }
@@ -279,16 +316,83 @@ fn resolve_effective(
         None => ("127.0.0.1".to_string(), DEFAULT_CONTROLLER_PORT),
     };
 
-    let bin = cli
-        .bin
-        .clone()
-        .or(block.bin)
-        .ok_or_else(|| {
-            "no training binary configured — pass `--bin <path>` or set \
-             `join.bin` in fdl.yml (the binary is the protocol: it dials, \
-             joins, and runs this host's ranks)"
-                .to_string()
-        })?;
+    // The binary: a path to run, or a source to build. Flags win over
+    // the block on each side, and naming both ways is an authoring error
+    // rather than a precedence puzzle — a box that builds its own binary
+    // and is also handed one has no defensible answer.
+    let bin_path = cli.bin.clone().or(block.bin);
+    let source = match (cli.source.clone(), block.source) {
+        (Some(from), b) => Some(WorkerSource {
+            from,
+            // The compact `--source` flag carries only the transport, so
+            // the rest keeps coming from the block unless its own flag
+            // overrides it (same shape as `--ssh`).
+            cwd: cli.source_cwd.clone().or_else(|| b.as_ref().and_then(|b| b.cwd.clone())),
+            build: cli.source_build.clone().or_else(|| b.as_ref().and_then(|b| b.build.clone())),
+            bin: cli
+                .source_bin
+                .clone()
+                .or_else(|| b.as_ref().map(|b| b.bin.clone()))
+                .ok_or_else(|| {
+                    "a source needs the artifact it produces — pass \
+                     `--source-bin <path relative to the project dir>` or \
+                     set `join.source.bin` in fdl.yml"
+                        .to_string()
+                })?,
+        }),
+        (None, Some(mut b)) => {
+            if let Some(cwd) = cli.source_cwd.clone() {
+                b.cwd = Some(cwd);
+            }
+            if let Some(build) = cli.source_build.clone() {
+                b.build = Some(build);
+            }
+            if let Some(bin) = cli.source_bin.clone() {
+                b.bin = bin;
+            }
+            Some(b)
+        }
+        (None, None) => None,
+    };
+    // A source flag with no source to attach to is an authoring error,
+    // not something to drop on the floor: the operator meant it to change
+    // the run.
+    if source.is_none() {
+        for (flag, set) in [
+            ("--source-cwd", cli.source_cwd.is_some()),
+            ("--source-build", cli.source_build.is_some()),
+            ("--source-bin", cli.source_bin.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "{flag} has no source to apply to — pass `--source \
+                     <spec>` too, or set `join.source` in fdl.yml"
+                ));
+            }
+        }
+    }
+
+    let bin = match (bin_path, source) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "`bin:` and `source:` both name this box's training binary \
+                 — keep the one you mean. `bin:` runs a binary as given; \
+                 `source:` fetches and builds one here"
+                    .to_string(),
+            );
+        }
+        (Some(path), None) => BinSource::Given(path),
+        (None, Some(source)) => BinSource::Build(source),
+        (None, None) => {
+            return Err(
+                "no training binary configured — pass `--bin <path>` (run \
+                 it as given) or `--source <spec>` (build it here), or set \
+                 `join.bin` / `join.source` in fdl.yml. The binary is the \
+                 protocol: it dials, joins, and runs this host's ranks"
+                    .to_string(),
+            );
+        }
+    };
 
     let devices = match &cli.devices {
         Some(spec) => parse_devices(spec)?,
@@ -317,6 +421,7 @@ fn resolve_effective(
         devices,
         persist: cli.persist || block.persist,
         bin_args,
+        libtorch_spec: cli.libtorch.clone().or(block.libtorch),
         data_path: cli.data_path.clone().or(block.data_path),
         data_source: cli.data_source.clone().or(block.data_source),
     })
@@ -460,19 +565,46 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Active libtorch of this box: `(lib dir to prepend on
-/// LD_LIBRARY_PATH, variant label for the hello)`. Anchored on the
-/// project root when the config walk found one (a command-dir cwd's
-/// `Context::resolve` would stop a level too low); the plain context
-/// fallback covers project-less setups (`~/.flodl`).
+/// Active libtorch of this box: `(variant directory, variant label for
+/// the hello)`. Anchored on the project root when the config walk found
+/// one (a command-dir cwd's `Context::resolve` would stop a level too
+/// low); the plain context fallback covers project-less setups
+/// (`~/.flodl`).
+///
+/// The directory rather than its `lib/`: the build wants `LIBTORCH_PATH`
+/// (headers included) and the child wants `lib/`, so one value serves
+/// both and neither caller has to guess which it was handed.
 fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, String)> {
     let root = match project_root {
         Some(r) => r.to_path_buf(),
         None => Context::resolve().root,
     };
     let info = crate::libtorch::detect::read_active(&root)?;
-    let lib = root.join("libtorch").join(&info.path).join("lib");
-    lib.is_dir().then_some((lib, info.path))
+    let dir = root.join("libtorch").join(&info.path);
+    dir.join("lib").is_dir().then_some((dir, info.path))
+}
+
+/// `LD_LIBRARY_PATH` for the training binary, with this box's inherited
+/// value appended.
+///
+/// The ordering inside is not ours to choose: on ROCm the system runtime
+/// must precede libtorch's own lib dir, because libtorch-rocm bundles the
+/// whole userspace ROCm stack and a bundle that disagrees with the host's
+/// amdkfd driver segfaults the rank at its first GPU op. Prepending
+/// unconditionally, which is what this did before, is the segfault
+/// configuration on an AMD box.
+fn child_ld_library_path(libtorch_dir: &Path, variant: &str) -> String {
+    let lib = libtorch_dir.join("lib").display().to_string();
+    let vendor = crate::libtorch::detect::variant_vendor(variant);
+    let value = crate::libtorch::detect::ld_library_path_value(
+        vendor,
+        &lib,
+        &std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string()),
+    );
+    match std::env::var("LD_LIBRARY_PATH") {
+        Ok(cur) if !cur.is_empty() => format!("{value}:{cur}"),
+        _ => value,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,10 +624,10 @@ fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, Strin
 /// outlive the run it served.
 fn attempt(
     eff: &Effective,
-    libtorch: Option<&(PathBuf, String)>,
+    active_libtorch: Option<&(PathBuf, String)>,
 ) -> Result<i32, Fail> {
     let mut notes = Vec::new();
-    let prepared = prepare::prepare(&eff.data_spec(), &mut notes);
+    let prepared = prepare::prepare(&eff.prepare_spec(active_libtorch), &mut notes);
     prepare::print_notes(&notes);
     let prepared = prepared?;
 
@@ -539,28 +671,53 @@ fn attempt(
         None => (eff.controller_host.clone(), eff.controller_port),
     };
 
-    let libtorch_label = libtorch.map(|(_, l)| l.as_str()).unwrap_or("");
+    // Preparation is the authority on libtorch: it either acquired a
+    // variant or carried the active one through, and the label it settles
+    // on is what the join hello announces.
+    let libtorch_label = prepared.libtorch.as_ref().map(|(_, l)| l.as_str()).unwrap_or("");
     let spec_hex = agent_spec_hex(eff, (&dial.0, dial.1), libtorch_label, &prepared);
 
-    let mut cmd = Command::new(&eff.bin);
+    // A built binary runs in the project directory inside the fetched
+    // tree, which is where its own relative paths resolve; a given one
+    // keeps fdl's cwd, exactly as before.
+    let (bin, bin_cwd) = match (&eff.bin, &prepared.bin) {
+        (BinSource::Build(_), Some(built)) => (built.bin.clone(), Some(built.cwd.clone())),
+        (BinSource::Given(path), None) => (PathBuf::from(path), None),
+        // Neither combination is reachable — preparation returns a binary
+        // exactly when it was given a source — so say so rather than
+        // quietly preferring one and hiding a wiring inversion.
+        (kind, built) => {
+            return Err(Fail::Permanent(format!(
+                "internal: preparation and the resolved binary disagree \
+                 ({}, built={})",
+                match kind {
+                    BinSource::Given(_) => "a path was given",
+                    BinSource::Build(_) => "a source was given",
+                },
+                built.is_some(),
+            )));
+        }
+    };
+
+    let mut cmd = Command::new(&bin);
     cmd.args(&eff.bin_args)
         .env(ENV_AGENT_JSON, &spec_hex)
         // Children report under the logical roster name even when it
         // differs from `hostname` — same override fan-out applies.
         .env(crate::cluster::ENV_HOST_OVERRIDE, &eff.host)
         .stdin(Stdio::null());
-    if let Some((lib, _)) = libtorch {
-        let merged = match std::env::var("LD_LIBRARY_PATH") {
-            Ok(cur) if !cur.is_empty() => format!("{}:{cur}", lib.display()),
-            _ => lib.display().to_string(),
-        };
-        cmd.env("LD_LIBRARY_PATH", merged);
+    if let Some(cwd) = &bin_cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some((dir, variant)) = &prepared.libtorch {
+        cmd.env("LD_LIBRARY_PATH", child_ld_library_path(dir, variant));
     }
 
-    // The path was checked before the loop, so a spawn failure here is
-    // the file itself: not executable, wrong architecture, bad interpreter.
+    // A given path was checked before the loop and a built one was just
+    // written, so a spawn failure here is the file itself: not
+    // executable, wrong architecture, bad interpreter.
     let status = cmd.status().map_err(|e| {
-        Fail::Permanent(format!("run {}: {e}", eff.bin))
+        Fail::Permanent(format!("run {}: {e}", bin.display()))
     });
     if let Some(mut t) = tunnel.take() {
         let _ = t.kill();
@@ -676,6 +833,11 @@ mod tests {
             identity: None,
             token: None,
             bin: None,
+            source: None,
+            source_cwd: None,
+            source_build: None,
+            source_bin: None,
+            libtorch: None,
             host: None,
             devices: None,
             persist: false,
@@ -696,12 +858,28 @@ mod tests {
             }),
             token: Some("aa".repeat(16)),
             bin: Some("target/release/train".into()),
+            source: None,
+            libtorch: Some("auto".into()),
             host: Some("worker-7".into()),
             devices: Some(vec![0, 1]),
             persist: true,
             args: vec!["--model".into(), "lenet".into()],
             data_path: Some("/flodl/data".into()),
             data_source: Some("sshfs://flodl@ctrl:/srv/data".into()),
+        }
+    }
+
+    /// A block that builds its binary instead of naming one.
+    fn source_block() -> WorkerJoin {
+        WorkerJoin {
+            source: Some(WorkerSource {
+                from: "rsync://exa:/home/op/rdl".into(),
+                cwd: Some("ddp-bench".into()),
+                build: Some("cargo build --release --bin ddp-bench".into()),
+                bin: "target/release/ddp-bench".into(),
+            }),
+            bin: None,
+            ..full_block()
         }
     }
 
@@ -713,11 +891,13 @@ mod tests {
             identity: Some("/tmp/id".into()),
             token: Some("bb".repeat(16)),
             bin: Some("other/bin".into()),
+            libtorch: Some("cu128".into()),
             host: Some("pascal".into()),
             devices: Some("2".into()),
             persist: false,
             data_path: Some("/mnt/corpus".into()),
             data_source: Some("sshfs://exa/mnt/corpus".into()),
+            ..no_flags()
         };
         let tail: Vec<String> = vec!["--epochs".into(), "3".into()];
         let eff = resolve_effective(
@@ -738,7 +918,8 @@ mod tests {
         assert_eq!(ssh.identity_file.as_deref(), Some("/tmp/id"));
         assert_eq!(ssh.options, vec!["StrictHostKeyChecking=accept-new".to_string()]);
         assert_eq!(eff.token.as_deref(), Some("bb".repeat(16).as_str()));
-        assert_eq!(eff.bin, "other/bin");
+        assert_eq!(eff.bin, BinSource::Given("other/bin".into()));
+        assert_eq!(eff.libtorch_spec.as_deref(), Some("cu128"));
         assert_eq!(eff.host, "pascal");
         assert_eq!(eff.devices, Some(vec![2]));
         // persist: block `true` sticks (the flag can only turn it on).
@@ -758,7 +939,8 @@ mod tests {
         let ssh = eff.ssh.as_ref().unwrap();
         assert_eq!(ssh.target.as_deref(), Some("bastion"));
         assert_eq!(ssh.identity_file.as_deref(), Some("/etc/flodl/join_key"));
-        assert_eq!(eff.bin, "target/release/train");
+        assert_eq!(eff.bin, BinSource::Given("target/release/train".into()));
+        assert_eq!(eff.libtorch_spec.as_deref(), Some("auto"));
         assert_eq!(eff.host, "worker-7");
         assert_eq!(eff.devices, Some(vec![0, 1]));
         assert!(eff.persist);
@@ -769,12 +951,76 @@ mod tests {
             Some("sshfs://flodl@ctrl:/srv/data"),
         );
         // The tunnel block's key and options carry to the data mount:
-        // same box, same trust path.
-        let spec = eff.data_spec();
+        // same box, same key (which that key must permit — see
+        // `prepare::DataSpec::ssh`).
+        let spec = eff.prepare_spec(None);
         assert_eq!(
-            spec.ssh.and_then(|s| s.identity_file.as_deref()),
+            spec.data.ssh.and_then(|s| s.identity_file.as_deref()),
             Some("/etc/flodl/join_key"),
         );
+    }
+
+    #[test]
+    fn a_source_block_becomes_a_source_spec_carrying_the_same_key() {
+        let eff = resolve_effective(&no_flags(), None, Some(source_block()), "localbox").unwrap();
+        let spec = eff.prepare_spec(None);
+        let source = spec.source.expect("a source block yields a source spec");
+        assert_eq!(source.from, "rsync://exa:/home/op/rdl");
+        assert_eq!(source.cwd, Some("ddp-bench"));
+        assert_eq!(source.bin, "target/release/ddp-bench");
+        // The pull runs over the same hop the tunnel uses.
+        assert_eq!(
+            source.ssh.and_then(|s| s.identity_file.as_deref()),
+            Some("/etc/flodl/join_key"),
+        );
+    }
+
+    #[test]
+    fn naming_both_a_binary_and_a_source_is_a_loud_error() {
+        // Not a precedence puzzle: a box handed both has no defensible
+        // answer, so it must be told rather than guessed at.
+        let block = WorkerJoin { bin: Some("target/release/train".into()), ..source_block() };
+        let err = resolve_effective(&no_flags(), None, Some(block), "x").unwrap_err();
+        assert!(err.contains("both name"), "got: {err}");
+    }
+
+    #[test]
+    fn a_source_flag_keeps_the_blocks_other_source_fields() {
+        // Same shape as the compact `--ssh`: the flag carries the
+        // transport, the block still answers for the rest.
+        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let eff = resolve_effective(&cli, None, Some(source_block()), "x").unwrap();
+        assert_eq!(
+            eff.bin,
+            BinSource::Build(WorkerSource {
+                from: "file:///mnt/rdl".into(),
+                cwd: Some("ddp-bench".into()),
+                build: Some("cargo build --release --bin ddp-bench".into()),
+                bin: "target/release/ddp-bench".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_source_flag_with_no_artifact_anywhere_is_a_loud_error() {
+        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let err = resolve_effective(&cli, None, None, "x").unwrap_err();
+        assert!(err.contains("--source-bin"), "got: {err}");
+    }
+
+    #[test]
+    fn a_source_detail_flag_with_no_source_is_a_loud_error() {
+        // Silently dropping it would leave the operator with a run that
+        // ignored what they typed, which is the failure `--`-forwarded
+        // options already taught this CLI once.
+        let cli = JoinArgs {
+            bin: Some("t/bin".into()),
+            source_cwd: Some("ddp-bench".into()),
+            ..no_flags()
+        };
+        let err = resolve_effective(&cli, None, None, "x").unwrap_err();
+        assert!(err.contains("--source-cwd"), "got: {err}");
+        assert!(err.contains("no source"), "got: {err}");
     }
 
     #[test]
@@ -896,6 +1142,7 @@ mod tests {
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
         let prepared = Prepared {
             data_path: Some(PathBuf::from("/flodl/data")),
+            ..Prepared::default()
         };
         let hex =
             agent_spec_hex(&eff, ("127.0.0.1", 40123), "builds/sm61-sm120", &prepared);

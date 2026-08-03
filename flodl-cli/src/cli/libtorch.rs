@@ -206,7 +206,7 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
     };
 
     match libtorch::download::run(opts) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             cli_error!("{e}");
             ExitCode::FAILURE

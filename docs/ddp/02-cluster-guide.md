@@ -322,6 +322,56 @@ node-local cache). A root your provisioning already mounts needs no
 scheme at all - name its path in `data_path` and leave `data_source`
 unset; declare neither and nothing is checked or shipped.
 
+The mount authenticates with the `ssh:` block's own key, so a
+guardrailed join sshd has to permit sftp for it to come up at all - see
+the recipe below, which is where that costs a decision.
+
+**Compiling on the node.** `bin:` names a binary to run as given. Its
+alternative builds one here, which is how the ABI stops being a matter of
+manifest discipline: the box links against the exact libtorch it holds.
+
+```yaml
+join:
+  libtorch: auto                # acquire into ~/.flodl/libtorch/ and
+                                #   activate; `auto` reads THIS box's
+                                #   devices, so one image serves both vendors
+  source:
+    from: rsync://flodl@ctrl.example.com:/home/op/my-train
+    cwd: ddp-bench              # project dir inside the tree; governs
+                                #   the build AND the run
+    build: cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench
+    bin: target/release/ddp-bench
+```
+
+Three transports, and the scheme names the tool rather than a wire
+protocol, the same convention `data_source` uses: `file:///abs/path` for
+a directory already on the box, `rsync://[user@]host[:port]:/abs/path`
+for a working tree over ssh, `git+https://host/owner/repo#<ref>` (or
+`git+ssh://`) for a pinned checkout. rsync is the one that carries
+UNCOMMITTED work, which is what a training crate living in no repo at all
+needs; `git+` insists on a ref because a default branch floats, and a
+floating ref is not a pin. Over ssh the credentials come from the `ssh:`
+block, so that key's forced command has to permit rsync (`rrsync -ro
+<dir>`) - the nologin join key does not.
+
+The tree always lands on LOCAL disk first. cargo fingerprints by stat'ing
+every source file on every invocation, so building over a mount pays that
+latency thousands of times before a line compiles, and the attribute
+caching that would hide it makes cargo hand back a stale binary. The
+fetch preserves mtimes and leaves the build directory alone, so a re-dial
+costs the changed files and nothing else.
+
+`build:` defaults to `cargo build --release` and is a shell line, so it
+can be a script committed beside the code: the recipe then travels with
+the source while its invocation stays in this box's config. It receives
+`LIBTORCH_PATH`, `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`, and nothing
+else is assumed - `cuda` and `rocm` are *this* repo's feature names, and a
+user's crate pins its flodl features in its own manifest, so the vendor is
+handed over for a recipe to use or ignore. There is no toolchain field on
+purpose: a crate that builds on the operator's box already carries its
+`Cargo.toml`, its lockfile and its `rust-toolchain.toml` if they pinned
+one, and `RUSTUP_TOOLCHAIN` set here would silently override that pin.
+
 Two other things are settled before the dial. The GPU stack: no usable
 device at all and the box does not dial, since the agent's own check
 comes *after* admission, when this host has already been counted into a
@@ -337,9 +387,12 @@ Failures then split by what retrying can do about them, because
 `persist` must treat them differently: a controller that is not up yet
 deserves the backoff loop (exit **1**), while a box with no GPU never
 grows one (exit **2**, and no re-dial). Without the split a
-misprovisioned instance hot-loops instead of stopping. fdl never powers
-a box off itself - the exit code is how whatever owns the instance
-hears about it:
+misprovisioned instance hot-loops instead of stopping. Source that does
+not COMPILE lands on the transient side, which reads lenient and is not:
+the source is remote, so the fix is a push away, and pairing a compile
+error with the `poweroff` below would let one typo take out a fleet. fdl
+never powers a box off itself - the exit code is how whatever owns the
+instance hears about it:
 
 ```ini
 # /etc/systemd/system/flodl-join.service
@@ -382,6 +435,39 @@ Match User flodl-join
 Expose it on a non-standard external port (a router forward to the
 box's 22, or a dedicated sshd instance on its own port), and hand
 workers `fdl join --ssh flodl-join@host:<port> --identity <key>`.
+
+**A forced command also refuses sftp, which the data mount needs.**
+`command=` (and `ForceCommand`) covers shell, exec *and subsystem*
+requests, so `/usr/sbin/nologin` turns sftp away - and `data_source:
+sshfs://...` is sftp. `ssh -N` is untouched because it asks for no
+command at all, which is exactly why the tunnel keeps working while the
+mount comes back "permission denied"; rsync over ssh fails the same way,
+since it execs `rsync --server` on the far side. So the forced command
+has to say which door this key opens:
+
+```
+# A. one key for both: `ssh -N` plus a read-only sftp door
+restrict,port-forwarding,permitopen="127.0.0.1:1337",command="internal-sftp -R -d /flodl/data" ssh-ed25519 AAAA... flodl-join
+
+# B. two keys: the tunnel key above stays nologin-tight, and a second one
+#    is directory-scoped rather than merely read-only
+restrict,command="rrsync -ro /srv/flodl-run" ssh-ed25519 AAAA... flodl-source
+```
+
+A key carries exactly one forced command, so no single key serves both
+sshfs and rsync, which makes this a choice rather than a checklist. `-R`
+makes internal-sftp read-only, but `-d` only sets the *starting*
+directory: the client can still read whatever that user can, so
+containment under A is the dedicated no-shell user plus a daemon-level
+`ChrootDirectory` (which wants a root-owned parent). `rrsync` ships with
+rsync and enforces its directory itself, so B leaves a leaked tunnel key
+worth a forward and nothing more, at the cost of distributing two keys.
+Weigh A by what else that user can read: a compromised join key becomes
+a read of the data root.
+
+The third option needs no key at all, and is the right one whenever the
+tunnel key should stay tighter than the mount: mount the source root
+during provisioning and declare a bare `data_path`.
 
 The ephemeral variant of the same recipe is a **dedicated sshd
 instance whose lifetime brackets the run**: its own config, its own

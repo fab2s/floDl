@@ -812,10 +812,14 @@ fn runtime_ld_library_path(worker_path: &str, arch: &str) -> String {
         "{path}/libtorch/{arch}/lib",
         path = worker_path.trim_end_matches('/'),
     );
-    match crate::libtorch::detect::variant_vendor(arch) {
-        Some(flodl_hw::GpuVendor::Amd) => format!("/opt/rocm/lib:{libtorch_lib}"),
-        _ => libtorch_lib,
-    }
+    // `/opt/rocm` as a literal, not this box's `$ROCM_PATH`: the path is
+    // composed for the REMOTE host, whose ROCm root our environment
+    // knows nothing about.
+    crate::libtorch::detect::ld_library_path_value(
+        crate::libtorch::detect::variant_vendor(arch),
+        &libtorch_lib,
+        "/opt/rocm",
+    )
 }
 
 /// Extract a CUDA major.minor string from a `precompiled/cuNN` arch

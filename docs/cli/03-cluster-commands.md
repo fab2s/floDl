@@ -174,11 +174,48 @@ source on its next re-dial, with no reprovisioning.
   already-mounted path is left alone and reused; a mount from a
   *different* source is reported and still reused, since unmounting
   behind the operator would be worse. Credentials come from the `ssh:`
-  block — same box, same trust path.
+  block — same box, same key, and that key has to permit sftp: a join
+  key guardrailed with `command="/usr/sbin/nologin"` refuses it, so the
+  tunnel comes up and the mount says permission denied. Either the key
+  carries `command="internal-sftp -R -d /flodl/data"` instead, or the
+  root is mounted during provisioning and `--data-path` is declared
+  bare. Both are in the [guardrail
+  recipe](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window).
 - **The local directories.** `~/.flodl/data` (the across-run dataset
   cache) and the temp dir (the within-run disk stage) are proven writable
   by writing. RAM-backed (`tmpfs`) or nearly-full volumes are reported,
   not refused.
+- **libtorch**, when `--libtorch` names a variant: acquired into
+  `~/.flodl/libtorch/` and made active. `auto` routes on the devices
+  *this* box has, which is what lets one golden image serve NVIDIA and
+  AMD instances. Never into the project tree, which on a walk-in is
+  frequently a read-only mount.
+- **The training binary**, when `--source` names a tree instead of
+  `--bin` naming a path. The tree is fetched to local disk and built
+  there, so it links against the libtorch this box holds and the ABI
+  matches by construction:
+
+  ```bash
+  fdl join --ssh flodl-join@ctrl --libtorch auto \
+           --source rsync://flodl@ctrl:/home/op/my-train \
+           --source-bin target/release/my-train
+  ```
+
+  Building from a mount is never an option: cargo fingerprints by
+  stat'ing every source file on every invocation, and the attribute
+  caching that would hide that latency makes it serve a stale binary. The
+  fetch preserves mtimes, so the build stays incremental across dials
+  rather than being a cold rebuild in an incremental costume.
+
+  `--source-cwd` is the project directory inside the tree and governs the
+  build and the run both; `--source-build` is a shell line (default
+  `cargo build --release`) and can be a script committed beside the code,
+  so the recipe travels with the source while its invocation stays in the
+  box's config. It receives `LIBTORCH_PATH`, `FDL_GPU_FEATURE` and
+  `LD_LIBRARY_PATH`. There is deliberately no toolchain flag: the tree
+  carries its own `rust-toolchain.toml` and lockfile when the operator
+  pinned them, and `RUSTUP_TOOLCHAIN` set here would silently override
+  that.
 
 A source your provisioning already mounts needs no scheme at all: name
 its path in `--data-path`. Nothing is checked and nothing is shipped
@@ -189,8 +226,13 @@ Exit codes:
 | code | meaning | `--persist` |
 |---|---|---|
 | **0** | the agent's own: this host's ranks all finished cleanly | re-dials |
-| **1** | transient failure — controller unreachable, mount attempt failed | re-dials |
-| **2** | permanent failure — no GPU, unresolvable source, missing binary, unwritable stage | **stops** |
+| **1** | transient failure — controller unreachable, mount or fetch attempt failed, **the source did not compile** | re-dials |
+| **2** | permanent failure — no GPU, a spec that does not parse, a missing binary or toolchain, unwritable stage | **stops** |
+
+A compile error being transient is deliberate rather than lenient. The
+source is remote, so the fix is a push away, and the systemd recipe below
+pairs code 2 with `poweroff`: a box that stopped permanently over a typo
+would take the fleet with it.
 
 fdl never powers a box off itself; 2 is how the thing that owns the
 instance hears about it:

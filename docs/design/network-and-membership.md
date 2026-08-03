@@ -157,9 +157,13 @@ is gated on bind scope:
 | non-loopback (rig mode) | **pre-shared salt** as today (fdl fan-out delivers it), or explicit `open_admission: true` with a loud warning | reaching a LAN/WAN port proves nothing; silent open admission would let a network neighbor *participate in* (poison) training, which is strictly worse than observing cleartext |
 
 Deployment hardening that falls out for free: the worker's SSH key
-can be a restricted `authorized_keys` entry on the controller host -
-`no-pty,permitopen="127.0.0.1:<port>"` - granting exactly the tunnel
-and nothing else. That makes the credential safe to bake into cloud
+can be a restricted `authorized_keys` entry on the controller host,
+granting exactly the tunnel and nothing else - `restrict`,
+`port-forwarding`, `permitopen="127.0.0.1:<port>"` and a forced
+`command=`, that last one load-bearing because `no-pty` alone still
+leaves `ssh host <cmd>` wide open (full recipe, including what the
+forced command costs a walk-in's data mount, in
+[the cluster guide](../ddp/02-cluster-guide.md)). That makes the credential safe to bake into cloud
 images: a leaked key lets someone join a training run if they can
 also reach the controller's sshd, and nothing more.
 

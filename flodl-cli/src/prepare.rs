@@ -6,10 +6,13 @@
 //! makes `--persist` a provisioning loop for free — a box picks up a
 //! changed source on its next re-dial, with no reprovisioning.
 //!
-//! What it does today: gate on the GPU stack, put the dataset source
-//! root where the ranks will look for it, and confirm the node-local
-//! directories the data plane writes are actually writable. libtorch and
-//! the training binary join the list when they become specs too.
+//! Five steps, in an order that is itself load-bearing. First the cheap
+//! ones: gate on the GPU stack, put the dataset source root where the
+//! ranks will look for it, prove the node-local directories the data
+//! plane writes are writable. Then what a box may not have yet — the
+//! training source, a libtorch variant, and the binary built from both —
+//! because those take minutes, and discovering an unwritable stage
+//! directory after a cold build has wasted the build.
 //!
 //! Failures split two ways, and the split is the point. `--persist`
 //! re-dials forever with backoff, which is right for a controller that
@@ -20,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{SshConfig, DEFAULT_DATA_PATH};
+use crate::context::Context;
+use crate::source::Built;
+use crate::spec::{parse_ssh_target, split_scheme, SshTarget};
 use crate::style;
 
 /// Why preparation stopped, and whether trying again could help.
@@ -56,6 +62,48 @@ pub struct Prepared {
     /// its own default, which is what a run that never mentions data
     /// expects.
     pub data_path: Option<PathBuf>,
+    /// The libtorch this box will train against: `(variant directory,
+    /// variant label)`. Acquired when a spec asked for one, otherwise
+    /// whatever was already active here. One field rather than two
+    /// because the answer has one authority: the build links against it
+    /// and the ranks load from it.
+    pub libtorch: Option<(PathBuf, String)>,
+    /// The training binary this box built, and the directory it expects
+    /// as cwd. `None` when the operator named a binary instead of a
+    /// source.
+    pub bin: Option<Built>,
+}
+
+/// Everything this box has to settle before it dials.
+#[derive(Debug, Default)]
+pub struct PrepareSpec<'a> {
+    pub data: DataSpec<'a>,
+    /// libtorch variant to acquire: `auto`, `cpu`, `cu126`, `cu128`,
+    /// `rocm7.0`. `None` leaves this box on whatever it already has.
+    pub libtorch: Option<&'a str>,
+    /// This box's already-active libtorch, when fdl found one. Used when
+    /// no variant is acquired, and it is what the build links against.
+    pub active_libtorch: Option<&'a (PathBuf, String)>,
+    /// Training source to fetch and build. `None` when the operator
+    /// named an existing binary.
+    pub source: Option<SourceSpec<'a>>,
+}
+
+/// The source half of the join recipe.
+#[derive(Debug, Default)]
+pub struct SourceSpec<'a> {
+    /// Transport plus location (see [`crate::source::parse`]).
+    pub from: &'a str,
+    /// Project directory inside the fetched tree. Governs the build AND
+    /// the run, so it answers "where is the project in this tree" once.
+    pub cwd: Option<&'a str>,
+    /// Build recipe, a shell line. `None` uses cargo's release build.
+    pub build: Option<&'a str>,
+    /// Built artifact, relative to `cwd`.
+    pub bin: &'a str,
+    /// The join block's ssh credentials, for a transport that needs
+    /// them. Same reuse (and same caveat) as [`DataSpec::ssh`].
+    pub ssh: Option<&'a SshConfig>,
 }
 
 /// The data half of the join recipe, as resolved from flags over the
@@ -69,9 +117,18 @@ pub struct DataSpec<'a> {
     /// The join block's tunnel credentials. Reused for the data mount:
     /// in the shape this exists for, the data host IS the controller box
     /// the tunnel already authenticates against, so a second key field
-    /// would be surface that only ever repeats the first one. A box that
-    /// needs different credentials mounts its source in provisioning and
-    /// declares a bare `path`.
+    /// would be surface that only ever repeats the first one.
+    ///
+    /// One consequence belongs in the operator's hands rather than in
+    /// their debugging: a forced `command=` on that key covers subsystem
+    /// requests, so a join key guardrailed with `/usr/sbin/nologin`
+    /// turns sftp away and the mount never comes up while the tunnel
+    /// keeps working (`ssh -N` requests no command at all). Either the
+    /// key permits sftp (`internal-sftp -R`), or the source root is
+    /// mounted during provisioning and `path` is declared bare — which
+    /// is also the answer for a box whose mount needs different
+    /// credentials entirely. Both spellings are in the guardrail recipe
+    /// in docs/ddp/02-cluster-guide.md.
     pub ssh: Option<&'a SshConfig>,
 }
 
@@ -87,14 +144,178 @@ const CACHE_SUBPATH: &str = ".flodl/data";
 /// operator meant to train from.
 const LOW_SPACE_KIB: u64 = 1 << 20;
 
+/// Where a fetched source tree lands, under the global root. Sibling of
+/// the `libtorch/` and `data/` the same root already carries, per the
+/// convention that anything fdl manages locally on one box lives there
+/// while only paths a config names across hosts are absolute.
+const SOURCE_SUBDIR: &str = "source";
+
 /// Prepare this box. `notes` collects everything worth telling the
 /// operator that is not a failure (a reused mount, a tmpfs stage, a
 /// nearly-full volume); the caller prints them.
-pub fn prepare(spec: &DataSpec, notes: &mut Vec<String>) -> Result<Prepared, Fail> {
+///
+/// Cheap before expensive: the gate, the mount and the write proofs all
+/// finish in about the time it takes to say so, while a source fetch and
+/// a cold build take minutes. The source comes before libtorch for the
+/// same reason at a smaller scale — a tree is megabytes and a libtorch
+/// variant is gigabytes, so a broken spec should fail before the
+/// download rather than after it.
+pub fn prepare(spec: &PrepareSpec, notes: &mut Vec<String>) -> Result<Prepared, Fail> {
     check_gpu_stack()?;
-    let data_path = resolve_data_root(spec, notes)?;
+    let data_path = resolve_data_root(&spec.data, notes)?;
     check_local_dirs(notes)?;
-    Ok(Prepared { data_path })
+
+    let tree = match &spec.source {
+        Some(source) => Some(fetch_source(source, notes)?),
+        None => None,
+    };
+    let libtorch = match spec.libtorch {
+        Some(token) => Some(acquire_libtorch(token, notes)?),
+        None => spec.active_libtorch.cloned(),
+    };
+    let bin = match (&spec.source, &tree) {
+        (Some(source), Some(tree)) => {
+            Some(build_source(source, tree, libtorch.as_ref(), notes)?)
+        }
+        _ => None,
+    };
+    Ok(Prepared { data_path, libtorch, bin })
+}
+
+// ---------------------------------------------------------------------------
+// libtorch
+// ---------------------------------------------------------------------------
+
+/// Acquire a libtorch variant and return `(variant directory, label)`.
+///
+/// Into the GLOBAL root, never the project one: a walk-in is consuming
+/// artifacts, and the project root it happens to stand in is frequently a
+/// read-only shared mount (see [`Context::global`]). Idempotent — the
+/// downloader recognises a variant already installed at the pinned
+/// version and returns without touching the network.
+///
+/// `auto` is the fleet-friendly value: it routes on the devices this box
+/// actually has, so one golden image serves NVIDIA and AMD instances.
+fn acquire_libtorch(token: &str, notes: &mut Vec<String>) -> Result<(PathBuf, String), Fail> {
+    let variant = parse_libtorch_token(token)?;
+    let ctx = Context::global();
+    let id = crate::libtorch::download::run_with_context(
+        crate::libtorch::download::DownloadOpts {
+            variant,
+            custom_path: None,
+            // Write `.active` under the global root so anything else fdl
+            // does on this box afterwards agrees with what trains here.
+            activate: true,
+            dry_run: false,
+            force_linux: false,
+        },
+        &ctx,
+    )
+    // A download that fails is the network, or a mirror having a bad
+    // day: worth another dial rather than stopping the box.
+    .map_err(Fail::Transient)?;
+
+    let dir = ctx.root.join("libtorch").join(&id);
+    if !dir.join("lib").is_dir() {
+        return Err(Fail::Permanent(format!(
+            "libtorch `{id}` is not usable at {} (no lib/) — remove it and \
+             let fdl fetch it again",
+            dir.display(),
+        )));
+    }
+    notes.push(format!("libtorch: {id} at {}", dir.display()));
+    Ok((dir, id))
+}
+
+/// Map a `libtorch:` value onto a downloadable variant. The accepted
+/// values are `fdl libtorch download`'s own flags spelled as one token,
+/// so the two surfaces cannot drift into naming different things.
+fn parse_libtorch_token(token: &str) -> Result<crate::libtorch::download::Variant, Fail> {
+    use crate::libtorch::download::Variant;
+    match token.trim() {
+        "auto" => Ok(Variant::Auto),
+        "cpu" => Ok(Variant::Cpu),
+        "cu126" | "12.6" => Ok(Variant::Cuda126),
+        "cu128" | "12.8" => Ok(Variant::Cuda128),
+        "rocm7.0" | "rocm70" | "7.0" => Ok(Variant::Rocm70),
+        other => Err(Fail::Permanent(format!(
+            "unknown libtorch variant `{other}` — fdl ships `auto`, `cpu`, \
+             `cu126`, `cu128` and `rocm7.0`. `auto` picks from the devices \
+             this box has, which is what lets one image serve both vendors"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The training source
+// ---------------------------------------------------------------------------
+
+/// Materialise the source tree on local disk and hand back its root.
+fn fetch_source(spec: &SourceSpec, notes: &mut Vec<String>) -> Result<PathBuf, Fail> {
+    let source = crate::source::parse(spec.from)?;
+    let dest = Context::global().root.join(SOURCE_SUBDIR);
+    crate::source::materialize(&source, &dest, spec.ssh, notes)?;
+    Ok(dest)
+}
+
+/// Build the fetched tree.
+///
+/// The recipe runs with the environment an `fdl.yml` `commands.run` line
+/// already relies on, so a recipe that works there works here. What it
+/// deliberately does NOT get is a feature flag fdl chose: `cuda` and
+/// `rocm` are this repo's feature names, and a user's crate pins its
+/// flodl features in its own manifest and may expose none of them, so
+/// the vendor is handed over as `$FDL_GPU_FEATURE` for a recipe to use
+/// or ignore.
+fn build_source(
+    spec: &SourceSpec,
+    tree: &Path,
+    libtorch: Option<&(PathBuf, String)>,
+    notes: &mut Vec<String>,
+) -> Result<Built, Fail> {
+    if libtorch.is_none() {
+        notes.push(
+            "no libtorch is active on this box and none was requested, so \
+             the build gets no LIBTORCH_PATH — set `libtorch:` (`auto` \
+             picks for this box) unless the recipe supplies its own"
+                .to_string(),
+        );
+    }
+    let env = build_env(libtorch);
+    crate::source::build(tree, spec.cwd, spec.build, spec.bin, &env, notes)
+}
+
+/// The environment a build recipe gets.
+fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> {
+    let Some((dir, variant)) = libtorch else {
+        return Vec::new();
+    };
+    let lib = dir.join("lib").display().to_string();
+    let vendor = crate::libtorch::detect::variant_vendor(variant);
+    vec![
+        // What flodl-sys/build.rs reads to find headers and libraries.
+        ("LIBTORCH_PATH".to_string(), dir.display().to_string()),
+        // The vendor's cargo feature, so a recipe can say
+        // `--features $FDL_GPU_FEATURE` instead of naming a vendor.
+        // Falls back to `cuda` exactly as `fdl run` does for the same
+        // case, so the variable means one thing everywhere in fdl.
+        (
+            "FDL_GPU_FEATURE".to_string(),
+            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_else(|| "cuda".to_string()),
+        ),
+        // Build scripts and the linker both want to find the libs, and
+        // on ROCm the ordering is the difference between a working
+        // process and a segfault at the first GPU op.
+        (
+            "LD_LIBRARY_PATH".to_string(),
+            crate::libtorch::detect::ld_library_path_value(vendor, &lib, &rocm_root()),
+        ),
+    ]
+}
+
+/// This box's ROCm root, for composing a loader path that runs HERE.
+fn rocm_root() -> String {
+    std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -256,35 +477,18 @@ fn ensure_mountpoint(dir: &Path) -> Result<(), Fail> {
 // Source specs
 // ---------------------------------------------------------------------------
 
-/// A parsed transport target.
-#[derive(Debug, PartialEq, Eq)]
-struct SourceTarget {
-    /// `[user@]host:/abs/path`, exactly as sshfs takes it — and exactly
-    /// as `/proc/mounts` reports it back, which is what makes the
-    /// already-mounted comparison a string compare.
-    remote: String,
-    /// Non-default ssh port, when the spec named one.
-    port: Option<u16>,
-}
-
-/// Split `<scheme>://<rest>`. A value with no `://` has no scheme —
-/// which for a data source is an error, because a path that is already
-/// mounted belongs in `data_path:`. The three artifacts a box needs
-/// (data, libtorch, the flodl source) share this grammar and nothing
-/// else; their resolvers have no common shape worth abstracting.
-fn split_scheme(spec: &str) -> (Option<&str>, &str) {
-    match spec.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, spec),
-    }
-}
-
 /// Parse a `data_source:` value. Unsupported schemes error loudly rather
 /// than being stubbed: a box that cannot reach its data must say so here,
 /// not fail mid-epoch.
-fn parse_source(spec: &str) -> Result<SourceTarget, Fail> {
+fn parse_source(spec: &str) -> Result<SshTarget, Fail> {
     match split_scheme(spec) {
-        (Some("sshfs"), rest) => parse_sshfs(rest),
+        (Some("sshfs"), rest) => parse_ssh_target(rest).map_err(|why| {
+            Fail::Permanent(format!(
+                "invalid data_source `sshfs://{rest}` — {why}. Expected \
+                 `sshfs://[user@]host[:port]/abs/path` (or the scp spelling \
+                 `sshfs://[user@]host:/abs/path`)"
+            ))
+        }),
         (Some(scheme), _) => Err(Fail::Permanent(format!(
             "unsupported data_source scheme `{scheme}://` — fdl ships \
              `sshfs://` today. A source another tool already mounted \
@@ -297,59 +501,6 @@ fn parse_source(spec: &str) -> Result<SourceTarget, Fail> {
              `sshfs://user@host:/flodl/data`"
         ))),
     }
-}
-
-/// `[user@]host[:port]/abs/path`, and the scp spelling
-/// `[user@]host:/abs/path` for the same thing — sshfs itself takes the
-/// second, so refusing it would be a gratuitous trap.
-fn parse_sshfs(rest: &str) -> Result<SourceTarget, Fail> {
-    let bad = |why: &str| {
-        Fail::Permanent(format!(
-            "invalid data_source `sshfs://{rest}` — {why}. Expected \
-             `sshfs://[user@]host[:port]/abs/path` (or the scp spelling \
-             `sshfs://[user@]host:/abs/path`)"
-        ))
-    };
-    let (user, hostpart) = match rest.split_once('@') {
-        Some(("", _)) => return Err(bad("empty user before `@`")),
-        Some((u, h)) => (Some(u), h),
-        None => (None, rest),
-    };
-
-    // Split host from path at whichever delimiter comes first. A `:`
-    // followed by digits is a port; a `:` followed by `/` is the scp
-    // separator.
-    let colon = hostpart.find(':');
-    let slash = hostpart.find('/');
-    let (host, port, path) = match (colon, slash) {
-        (Some(c), s) if s.is_none_or(|s| c < s) => {
-            let after = &hostpart[c + 1..];
-            if after.starts_with('/') {
-                (&hostpart[..c], None, after)
-            } else {
-                let end = after.find('/').ok_or_else(|| bad("no remote path"))?;
-                let port = after[..end]
-                    .parse::<u16>()
-                    .map_err(|_| bad("port is not a number"))?;
-                (&hostpart[..c], Some(port), &after[end..])
-            }
-        }
-        (_, Some(s)) => (&hostpart[..s], None, &hostpart[s..]),
-        (_, None) => return Err(bad("no remote path")),
-    };
-    if host.is_empty() {
-        return Err(bad("empty host"));
-    }
-    if path.len() < 2 {
-        return Err(bad("the remote path must be absolute"));
-    }
-    Ok(SourceTarget {
-        remote: match user {
-            Some(u) => format!("{u}@{host}:{path}"),
-            None => format!("{host}:{path}"),
-        },
-        port,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +518,7 @@ fn parse_sshfs(rest: &str) -> Result<SourceTarget, Fail> {
 /// which is what makes a re-dial cheap (the next attempt finds it and
 /// reuses it). `fusermount -u <mountpoint>` drops it.
 fn mount_sshfs(
-    target: &SourceTarget,
+    target: &SshTarget,
     mountpoint: &Path,
     ssh: Option<&SshConfig>,
 ) -> Result<(), Fail> {
@@ -411,7 +562,7 @@ fn mount_sshfs(
 /// first value it sees per key, so the operator's win), then flodl's
 /// defaults. Returned as argv for testability.
 fn sshfs_argv(
-    target: &SourceTarget,
+    target: &SshTarget,
     mountpoint: &Path,
     ssh: Option<&SshConfig>,
 ) -> Vec<String> {
@@ -425,7 +576,8 @@ fn sshfs_argv(
         argv.push(v);
     };
     if let Some(ssh) = ssh {
-        // The tunnel's own options and key: same box, same trust path.
+        // The tunnel's own options and key: same box, same trust path,
+        // which that key has to actually permit (see `DataSpec::ssh`).
         if let Some(warning) = crate::cluster::batchmode_override_warning(
             &ssh.options,
             &target.remote,
@@ -602,21 +754,12 @@ mod tests {
     }
 
     #[test]
-    fn a_source_spec_parses_all_three_spellings() {
-        // scp spelling — what sshfs itself takes.
-        assert_eq!(
-            parse_source("sshfs://flodl@exa:/flodl/data").unwrap(),
-            SourceTarget { remote: "flodl@exa:/flodl/data".into(), port: None },
-        );
-        // URL spelling, no user.
-        assert_eq!(
-            parse_source("sshfs://exa/flodl/data").unwrap(),
-            SourceTarget { remote: "exa:/flodl/data".into(), port: None },
-        );
-        // With a port.
+    fn the_sshfs_scheme_reaches_the_shared_grammar() {
+        // The spellings themselves are `crate::spec`'s tests; this is the
+        // wrapper's job — dispatch on the scheme, hand back a target.
         assert_eq!(
             parse_source("sshfs://flodl@exa:2222/flodl/data").unwrap(),
-            SourceTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
+            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
         );
     }
 
@@ -626,15 +769,15 @@ mod tests {
             "/flodl/data",                 // no scheme: belongs in data_path
             "smb://server/share",          // scheme we do not ship
             "sshfs://exa",                 // no path
-            "sshfs://exa:2222",            // port, still no path
             "sshfs://exa:banana/data",     // port that is not a number
-            "sshfs://@exa:/flodl/data",    // empty user
             "sshfs://:/flodl/data",        // empty host
-            "sshfs:///flodl/data",         // empty host, URL spelling
             "sshfs://exa:/",               // root is not a source root
         ] {
             let err = parse_source(spec).unwrap_err();
             assert!(err.is_permanent(), "{spec} should be permanent: {err:?}");
+            // Whatever the shape, the message names the field the
+            // operator has to go and fix.
+            assert!(err.message().contains("data_source"), "{spec}: {err:?}");
         }
     }
 

@@ -100,9 +100,19 @@ pub mod status;
 pub mod join;
 
 /// Training preparation for a dial-in worker: the GPU gate, the dataset
-/// source root, and the node-local directories the data plane writes.
-/// Runs before the join window opens on this box, once per attempt.
+/// source root, libtorch, the training binary, and the node-local
+/// directories the data plane writes. Runs before this box dials in,
+/// once per attempt.
 pub mod prepare;
+
+/// The scheme-plus-path grammar shared by the artifact specs (dataset
+/// source, libtorch, training source). Grammar only — the resolvers
+/// have no common shape worth abstracting.
+pub mod spec;
+
+/// The training source: materialise a spec into a local tree, then
+/// build it there. Never build from a mount, and never lose an mtime.
+pub mod source;
 
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.

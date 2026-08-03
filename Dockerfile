@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     pkg-config \
     graphviz \
+    # rsync: the source-fetch resolver's mtime-preserving transport. Present
+    # so its tests exercise the real tool rather than skipping.
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Rust ---

@@ -242,11 +242,33 @@ pub struct WorkerJoin {
     /// controller hands the salt out in the accept reply).
     #[serde(default)]
     pub token: Option<String>,
-    /// Training binary to run in agent role. The one field `fdl join`
-    /// cannot default: the binary IS the protocol (it dials, joins,
-    /// and spawns this host's relay + rank children itself).
+    /// Training binary to run in agent role, as a path on this box: use
+    /// it as given. Mutually exclusive with `source:`, and one of the
+    /// two is required — the binary IS the protocol (it dials, joins,
+    /// and spawns this host's relay + rank children itself), so `fdl
+    /// join` cannot default it.
+    ///
+    /// This is also the escape hatch for a box whose owner wants the
+    /// last word on what it compiles and runs: a declared binary wins
+    /// over any source a controller would hand it.
     #[serde(default)]
     pub bin: Option<String>,
+    /// Build the training binary here instead of naming one. The box
+    /// fetches the tree to local disk and compiles it against its OWN
+    /// libtorch, which is what makes the ABI match by construction
+    /// rather than by manifest discipline.
+    #[serde(default)]
+    pub source: Option<WorkerSource>,
+    /// libtorch variant to acquire before building or running:
+    /// `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`. It lands under
+    /// `~/.flodl/libtorch/` (never the project tree, which on a walk-in
+    /// is often a read-only mount) and becomes this box's active
+    /// variant. Unset leaves the box on whatever it already has.
+    ///
+    /// `auto` is the fleet value: it routes on the devices THIS box has,
+    /// so one golden image serves NVIDIA and AMD instances.
+    #[serde(default)]
+    pub libtorch: Option<String>,
     /// Logical host name presented in the join hello (default: this
     /// machine's hostname).
     #[serde(default)]
@@ -288,6 +310,60 @@ pub struct WorkerJoin {
     /// flags). A `--` tail on the command line replaces this list.
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+/// `join.source:` — build the training binary on this box.
+///
+/// A tree always lands on LOCAL disk before it is built, whatever the
+/// transport: cargo fingerprints by stat'ing every source file on every
+/// invocation, so compiling over a network mount pays that latency
+/// thousands of times, and the attribute caching that would hide the
+/// latency makes cargo serve a stale binary. The fetch preserves mtimes,
+/// which is what keeps the loop incremental rather than a cold rebuild
+/// wearing an incremental costume.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSource {
+    /// Transport plus location. Three ship:
+    ///
+    /// ```text
+    /// file:///abs/path                      a directory on this box (a mount, a disk)
+    /// rsync://[user@]host[:port]:/abs/path  a working tree over ssh
+    /// git+https://host/owner/repo#<ref>     a pinned checkout (also git+ssh://)
+    /// ```
+    ///
+    /// rsync is the one that carries UNCOMMITTED work, which is what a
+    /// training crate living in no repo at all needs. `git+` wants a ref
+    /// (`#<tag|branch|sha>`) because a default branch floats, and a
+    /// floating ref is not a pin.
+    pub from: String,
+    /// Project directory inside the fetched tree (default: its root).
+    /// Governs the build and the run both, so it answers "where is the
+    /// project in this tree" exactly once. A path dep pointing outside
+    /// this directory still resolves, which is why the fetched tree has
+    /// to be the dep root and not just the crate.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Build recipe, run as a shell line in `cwd`. Default: `cargo build
+    /// --release`, which is right whenever the crate carries its own
+    /// `Cargo.toml`, lockfile and `rust-toolchain.toml` — the usual case
+    /// for a crate that builds on the operator's own box.
+    ///
+    /// It can be a script committed beside the code (`./ci/node-build.sh`),
+    /// so the recipe travels with the source while its invocation stays
+    /// here. fdl exports what it resolved: `LIBTORCH_PATH`,
+    /// `FDL_GPU_FEATURE` (say `--features $FDL_GPU_FEATURE` rather than
+    /// naming a vendor) and `LD_LIBRARY_PATH`.
+    ///
+    /// It re-runs on every dial, so it must be cheap when nothing
+    /// changed. cargo is; a recipe that rebuilds unconditionally is not.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Built artifact, relative to `cwd` (e.g. `target/release/train`).
+    /// Not guessed: `cargo build` in a workspace member writes to the
+    /// WORKSPACE `target/`, not the member's, so any rule fdl invented
+    /// would be wrong for someone.
+    pub bin: String,
 }
 
 /// CUDA device indices on a host. Either explicit (a list of indices) or
