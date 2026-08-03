@@ -250,7 +250,7 @@ impl Effective {
                     from: &s.from,
                     cwd: s.cwd.as_deref(),
                     build: s.build.as_deref(),
-                    bin: &s.bin,
+                    bin: s.bin.as_deref(),
                     ssh: self.ssh.as_ref(),
                 }),
             },
@@ -329,16 +329,10 @@ fn resolve_effective(
             // overrides it (same shape as `--ssh`).
             cwd: cli.source_cwd.clone().or_else(|| b.as_ref().and_then(|b| b.cwd.clone())),
             build: cli.source_build.clone().or_else(|| b.as_ref().and_then(|b| b.build.clone())),
-            bin: cli
-                .source_bin
-                .clone()
-                .or_else(|| b.as_ref().map(|b| b.bin.clone()))
-                .ok_or_else(|| {
-                    "a source needs the artifact it produces — pass \
-                     `--source-bin <path relative to the project dir>` or \
-                     set `join.source.bin` in fdl.yml"
-                        .to_string()
-                })?,
+            // No artifact anywhere is legal: a published tree carries a
+            // run manifest that names it, and that manifest is the
+            // authority when it is there.
+            bin: cli.source_bin.clone().or_else(|| b.as_ref().and_then(|b| b.bin.clone())),
         }),
         (None, Some(mut b)) => {
             if let Some(cwd) = cli.source_cwd.clone() {
@@ -348,7 +342,7 @@ fn resolve_effective(
                 b.build = Some(build);
             }
             if let Some(bin) = cli.source_bin.clone() {
-                b.bin = bin;
+                b.bin = Some(bin);
             }
             Some(b)
         }
@@ -565,23 +559,16 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Active libtorch of this box: `(variant directory, variant label for
-/// the hello)`. Anchored on the project root when the config walk found
-/// one (a command-dir cwd's `Context::resolve` would stop a level too
-/// low); the plain context fallback covers project-less setups
-/// (`~/.flodl`).
-///
-/// The directory rather than its `lib/`: the build wants `LIBTORCH_PATH`
-/// (headers included) and the child wants `lib/`, so one value serves
-/// both and neither caller has to guess which it was handed.
+/// Active libtorch of this box, anchored on the project root when the
+/// config walk found one (a command-dir cwd's `Context::resolve` would
+/// stop a level too low); the plain context fallback covers project-less
+/// setups (`~/.flodl`).
 fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, String)> {
     let root = match project_root {
         Some(r) => r.to_path_buf(),
         None => Context::resolve().root,
     };
-    let info = crate::libtorch::detect::read_active(&root)?;
-    let dir = root.join("libtorch").join(&info.path);
-    dir.join("lib").is_dir().then_some((dir, info.path))
+    crate::libtorch::detect::active_variant(&root)
 }
 
 /// `LD_LIBRARY_PATH` for the training binary, with this box's inherited
@@ -628,7 +615,7 @@ fn attempt(
 ) -> Result<i32, Fail> {
     let mut notes = Vec::new();
     let prepared = prepare::prepare(&eff.prepare_spec(active_libtorch), &mut notes);
-    prepare::print_notes(&notes);
+    prepare::print_notes("join", &notes);
     let prepared = prepared?;
 
     let mut tunnel: Option<Child> = None;
@@ -699,8 +686,31 @@ fn attempt(
         }
     };
 
+    // The run's arguments belong to the run. A published manifest replaces
+    // whatever this box carried, because rank children re-enter the binary
+    // with them: a standing fleet holding its own copy would train the new
+    // run with the previous one's hyperparameters. Saying so out loud is
+    // the difference between authority and a silent substitution.
+    let args: &[String] = match &prepared.args {
+        Some(published) => {
+            if !eff.bin_args.is_empty() && published != &eff.bin_args {
+                eprintln!(
+                    "{}",
+                    style::dim(&format!(
+                        "fdl join: the published run's arguments replace \
+                         this box's ({} -> {})",
+                        eff.bin_args.join(" "),
+                        published.join(" "),
+                    )),
+                );
+            }
+            published
+        }
+        None => &eff.bin_args,
+    };
+
     let mut cmd = Command::new(&bin);
-    cmd.args(&eff.bin_args)
+    cmd.args(args)
         .env(ENV_AGENT_JSON, &spec_hex)
         // Children report under the logical roster name even when it
         // differs from `hostname` — same override fan-out applies.
@@ -876,7 +886,7 @@ mod tests {
                 from: "rsync://exa:/home/op/rdl".into(),
                 cwd: Some("ddp-bench".into()),
                 build: Some("cargo build --release --bin ddp-bench".into()),
-                bin: "target/release/ddp-bench".into(),
+                bin: Some("target/release/ddp-bench".into()),
             }),
             bin: None,
             ..full_block()
@@ -967,7 +977,7 @@ mod tests {
         let source = spec.source.expect("a source block yields a source spec");
         assert_eq!(source.from, "rsync://exa:/home/op/rdl");
         assert_eq!(source.cwd, Some("ddp-bench"));
-        assert_eq!(source.bin, "target/release/ddp-bench");
+        assert_eq!(source.bin, Some("target/release/ddp-bench"));
         // The pull runs over the same hop the tunnel uses.
         assert_eq!(
             source.ssh.and_then(|s| s.identity_file.as_deref()),
@@ -996,16 +1006,27 @@ mod tests {
                 from: "file:///mnt/rdl".into(),
                 cwd: Some("ddp-bench".into()),
                 build: Some("cargo build --release --bin ddp-bench".into()),
-                bin: "target/release/ddp-bench".into(),
+                bin: Some("target/release/ddp-bench".into()),
             }),
         );
     }
 
     #[test]
-    fn a_source_flag_with_no_artifact_anywhere_is_a_loud_error() {
+    fn a_source_with_no_artifact_is_legal_because_a_manifest_may_name_it() {
+        // The controller's published tree carries a run manifest, and that
+        // manifest is the authority. Refusing here would make every worker
+        // config repeat what the publish already said.
         let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
-        let err = resolve_effective(&cli, None, None, "x").unwrap_err();
-        assert!(err.contains("--source-bin"), "got: {err}");
+        let eff = resolve_effective(&cli, None, None, "x").unwrap();
+        assert_eq!(
+            eff.bin,
+            BinSource::Build(WorkerSource {
+                from: "file:///mnt/rdl".into(),
+                cwd: None,
+                build: None,
+                bin: None,
+            }),
+        );
     }
 
     #[test]

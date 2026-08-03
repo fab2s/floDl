@@ -24,7 +24,7 @@ use std::process::Command;
 
 use crate::config::{SshConfig, DEFAULT_DATA_PATH};
 use crate::context::Context;
-use crate::source::Built;
+use crate::source::{Built, Manifest};
 use crate::spec::{parse_ssh_target, split_scheme, SshTarget};
 use crate::style;
 
@@ -72,6 +72,10 @@ pub struct Prepared {
     /// as cwd. `None` when the operator named a binary instead of a
     /// source.
     pub bin: Option<Built>,
+    /// The run's arguments, when a controller published them. They
+    /// replace whatever this box carried: args must match the run,
+    /// because rank children re-enter the binary with them.
+    pub args: Option<Vec<String>>,
 }
 
 /// Everything this box has to settle before it dials.
@@ -99,8 +103,9 @@ pub struct SourceSpec<'a> {
     pub cwd: Option<&'a str>,
     /// Build recipe, a shell line. `None` uses cargo's release build.
     pub build: Option<&'a str>,
-    /// Built artifact, relative to `cwd`.
-    pub bin: &'a str,
+    /// Built artifact, relative to `cwd`. `None` when this box leaves it
+    /// to the controller's run manifest.
+    pub bin: Option<&'a str>,
     /// The join block's ssh credentials, for a transport that needs
     /// them. Same reuse (and same caveat) as [`DataSpec::ssh`].
     pub ssh: Option<&'a SshConfig>,
@@ -165,7 +170,7 @@ pub fn prepare(spec: &PrepareSpec, notes: &mut Vec<String>) -> Result<Prepared, 
     let data_path = resolve_data_root(&spec.data, notes)?;
     check_local_dirs(notes)?;
 
-    let tree = match &spec.source {
+    let fetched = match &spec.source {
         Some(source) => Some(fetch_source(source, notes)?),
         None => None,
     };
@@ -173,13 +178,58 @@ pub fn prepare(spec: &PrepareSpec, notes: &mut Vec<String>) -> Result<Prepared, 
         Some(token) => Some(acquire_libtorch(token, notes)?),
         None => spec.active_libtorch.cloned(),
     };
-    let bin = match (&spec.source, &tree) {
-        (Some(source), Some(tree)) => {
-            Some(build_source(source, tree, libtorch.as_ref(), notes)?)
+    let (bin, args) = match (&spec.source, &fetched) {
+        (Some(source), Some((tree, manifest))) => {
+            let recipe = merge_manifest(source, manifest.as_ref())?;
+            let built = build_source(&recipe, tree, libtorch.as_ref(), notes)?;
+            (Some(built), manifest.as_ref().map(|m| m.args.clone()))
         }
-        _ => None,
+        _ => (None, None),
     };
-    Ok(Prepared { data_path, libtorch, bin })
+    Ok(Prepared { data_path, libtorch, bin, args })
+}
+
+/// What to build, once the controller has had its say.
+///
+/// The manifest wins over the box's own config, and that is the point of
+/// it: everything here belongs to the RUN, and a cohort where one box
+/// disagrees about the binary or its arguments is not a cohort. The local
+/// values stay as the answer when nobody has published — a rig where the
+/// operator drives `fdl join` by hand needs no publish at all.
+fn merge_manifest<'a>(
+    local: &'a SourceSpec<'a>,
+    manifest: Option<&'a Manifest>,
+) -> Result<Recipe<'a>, Fail> {
+    let Some(m) = manifest else {
+        let Some(bin) = local.bin else {
+            // Nothing published, and nothing declared here either: the
+            // box cannot know what to run. Transient, because the far
+            // side publishing is exactly what fixes it — including the
+            // window where a publish has cleared the manifest and not
+            // yet written the new one.
+            return Err(Fail::Transient(
+                "the fetched source carries no run manifest and this box \
+                 declares no artifact — publish a run on the controller \
+                 (`fdl publish`), or name it locally with `--source-bin`"
+                    .to_string(),
+            ));
+        };
+        return Ok(Recipe { cwd: local.cwd, build: local.build, bin });
+    };
+    Ok(Recipe {
+        cwd: m.cwd.as_deref().or(local.cwd),
+        build: m.build.as_deref().or(local.build),
+        bin: &m.bin,
+    })
+}
+
+/// The resolved build recipe: the manifest's answers where it has them,
+/// the box's own where it does not.
+#[derive(Debug)]
+struct Recipe<'a> {
+    cwd: Option<&'a str>,
+    build: Option<&'a str>,
+    bin: &'a str,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,25 +300,70 @@ fn parse_libtorch_token(token: &str) -> Result<crate::libtorch::download::Varian
 // The training source
 // ---------------------------------------------------------------------------
 
-/// Materialise the source tree on local disk and hand back its root.
-fn fetch_source(spec: &SourceSpec, notes: &mut Vec<String>) -> Result<PathBuf, Fail> {
+/// Materialise the source tree on local disk and hand back its root plus
+/// whatever run manifest came with it.
+fn fetch_source(
+    spec: &SourceSpec,
+    notes: &mut Vec<String>,
+) -> Result<(PathBuf, Option<Manifest>), Fail> {
     let source = crate::source::parse(spec.from)?;
     let dest = Context::global().root.join(SOURCE_SUBDIR);
     crate::source::materialize(&source, &dest, spec.ssh, notes)?;
-    Ok(dest)
+    let manifest = Manifest::read(&dest)?;
+    if let Some(m) = &manifest {
+        notes.push(format!(
+            "run manifest: bin {}{}{}{}",
+            m.bin,
+            m.cwd.as_deref().map(|c| format!(" in {c}")).unwrap_or_default(),
+            m.published_epoch
+                .and_then(age_hint)
+                .map(|age| format!(", published {age}"))
+                .unwrap_or_default(),
+            if m.built { "" } else { " — NOT built by the controller" },
+        ));
+        if let (Some(theirs), Some(ours)) = (&m.rustc, local_rustc()) {
+            if theirs != &ours {
+                notes.push(format!(
+                    "the controller built this with {theirs}, this box has \
+                     {ours} — advisory only, every box compiles its own \
+                     binary and a toolchain too old fails loudly at compile \
+                     time",
+                ));
+            }
+        }
+    }
+    Ok((dest, manifest))
+}
+
+/// How long ago a publish happened, in the roughest terms that are still
+/// useful. `None` when the clock disagrees with the manifest (a box whose
+/// time has not synced yet says nothing rather than something wrong).
+fn age_hint(then: u64) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let secs = now.checked_sub(then)?;
+    Some(match secs {
+        0..=90 => "just now".to_string(),
+        s if s < 5400 => format!("{}m ago", s / 60),
+        s if s < 172_800 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    })
+}
+
+/// `rustc -V` here, for the manifest's advisory comparison.
+fn local_rustc() -> Option<String> {
+    let out = Command::new("rustc").arg("-V").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Build the fetched tree.
-///
-/// The recipe runs with the environment an `fdl.yml` `commands.run` line
-/// already relies on, so a recipe that works there works here. What it
-/// deliberately does NOT get is a feature flag fdl chose: `cuda` and
-/// `rocm` are this repo's feature names, and a user's crate pins its
-/// flodl features in its own manifest and may expose none of them, so
-/// the vendor is handed over as `$FDL_GPU_FEATURE` for a recipe to use
-/// or ignore.
 fn build_source(
-    spec: &SourceSpec,
+    recipe: &Recipe,
     tree: &Path,
     libtorch: Option<&(PathBuf, String)>,
     notes: &mut Vec<String>,
@@ -281,41 +376,19 @@ fn build_source(
                 .to_string(),
         );
     }
-    let env = build_env(libtorch);
-    crate::source::build(tree, spec.cwd, spec.build, spec.bin, &env, notes)
-}
-
-/// The environment a build recipe gets.
-fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> {
-    let Some((dir, variant)) = libtorch else {
-        return Vec::new();
-    };
-    let lib = dir.join("lib").display().to_string();
-    let vendor = crate::libtorch::detect::variant_vendor(variant);
-    vec![
-        // What flodl-sys/build.rs reads to find headers and libraries.
-        ("LIBTORCH_PATH".to_string(), dir.display().to_string()),
-        // The vendor's cargo feature, so a recipe can say
-        // `--features $FDL_GPU_FEATURE` instead of naming a vendor.
-        // Falls back to `cuda` exactly as `fdl run` does for the same
-        // case, so the variable means one thing everywhere in fdl.
-        (
-            "FDL_GPU_FEATURE".to_string(),
-            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_else(|| "cuda".to_string()),
-        ),
-        // Build scripts and the linker both want to find the libs, and
-        // on ROCm the ordering is the difference between a working
-        // process and a segfault at the first GPU op.
-        (
-            "LD_LIBRARY_PATH".to_string(),
-            crate::libtorch::detect::ld_library_path_value(vendor, &lib, &rocm_root()),
-        ),
-    ]
-}
-
-/// This box's ROCm root, for composing a loader path that runs HERE.
-fn rocm_root() -> String {
-    std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string())
+    let env = crate::source::build_env(libtorch);
+    crate::source::build(tree, recipe.cwd, recipe.build, recipe.bin, &env, notes).map_err(|e| {
+        if e.is_permanent() {
+            return e;
+        }
+        // Still transient, with the worker's next step spelled out: this
+        // box cannot fix a compile error, and it must not stop over one.
+        Fail::Transient(format!(
+            "{} — fix it at the source; this box picks the fix up on its \
+             next dial",
+            e.message(),
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -724,11 +797,12 @@ fn next_probe_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Print what preparation found. Notes are advisory by construction —
-/// every fatal condition already returned a [`Fail`].
-pub fn print_notes(notes: &[String]) {
+/// Print what preparation found, under the name of the command that
+/// found it. Notes are advisory by construction — every fatal condition
+/// already returned a [`Fail`].
+pub fn print_notes(command: &str, notes: &[String]) {
     for note in notes {
-        eprintln!("{}", style::dim(&format!("fdl join: {note}")));
+        eprintln!("{}", style::dim(&format!("fdl {command}: {note}")));
     }
 }
 
@@ -761,6 +835,62 @@ mod tests {
             parse_source("sshfs://flodl@exa:2222/flodl/data").unwrap(),
             SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
         );
+    }
+
+    #[test]
+    fn a_published_manifest_outranks_the_boxs_own_recipe() {
+        // The point of a manifest: everything in it belongs to the RUN, and
+        // a cohort where one box disagrees about the binary is not a
+        // cohort.
+        let local = SourceSpec {
+            from: "rsync://ctrl:/srv/run/tree",
+            cwd: Some("stale"),
+            build: Some("stale-build"),
+            bin: Some("stale-bin"),
+            ssh: None,
+        };
+        let manifest = Manifest {
+            cwd: Some("ddp-bench".into()),
+            build: Some("cargo build --release".into()),
+            bin: "target/release/ddp-bench".into(),
+            ..Manifest::default()
+        };
+        let recipe = merge_manifest(&local, Some(&manifest)).unwrap();
+        assert_eq!(recipe.cwd, Some("ddp-bench"));
+        assert_eq!(recipe.build, Some("cargo build --release"));
+        assert_eq!(recipe.bin, "target/release/ddp-bench");
+    }
+
+    #[test]
+    fn a_manifest_that_says_nothing_leaves_the_local_answer_standing() {
+        // A hand-driven box needs no publish at all, and a manifest that
+        // omits a field is not an instruction to forget the local one.
+        let local = SourceSpec {
+            from: "file:///mnt/rdl",
+            cwd: Some("ddp-bench"),
+            build: Some("./ci/node-build.sh"),
+            bin: Some("target/release/x"),
+            ssh: None,
+        };
+        let bare = Manifest { bin: "target/release/y".into(), ..Manifest::default() };
+        let recipe = merge_manifest(&local, Some(&bare)).unwrap();
+        assert_eq!(recipe.cwd, Some("ddp-bench"));
+        assert_eq!(recipe.build, Some("./ci/node-build.sh"));
+        assert_eq!(recipe.bin, "target/release/y");
+
+        let recipe = merge_manifest(&local, None).unwrap();
+        assert_eq!(recipe.bin, "target/release/x");
+    }
+
+    #[test]
+    fn no_manifest_and_no_local_artifact_waits_rather_than_stopping() {
+        // This is also the window a publish opens on purpose: it clears the
+        // manifest before it touches the tree, so a box dialing mid-publish
+        // must come back rather than train something unvalidated.
+        let local = SourceSpec { from: "rsync://ctrl:/srv/run/tree", ..Default::default() };
+        let err = merge_manifest(&local, None).unwrap_err();
+        assert!(!err.is_permanent(), "the fix is a publish away: {err:?}");
+        assert!(err.message().contains("fdl publish"), "got: {err:?}");
     }
 
     #[test]

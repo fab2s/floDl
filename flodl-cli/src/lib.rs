@@ -114,6 +114,12 @@ pub mod spec;
 /// build it there. Never build from a mount, and never lose an mtime.
 pub mod source;
 
+/// `fdl publish`: put a run where the fleet can pull it — resolve a
+/// source spec into a served directory, build it once as a gate, and
+/// write the manifest that makes the controller the authority for what a
+/// run is.
+pub mod publish;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

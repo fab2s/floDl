@@ -23,6 +23,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::SshConfig;
 use crate::prepare::Fail;
 use crate::spec::{parse_ssh_target, split_scheme, SshTarget};
@@ -75,6 +77,111 @@ pub enum Source {
 pub struct Built {
     pub bin: PathBuf,
     pub cwd: PathBuf,
+}
+
+/// File name of the run manifest, at the root of a published tree.
+pub const MANIFEST_FILE: &str = ".fdl-run.yml";
+
+/// The controller's answer to "what is this run", written beside the
+/// source it published and read by every box that fetches it.
+///
+/// It exists because a worker's own config is the wrong place for
+/// anything that changes per run. `args` is the sharp case: they must
+/// match the run, since rank children re-enter the binary with them, so a
+/// standing fleet carrying its own copy trains the next run with the
+/// previous one's hyperparameters. Everything stable for a box (its
+/// credentials, its libtorch policy, where to pull from) stays local;
+/// everything that belongs to the *run* comes from here.
+///
+/// **Its presence is the publish's commit point.** `fdl publish` removes
+/// it before it touches the tree and writes it only once the build has
+/// passed, so a box that dials mid-publish, or after a publish whose
+/// build failed, finds no manifest and waits for the next dial rather
+/// than training something unvalidated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    /// Project directory inside the tree; `None` = its root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Build recipe; `None` = the default cargo release build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// Artifact, relative to `cwd`.
+    pub bin: String,
+    /// The binary's own arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Where the controller got this tree, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// `rustc -V` on the controller when it built this, ADVISORY. A
+    /// mismatch is worth reporting and not worth enforcing: every box
+    /// compiles its own binary, cohort agreement is about model
+    /// structure, and a toolchain too old fails loudly at compile time
+    /// anyway. Enforcing it would cost a toolchain install per box and
+    /// buy what a warning already gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<String>,
+    /// Unix seconds at publish, so a box can say how old its run is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_epoch: Option<u64>,
+    /// False when the publish skipped its build gate (`--no-build`), so a
+    /// worker can say out loud that nothing has compiled this tree yet.
+    #[serde(default)]
+    pub built: bool,
+}
+
+impl Manifest {
+    /// Read the manifest at the root of `tree`. `Ok(None)` when there is
+    /// none, which is a state with meaning rather than an error: nobody
+    /// has published a run into this tree.
+    pub fn read(tree: &Path) -> Result<Option<Manifest>, Fail> {
+        let path = tree.join(MANIFEST_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Fail::Permanent(format!(
+                    "cannot read the run manifest {}: {e}",
+                    path.display(),
+                )));
+            }
+        };
+        serde_yaml_ng::from_str(&text)
+            .map(Some)
+            .map_err(|e| Fail::Permanent(format!("{} is not a run manifest: {e}", path.display())))
+    }
+
+    /// Write the manifest at the root of `tree`.
+    pub fn write(&self, tree: &Path) -> Result<(), Fail> {
+        let path = tree.join(MANIFEST_FILE);
+        let body = serde_yaml_ng::to_string(self)
+            .map_err(|e| Fail::Permanent(format!("cannot serialize the run manifest: {e}")))?;
+        std::fs::write(
+            &path,
+            format!(
+                "# Written by `fdl publish`. The controller is the authority \
+                 for a run:\n# a worker merges this over its own config, \
+                 because args must match the run\n# (rank children re-enter \
+                 the binary with them). Do not hand-edit — the next\n# \
+                 publish overwrites it, and its presence is what tells a \
+                 worker the run\n# is ready.\n{body}"
+            ),
+        )
+        .map_err(|e| {
+            Fail::Permanent(format!("cannot write the run manifest {}: {e}", path.display()))
+        })
+    }
+
+    /// Remove the manifest, which is how a publish says "not ready yet".
+    pub fn remove(tree: &Path) -> Result<(), Fail> {
+        match std::fs::remove_file(tree.join(MANIFEST_FILE)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Fail::Permanent(format!("cannot clear the run manifest: {e}"))),
+        }
+    }
 }
 
 /// Parse a source spec.
@@ -344,6 +451,46 @@ fn git_output(args: &[&str]) -> Result<(), String> {
     Err(if stderr.is_empty() { format!("exited {}", out.status) } else { stderr })
 }
 
+/// The environment a build recipe gets: the same names an `fdl.yml`
+/// `commands.run` line already relies on, so a recipe that works there
+/// works here.
+///
+/// What it deliberately does NOT contain is a feature flag fdl chose.
+/// `cuda` and `rocm` are this repo's feature names; a user's crate pins
+/// its flodl features in its own manifest and may expose neither, so the
+/// vendor is handed over as `$FDL_GPU_FEATURE` for a recipe to use or
+/// ignore.
+pub fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> {
+    let Some((dir, variant)) = libtorch else {
+        return Vec::new();
+    };
+    let lib = dir.join("lib").display().to_string();
+    let vendor = crate::libtorch::detect::variant_vendor(variant);
+    vec![
+        // What flodl-sys/build.rs reads to find headers and libraries.
+        ("LIBTORCH_PATH".to_string(), dir.display().to_string()),
+        // The vendor's cargo feature, so a recipe can say
+        // `--features $FDL_GPU_FEATURE` instead of naming a vendor.
+        // Falls back to `cuda` exactly as `fdl run` does for the same
+        // case, so the variable means one thing everywhere in fdl.
+        (
+            "FDL_GPU_FEATURE".to_string(),
+            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_else(|| "cuda".to_string()),
+        ),
+        // Build scripts and the linker both want to find the libs, and
+        // on ROCm the ordering is the difference between a working
+        // process and a segfault at the first GPU op.
+        (
+            "LD_LIBRARY_PATH".to_string(),
+            crate::libtorch::detect::ld_library_path_value(
+                vendor,
+                &lib,
+                &std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string()),
+            ),
+        ),
+    ]
+}
+
 /// Build the tree and hand back the binary.
 ///
 /// `cwd` is the project directory inside the tree (the default is the
@@ -395,17 +542,16 @@ pub fn build(
         .status()
         .map_err(|e| Fail::Permanent(format!("spawn `{recipe}`: {e}")))?;
     if !status.success() {
-        // Transient, and that is deliberate. The source is remote, so a
-        // compile error is the most transient thing in this system: the
-        // fix is a push away, and a box that exits permanently here
-        // would be powered off by the systemd recipe over a typo, taking
-        // the fleet with it. It keeps re-dialing, loudly, at the backoff
-        // cap.
+        // The fact, with no audience assumed: a worker and a publishing
+        // controller both land here and owe the operator different next
+        // steps, so each adds its own. Transient by default because the
+        // worker is the caller that re-dials, and a compile error is the
+        // most transient thing in that system — the fix is a push away,
+        // while exiting permanently would let the systemd recipe power a
+        // box off over a typo.
         return Err(Fail::Transient(format!(
             "the source does not build ({status}) — see the compiler \
-             output above. Fix it at the source and this box picks the \
-             fix up on its next dial; nothing here retries into a \
-             different answer"
+             output above"
         )));
     }
 

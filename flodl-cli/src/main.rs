@@ -8,13 +8,13 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
-    join, overlay, parse_or_schema_from, probe, run, setup, skill, status, style,
+    join, overlay, parse_or_schema_from, probe, publish, run, setup, skill, status, style,
     update_check,
 };
 
 use builtins::{
     AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, ProbeArgs,
-    SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
+    PublishArgs, SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
 };
 
 use std::env;
@@ -198,6 +198,18 @@ fn main() -> ExitCode {
             let cli: StartArgs = parse_sub("fdl start", &args[1..]);
             let code = status::run_start(cli.addr.as_deref(), cli.token.as_deref());
             if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        "publish" => {
+            // Same `--` split as `join`: everything after it is the
+            // training binary's own, and for a publish that means the
+            // manifest's `args` — the run's, not this box's.
+            let (head, tail) = match args.iter().position(|a| a == "--") {
+                Some(i) => (&args[..i], Some(&args[i + 1..])),
+                None => (&args[..], None),
+            };
+            let cli: PublishArgs = parse_sub("fdl publish", &head[1..]);
+            let code = publish::run(&cli, tail);
+            ExitCode::from(code.clamp(0, 255) as u8)
         }
         "join" => {
             // Everything after a standalone `--` belongs to the training

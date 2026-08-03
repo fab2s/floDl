@@ -363,7 +363,12 @@ pub struct WorkerSource {
     /// Not guessed: `cargo build` in a workspace member writes to the
     /// WORKSPACE `target/`, not the member's, so any rule fdl invented
     /// would be wrong for someone.
-    pub bin: String,
+    ///
+    /// Optional because a published tree carries a run manifest that
+    /// names it, and that manifest is the authority when present. Declare
+    /// it here for a box the operator drives by hand.
+    #[serde(default)]
+    pub bin: Option<String>,
 }
 
 /// CUDA device indices on a host. Either explicit (a list of indices) or

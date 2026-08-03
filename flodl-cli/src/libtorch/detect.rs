@@ -1,7 +1,7 @@
 //! libtorch installation detection and .arch metadata parsing.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::util::system::GpuInfo;
 use flodl_hw::GpuVendor;
@@ -250,6 +250,18 @@ pub fn ld_library_path_lines(vendor: Option<GpuVendor>, libtorch_lib: &str) -> V
         ],
         _ => vec![format!("export LD_LIBRARY_PATH=\"{libtorch_lib}{tail}\"")],
     }
+}
+
+/// This box's active libtorch as `(variant directory, variant label)`,
+/// anchored on `root` (a project root, or the global one).
+///
+/// The directory rather than its `lib/`: a build wants `LIBTORCH_PATH`
+/// (headers included) and a child process wants `lib/`, so one value
+/// serves both and neither caller has to guess which it was handed.
+pub fn active_variant(root: &Path) -> Option<(PathBuf, String)> {
+    let info = read_active(root)?;
+    let dir = root.join("libtorch").join(&info.path);
+    dir.join("lib").is_dir().then_some((dir, info.path))
 }
 
 /// `LD_LIBRARY_PATH` VALUE for running against `libtorch_lib`, in the

@@ -343,6 +343,40 @@ join:
     bin: target/release/ddp-bench
 ```
 
+**And the controller can be the authority for what a run IS.** `fdl
+publish` resolves a source spec into a served directory, builds it once
+as a gate, and writes a run manifest at the tree's root:
+
+```bash
+fdl publish file:///home/op/my-train --bin target/release/my-train \
+            -- --model resnet --epochs 20
+```
+
+A worker pointed at that tree then needs nothing but the pointer, because
+`cwd` / `build` / `bin` / `args` come from the manifest:
+
+```yaml
+join:
+  source:
+    from: rsync://flodl@ctrl.example.com:/home/op/.flodl/run/tree
+```
+
+So chaining runs on a standing fleet is one command: publish again, and
+every box picks the new run up on its next dial with nothing to edit
+anywhere. `args` is why this is a correctness matter rather than an
+ergonomic one — they must match the run, since rank children re-enter the
+binary with them, so a fleet carrying its own copy trains the next run
+with the previous one's hyperparameters. The manifest's PRESENCE is the
+commit point: publish clears it before touching the tree and writes it
+only after the build passes, so a box dialing mid-publish finds no
+manifest and waits rather than training something unvalidated. That wait
+is a transient failure, and a failed gate publishes nothing at all.
+
+The gate is one build, not N: every worker still compiles its own, since
+a controller producing binaries for each worker variant is the build
+matrix this design deleted. It needs no GPU libtorch either, so a
+coordinator-only box pays rustup plus `fdl libtorch download --cpu`.
+
 Three transports, and the scheme names the tool rather than a wire
 protocol, the same convention `data_source` uses: `file:///abs/path` for
 a directory already on the box, `rsync://[user@]host[:port]:/abs/path`

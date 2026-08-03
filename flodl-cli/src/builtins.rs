@@ -224,6 +224,72 @@ pub struct JoinArgs {
     pub data_source: Option<String>,
 }
 
+/// Publish a training run for a fleet to pull.
+///
+/// The controller side of compiling on the node: resolves a source spec
+/// into a served directory, builds it once as a gate, and writes the run
+/// manifest workers read. Chaining runs on a standing fleet is then one
+/// command — publish again and every box picks the new run up on its next
+/// dial, with nothing to edit on any worker.
+///
+/// Arguments after a standalone `--` are the training binary's own, and
+/// they go in the manifest rather than into any worker's config: they must
+/// match the run, because rank children re-enter the binary with them, so
+/// a fleet carrying its own copy would train the next run with the
+/// previous one's hyperparameters.
+///
+/// The build proves the tree for THIS box's libtorch variant, and one
+/// build is all it is: every worker still compiles its own, since a
+/// controller producing binaries for N variants is a build matrix. A gate
+/// needs no GPU libtorch — `fdl libtorch download --cpu` is enough —
+/// because it is catching user-code errors, not shipping an artifact.
+///
+/// Exit code: 0 when the run is published; 1 otherwise, and a failed gate
+/// publishes nothing, so the fleet keeps running whatever it had.
+#[derive(crate::FdlArgs, Debug)]
+pub struct PublishArgs {
+    /// Source to publish: `file:///abs/path`,
+    /// `rsync://[user@]host[:port]:/abs/path`, or
+    /// `git+https://host/owner/repo#<tag|branch|sha>`.
+    #[arg]
+    pub source: Option<String>,
+    /// Built artifact, relative to the project directory — what workers
+    /// run. Required: a workspace member's build lands in the WORKSPACE
+    /// `target/`, so no rule fdl invented would be right for everyone.
+    #[option]
+    pub bin: Option<String>,
+    /// Project directory inside the tree (default: its root). Governs
+    /// the build and the run both.
+    #[option]
+    pub cwd: Option<String>,
+    /// Build recipe, a shell line (default: `cargo build --release`).
+    /// Gets `LIBTORCH_PATH`, `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`.
+    #[option]
+    pub build: Option<String>,
+    /// Served directory (default: `~/.flodl/run`). The tree lands in
+    /// `<dir>/tree`, which is what a worker's source spec points at.
+    #[option]
+    pub to: Option<String>,
+    /// Skip the build gate. Publishes source nothing has compiled, so
+    /// the first worker to fetch it is where a broken build surfaces.
+    #[option]
+    pub no_build: bool,
+    /// Identity file for a source pulled over ssh (`rsync -e ssh -i`).
+    #[option]
+    pub identity: Option<String>,
+}
+
+impl PublishArgs {
+    /// Credentials for a source pulled over ssh. The spec itself carries
+    /// user, host and port, so only the key can be missing.
+    pub fn ssh_config(&self) -> Option<crate::config::SshConfig> {
+        self.identity.as_ref().map(|id| crate::config::SshConfig {
+            identity_file: Some(id.clone()),
+            ..Default::default()
+        })
+    }
+}
+
 /// Generate flodl API reference.
 #[derive(crate::FdlArgs, Debug)]
 pub struct ApiRefArgs {
@@ -528,6 +594,11 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(StartArgs::schema),
         },
         BuiltinSpec {
+            path: &["publish"],
+            description: Some("Publish a training run for a fleet to pull"),
+            schema_fn: Some(PublishArgs::schema),
+        },
+        BuiltinSpec {
             path: &["join"],
             description: Some(
                 "Join a cluster run's window as a self-deployed worker",
@@ -686,8 +757,9 @@ mod tests {
         // documents the coupling explicitly.
         let dispatched = [
             "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "start", "join", "api-ref", "init", "add", "install", "skill",
-            "schema", "completions", "autocomplete", "config", "version",
+            "start", "publish", "join", "api-ref", "init", "add", "install",
+            "skill", "schema", "completions", "autocomplete", "config",
+            "version",
         ];
         for name in &dispatched {
             assert!(
@@ -706,8 +778,9 @@ mod tests {
             names,
             vec![
                 "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "start", "join", "install", "skill",
-                "api-ref", "config", "schema", "completions", "autocomplete",
+                "probe", "status", "start", "publish", "join", "install",
+                "skill", "api-ref", "config", "schema", "completions",
+                "autocomplete",
             ]
         );
     }

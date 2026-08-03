@@ -104,6 +104,68 @@ to fire), quorum not met (with counts), window already closed, bad
 token. Exit code: **0** when the start was armed (the world forms at
 the next poll — watch `fdl status`), **1** otherwise.
 
+## `fdl publish`
+
+Put a training run where a fleet can pull it. The controller side of
+compiling on the node: it resolves a source spec into a served
+directory, builds it once as a gate, and writes the run manifest workers
+read.
+
+```bash
+# The operator's own crate, wherever it lives, with the run's arguments:
+fdl publish file:///home/op/my-train --bin target/release/my-train \
+            -- --model resnet --epochs 20
+
+# A pinned checkout, fetched by the controller itself (a remote
+# controller has no copy of your tree):
+fdl publish git+https://github.com/me/train#v3 --bin target/release/train
+
+# This repo's own vehicle: a workspace-excluded crate, so `--cwd`:
+fdl publish file:///home/op/rdl --cwd ddp-bench \
+            --build 'cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench' \
+            --bin target/release/ddp-bench -- --model olmo-graph --epochs 1
+```
+
+The tree lands in `<served>/tree` (default `~/.flodl/run/tree`), which
+is what a worker's `--source` points at, and the manifest sits at its
+root so one fetch carries both.
+
+**Chaining runs on a standing fleet is then one command.** Publish
+again and every box picks the new run up on its next dial, with nothing
+to edit on any worker. That is the point of the manifest: a worker's own
+config keeps only what is stable for that box (its credentials, its
+libtorch policy, where to pull from), while `cwd` / `build` / `bin` /
+`args` belong to the run and come from the controller. `args` is the
+sharp case rather than a convenience: they must match the run, because
+rank children re-enter the binary with them, so a fleet carrying its own
+copy would train the next run with the previous one's hyperparameters.
+
+**The build is validation, not an artifact.** One build gates the
+publish; every worker still compiles its own, because a controller
+producing binaries for N worker variants is the build matrix this design
+deleted. It also needs no GPU libtorch — compiling without a GPU feature
+against the cheap CPU variant catches user-code errors just as well — so
+the cost of having it on by default is rustup plus `fdl libtorch
+download --cpu`. What it buys is that a tree which cannot compile never
+reaches the fleet, where N boxes would each discover it separately in
+logs nobody is watching. It proves the tree for the *controller's*
+variant only: a break that exists solely under `--features rocm` passes
+a CUDA gate and lands on a worker. `--no-build` skips it and the
+manifest records that nothing has compiled this tree.
+
+**The manifest's presence is the commit point.** `fdl publish` removes
+it before it touches the tree and writes it only once the build has
+passed, so a box that dials mid-publish, or after a publish whose build
+failed, finds no manifest and waits for the next dial instead of
+training something unvalidated. A failed gate publishes nothing, and the
+fleet keeps running whatever it had.
+
+The served directory is what a source key must be scoped to, and
+`fdl publish` prints the line: `command="rrsync -ro <served>"` (see the
+[guardrail recipe](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window)).
+
+Exit code: **0** when the run is published, **1** otherwise.
+
 ## `fdl join`
 
 Join a cluster run's window as a **self-deployed worker**: the
@@ -216,6 +278,20 @@ source on its next re-dial, with no reprovisioning.
   carries its own `rust-toolchain.toml` and lockfile when the operator
   pinned them, and `RUSTUP_TOOLCHAIN` set here would silently override
   that.
+
+  All three are optional when the tree came from [`fdl
+  publish`](#fdl-publish): it carries a run manifest naming them, and
+  that manifest is the authority, so a worker pointed at a published tree
+  needs nothing but the pointer:
+
+  ```bash
+  fdl join --ssh flodl-join@ctrl --source rsync://flodl@ctrl:/home/op/.flodl/run/tree
+  ```
+
+  A tree with no manifest and no local artifact is a **transient**
+  failure, not a permanent one: publishing is exactly what fixes it, and
+  that includes the window a publish opens deliberately while its build
+  runs.
 
 A source your provisioning already mounts needs no scheme at all: name
 its path in `--data-path`. Nothing is checked and nothing is shipped

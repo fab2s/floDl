@@ -179,6 +179,21 @@ commands:
 #   #   bin: target/release/ddp-bench # artifact, relative to cwd. Not guessed:
 #   #                                 # a workspace member's build lands in the
 #   #                                 # WORKSPACE target/, not the member's.
+#   #
+#   # cwd / build / bin / args are all OPTIONAL here, because a tree the
+#   # controller published with `fdl publish` carries a run manifest that
+#   # names them, and that manifest is the authority when present. Declare
+#   # them for a box you drive by hand; leave them out and the worker
+#   # config holds only what is stable for THIS box (its credentials, its
+#   # libtorch policy, where to pull from) while everything belonging to
+#   # the run comes from the controller. That is what makes chaining runs
+#   # on a standing fleet one command: `fdl publish` again, and every box
+#   # picks the new run up on its next dial with nothing to edit here.
+#   #
+#   # args matter most: they must match the run, because rank children
+#   # re-enter the binary with them, so a fleet carrying its own copy
+#   # would train the next run with the previous one's hyperparameters.
+#   # A published manifest replaces this block's args and says so.
 #
 #   # --- libtorch on THIS box ----------------------------------------------
 #   # Acquire a variant into ~/.flodl/libtorch/ (never the project tree,
