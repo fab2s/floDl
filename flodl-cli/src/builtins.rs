@@ -136,9 +136,17 @@ pub struct StartArgs {
 /// through its guardrailed sshd (reachability = authentication); with
 /// neither, the controller must run open admission.
 ///
-/// Exit code: the agent's exit code (0 = this host finished cleanly).
-/// `--persist` re-dials on every exit instead — the systemd /
-/// golden-image mode.
+/// Before dialing, the box is prepared: the GPU stack is checked, the
+/// dataset source root is put where the ranks will look for it
+/// (`--data-source` mounts it read-only when it is not already there),
+/// and the directories the data plane writes are proven writable.
+/// Preparation re-runs per attempt, so a `--persist` box picks up a
+/// changed source on its next re-dial.
+///
+/// Exit code: the agent's exit code (0 = this host finished cleanly);
+/// 2 for a failure retrying cannot fix (no GPU, an unresolvable source,
+/// a missing binary), which `--persist` does not re-dial; 1 for a
+/// transient one, which it does — the systemd / golden-image mode.
 #[derive(crate::FdlArgs, Debug)]
 pub struct JoinArgs {
     /// Controller mux address, `host[:port]` (default port 1337).
@@ -173,6 +181,14 @@ pub struct JoinArgs {
     /// when the agent does.
     #[option]
     pub persist: bool,
+    /// Dataset source root on this box, shipped to this host's ranks
+    /// (with `--data-source`, the mountpoint; default `/flodl/data`).
+    #[option]
+    pub data_path: Option<String>,
+    /// Transport that establishes the source root when it is not
+    /// already mounted, e.g. `sshfs://user@ctrl:/flodl/data`.
+    #[option]
+    pub data_source: Option<String>,
 }
 
 /// Generate flodl API reference.

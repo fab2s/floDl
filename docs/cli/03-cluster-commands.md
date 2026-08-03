@@ -143,8 +143,65 @@ fdl join --ssh flodl-join@ctrl.example.com --identity ~/.ssh/join_key \
 Every flag defaults from a top-level `join:` block in `fdl.yml` (see
 `fdl.yml.example`), so a golden image boots into bare `fdl join`.
 
-Exit code: the agent's own — **0** when this host's ranks all finished
-cleanly. Under `--persist` the command only returns on setup errors.
+### Preparation, before the dial
+
+Admission starts a window deadline, so everything a box needs is
+acquired before it dials, and re-acquired on every attempt — which is
+what makes `--persist` a provisioning loop: a box picks up a changed
+source on its next re-dial, with no reprovisioning.
+
+- **The GPU gate.** No usable device at all, and the box does not dial.
+  The agent already refuses an empty device list, but only *after*
+  admission — by then this host has been counted into a quorum and takes
+  the cohort's formation down with it. The bar is "any usable device",
+  not "nothing to report": an unusable card beside working ones (an AMD
+  iGPU with no ROCm runtime, say) is what `fdl probe` flags and what a
+  perfectly trainable box looks like. Those findings become the
+  *explanation* when there is genuinely nothing.
+- **The dataset source root.** `--data-path` is the local path this
+  box's ranks read from; it is verified, then shipped to them, so the
+  training binary needs no data flag. `--data-source` mounts it first
+  when it is not already there:
+
+  ```bash
+  fdl join --ssh flodl-join@ctrl --bin target/release/train \
+           --data-source sshfs://flodl-join@ctrl:/flodl/data
+  ```
+
+  The mount goes up **read-only**: a rank reads the source root and
+  never writes it (anything missing is acquired into `~/.flodl/data`
+  instead), so the kernel enforces what was otherwise a convention. An
+  already-mounted path is left alone and reused; a mount from a
+  *different* source is reported and still reused, since unmounting
+  behind the operator would be worse. Credentials come from the `ssh:`
+  block — same box, same trust path.
+- **The local directories.** `~/.flodl/data` (the across-run dataset
+  cache) and the temp dir (the within-run disk stage) are proven writable
+  by writing. RAM-backed (`tmpfs`) or nearly-full volumes are reported,
+  not refused.
+
+A source your provisioning already mounts needs no scheme at all: name
+its path in `--data-path`. Nothing is checked and nothing is shipped
+when neither field is set.
+
+Exit codes:
+
+| code | meaning | `--persist` |
+|---|---|---|
+| **0** | the agent's own: this host's ranks all finished cleanly | re-dials |
+| **1** | transient failure — controller unreachable, mount attempt failed | re-dials |
+| **2** | permanent failure — no GPU, unresolvable source, missing binary, unwritable stage | **stops** |
+
+fdl never powers a box off itself; 2 is how the thing that owns the
+instance hears about it:
+
+```ini
+# /etc/systemd/system/flodl-join.service
+Restart=always
+RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+FailureAction=poweroff       # ... and self-deprovision it
+```
+
 Full protocol walkthrough, trust model, and the join-sshd guardrail
 recipe: [DDP reference](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window).
 

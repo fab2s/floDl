@@ -675,7 +675,9 @@ fn synthesize_world<'a>(
                 // The controller has nothing to say about the source
                 // root of a host it never configured. A walk-in learns
                 // its own from the join config on its box, which is
-                // where the path is actually resolvable.
+                // where the path is actually resolvable, and its agent
+                // writes it into this envelope on arrival
+                // (`AgentSpec::data_path`).
                 data_path: None,
                 ssh: None,
                 // On a loopback-bound mux a walk-in can only have
@@ -1055,6 +1057,10 @@ pub fn run_launcher_with_config(
                 local_devices: host.local_devices.clone(),
                 libtorch: host.arch.clone().unwrap_or_default(),
                 dataset_sig_hex: None,
+                // Fan-out: the roster already carries this host's source
+                // root into its envelope, so the agent has nothing to
+                // localize.
+                data_path: None,
             };
             if host.host == me {
                 // Merged env for the local children (cluster-scope

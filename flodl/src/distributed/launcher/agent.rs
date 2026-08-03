@@ -86,6 +86,18 @@ pub struct AgentSpec {
     /// the rendezvous path.
     #[serde(default)]
     pub dataset_sig_hex: Option<String>,
+    /// Dataset source root on THIS host, resolved on the box itself
+    /// (`fdl join`'s prepare phase mounts it when needed, then puts the
+    /// resulting path here). Written into the host block of the
+    /// controller-authored envelope so this host's ranks read it through
+    /// the same `LocalCluster::data_path()` a fan-out rank uses.
+    ///
+    /// Set only for a walk-in: the controller never configured that
+    /// host, so its roster entry carries no source root and has nothing
+    /// to be overridden. `None` on the fan-out path, where the roster IS
+    /// the authority.
+    #[serde(default)]
+    pub data_path: Option<String>,
 }
 
 impl AgentSpec {
@@ -135,6 +147,7 @@ pub(crate) fn join_world(
     controller_port: u16,
     pre_shared: Option<SessionSalt>,
     hello: JoinMsgWire,
+    data_path: Option<&str>,
 ) -> Result<JoinOutcome> {
     use std::net::ToSocketAddrs;
     let addr = (controller_host, controller_port)
@@ -236,10 +249,15 @@ pub(crate) fn join_world(
             // join-verified address; fan-out agents rewrite to the
             // values already in place (their tunnels bind the
             // controller port itself), so this is a no-op there.
-            let envelope_hex = rewrite_envelope_controller(
+            //
+            // A walk-in's dataset source root is the same shape of fact
+            // — host-local truth the controller never configured — so it
+            // rides the same rewrite.
+            let envelope_hex = localize_envelope(
                 &envelope_hex,
                 controller_host,
                 controller_port,
+                data_path,
             )?;
             let relay_spec_hex = relay_spec_hex
                 .map(|hex| {
@@ -263,14 +281,21 @@ pub(crate) fn join_world(
     }
 }
 
-/// Rewrite the slim envelope's `controller.host` / `controller.port`
-/// with the join-verified address (see the call site in [`join_world`]).
+/// Replace the parts of the slim envelope only this box can author: the
+/// `controller.host` / `controller.port` the join just proved reachable,
+/// and — for a walk-in — the `worker.data_path` its prepare phase
+/// resolved (see the call site in [`join_world`]).
+///
+/// `data_path` of `None` leaves the envelope's own value alone, which is
+/// what the fan-out path needs: there the roster IS the authority.
+///
 /// Loud on malformed artifacts — a truncated envelope must fail here,
 /// named, not in a rank child's parser.
-fn rewrite_envelope_controller(
+fn localize_envelope(
     envelope_hex: &str,
     host: &str,
     port: u16,
+    data_path: Option<&str>,
 ) -> Result<String> {
     let bytes = crate::distributed::cluster::hex_decode(envelope_hex)
         .map_err(|e| TensorError::new(&format!("cluster agent: envelope hex: {e}")))?;
@@ -286,6 +311,18 @@ fn rewrite_envelope_controller(
     };
     controller.insert("host".into(), serde_json::Value::String(host.to_string()));
     controller.insert("port".into(), serde_json::Value::from(port));
+    if let Some(data_path) = data_path {
+        let Some(worker) = envelope.get_mut("worker").and_then(|w| w.as_object_mut())
+        else {
+            return Err(TensorError::new(
+                "cluster agent: envelope carries no worker object",
+            ));
+        };
+        worker.insert(
+            "data_path".into(),
+            serde_json::Value::String(data_path.to_string()),
+        );
+    }
     let json = serde_json::to_string(&envelope).map_err(|e| {
         TensorError::new(&format!("cluster agent: envelope re-encode: {e}"))
     })?;
@@ -401,6 +438,7 @@ pub fn run_agent() -> Result<()> {
         spec.controller_port,
         pre_shared,
         hello,
+        spec.data_path.as_deref(),
     )?;
     // Children inherit this process's environment (the fan-out ssh
     // command already applied cluster/host env blocks to it); no extra
@@ -444,6 +482,7 @@ pub(crate) fn join_and_spawn_local(
         spec.controller_port,
         pre_shared,
         hello,
+        spec.data_path.as_deref(),
     )?;
     spawn_host_children(&spec.host, &devices, &outcome, extra_env)
 }
@@ -796,11 +835,13 @@ mod tests {
 
     /// Minimal controller-authored envelope, hex-encoded — the
     /// controller's (possibly wrong-for-this-host) dial address baked
-    /// in, as `build_slim_envelope_for` does.
+    /// in, as `build_slim_envelope_for` does. The `worker` object is
+    /// always present there, so it is present here.
     fn test_envelope_hex(host: &str, port: u16) -> String {
         let envelope = serde_json::json!({
             "controller": { "host": host, "port": port },
             "world_size": 2,
+            "worker": { "host": "worker-x", "ranks": [3, 4] },
         });
         crate::distributed::cluster::hex_encode(envelope.to_string().as_bytes())
     }
@@ -863,6 +904,7 @@ mod tests {
             local_devices: Some(vec![0, 1]),
             libtorch: "builds/sm61-sm120".to_string(),
             dataset_sig_hex: None,
+            data_path: Some("/flodl/data".to_string()),
         };
         let hex = spec.to_env_hex().unwrap();
         let bytes = crate::distributed::cluster::hex_decode(&hex).unwrap();
@@ -878,6 +920,9 @@ mod tests {
         assert_eq!(minimal.salt_hex, None);
         assert_eq!(minimal.local_devices, None);
         assert_eq!(minimal.dataset_sig_hex, None);
+        // No source root declared on that box: the envelope's own value
+        // stands, so the training binary keeps its default.
+        assert_eq!(minimal.data_path, None);
     }
 
     #[test]
@@ -903,7 +948,9 @@ mod tests {
                 },
             ],
         );
-        let outcome = join_world("127.0.0.1", port, None, test_hello()).unwrap();
+        let outcome =
+            join_world("127.0.0.1", port, None, test_hello(), Some("/srv/corpus"))
+                .unwrap();
         assert_eq!(outcome.salt, salt);
         assert_eq!(outcome.ranks, vec![3, 4]);
         // Join-verified address rewrite: the artifacts now dial where
@@ -915,6 +962,10 @@ mod tests {
         assert_eq!(envelope["controller"]["host"], "127.0.0.1");
         assert_eq!(envelope["controller"]["port"], port);
         assert_eq!(envelope["world_size"], 2, "other fields untouched");
+        // A walk-in's source root: resolved on this box, so this box
+        // writes it into the envelope its ranks read.
+        assert_eq!(envelope["worker"]["data_path"], "/srv/corpus");
+        assert_eq!(envelope["worker"]["host"], "worker-x", "other fields untouched");
         let relay: super::super::RelaySpec = serde_json::from_slice(
             &crate::distributed::cluster::hex_decode(
                 outcome.relay_spec_hex.as_deref().unwrap(),
@@ -927,6 +978,54 @@ mod tests {
         assert_eq!(relay.ranks, vec![3, 4], "other fields untouched");
         // The controller saw the hello it was sent.
         assert_eq!(controller.join().unwrap(), test_hello());
+    }
+
+    /// The fan-out half of the same rewrite: a managed host's roster
+    /// entry IS the authority on its source root, so an agent with
+    /// nothing of its own must leave the controller's value in place.
+    /// Getting this backwards would silently repoint every fan-out rank.
+    #[test]
+    fn localize_leaves_the_rosters_data_path_alone_when_the_box_has_none() {
+        let envelope = serde_json::json!({
+            "controller": { "host": "10.0.0.1", "port": 1337 },
+            "worker": { "host": "exa", "data_path": "/flodl/data" },
+        });
+        let hex = crate::distributed::cluster::hex_encode(
+            envelope.to_string().as_bytes(),
+        );
+        let out = localize_envelope(&hex, "127.0.0.1", 40123, None).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(&out).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["worker"]["data_path"], "/flodl/data");
+        assert_eq!(got["controller"]["host"], "127.0.0.1");
+
+        // ... and a walk-in's value wins over whatever the envelope
+        // carried, because the controller cannot have known better.
+        let out = localize_envelope(&hex, "127.0.0.1", 40123, Some("/srv/c")).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(&out).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["worker"]["data_path"], "/srv/c");
+    }
+
+    #[test]
+    fn localize_is_loud_on_a_malformed_envelope() {
+        let hex = crate::distributed::cluster::hex_encode(
+            serde_json::json!({ "controller": { "host": "h", "port": 1 } })
+                .to_string()
+                .as_bytes(),
+        );
+        // No worker object: only reachable on a truncated envelope, and
+        // it must name itself rather than surface in a rank's parser.
+        let err = localize_envelope(&hex, "h", 1, Some("/srv/c"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no worker object"), "got: {err}");
+        // Same envelope with nothing to localize stays fine.
+        assert!(localize_envelope(&hex, "h", 1, None).is_ok());
     }
 
     #[test]
@@ -947,7 +1046,7 @@ mod tests {
                 },
             ],
         );
-        let outcome = join_world("127.0.0.1", port, Some(salt), test_hello()).unwrap();
+        let outcome = join_world("127.0.0.1", port, Some(salt), test_hello(), None).unwrap();
         assert_eq!(outcome.salt, salt);
         assert!(outcome.relay_spec_hex.is_none());
         controller.join().unwrap();
@@ -962,7 +1061,7 @@ mod tests {
             salt,
             vec![JoinMsgWire::Reject { reason: "dataset signature mismatch".to_string() }],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("REJECTED"), "got: {err}");
@@ -981,7 +1080,7 @@ mod tests {
                 JoinMsgWire::Abort { reason: "quorum not met".to_string() },
             ],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("aborted"), "got: {err}");
@@ -1002,7 +1101,7 @@ mod tests {
                 formation_wait_secs: 60,
             }],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("trust mode"), "got: {err}");

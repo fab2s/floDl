@@ -99,6 +99,11 @@ pub mod status;
 /// bootstrap-spec synthesis, training-binary supervision.
 pub mod join;
 
+/// Training preparation for a dial-in worker: the GPU gate, the dataset
+/// source root, and the node-local directories the data plane writes.
+/// Runs before the join window opens on this box, once per attempt.
+pub mod prepare;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

@@ -1075,10 +1075,58 @@ fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatu
     NcclStatus { library_path: found.first().cloned(), all_found: found, via_docker: None }
 }
 
+/// What is mounted AT `path` exactly: `(source, fs_type)` from
+/// `/proc/mounts`, e.g. `("flodl@exa:/flodl/data", "fuse.sshfs")`.
+/// `None` when `path` is not itself a mount point — which is how
+/// [`crate::prepare`] tells "already mounted, nothing to do" from "mount
+/// it now" without shelling out to `mountpoint(1)`. Contrast
+/// [`detect_fs_type`], which walks toward the root and therefore always
+/// answers something.
+pub(crate) fn mounted_at(path: &Path) -> Option<(String, String)> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Last match wins: a mount point can be stacked, and the effective
+    // filesystem is the one mounted most recently.
+    let mut found = None;
+    for line in mounts.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 && Path::new(cols[1]) == abs {
+            found = Some((unescape_mount(cols[0]), cols[2].to_string()));
+        }
+    }
+    found
+}
+
+/// `/proc/mounts` octal-escapes space, tab, newline and backslash in
+/// the source and mount-point columns. Only the source is user-facing
+/// here (it goes into a mismatch warning), and a path with a space in it
+/// would otherwise print as `exa:/flodl\040data`.
+fn unescape_mount(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.clone().take(3).collect();
+        match u8::from_str_radix(&digits, 8) {
+            Ok(byte) if digits.len() == 3 => {
+                out.push(byte as char);
+                for _ in 0..3 {
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Best-effort filesystem-type lookup via `/proc/mounts`. Walks toward
 /// the root looking for the closest mount-point that contains `path`.
 /// Returns `None` on non-Linux or when `/proc/mounts` is unavailable.
-fn detect_fs_type(path: &Path) -> Option<String> {
+pub(crate) fn detect_fs_type(path: &Path) -> Option<String> {
     let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut best: Option<(usize, String)> = None;
@@ -1732,5 +1780,30 @@ mod tests {
         if std::path::Path::new("/proc/mounts").exists() {
             assert!(t.is_some(), "expected fs_type for /");
         }
+    }
+
+    #[test]
+    fn mounted_at_answers_only_for_a_real_mount_point() {
+        if !std::path::Path::new("/proc/mounts").exists() {
+            return;
+        }
+        // `/` is a mount point on every Linux box.
+        assert!(mounted_at(Path::new("/")).is_some());
+        // A path INSIDE a mount is not the mount point — this is the
+        // whole distinction from `detect_fs_type`, and the one that
+        // decides "mount it" from "already mounted".
+        let inside = std::env::temp_dir().join("fdl-not-a-mount-point");
+        assert!(mounted_at(&inside).is_none());
+        assert!(detect_fs_type(&inside).is_some(), "but it has an fs type");
+    }
+
+    #[test]
+    fn mount_fields_come_back_unescaped() {
+        assert_eq!(unescape_mount("exa:/flodl\\040data"), "exa:/flodl data");
+        assert_eq!(unescape_mount("plain:/flodl/data"), "plain:/flodl/data");
+        // A trailing backslash, or one that is not a full octal escape,
+        // is passed through rather than eating the rest of the field.
+        assert_eq!(unescape_mount("odd\\"), "odd\\");
+        assert_eq!(unescape_mount("odd\\9x"), "odd\\9x");
     }
 }

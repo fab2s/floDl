@@ -8,12 +8,16 @@
 //! its whole job is orchestration —
 //!
 //!   1. resolve settings (flags over the fdl.yml `join:` block),
-//!   2. optionally bring up an ssh `-L` forward of the controller port
+//!   2. prepare this box ([`crate::prepare`]): the GPU gate, the dataset
+//!      source root, the node-local directories the data plane writes —
+//!      all of it BEFORE the dial, because admission starts a window
+//!      deadline,
+//!   3. optionally bring up an ssh `-L` forward of the controller port
 //!      (the guardrailed-sshd trust path: reachability = authentication),
-//!   3. synthesize the agent bootstrap spec into the binary's
+//!   4. synthesize the agent bootstrap spec into the binary's
 //!      environment (`FLODL_INTERNAL_AGENT_JSON`, hex-encoded JSON — the
 //!      same envelope cluster fan-out ships),
-//!   4. run + supervise the binary, and in `--persist` mode re-dial
+//!   5. run + supervise the binary, and in `--persist` mode re-dial
 //!      with backoff when it exits (the systemd / golden-image loop).
 //!
 //! The spec (which may carry the pre-shared session token) rides the
@@ -29,12 +33,29 @@ use std::time::{Duration, Instant};
 use crate::builtins::JoinArgs;
 use crate::config::{self, SshConfig, WorkerJoin, DEFAULT_CONTROLLER_PORT};
 use crate::context::Context;
+use crate::prepare::{self, DataSpec, Fail, Prepared};
 use crate::style;
 
 /// Agent bootstrap env var — must match flodl's
 /// `distributed::launcher::ENV_AGENT_JSON` (the field names in the hex
 /// JSON must match `AgentSpec`; locked by `agent_spec_shape_is_the_wire_contract`).
 const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
+
+/// Exit code for a failure retrying cannot fix: no usable GPU, a spec
+/// that does not parse, a directory that cannot be created, a missing
+/// binary. Distinct from 1 (a transient failure, one-shot) so a
+/// fleet can act on the difference without parsing stderr:
+///
+/// ```ini
+/// # /etc/systemd/system/flodl-join.service
+/// Restart=always
+/// RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+/// FailureAction=poweroff       # ... and self-deprovision it
+/// ```
+///
+/// fdl deliberately does not power a box off itself: the decision belongs
+/// to whatever owns the instance's lifecycle, and 2 is how it hears about it.
+pub const EXIT_PERMANENT: i32 = 2;
 
 /// How long the ssh forward gets to come up (auth + local bind).
 const TUNNEL_READY_BUDGET: Duration = Duration::from_secs(20);
@@ -52,15 +73,16 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(120);
 /// no `--` was given (the config block's `args:` applies); a present
 /// but empty tail is an explicit "no arguments".
 ///
-/// Exit code: the agent's own exit code (one-shot); 1 on any
-/// orchestration failure. `--persist` only returns on setup errors —
-/// agent exits re-dial forever.
+/// Exit code: the agent's own exit code (one-shot); [`EXIT_PERMANENT`]
+/// for a failure retrying cannot fix; 1 for a transient one. `--persist`
+/// re-dials through transient failures and agent exits, and returns only
+/// on a permanent one.
 pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     let (block, project_root) = match load_join_block() {
         Ok(pair) => pair,
         Err(e) => {
             crate::cli_error!("{e}");
-            return 1;
+            return EXIT_PERMANENT;
         }
     };
     let eff = match resolve_effective(
@@ -72,7 +94,7 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         Ok(eff) => eff,
         Err(e) => {
             crate::cli_error!("{e}");
-            return 1;
+            return EXIT_PERMANENT;
         }
     };
     if eff.controller_defaulted {
@@ -95,7 +117,7 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
              `--bin` (or fdl.yml `join.bin`) at it",
             eff.bin,
         );
-        return 1;
+        return EXIT_PERMANENT;
     }
 
     // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
@@ -109,16 +131,40 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
-        let code = attempt(&eff, libtorch.as_ref());
-        if !eff.persist {
-            return code;
-        }
+        // What happened, phrased for the re-dial line. Every branch that
+        // is not re-dialable returns from here.
+        let outcome = match attempt(&eff, libtorch.as_ref()) {
+            Ok(code) => {
+                if !eff.persist {
+                    return code;
+                }
+                format!("agent exited with code {code}")
+            }
+            Err(fail) => {
+                crate::cli_error!("{}", fail.message());
+                if fail.is_permanent() {
+                    // The whole point of the class: a box that cannot be
+                    // fixed by waiting must stop, not hot-loop.
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "fdl join: not re-dialing — retrying cannot \
+                             fix this (exit {EXIT_PERMANENT})"
+                        )),
+                    );
+                    return EXIT_PERMANENT;
+                }
+                if !eff.persist {
+                    return 1;
+                }
+                "attempt failed".to_string()
+            }
+        };
         if started.elapsed() > BACKOFF_RESET_AFTER {
             backoff = BACKOFF_MIN;
         }
         eprintln!(
-            "fdl join: agent exited with code {code} after {}s; re-dialing \
-             in {}s (--persist)",
+            "fdl join: {outcome} after {}s; re-dialing in {}s (--persist)",
             started.elapsed().as_secs(),
             backoff.as_secs(),
         );
@@ -155,6 +201,24 @@ struct Effective {
     persist: bool,
     /// The binary's own arguments.
     bin_args: Vec<String>,
+    /// Dataset source root on this box (the mountpoint when
+    /// `data_source` is set); `None` ships nothing to the ranks.
+    data_path: Option<String>,
+    /// Transport that establishes the source root, `<scheme>://<target>`.
+    data_source: Option<String>,
+}
+
+impl Effective {
+    /// The data half, for [`crate::prepare`]. The tunnel block rides
+    /// along: the data host is the controller box in the shape this
+    /// exists for, so its key and options apply to the mount too.
+    fn data_spec(&self) -> DataSpec<'_> {
+        DataSpec {
+            path: self.data_path.as_deref(),
+            source: self.data_source.as_deref(),
+            ssh: self.ssh.as_ref(),
+        }
+    }
 }
 
 /// Merge flags over the config block. Pure — all I/O (hostname, config
@@ -253,6 +317,8 @@ fn resolve_effective(
         devices,
         persist: cli.persist || block.persist,
         bin_args,
+        data_path: cli.data_path.clone().or(block.data_path),
+        data_source: cli.data_source.clone().or(block.data_source),
     })
 }
 
@@ -354,7 +420,19 @@ fn parse_devices(spec: &str) -> Result<Option<Vec<u8>>, String> {
 /// Build the hex-encoded JSON payload for [`ENV_AGENT_JSON`]. Field
 /// names ARE the wire contract with flodl's `AgentSpec` deserializer;
 /// optional fields are omitted (serde defaults fill them).
-fn agent_spec_hex(eff: &Effective, dial: (&str, u16), libtorch_label: &str) -> String {
+///
+/// The prepared data path travels this way rather than in the join hello
+/// because the controller has nothing to say about it: it never
+/// configured this host, and only this box knows where its source root
+/// actually ended up. flodl's agent inserts it into the envelope its
+/// rank children read, beside the same-shaped rewrite it already does
+/// for the controller address.
+fn agent_spec_hex(
+    eff: &Effective,
+    dial: (&str, u16),
+    libtorch_label: &str,
+    prepared: &Prepared,
+) -> String {
     let mut spec = serde_json::json!({
         "host": eff.host,
         "controller_host": dial.0,
@@ -366,6 +444,9 @@ fn agent_spec_hex(eff: &Effective, dial: (&str, u16), libtorch_label: &str) -> S
     }
     if let Some(devices) = &eff.devices {
         spec["local_devices"] = serde_json::json!(devices);
+    }
+    if let Some(data) = &prepared.data_path {
+        spec["data_path"] = serde_json::json!(data.display().to_string());
     }
     hex_encode(spec.to_string().as_bytes())
 }
@@ -398,21 +479,30 @@ fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, Strin
 // One attempt: tunnel up (optional), agent run, teardown
 // ---------------------------------------------------------------------------
 
-/// One full join attempt. Returns the agent's exit code (or 1 on
-/// orchestration failure). The tunnel — when one is configured — lives
-/// exactly as long as the attempt: rebuilt fresh each re-dial, so a
-/// half-dead forward can never outlive the run it served.
-fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
+/// One full join attempt: prepare, tunnel, dial, supervise. Returns the
+/// agent's exit code, or the classed reason preparation/orchestration
+/// stopped.
+///
+/// Preparation comes first and every attempt re-runs it: admission
+/// starts a window deadline, so a mount established after the dial burns
+/// it, and re-running is how `--persist` becomes a provisioning loop.
+///
+/// The tunnel — when one is configured — lives exactly as long as the
+/// attempt: rebuilt fresh each re-dial, so a half-dead forward can never
+/// outlive the run it served.
+fn attempt(
+    eff: &Effective,
+    libtorch: Option<&(PathBuf, String)>,
+) -> Result<i32, Fail> {
+    let mut notes = Vec::new();
+    let prepared = prepare::prepare(&eff.data_spec(), &mut notes);
+    prepare::print_notes(&notes);
+    let prepared = prepared?;
+
     let mut tunnel: Option<Child> = None;
     let dial: (String, u16) = match &eff.ssh {
         Some(ssh) => {
-            let local_port = match pick_local_port() {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::cli_error!("{e}");
-                    return 1;
-                }
-            };
+            let local_port = pick_local_port().map_err(Fail::Transient)?;
             let argv = build_tunnel_argv(
                 ssh,
                 local_port,
@@ -425,22 +515,23 @@ fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
                 eff.controller_host,
                 eff.controller_port,
             );
-            let mut child = match Command::new(&argv[0])
+            let mut child = Command::new(&argv[0])
                 .args(&argv[1..])
                 .stdin(Stdio::null())
                 .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    crate::cli_error!("spawn ssh tunnel: {e}");
-                    return 1;
-                }
-            };
+                .map_err(|e| {
+                    // No ssh on the box is a provisioning fact, not a
+                    // passing condition.
+                    Fail::Permanent(format!("spawn ssh tunnel: {e}"))
+                })?;
+            // Auth failure and an unreachable host are both possible
+            // here and ssh does not let us tell them apart, so this
+            // stays re-dialable: a wrong key hits the backoff cap and
+            // keeps saying so, once a minute, loudly.
             if let Err(e) = wait_tunnel_ready(&mut child, local_port) {
-                crate::cli_error!("{e}");
                 let _ = child.kill();
                 let _ = child.wait();
-                return 1;
+                return Err(Fail::Transient(e));
             }
             tunnel = Some(child);
             ("127.0.0.1".to_string(), local_port)
@@ -449,7 +540,7 @@ fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
     };
 
     let libtorch_label = libtorch.map(|(_, l)| l.as_str()).unwrap_or("");
-    let spec_hex = agent_spec_hex(eff, (&dial.0, dial.1), libtorch_label);
+    let spec_hex = agent_spec_hex(eff, (&dial.0, dial.1), libtorch_label, &prepared);
 
     let mut cmd = Command::new(&eff.bin);
     cmd.args(&eff.bin_args)
@@ -466,18 +557,16 @@ fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
         cmd.env("LD_LIBRARY_PATH", merged);
     }
 
-    let code = match cmd.status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            crate::cli_error!("run {}: {e}", eff.bin);
-            1
-        }
-    };
+    // The path was checked before the loop, so a spawn failure here is
+    // the file itself: not executable, wrong architecture, bad interpreter.
+    let status = cmd.status().map_err(|e| {
+        Fail::Permanent(format!("run {}: {e}", eff.bin))
+    });
     if let Some(mut t) = tunnel.take() {
         let _ = t.kill();
         let _ = t.wait();
     }
-    code
+    Ok(status?.code().unwrap_or(1))
 }
 
 /// Reserve a loopback port for the tunnel's local end: bind :0, read
@@ -590,6 +679,8 @@ mod tests {
             host: None,
             devices: None,
             persist: false,
+            data_path: None,
+            data_source: None,
         }
     }
 
@@ -609,6 +700,8 @@ mod tests {
             devices: Some(vec![0, 1]),
             persist: true,
             args: vec!["--model".into(), "lenet".into()],
+            data_path: Some("/flodl/data".into()),
+            data_source: Some("sshfs://flodl@ctrl:/srv/data".into()),
         }
     }
 
@@ -623,6 +716,8 @@ mod tests {
             host: Some("pascal".into()),
             devices: Some("2".into()),
             persist: false,
+            data_path: Some("/mnt/corpus".into()),
+            data_source: Some("sshfs://exa/mnt/corpus".into()),
         };
         let tail: Vec<String> = vec!["--epochs".into(), "3".into()];
         let eff = resolve_effective(
@@ -650,6 +745,8 @@ mod tests {
         assert!(eff.persist);
         // A `--` tail replaces the block's args.
         assert_eq!(eff.bin_args, vec!["--epochs".to_string(), "3".into()]);
+        assert_eq!(eff.data_path.as_deref(), Some("/mnt/corpus"));
+        assert_eq!(eff.data_source.as_deref(), Some("sshfs://exa/mnt/corpus"));
     }
 
     #[test]
@@ -666,6 +763,18 @@ mod tests {
         assert_eq!(eff.devices, Some(vec![0, 1]));
         assert!(eff.persist);
         assert_eq!(eff.bin_args, vec!["--model".to_string(), "lenet".into()]);
+        assert_eq!(eff.data_path.as_deref(), Some("/flodl/data"));
+        assert_eq!(
+            eff.data_source.as_deref(),
+            Some("sshfs://flodl@ctrl:/srv/data"),
+        );
+        // The tunnel block's key and options carry to the data mount:
+        // same box, same trust path.
+        let spec = eff.data_spec();
+        assert_eq!(
+            spec.ssh.and_then(|s| s.identity_file.as_deref()),
+            Some("/etc/flodl/join_key"),
+        );
     }
 
     #[test]
@@ -681,6 +790,10 @@ mod tests {
         assert_eq!(eff.devices, None);
         assert!(!eff.persist);
         assert!(eff.bin_args.is_empty());
+        // No data fields: prepare checks nothing and ships nothing, so
+        // the training binary keeps its own default.
+        assert!(eff.data_path.is_none());
+        assert!(eff.data_source.is_none());
     }
 
     #[test]
@@ -781,7 +894,11 @@ mod tests {
             ..no_flags()
         };
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
-        let hex = agent_spec_hex(&eff, ("127.0.0.1", 40123), "builds/sm61-sm120");
+        let prepared = Prepared {
+            data_path: Some(PathBuf::from("/flodl/data")),
+        };
+        let hex =
+            agent_spec_hex(&eff, ("127.0.0.1", 40123), "builds/sm61-sm120", &prepared);
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -793,12 +910,13 @@ mod tests {
         assert_eq!(spec["salt_hex"], "ab".repeat(16));
         assert_eq!(spec["local_devices"], serde_json::json!([0, 1]));
         assert_eq!(spec["libtorch"], "builds/sm61-sm120");
+        assert_eq!(spec["data_path"], "/flodl/data");
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
             let cli = JoinArgs { bin: Some("t/bin".into()), ..no_flags() };
             let eff = resolve_effective(&cli, None, None, "cloud-1").unwrap();
-            agent_spec_hex(&eff, ("10.0.0.1", 1337), "")
+            agent_spec_hex(&eff, ("10.0.0.1", 1337), "", &Prepared::default())
         };
         let bytes: Vec<u8> = (0..open.len())
             .step_by(2)
@@ -808,6 +926,9 @@ mod tests {
         assert!(spec.get("salt_hex").is_none());
         assert!(spec.get("local_devices").is_none());
         assert!(spec.get("dataset_sig_hex").is_none());
+        // A box that declares no source root must ship no key at all:
+        // an empty string here would point every rank at the process cwd.
+        assert!(spec.get("data_path").is_none());
     }
 
     #[test]

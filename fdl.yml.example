@@ -139,3 +139,30 @@ commands:
 #   # devices: [0, 1]               # CUDA ids to offer (default: all GPUs)
 #   # persist: true                 # re-dial with backoff when the agent
 #   #                               # exits — the systemd / fleet mode
+#
+#   # --- the dataset source root on THIS box -------------------------------
+#   # data_path is the LOCAL path this box's ranks read their training data
+#   # from, the same role cluster.workers[].data_path plays for a fan-out
+#   # host: `fdl join` verifies it before dialing and ships it to the ranks,
+#   # so the training binary needs no data flag. Unset ships nothing and the
+#   # binary keeps its own default.
+#   #
+#   # data_source is optional and only for a root that is NOT already there:
+#   # fdl mounts it at data_path (default /flodl/data) before dialing. One
+#   # scheme ships today, and the mount goes up READ-ONLY, because a rank
+#   # reads the source root and never writes it (anything missing is
+#   # acquired into ~/.flodl/data instead). A source your provisioning
+#   # already mounted needs no scheme at all — name its path in data_path
+#   # and leave data_source unset. Credentials come from the ssh: block
+#   # above: same box, same trust path.
+#   # data_path: /flodl/data
+#   # data_source: sshfs://flodl@ctrl.example.com:/flodl/data
+#   #                               # or sshfs://host:2222/flodl/data
+#
+#   # Preparation (GPU stack, source root, writable stage dirs) runs before
+#   # every dial, so a --persist box picks up a changed source on its next
+#   # re-dial. A failure retrying cannot fix exits 2 and does NOT re-dial;
+#   # in a unit file, act on that instead of parsing stderr:
+#   #   Restart=always
+#   #   RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+#   #   FailureAction=poweroff       # ... and self-deprovision it

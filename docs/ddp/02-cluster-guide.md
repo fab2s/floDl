@@ -115,6 +115,7 @@ sequenceDiagram
     OP->>CTRL: fdl @cluster-x train …
     activate CTRL
     Note over CTRL: join window opens<br/>(status: waiting)
+    FJ->>FJ: prepare: GPU gate, source root,<br/>writable stage dirs
     FJ->>SSHD: ssh -L ⟶ forward to 127.0.0.1:1337
     FJ->>AG: exec binary in agent role<br/>(spec in env, never argv)
     AG->>CTRL: dial + hello (HMAC: token / salt)
@@ -123,7 +124,7 @@ sequenceDiagram
     OP->>CTRL: fdl status  ⟶  "roster startable"
     OP->>CTRL: fdl start (POST /start, authenticated)
     CTRL-->>AG: WorldFormed — envelope + relay spec
-    Note over AG: rewrites controller address with<br/>the one THIS join provably used
+    Note over AG: stamps in what only THIS box knows:<br/>the join-verified address, its source root
     AG->>RR: spawn relay + one rank per GPU
     RR->>CTRL: relay dials in — training runs
     RR-->>AG: children exit
@@ -291,6 +292,61 @@ finished, controller rebooted - the agent exits, `fdl join` backs off
 (5s doubling to 60s) and dials again, so a fleet of workers can sit
 ready before the operator ever launches, walk into the staging hold,
 and be re-armed for the next run the moment one ends.
+
+**Preparing the box, before the dial.** Admission starts a window
+deadline, so a box acquires what it needs *first* - and re-acquires it
+on every attempt, which turns `persist` into a provisioning loop: new
+source, next re-dial, no reprovisioning.
+
+```yaml
+join:
+  data_path: /flodl/data      # the LOCAL root this box's ranks read
+  data_source:                # optional: mount it when it is not there
+    sshfs://flodl-join@ctrl.example.com:/flodl/data
+```
+
+`data_path` plays the same role for a walk-in that
+`cluster.workers[].data_path` plays for a fan-out host - and travels a
+different road to get there, because the controller never configured
+this host and has nothing to say about where its data lives. The box
+resolves the path itself, and its agent writes it into the host block
+of the formed-world envelope on arrival: the same rewrite that stamps
+the join-verified controller address, for the same reason. Downstream,
+a rank reads it through the same `LocalCluster::data_path()` a fan-out
+rank uses, so the training binary needs no data flag either way.
+
+The mount goes up **read-only**, which is not a precaution but the
+enforcement of an invariant: a rank reads the source root and never
+writes it (anything missing is acquired into `~/.flodl/data`, the
+node-local cache). A root your provisioning already mounts needs no
+scheme at all - name its path in `data_path` and leave `data_source`
+unset; declare neither and nothing is checked or shipped.
+
+Two other things are settled before the dial. The GPU stack: no usable
+device at all and the box does not dial, since the agent's own check
+comes *after* admission, when this host has already been counted into a
+quorum. The bar there is "any usable device", not "nothing to report" -
+an unusable card beside working ones is what `fdl probe` flags and what
+a perfectly trainable box looks like, so those findings become the
+explanation when there is genuinely nothing rather than a veto. And the
+two directories the data plane writes (`~/.flodl/data` and the temp dir)
+are proven writable by writing; tmpfs or a nearly-full volume is
+reported, not refused.
+
+Failures then split by what retrying can do about them, because
+`persist` must treat them differently: a controller that is not up yet
+deserves the backoff loop (exit **1**), while a box with no GPU never
+grows one (exit **2**, and no re-dial). Without the split a
+misprovisioned instance hot-loops instead of stopping. fdl never powers
+a box off itself - the exit code is how whatever owns the instance
+hears about it:
+
+```ini
+# /etc/systemd/system/flodl-join.service
+Restart=always
+RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+FailureAction=poweroff       # ... and self-deprovision it
+```
 
 **Guardrailing the join sshd.** When workers arrive from outside the
 private network, the sshd their tunnels land on is the trust boundary

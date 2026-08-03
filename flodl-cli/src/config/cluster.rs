@@ -260,6 +260,30 @@ pub struct WorkerJoin {
     /// re-dials instead of exiting. The systemd / golden-image mode.
     #[serde(default)]
     pub persist: bool,
+    /// Dataset source root on THIS box — a local path, the same role
+    /// `cluster.workers[].data_path` plays for a fan-out host. `fdl
+    /// join` verifies it before dialing and ships it to this host's
+    /// ranks, so the training binary needs no data flag. Unset ships
+    /// nothing: the binary keeps its own default.
+    ///
+    /// With `data_source:` set this is the MOUNTPOINT, defaulting to
+    /// [`DEFAULT_DATA_PATH`].
+    #[serde(default)]
+    pub data_path: Option<String>,
+    /// Transport that establishes `data_path:` when it is not already
+    /// there, `<scheme>://<target>`. One scheme ships today:
+    ///
+    /// ```text
+    /// sshfs://[user@]host[:port]/abs/path
+    /// sshfs://[user@]host:/abs/path        # the scp spelling, same thing
+    /// ```
+    ///
+    /// A source already mounted by provisioning needs nothing here —
+    /// name its path in `data_path:` and leave this unset. The mount
+    /// goes up READ-ONLY: a rank reads the source root and never
+    /// writes it, so the kernel, not a convention, enforces that.
+    #[serde(default)]
+    pub data_source: Option<String>,
     /// Arguments for the training binary (the binary's own training
     /// flags). A `--` tail on the command line replaces this list.
     #[serde(default)]
