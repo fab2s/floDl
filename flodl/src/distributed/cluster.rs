@@ -226,6 +226,46 @@ pub struct WorkerBlock {
     /// by convention. Hint for the launcher only; the library does not
     /// consume this field.
     pub arch: Option<String>,
+
+    /// Dataset source root on this worker: the directory its ranks READ
+    /// training data from. May be a shared mount visible to every host
+    /// or a node-local directory, and the library does not distinguish
+    /// them: it forwards the path, the training binary reads it.
+    ///
+    /// `None` when the host did not declare `data_path:`. Only an
+    /// EXPLICIT declaration travels, so the convention default never
+    /// arrives as a path that may not exist. Reach it through
+    /// [`LocalCluster::data_path`] rather than this field, so
+    /// single-host runs take the same code path.
+    pub data_path: Option<String>,
+}
+
+/// This process's dataset source root, or `None` when nothing declared
+/// one.
+///
+/// The one call a training binary needs to honour a cluster's
+/// `data_path:` without knowing whether it is running under a cluster
+/// at all. `None` covers both "no cluster envelope" (a solo run) and
+/// "cluster, but this host declared no source root", which want the
+/// same answer: keep whatever default the binary defines.
+///
+/// Returns `Err` only on a malformed envelope, which is the same error
+/// the rank would hit moments later during rendezvous. Propagate it
+/// rather than treating a corrupt envelope as an absent one.
+///
+/// ```no_run
+/// # fn main() -> flodl::tensor::Result<()> {
+/// let data_dir = match flodl::distributed::cluster_data_path()? {
+///     Some(p) => p,
+///     None => std::path::PathBuf::from("data"),
+/// };
+/// # let _ = data_dir;
+/// # Ok(())
+/// # }
+/// ```
+pub fn cluster_data_path() -> Result<Option<std::path::PathBuf>> {
+    Ok(LocalCluster::from_env()?
+        .and_then(|c| c.data_path().map(std::path::PathBuf::from)))
 }
 
 impl LocalCluster {
@@ -384,6 +424,16 @@ impl LocalCluster {
         self.world_size
     }
 
+    /// This worker's dataset source root, when its host declared one.
+    ///
+    /// Unlike [`Self::this_worker`] this does not verify the hostname:
+    /// the envelope carries exactly one worker block and it is this
+    /// process's own, so reading a path out of it needs no identity
+    /// check and stays usable before the logger label is set.
+    pub fn data_path(&self) -> Option<&str> {
+        self.worker.data_path.as_deref()
+    }
+
     /// Consistency check: resolved hostname must match the envelope's
     /// `worker.host`. If they mismatch, the launcher shipped this envelope to
     /// the wrong host -- loud error.
@@ -514,6 +564,11 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         .and_then(Value::as_str)
         .map(String::from);
 
+    let data_path = obj
+        .get("data_path")
+        .and_then(Value::as_str)
+        .map(String::from);
+
     Ok(WorkerBlock {
         host: name,
         ranks,
@@ -521,6 +576,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         nccl_socket_ifname,
         path,
         arch,
+        data_path,
     })
 }
 

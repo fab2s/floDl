@@ -67,7 +67,9 @@ pub use checkpoint_forge::load_consensus_checkpoint;
 /// Loader for the outer-optimizer momentum sidecar (`<stem>.outer.fdl`),
 /// used by the launcher on resume to re-seed the outer optimizer.
 pub use checkpoint_forge::load_outer_momentum;
-pub use cluster::{WorkerBlock, LocalCluster, is_reserved_cluster_env_key};
+pub use cluster::{
+    WorkerBlock, LocalCluster, cluster_data_path, is_reserved_cluster_env_key,
+};
 pub use launcher::{FullCluster, FullWorker, Role};
 /// Join-window start-switch mode (`controller.join.start:` — auto /
 /// manual / hybrid). Public because [`ClusterBuilder::controller`]'s

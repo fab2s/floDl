@@ -471,6 +471,49 @@ cluster:
         assert_eq!(parsed.workers[0].local_devices, LocalDevices::All);
     }
 
+    /// The per-rank envelope carries a DECLARED `data_path:` and stays
+    /// silent otherwise.
+    ///
+    /// Load-bearing in the negative direction. The rank now consumes
+    /// this field (it reaches `--data-dir` via
+    /// `LocalCluster::data_path`), so reverting to
+    /// `effective_data_path()` would hand every cluster that never
+    /// mentioned data the convention default `/flodl/data`, a path most
+    /// hosts do not have. A silent host must stay silent so the
+    /// training binary keeps its own default.
+    #[test]
+    fn local_envelope_carries_data_path_only_when_declared() {
+        let yaml = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /tmp/solo
+  workers:
+    - host: declares
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+      data_path: /mnt/corpus
+    - host: silent
+      local_devices: all
+      nccl_socket_ifname: lo
+      path: /tmp/solo
+";
+        let cfg: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let cluster = cfg.cluster.unwrap();
+
+        let declares = cluster.local_envelope_for(&cluster.workers[0]);
+        let silent = cluster.local_envelope_for(&cluster.workers[1]);
+
+        assert_eq!(declares["worker"]["data_path"], "/mnt/corpus");
+        assert!(
+            silent["worker"].get("data_path").is_none(),
+            "an undeclared host must not receive the convention default: {}",
+            silent["worker"]
+        );
+    }
+
     #[test]
     fn local_devices_rejects_unknown_string() {
         let yaml = "\

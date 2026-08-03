@@ -502,6 +502,79 @@
         assert!(env["worker"].get("ssh").is_none(), "ssh must be stripped");
     }
 
+    /// The whole `data_path` chain in one assert: cluster json ->
+    /// `FullWorker` -> slim envelope -> `LocalCluster::data_path`.
+    ///
+    /// Before this landed the value was parsed on the controller only,
+    /// never written to the slim envelope, and had nowhere to land on
+    /// `WorkerBlock`, so a rank could not see it even in principle. The
+    /// asymmetric fixture pins the other half of the rule: a host that
+    /// declares nothing must carry nothing, because the alternative
+    /// (shipping the convention default) points every run that never
+    /// mentioned data at a directory that is not there.
+    #[test]
+    fn data_path_reaches_the_rank_only_when_declared() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "workers": [
+                {
+                    "host": "declares",
+                    "ranks": [0],
+                    "local_devices": [0],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl",
+                    "data_path": "/mnt/corpus"
+                },
+                {
+                    "host": "silent",
+                    "ranks": [1],
+                    "local_devices": [1],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl"
+                }
+            ]
+        });
+        let full = FullCluster::from_value(&v).unwrap();
+
+        let declares = full.workers.iter().find(|w| w.host == "declares").unwrap();
+        let silent = full.workers.iter().find(|w| w.host == "silent").unwrap();
+        assert_eq!(declares.data_path.as_deref(), Some("/mnt/corpus"));
+        assert_eq!(silent.data_path, None);
+
+        let a = build_slim_envelope_for(&full, declares, &full.controller.host, false);
+        let b = build_slim_envelope_for(&full, silent, &full.controller.host, false);
+        assert_eq!(a["worker"]["data_path"], "/mnt/corpus");
+        assert!(
+            b["worker"].get("data_path").is_none(),
+            "an undeclared host must not carry the key at all"
+        );
+
+        let a = crate::distributed::LocalCluster::from_value(&a).unwrap();
+        let b = crate::distributed::LocalCluster::from_value(&b).unwrap();
+        assert_eq!(a.data_path(), Some("/mnt/corpus"));
+        assert_eq!(b.data_path(), None);
+    }
+
+    /// `to_json` is the symmetric half of `from_value`, and the
+    /// auto-promote path round-trips a programmatic cluster through it.
+    #[test]
+    fn data_path_survives_full_cluster_to_json() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "workers": [{
+                "host": "h",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/opt/flodl",
+                "data_path": "/mnt/corpus"
+            }]
+        });
+        let round = FullCluster::from_value(&FullCluster::from_value(&v).unwrap().to_json())
+            .unwrap();
+        assert_eq!(round.workers[0].data_path.as_deref(), Some("/mnt/corpus"));
+    }
+
     #[test]
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();

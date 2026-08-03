@@ -284,6 +284,7 @@ impl ClusterBuilder {
                 nccl_socket_ifname: "lo".to_string(),
                 path: cwd,
                 arch: None,
+                data_path: None,
                 ssh: None,
                 tunnel: false,
                 env: std::collections::BTreeMap::new(),
@@ -486,6 +487,7 @@ pub struct HostBuilder {
     nccl_socket_ifname: Option<String>,
     path: Option<String>,
     arch: Option<String>,
+    data_path: Option<String>,
     ssh: Option<crate::distributed::launcher::SshConfig>,
     tunnel: bool,
     env: std::collections::BTreeMap<String, String>,
@@ -501,6 +503,7 @@ impl HostBuilder {
             nccl_socket_ifname: None,
             path: None,
             arch: None,
+            data_path: None,
             ssh: None,
             tunnel: false,
             env: std::collections::BTreeMap::new(),
@@ -557,6 +560,18 @@ impl HostBuilder {
     /// resolves the runtime libtorch at `<path>/libtorch/<arch>/`.
     pub fn arch(mut self, p: impl Into<String>) -> Self {
         self.arch = Some(p.into());
+        self
+    }
+
+    /// Dataset source root on this host: where its ranks READ training
+    /// data from. A shared mount or a node-local directory, whichever
+    /// the deployment provides. Mirrors the YAML field
+    /// `workers[].data_path`.
+    ///
+    /// Left unset, nothing travels to the rank and the training binary
+    /// keeps its own default.
+    pub fn data_path(mut self, p: impl Into<String>) -> Self {
+        self.data_path = Some(p.into());
         self
     }
 
@@ -655,6 +670,7 @@ impl HostBuilder {
             nccl_socket_ifname: self.nccl_socket_ifname.expect("checked above"),
             path: self.path.expect("checked above"),
             arch: self.arch,
+            data_path: self.data_path,
             ssh: self.ssh,
             tunnel: self.tunnel,
             env: self.env,

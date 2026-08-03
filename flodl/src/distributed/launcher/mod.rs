@@ -672,6 +672,11 @@ fn synthesize_world<'a>(
                 nccl_socket_ifname: String::new(),
                 path: String::new(),
                 arch: None,
+                // The controller has nothing to say about the source
+                // root of a host it never configured. A walk-in learns
+                // its own from the join config on its box, which is
+                // where the path is actually resolvable.
+                data_path: None,
                 ssh: None,
                 // On a loopback-bound mux a walk-in can only have
                 // arrived through an sshd forward, so its rank children

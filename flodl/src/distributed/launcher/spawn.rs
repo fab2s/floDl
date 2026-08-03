@@ -878,6 +878,12 @@ pub(super) fn build_slim_envelope_for(
     if let Some(a) = &worker.arch {
         host_obj.insert("arch".into(), Value::String(a.clone()));
     }
+    // Dataset source root, emitted only when the host declared one.
+    // Absent means "the training binary keeps its own default", which
+    // is what every cluster that never mentions data paths expects.
+    if let Some(d) = &worker.data_path {
+        host_obj.insert("data_path".into(), Value::String(d.clone()));
+    }
 
     let mut controller_obj = serde_json::Map::new();
     controller_obj.insert(

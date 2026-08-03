@@ -91,13 +91,22 @@
 #     instead of erroring on a missing libnccl.so on the host. Omit
 #     when the host runs flodl natively. Per-host, NOT global: mixed
 #     deployments (controller in Docker, worker bare-metal) are common.
-#   - `data_path:` (optional) shared-storage path visible to this host.
-#     flodl assumes a filesystem reachable at the same logical path on
-#     every node (NAS / SMB / virtiofs / S3-FUSE / SSHFS) holding
-#     training data, model checkpoints, and per-rank logs. Defaults to
-#     `/flodl/data` when omitted. `fdl probe` verifies it exists + is
-#     readable on each host before fan-out. Multi-host checkpoint /
-#     resume paths must live here (see `save_path` / `resume_from`).
+#   - `data_path:` (optional) dataset SOURCE ROOT on this host: where
+#     its ranks read training data from, plus model checkpoints and
+#     per-rank logs. Usually a filesystem reachable at the same logical
+#     path on every node (NAS / SMB / virtiofs / S3-FUSE / SSHFS), which
+#     is the recommended shape; a node-local directory is legal too, and
+#     then each host holds its own copy. `fdl probe` verifies it exists
+#     + is readable on each host before fan-out, and multi-host
+#     checkpoint / resume paths must live here (see `save_path` /
+#     `resume_from`).
+#
+#     DECLARING IT CHANGES A RUN. The path travels to every rank and
+#     supplies the training binary's data directory (ddp-bench's
+#     `--data-dir`, which still wins when passed explicitly). Omitted,
+#     nothing travels and the binary keeps its own default, so the
+#     `/flodl/data` convention below is what `fdl probe` checks against,
+#     never something a run is silently pointed at.
 #
 # `controller.port:` defaults to 1337 when omitted (replaces
 # PyTorch's MASTER_PORT default of 29500). This single port carries
@@ -180,7 +189,7 @@ cluster:
     path: /opt/flodl                  # controller's view of the shared project root
     # docker: cuda                    # optional pre-flight build context
     # arch: precompiled/cu128         # optional libtorch variant for pre-flight
-    # data_path: /flodl/data          # shared-storage root (default /flodl/data)
+    # data_path: /flodl/data          # dataset source root; declaring it feeds every rank
     # join:                           # membership-window overrides (see above)
     #   min_rank_start: 2
     #   join_timeout: 300
@@ -197,7 +206,7 @@ cluster:
                                       # host NCCL scan); does NOT wrap training -- the
                                       # rank binary runs directly over SSH. Omit when
                                       # this worker runs flodl natively.
-      # data_path: /flodl/data        # shared-storage root (default /flodl/data)
+      # data_path: /flodl/data        # dataset source root; declaring it feeds every rank
 
     - host: node-b
       ssh:                            # optional sub-block; omit entirely to use defaults

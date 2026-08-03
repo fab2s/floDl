@@ -141,11 +141,14 @@ pub struct ClusterController {
     /// controller's project-root `.active` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// Shared-storage path visible to the controller. flodl assumes a
-    /// shared filesystem reachable at the same logical path on every
-    /// node — training data, model checkpoints, and per-rank logs all
-    /// live here. When absent, the convention default
-    /// [`DEFAULT_DATA_PATH`] applies.
+    /// Dataset source root visible to the controller: training data,
+    /// model checkpoints and per-rank logs. Usually a filesystem
+    /// reachable at the same logical path on every node, which is the
+    /// recommended shape; a node-local directory is legal, and then
+    /// each host holds its own copy. When absent, the convention
+    /// default [`DEFAULT_DATA_PATH`] applies to the checks (`fdl probe`,
+    /// pre-flight) but is NOT shipped to a run — see
+    /// [`ClusterWorker::data_path`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
     /// Join-window quorum knobs (dial-in membership). fdl-cli carries
@@ -468,13 +471,24 @@ pub struct ClusterWorker {
     /// where the basename names the CUDA version, not GPU archs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// Shared-storage path visible to this host. flodl assumes a
-    /// shared filesystem (NAS / SMB / virtiofs / S3-FUSE / SSHFS)
-    /// reachable at the same logical path on every node — training
-    /// data, model checkpoints, and per-rank logs all live here. When
-    /// absent, the convention default [`DEFAULT_DATA_PATH`] applies.
-    /// `fdl probe` verifies the path exists + is readable on each
-    /// host before training can fan out.
+    /// Dataset source root on this host: where its ranks READ training
+    /// data from, alongside model checkpoints and per-rank logs.
+    ///
+    /// Usually a shared filesystem (NAS / SMB / virtiofs / S3-FUSE /
+    /// SSHFS) reachable at the same logical path on every node, which
+    /// is the recommended shape and the one multi-host checkpointing
+    /// requires. A node-local directory is legal too, and then each
+    /// host holds its own copy. `fdl probe` verifies the path exists +
+    /// is readable on each host before training can fan out.
+    ///
+    /// **Declaring it changes a run.** The value travels to every rank
+    /// through the launcher envelope and supplies the training binary's
+    /// data directory (`LocalCluster::data_path` on the flodl side; an
+    /// explicit `--data-dir` still wins). When absent, nothing travels
+    /// and the binary keeps its own default: the convention default
+    /// [`DEFAULT_DATA_PATH`] governs the CHECKS only, because shipping
+    /// it would point every cluster that never mentioned data at a
+    /// directory most hosts do not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
     /// Names the docker compose service that provides this host's
@@ -741,14 +755,20 @@ impl ClusterConfig {
         // doesn't need them — the rank-side library has nothing to do
         // with SSH. They're already on the FULL envelope via serde on
         // `ClusterConfig` so the launcher picks them up there.
-        // Shared-data path: always serialize the effective value
-        // (declared or convention default) so the rank-side envelope
-        // surfaces a non-ambiguous path. Library validates existence
-        // via `fdl probe` before training; ship the path verbatim.
-        worker_obj.insert(
-            "data_path".into(),
-            Value::String(worker.effective_data_path().into()),
-        );
+        //
+        // Dataset source root: DECLARED values only, never
+        // `effective_data_path()`. The convention default names a path
+        // that most hosts do not actually have, and the rank consumes
+        // this one (it reaches `--data-dir` through
+        // `LocalCluster::data_path`), so shipping the default would
+        // point every run that never mentioned data at a directory that
+        // is not there. Absent = the training binary keeps its own
+        // default. Same split `check_remote_data_path` already makes:
+        // a declared path that is missing is an error, a convention
+        // default that is missing is a warning.
+        if let Some(dp) = &worker.data_path {
+            worker_obj.insert("data_path".into(), Value::String(dp.clone()));
+        }
 
         let mut controller_obj = serde_json::Map::new();
         controller_obj.insert("host".into(), Value::String(self.controller.host.clone()));

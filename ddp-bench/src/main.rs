@@ -70,9 +70,11 @@ struct Cli {
     #[option(default = "runs")]
     output: String,
 
-    /// Dataset cache directory.
-    #[option(default = "data")]
-    data_dir: std::path::PathBuf,
+    /// Dataset source directory. Absent: the cluster host's declared
+    /// `data_path:` when there is one, else `data` next to the binary's
+    /// working directory.
+    #[option]
+    data_dir: Option<std::path::PathBuf>,
 
     /// Training data source: "ram" parses the dataset into memory up
     /// front; "disk" reads per sample from the raw files through
@@ -768,7 +770,15 @@ fn run() -> flodl::tensor::Result<()> {
     };
     let batch_size = cli.batch_size;
     let output = cli.output.clone();
-    let data_dir = cli.data_dir.clone();
+    // Dataset source root, in precedence order: an explicit --data-dir,
+    // then the source root this cluster host declared, then the
+    // historical cwd-relative default. A solo run resolves to `data`
+    // exactly as before, since there is no envelope to read.
+    let data_dir = match cli.data_dir.clone() {
+        Some(p) => p,
+        None => flodl::distributed::cluster_data_path()?
+            .unwrap_or_else(|| std::path::PathBuf::from("data")),
+    };
     let monitor_port = cli.monitor;
     let validate = cli.validate;
     let save_baseline = cli.save_baseline;

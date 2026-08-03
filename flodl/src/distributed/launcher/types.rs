@@ -197,6 +197,16 @@ pub struct FullWorker {
     /// launcher uses this to build the remote-side LD_LIBRARY_PATH
     /// when no pre-flight envelope overrides it.
     pub arch: Option<String>,
+    /// Dataset source root on this worker: where a rank READS its
+    /// training data from. May be a shared mount visible to every host
+    /// or a node-local directory; the library does not care which, it
+    /// only forwards the path to the rank.
+    ///
+    /// `None` when the host did not declare `data_path:`, in which case
+    /// the run keeps whatever default its own CLI defines. Only an
+    /// EXPLICIT declaration travels, so a cluster that never mentions
+    /// data paths is unaffected by this field existing.
+    pub data_path: Option<String>,
     /// SSH endpoint for remote dispatch. `None` means the host runs
     /// on the same machine as the launcher (fork/exec path, no ssh).
     /// When `Some`, all fields inside are optional and fall back to
@@ -411,6 +421,9 @@ impl FullCluster {
                 o.insert("path".into(), serde_json::Value::String(h.path.clone()));
                 if let Some(a) = &h.arch {
                     o.insert("arch".into(), serde_json::Value::String(a.clone()));
+                }
+                if let Some(d) = &h.data_path {
+                    o.insert("data_path".into(), serde_json::Value::String(d.clone()));
                 }
                 if let Some(s) = &h.ssh {
                     let mut ssh_obj = serde_json::Map::new();
@@ -664,6 +677,11 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let data_path = obj
+        .get("data_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     let ssh = parse_ssh_block(
         obj.get("ssh"),
         &format!("workers[{i}] ({name:?})"),
@@ -692,6 +710,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         nccl_socket_ifname,
         path,
         arch,
+        data_path,
         ssh,
         tunnel,
         env,

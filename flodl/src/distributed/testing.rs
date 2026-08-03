@@ -121,6 +121,7 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             nccl_socket_ifname: "lo".to_string(),
             path: String::new(),
             arch: None,
+            data_path: None,
             ssh: None,
             tunnel: false,
             env: std::collections::BTreeMap::new(),
