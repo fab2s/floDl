@@ -24,16 +24,25 @@ post-deploy smoke test.
 
 **What it checks:**
 
-- **GPU inventory**: count, name, sm version, VRAM per device (via
-  `nvidia-smi`, no libtorch context touched).
-- **libtorch variant**: active variant, version, CUDA version, arch
+- **GPU inventory**: count, name, vendor, arch (sm or gfx), VRAM per
+  device — CUDA-free and libtorch-free by construction (NVIDIA via
+  nvidia-smi, AMD via the kernel's KFD topology), and the sweep's
+  findings ride along: an AMD card present with no ROCm runtime is
+  reported with the install command, not silently dropped.
+- **libtorch variant**: active variant, version, toolkit version, arch
   coverage, source (precompiled vs source-built).
-- **GPU/libtorch arch compatibility**: every visible GPU's sm version
-  is covered by the active libtorch's `archs:` metadata.
+- **GPU/libtorch arch compatibility**: every visible GPU's arch is
+  covered by the active libtorch's `archs:` metadata, both vendors
+  (tokenized match — a bare `5` no longer matches the `5` inside `7.5`).
+- **Host prerequisites**: the tools a native build needs (curl or wget,
+  unzip, a C++ compiler) and the ACTIVE variant's vendor toolkit
+  headers — the full set `flodl-sys/build.rs` demands (7 headers on
+  ROCm, which has no metapackage), each with the install command.
 - **NCCL availability**: host-level `libnccl.so` linkage, version. On
   workers with `docker: <svc>` declared in `fdl.cluster.yml`, the
   probe reports "via Docker image `<svc>`" instead of erroring on a
-  missing host-level libnccl.
+  missing host-level libnccl. Skipped on an AMD-only host (RCCL ships
+  inside libtorch-rocm).
 - **NCCL version skew (cluster mode)**: surfaces major.minor skew
   across hosts - the common failure mode on heterogeneous rigs.
   Resolution: [`fdl nccl build`](#fdl-nccl) to bridge.
@@ -129,6 +138,38 @@ fdl publish file:///home/op/rdl --cwd ddp-bench \
 The tree lands in `<served>/tree` (default `~/.flodl/run/tree`), which
 is what a worker's `--source` points at, and the manifest sits at its
 root so one fetch carries both.
+
+Flags: `--bin` (required — the artifact relative to the project dir; a
+workspace member's build lands in the WORKSPACE `target/`, so no rule
+fdl invented would be right for everyone), `--cwd` (project dir inside
+the tree), `--build` (a shell recipe, default `cargo build --release`;
+it receives `LIBTORCH_PATH`, `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`,
+with the system ROCm runtime — `$ROCM_PATH` / `$HIP_PATH` / `$HSA_PATH`,
+else `/opt/rocm` — resolved ahead of libtorch's bundled copy), `--to
+<dir>` (the served directory, default `~/.flodl/run`; the guardrail
+key's `rrsync -ro` scopes to exactly this, so pick it deliberately),
+`--identity <key>` (for an `rsync://` source the controller itself pulls
+over ssh) and `--no-build` (skip the gate — recorded in the manifest,
+loudly). One deliberate asymmetry with `fdl join`: publish owns the
+whole command so its flags are bare (`--cwd`), while join prefixes its
+source flags (`--source-cwd`) because join also carries data, tunnel and
+libtorch surfaces.
+
+**The manifest is `.fdl-run.yml`**, at the tree root:
+
+| field | meaning |
+|---|---|
+| `cwd` | project directory inside the tree (default: its root); governs the build AND the run |
+| `build` | build recipe, a shell line (default `cargo build --release`) |
+| `bin` | built artifact, relative to `cwd` — what workers run |
+| `args` | the binary's own arguments (everything after `--`) |
+| `origin` | the source spec the controller resolved, for provenance |
+| `rustc` | `rustc -V` on the controller — advisory; a worker reports a mismatch, never enforces it |
+| `published_epoch` | unix seconds at publish, so a box can say how old its run is |
+| `built` | `false` when `--no-build` skipped the gate; workers say so out loud |
+
+Do not hand-edit it: the next publish overwrites it, and its *presence*
+is what tells a worker the run is ready.
 
 **Chaining runs on a standing fleet is then one command.** Publish
 again and every box picks the new run up on its next dial, with nothing

@@ -134,11 +134,11 @@ commands:
     run: cargo test
     append: -- --nocapture
     docker: dev
-  cuda-test:
-    description: Run CUDA tests (parallel)
-    run: cargo test --features cuda
+  gpu-test:
+    description: Run GPU tests (parallel)
+    run: cargo test --features "$FDL_GPU_FEATURE"
     append: -- --nocapture
-    docker: cuda
+    docker: gpu
   shell:
     run: bash
     docker: dev
@@ -147,7 +147,7 @@ commands:
 
 ```bash
 fdl test                              # runs "test" in the "dev" docker service
-fdl gpu-test                         # runs in the "cuda" service
+fdl gpu-test                          # runs in the vendor's GPU service
 fdl test -- -p flodl-hf --test foo    # forwards `-p flodl-hf --test foo` to cargo
 fdl shell                             # opens an interactive shell
 fdl ddp-bench --list                  # dispatches into the ddp-bench sub-command
@@ -155,8 +155,23 @@ fdl ddp-bench --list                  # dispatches into the ddp-bench sub-comman
 
 When a `run:` command declares `docker: <service>`, `fdl` wraps it in
 `docker compose run --rm <service> bash -c "…"`. Without `docker:`, it
-runs on the host. `docker:` is only valid on `run:` commands -
-declaring it on a `path:` or preset entry is rejected at load time.
+runs on the host (with the same libtorch env applied). `docker:` is only
+valid on `run:` commands - declaring it on a `path:` or preset entry is
+rejected at load time.
+
+Two pieces of GPU indirection keep a manifest vendor-neutral:
+
+- **`docker: gpu`** is a logical service name: fdl resolves it to the
+  `cuda` or `rocm` compose service from the ACTIVE libtorch variant.
+  `docker: cuda` / `docker: rocm` remain explicit pins, passed through
+  verbatim; when no `rocm` service exists the resolution falls back to
+  `cuda` with a message.
+- **`$FDL_GPU_FEATURE`** is exported by fdl from the active variant
+  (`cuda`, `rocm`, or empty for a CPU variant), so a `run:` line says
+  `--features "$FDL_GPU_FEATURE"` — quoted, so the empty CPU value
+  stays a valid cargo invocation — instead of hardcoding a vendor.
+  Compose passes it into containers via the scaffolded `environment:`
+  blocks; native runs receive it directly.
 
 #### Forwarding extra args with `--` and `append:`
 

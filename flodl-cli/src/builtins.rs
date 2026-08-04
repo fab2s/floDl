@@ -207,7 +207,7 @@ pub struct JoinArgs {
     /// hostname).
     #[option]
     pub host: Option<String>,
-    /// CUDA device ids to offer, comma-separated (default: all GPUs
+    /// GPU device ids to offer, comma-separated (default: all GPUs
     /// on this host).
     #[option]
     pub devices: Option<String>,

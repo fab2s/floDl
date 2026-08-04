@@ -75,6 +75,11 @@ the covered targets rather than installing something that cannot run.
 ROCm libtorch is published for Linux only; `--rocm` on Windows or macOS
 is refused with that reason.
 
+When an AMD box behaves in a way `fdl probe` / `fdl diagnose` cannot
+explain, `rocm-capture.sh` at the repo root snapshots the whole stack in
+one pass (KFD topology, ROCm userspace, device permissions, both sides
+of the container boundary) — attach its output to a bug report.
+
 If your NVIDIA GPUs span both CUDA ranges (e.g. GTX 1060 + RTX 5060 Ti),
 no single pre-built variant covers both. Use `fdl libtorch build`.
 
@@ -319,22 +324,27 @@ In all three modes the scaffold generates:
 - `src/main.rs` - complete training template.
 - `fdl.yml.example` - committed manifest; fdl copies it to a gitignored
   `fdl.yml` on first use. Declares `build` / `test` / `run` / `check` /
-  `clippy` (and `shell` / `cuda-shell` in Docker modes) plus the `cuda-*`
-  siblings.
+  `clippy` plus the `gpu-*` siblings (`gpu-build` / `gpu-test` /
+  `gpu-run`, all `docker: gpu` + `--features "$FDL_GPU_FEATURE"`, so one
+  manifest serves both vendors) and `shell` / `gpu-shell` in Docker
+  modes.
 - `./fdl` - self-contained bootstrap script (`./fdl install` promotes it
   to `~/.local/bin/fdl`).
-- `.gitignore`.
+- `.gitignore` and `.env.example`.
 
 Docker modes additionally generate:
 
-- `Dockerfile` / `Dockerfile.cuda` (mounted variant) or
-  `Dockerfile.cpu` / `Dockerfile.cuda` (baked variant).
-- `docker-compose.yml`.
+- `Dockerfile` / `Dockerfile.cuda` / `Dockerfile.rocm` (mounted variant)
+  or `Dockerfile.cpu` / `Dockerfile.cuda` / `Dockerfile.rocm` (baked
+  variant).
+- `docker-compose.yml`, with `dev` / `cuda` / `rocm` services; the
+  logical `docker: gpu` in fdl.yml resolves to the vendor's service
+  from the active libtorch variant.
 
 Native mode skips all the Docker files - commands run on the host. Point
 `$LIBTORCH` / `$LD_LIBRARY_PATH` at a libtorch install (use
-`./fdl libtorch download --cpu` or `--cuda 12.8`) and `./fdl build`
-dispatches straight to `cargo build`.
+`./fdl libtorch download --cpu`, `--cuda 12.8` or `--rocm 7.0`) and
+`./fdl build` dispatches straight to `cargo build`.
 
 > The scaffold is fdl-native: there is no Makefile. Every task lives in
 > `fdl.yml` and runs via `./fdl <cmd>`. Libtorch environment variables

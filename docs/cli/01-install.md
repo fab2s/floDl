@@ -103,7 +103,7 @@ default when no verbosity flag is passed.
 
 ```bash
 fdl -v ddp-bench quick    # verbose: DDP sync, cadence changes, prefetch detail
-fdl -vv cuda-test         # debug: per-batch timing, internal loops
+fdl -vv gpu-test          # debug: per-batch timing, internal loops
 fdl -vvv shell            # trace: extreme granularity
 fdl --quiet test          # errors only
 fdl --no-ansi config show # plain output for pipes and CI

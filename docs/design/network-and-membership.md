@@ -81,12 +81,18 @@ membership change.
 A worker dials the controller port and sends a **join hello**:
 protocol version, host name, GPU inventory (count, arch), libtorch
 variant, dataset signature, and the deployment credential when the
-trust mode requires one (see below). The controller validates
-compatibility immediately - version, arch/libtorch coherence, dataset
-signature (a stale worker from a previous run is rejected loudly at
-the door, not discovered mid-epoch) - and runs its per-host prechecks
-right away rather than waiting for the window to close. By start
-time, everything admitted is already validated.
+trust mode requires one (see below). What admission validates today,
+immediately rather than at window close: protocol version, host-name
+uniqueness, device-list sanity, GPU-vendor coherence when the data
+plane is NCCL/RCCL (a mixed NCCL+RCCL cohort passes every structural
+check and hangs at formation, so the libtorch label's vendor is checked
+at the door; CPU averaging modes mix legally), and the dataset
+signature — with one honest caveat: `fdl join` does not yet stamp a
+real dataset signature into the hello (workers send zeros), so that
+check bites only for binaries that set it themselves. As-designed
+per-host prechecks beyond these have NOT been built; a run-identity
+check (the published manifest's token riding the hello) is the planned
+next admission fact.
 
 The join reply carries the **session salt**, the assigned global rank
 ids (one per local GPU, assigned in admission order), and the cluster
@@ -119,7 +125,12 @@ Until elastic scale-up lands, the world is formed once, at start:
   forms).
 
 All four are tunable; the timeouts scale with `FLODL_NET_TIMEOUT_SCALE`
-like the rest of the deadline set. When the window closes, world_size
+like the rest of the deadline set. Shipped alongside them (documented
+in the cluster guide, listed here so this section is not read as the
+whole knob set): `discovery` (a roster-free window that requires an
+explicit `min_rank_start`), `open_admission`, `token` (pre-shared
+session salt), `tunnel_only`, and `start: auto|manual|hybrid` (the
+staging hold). When the window closes, world_size
 freezes: seed-derived sharding, the cadence scheduler, and the
 window≤epoch invariant all see a static world. Elastic *death*
 (dead-rank detection, membership shrink, NCCL rebuild) continues to
@@ -195,7 +206,8 @@ deployments with zero new dependencies.
 One small state struct on the controller, three renderings:
 
 - **Phase**: `waiting(joined/quorum/target, window countdown, cap
-  countdown)` → `forming` → `training` → `done/failed`.
+  countdown)` → `staging` (manual/hybrid start: quorum met, roster
+  held for the operator) → `forming` → `training` → `done/failed`.
 - **Members**: per host - name, ranks, GPU inventory, join
   timestamp, precheck result.
 
@@ -286,7 +298,10 @@ collapsed the wire bytes.
    - **One agent per host** (`Role::Agent`, bootstrapped by
      `FLODL_INTERNAL_AGENT_JSON`) replaces per-rank SSH spawn; the
      minimal self-deploy spec is `{host, controller_host,
-     controller_port}` - the worker resolves its own GPUs. The join
+     controller_port}` - the worker resolves its own GPUs. As shipped
+     the spec also carries what only that box knows: its libtorch
+     variant label (the vendor-coherence fact), the session token, an
+     explicit device scope, and its resolved `data_path`. The join
      connection stays open as the host control link (`RankExited` up,
      `Abort` down, EOF = host death).
    - **Launcher-local hosts join in-process** (a thread dialing

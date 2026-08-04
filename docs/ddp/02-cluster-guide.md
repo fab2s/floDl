@@ -5,7 +5,7 @@ A cluster spans hosts via `fdl.cluster.yml` (deployment) or
 is the **controller** and is never a NCCL rank itself; every
 rank-carrying host lives under **workers**.
 
-### `fdl.cluster.yml` schema
+## `fdl.cluster.yml` schema
 
 ```yaml
 cluster:
@@ -45,6 +45,16 @@ cluster:
       nccl_socket_ifname: enp1s0
       path: /srv/flodl
       arch: builds/sm61-sm120     # different variant per worker is fine
+      # data_path: /flodl/data    # dataset source root on THIS host.
+      #                           # DECLARING IT CHANGES A RUN: the value
+      #                           # reaches every rank here and supplies the
+      #                           # training binary's data dir. Unset ships
+      #                           # nothing (the binary keeps its default);
+      #                           # the convention default /flodl/data then
+      #                           # governs only the pre-flight checks.
+      # env:                      # per-worker env for this host's rank
+      #   NCCL_SOCKET_NTHREADS: "2"   # children (reserved keys refused:
+      #                           # the visibility masks, FLODL_INTERNAL_*)
 
   # Cluster-scope env vars (apply to every rank child)
   # env:
@@ -74,7 +84,7 @@ Conventions:
   its fan-out SSH session instead of a direct TCP connection - see
   below.
 
-### Dial-in membership: the join window
+## Dial-in membership: the join window
 
 Workers **join** a run; the controller admits them. At launch the
 controller opens a join window on its port; every worker - fan-out-
@@ -85,6 +95,18 @@ When the window closes, the world freezes: `world_size` is whatever
 actually joined, and all coordination infrastructure (ElChe schedule,
 heartbeats, rendezvous) is sized to that world.
 
+**One thing admission refuses outright: mixing GPU vendors under an
+NCCL data plane.** NCCL and RCCL export the same symbols and the same
+128-byte unique-id format, so nothing structural rejects a mixed
+cohort - it hangs at formation, after the window deadline was spent.
+The hello's libtorch label already names the vendor, so a walk-in whose
+vendor disagrees with the cohort's is rejected at the door, with both
+fixes named. The CPU ElChe modes (`cpu_sync` / `cpu_cadence` /
+`cpu_async`) genuinely work cross-vendor - each box compiles its own
+binary against its own libtorch, and the averaging plane is
+vendor-blind - so under those modes mixing is allowed, and it is one of
+the reasons the CPU plane exists.
+
 `fdl @cluster <cmd>` fan-out is sugar over this protocol: it starts
 one worker agent per host over SSH, and those agents dial back in like
 any worker would. The defaults make fan-out behave exactly like a
@@ -93,7 +115,7 @@ configured capacity, so the window closes the instant every configured
 rank is in (zero added latency) and the run cannot start below full
 strength.
 
-#### The big picture, end to end
+### The big picture, end to end
 
 One run, every moving part - a discovery controller holding a manual
 window, one worker walking in through a guardrailed sshd tunnel
@@ -230,7 +252,9 @@ the cloud shape, where worker addresses do not exist before the VMs
 boot. Fan-out and discovery compose: an enumerated rig fans out as
 usual while cloud legs self-register into the same window.
 
-**The staging hold and `fdl start`.** With `start: manual` (or
+### The staging hold and `fdl start`
+
+With `start: manual` (or
 `hybrid`) the window becomes an operator surface: once quorum is met
 the run shows as `staging` in `fdl status` - the roster is startable
 but held - and `fdl start` fires the topology freeze. Manual is the
@@ -244,7 +268,9 @@ Refusals name their reason - auto mode, quorum not met, window already
 closed - and arming below quorum is refused rather than queued, so the
 operator always knows what they started.
 
-**Walking in: `fdl join`.** The worker-side command for all of the
+### Walking in: `fdl join`
+
+The worker-side command for all of the
 above - it dials a window, offers the box's GPUs, and runs your
 training binary in agent role:
 
@@ -293,7 +319,9 @@ finished, controller rebooted - the agent exits, `fdl join` backs off
 ready before the operator ever launches, walk into the staging hold,
 and be re-armed for the next run the moment one ends.
 
-**Preparing the box, before the dial.** Admission starts a window
+### Preparing the box, before the dial
+
+Admission starts a window
 deadline, so a box acquires what it needs *first* - and re-acquires it
 on every attempt, which turns `persist` into a provisioning loop: new
 source, next re-dial, no reprovisioning.
@@ -326,7 +354,9 @@ The mount authenticates with the `ssh:` block's own key, so a
 guardrailed join sshd has to permit sftp for it to come up at all - see
 the recipe below, which is where that costs a decision.
 
-**Compiling on the node.** `bin:` names a binary to run as given. Its
+### Compiling on the node
+
+`bin:` names a binary to run as given. Its
 alternative builds one here, which is how the ABI stops being a matter of
 manifest discipline: the box links against the exact libtorch it holds.
 
@@ -343,7 +373,9 @@ join:
     bin: target/release/ddp-bench
 ```
 
-**And the controller can be the authority for what a run IS.** `fdl
+### Publishing a run: the controller is the authority
+
+`fdl
 publish` resolves a source spec into a served directory, builds it once
 as a gate, and writes a run manifest at the tree's root:
 
@@ -448,7 +480,9 @@ RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 FailureAction=poweroff       # ... and self-deprovision it
 ```
 
-**Guardrailing the join sshd.** When workers arrive from outside the
+### Guardrailing the join sshd
+
+When workers arrive from outside the
 private network, the sshd their tunnels land on is the trust boundary
 - under `tunnel_only` it is the ONLY door, which is the point. The
 recipe keeps a compromised join key from being worth anything more
@@ -570,7 +604,7 @@ fn main() {
 }
 ```
 
-### One port, and tunneled workers
+## One port, and tunneled workers
 
 All cross-host traffic (membership join, NCCL bootstrap rendezvous,
 CPU-reduce data, coordinator control) accepts on the single
@@ -601,7 +635,7 @@ When every remote worker sets `tunnel: true`, the controller binds
 loopback only: the training port is then unreachable except through
 sshd on the controller host.
 
-### Activating the overlay
+## Activating the overlay
 
 Three equivalent forms (a command-line selector overrides `FDL_ENV`):
 
@@ -617,7 +651,7 @@ remote rank children, and tears them down on parent exit.
 
 See [CLI reference](../cli/03-cluster-commands.md#fdl-cluster-cmd---multi-host-fan-out) for the full command surface.
 
-### Per-case libtorch (heterogeneous rigs)
+## Per-case libtorch (heterogeneous rigs)
 
 One libtorch checkout can support multiple per-host variants via
 `libtorch/.active.<case>` pointer files. The `FDL_LIBTORCH_CASE=<case>`
@@ -627,7 +661,11 @@ cluster fan-out resolves each host's variant correctly.
 
 Single-host setups keep using bare `.active`.
 
-### NCCL version skew
+## NCCL version skew
+
+NVIDIA-only, both the problem and the tool: `fdl nccl build` compiles a
+CUDA libnccl, and RCCL ships inside libtorch-rocm (no separate host
+library to skew).
 
 When one host's libtorch ships NCCL 2.27.x and another's ships 2.26.x,
 NCCL refuses handshake across the major.minor skew. Build a matching
@@ -640,7 +678,7 @@ fdl nccl build                  # auto-detects target NCCL tag + local archs
 Wire it in via the worker's `env: LD_PRELOAD:` block in cluster.yml.
 See [CLI reference](../cli/03-cluster-commands.md#fdl-nccl) for full options.
 
-### Readiness gate - `fdl probe`
+## Readiness gate - `fdl probe`
 
 Before launching, audit the cluster:
 
@@ -655,7 +693,7 @@ a CI smoke test. Returns non-zero on errors; zero on green or
 warnings-only. See [CLI reference](../cli/03-cluster-commands.md#fdl-probe) for the full
 field listing.
 
-### Live run status - `fdl status`
+## Live run status - `fdl status`
 
 While a run is up, the controller port answers plain HTTP GETs with
 the run's membership state as `state.json` - lifecycle phase

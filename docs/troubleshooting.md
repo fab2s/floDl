@@ -117,8 +117,8 @@ GPU not available to Docker. For CPU-only development:
 
 **Fix:** Use CPU targets instead:
 ```bash
-fdl build    # not cuda-build
-fdl test     # not cuda-test
+fdl build    # not gpu-build
+fdl test     # not gpu-test
 ```
 
 ---

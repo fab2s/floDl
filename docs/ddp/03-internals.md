@@ -303,7 +303,7 @@ After abort, the communicator's `Drop` is a no-op.
 
 ---
 
-## CUDA synchronization primitives
+## GPU synchronization primitives
 
 ### `GpuEvent`
 

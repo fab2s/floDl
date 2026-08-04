@@ -487,7 +487,7 @@ Three ways to set the level, in priority order:
 ```bash
 # 1. CLI (sets FLODL_VERBOSITY for child processes too, including Docker)
 fdl -v   ddp-bench quick      # Verbose
-fdl -vv  cuda-test            # Debug
+fdl -vv  gpu-test             # Debug
 fdl -vvv shell                # Trace
 fdl --quiet test              # Errors only
 ```

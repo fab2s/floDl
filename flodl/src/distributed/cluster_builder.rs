@@ -249,9 +249,11 @@ impl ClusterBuilder {
         let gpus = crate::sys::detect_gpus();
         if gpus.is_empty() {
             return Err(TensorError::new(
-                "ClusterBuilder::all_local_gpus: no CUDA GPUs visible \
-                 (nvidia-smi reported none, or CUDA_VISIBLE_DEVICES \
-                 narrowed to empty). Use the single-device path instead.",
+                "ClusterBuilder::all_local_gpus: no usable GPU visible for this \
+                 build's vendor (none detected, or a visibility mask \
+                 narrowed the list to empty -- CUDA_VISIBLE_DEVICES, and \
+                 HIP/ROCR_VISIBLE_DEVICES on ROCm). Use the single-device \
+                 path instead.",
             ));
         }
         let hostname = crate::distributed::cluster::resolve_hostname()?;

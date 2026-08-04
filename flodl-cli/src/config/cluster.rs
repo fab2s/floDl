@@ -273,8 +273,8 @@ pub struct WorkerJoin {
     /// machine's hostname).
     #[serde(default)]
     pub host: Option<String>,
-    /// CUDA device indices to offer, one rank each (default: every
-    /// GPU nvidia-smi sees).
+    /// GPU device indices to offer, one rank each (default: every
+    /// device detection sees for the training build's vendor).
     #[serde(default)]
     pub devices: Option<Vec<u8>>,
     /// Keep dialing across runs: when the agent exits (run finished,

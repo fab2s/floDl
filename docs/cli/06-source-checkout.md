@@ -41,12 +41,12 @@ Any project (not just flodl itself) can adopt the `_live` suffix +
 `#[ignore]` convention; `fdl test-live` picks up any test matching
 the pattern within its `cargo test` scope.
 
-## CUDA / GPU testing
+## GPU testing
 
 ```bash
-fdl gpu-build            # build with CUDA feature
-fdl gpu-clippy           # lint with CUDA feature
-fdl gpu-test             # parallel CUDA tests (excludes NCCL / Graph)
+fdl gpu-build            # build with the active variant's GPU feature
+fdl gpu-clippy           # lint with the active variant's GPU feature
+fdl gpu-test             # parallel GPU tests (excludes NCCL / Graph)
 fdl gpu-test-nccl        # NCCL/DDP tests only (isolated processes)
 fdl gpu-test-graph       # CUDA Graph tests (exclusive GPU, single-threaded)
 fdl gpu-test-serial      # remaining serial tests
@@ -138,7 +138,7 @@ recipe, the 30-cell parity matrix).
 
 ```bash
 fdl shell         # dev container (CPU)
-fdl gpu-shell    # CUDA container
+fdl gpu-shell    # GPU container (cuda or rocm service)
 ```
 
 ## Re-building the CLI

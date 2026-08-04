@@ -829,7 +829,13 @@ installs the ROCm build, `--features rocm` compiles against it, and GPUs are
 enumerated from the kernel's KFD topology. Training on AMD is **not yet
 validated on hardware** - the vendor axis is in place, the runtime numbers
 are not. A libtorch build serves one vendor, so a host picks CUDA or ROCm,
-never both in one process.
+never both in one process (and a join window refuses a cohort mixing the
+two under NCCL/RCCL; the CPU averaging modes mix legally). Vendor-plural
+today: detection (`fdl probe` / `diagnose`), variant install, the walk-in
+path (`fdl join` / `fdl publish`), the container services and per-rank
+device pinning. Still NVIDIA-only: fan-out's remote `local_devices: all`
+probe, `fdl --gpus all` resolution, `fdl libtorch build` (source builds)
+and `fdl nccl build` (RCCL ships inside libtorch-rocm).
 
 Linux and [Windows via WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md)
 are the trained-on platforms - the benchmarks above were produced under

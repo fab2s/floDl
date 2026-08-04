@@ -15,8 +15,8 @@ services:
     stdin_open: true
     tty: true
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
     # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
     # `docker compose` (make, ci, IDE) from warning about it being unset.
     hostname: ${HOSTNAME:-}
@@ -80,8 +80,8 @@ services:
     # generous headroom for ResNet-class workspaces.
     shm_size: 2gb
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
     # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
     # `docker compose` (make, ci, IDE) from warning about it being unset.
     hostname: ${HOSTNAME:-}
@@ -210,8 +210,8 @@ services:
     tty: true
     shm_size: 2gb
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
     # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
     # `docker compose` (make, ci, IDE) from warning about it being unset.
     hostname: ${HOSTNAME:-}
@@ -338,8 +338,8 @@ services:
     # exhausts the 64 MB Docker default /dev/shm.
     shm_size: 2gb
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
     # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
     # `docker compose` (make, ci, IDE) from warning about it being unset.
     hostname: ${HOSTNAME:-}

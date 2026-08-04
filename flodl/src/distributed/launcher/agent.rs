@@ -349,7 +349,8 @@ fn rewrite_relay_controller(
 }
 
 /// Resolve the physical devices this worker offers: an explicit list
-/// from the spec/config, or every GPU nvidia-smi sees. Returns the
+/// from the spec/config, or every GPU detection sees for this build's
+/// vendor (masks applied). Returns the
 /// device ids plus one inventory label per device. Resolution happens
 /// HERE (on the worker) so `"all"` shorthands never cross the wire.
 pub(crate) fn resolve_devices(requested: Option<&Vec<u8>>) -> (Vec<u8>, Vec<String>) {

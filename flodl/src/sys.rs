@@ -6,8 +6,9 @@
 //! cluster mode — the spawned children inherit a corrupted CUDA
 //! context on heterogeneous-GPU rigs.
 //!
-//! [`detect_gpus`] avoids both problems by shelling out to `nvidia-smi`
-//! and parsing its CSV output. Use this when you need GPU info for
+//! [`detect_gpus`] avoids both problems by asking the vendor's own
+//! stack (nvidia-smi for NVIDIA, the kernel's KFD topology for AMD)
+//! with no GPU runtime initialized. Use this when you need GPU info for
 //! pre-`Trainer::run` decisions (mode filtering, log banners,
 //! CLI-flag validation) — see the "no CUDA before `Trainer::run`"
 //! invariant in the [`crate::distributed::Trainer`] docs.

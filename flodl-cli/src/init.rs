@@ -910,6 +910,11 @@ fn env_example_template(mode: Mode) -> String {
 # libtorch variant's `.arch` metadata and overrides whatever is set here.
 #CUDA_VERSION=12.8.0
 #CUDA_TAG=12.8
+
+# ROCm base image version for the `rocm` service (same rule). The service
+# mounts LIBTORCH_HOST_PATH like the cuda one, so the variant override above
+# covers both vendors.
+#ROCM_VERSION=7.0
 ",
         );
     }
@@ -937,15 +942,15 @@ fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
     // `gpu` is fdl's logical service: it resolves to the container
     // matching the active libtorch variant (`cuda` / `rocm`), so a
     // scaffolded project does not hardcode a vendor either.
-    let (cpu_svc, cuda_svc) = if use_docker {
+    let (cpu_svc, gpu_svc) = if use_docker {
         ("\n    docker: dev", "\n    docker: gpu")
     } else {
         ("", "")
     };
-    let cuda_note = if use_docker {
-        "(requires NVIDIA Container Toolkit)"
+    let gpu_note = if use_docker {
+        "(NVIDIA: Container Toolkit; AMD: /dev/kfd + render group)"
     } else {
-        "(requires a matching CUDA toolkit on the host)"
+        "(requires the vendor toolkit on the host)"
     };
     let preamble = if use_docker {
         "# Run any of these with `./fdl <cmd>` (or `fdl <cmd>` once installed\n\
@@ -973,11 +978,11 @@ fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
         String::new()
     };
 
-    let cuda_shell_block = if use_docker {
+    let gpu_shell_block = if use_docker {
         format!(
-            r#"  cuda-shell:
-    description: Interactive shell (CUDA container)
-    run: bash{cuda_svc}
+            r#"  gpu-shell:
+    description: Interactive shell (GPU container)
+    run: bash{gpu_svc}
 "#
         )
     } else {
@@ -1006,19 +1011,19 @@ commands:
   clippy:
     description: Lint
     run: cargo clippy -- -W clippy::all{cpu_svc}
-{shell_block}  # --- GPU {cuda_note} ---
+{shell_block}  # --- GPU {gpu_note} ---
   # $FDL_GPU_FEATURE is exported by fdl from the active libtorch variant,
   # so these stay correct if you switch variants.
   gpu-build:
     description: Build with GPU support
-    run: cargo build --features "$FDL_GPU_FEATURE"{cuda_svc}
+    run: cargo build --features "$FDL_GPU_FEATURE"{gpu_svc}
   gpu-test:
     description: Run GPU tests
-    run: cargo test --features "$FDL_GPU_FEATURE" -- --nocapture{cuda_svc}
+    run: cargo test --features "$FDL_GPU_FEATURE" -- --nocapture{gpu_svc}
   gpu-run:
     description: cargo run with GPU support
-    run: cargo run --features "$FDL_GPU_FEATURE"{cuda_svc}
-{cuda_shell_block}"#
+    run: cargo run --features "$FDL_GPU_FEATURE"{gpu_svc}
+{gpu_shell_block}"#
     )
 }
 
