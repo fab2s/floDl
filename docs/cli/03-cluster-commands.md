@@ -122,7 +122,7 @@ fdl publish git+https://github.com/me/train#v3 --bin target/release/train
 
 # This repo's own vehicle: a workspace-excluded crate, so `--cwd`:
 fdl publish file:///home/op/rdl --cwd ddp-bench \
-            --build 'cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench' \
+            --build 'cargo build --release --features "$FDL_GPU_FEATURE" --bin ddp-bench' \
             --bin target/release/ddp-bench -- --model olmo-graph --epochs 1
 ```
 
@@ -160,8 +160,12 @@ failed, finds no manifest and waits for the next dial instead of
 training something unvalidated. A failed gate publishes nothing, and the
 fleet keeps running whatever it had.
 
-The served directory is what a source key must be scoped to, and
-`fdl publish` prints the line: `command="rrsync -ro <served>"` (see the
+The served directory is what a source key must be scoped to:
+`command="rrsync -ro <served>"`. rrsync re-roots every requested path
+under that directory, so a worker behind it points its `source.from` at
+`rsync://<host>:/tree`, not the absolute path (which double-roots and
+fails). `fdl publish` prints both spellings, each labelled with the key
+it pairs with (see the
 [guardrail recipe](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window)).
 
 Exit code: **0** when the run is published, **1** otherwise.
@@ -285,6 +289,8 @@ source on its next re-dial, with no reprovisioning.
   needs nothing but the pointer:
 
   ```bash
+  # plain source key; behind a guardrailed rrsync key the spec is
+  # `rsync://flodl-join@ctrl:/tree` instead (rrsync re-roots the path)
   fdl join --ssh flodl-join@ctrl --source rsync://flodl@ctrl:/home/op/.flodl/run/tree
   ```
 
@@ -302,19 +308,29 @@ Exit codes:
 | code | meaning | `--persist` |
 |---|---|---|
 | **0** | the agent's own: this host's ranks all finished cleanly | re-dials |
-| **1** | transient failure — controller unreachable, mount or fetch attempt failed, **the source did not compile** | re-dials |
+| **1** | transient failure — the controller unreachable or the agent exiting 1, a mount or fetch attempt failed, **the source did not compile** | re-dials |
 | **2** | permanent failure — no GPU, a spec that does not parse, a missing binary or toolchain, unwritable stage | **stops** |
 
 A compile error being transient is deliberate rather than lenient. The
 source is remote, so the fix is a push away, and the systemd recipe below
 pairs code 2 with `poweroff`: a box that stopped permanently over a typo
-would take the fleet with it.
+would take the fleet with it. One exception: a compile failure on a box
+whose vendor toolkit headers are demonstrably missing is permanent —
+re-dialing cannot install a package, and the error names the `apt` line.
+
+One-shot mode (no `--persist`) passes the **agent's own exit code**
+through verbatim, so a training binary that exits 2 for its own reasons
+is indistinguishable from fdl's permanent class. The systemd recipe
+below is therefore written for `--persist`, where agent exits re-dial
+inside fdl and only classed preparation failures ever reach systemd —
+pair the recipe with `persist: true` (or treat 2 as reserved in your
+training binary).
 
 fdl never powers a box off itself; 2 is how the thing that owns the
 instance hears about it:
 
 ```ini
-# /etc/systemd/system/flodl-join.service
+# /etc/systemd/system/flodl-join.service  (fdl join --persist ...)
 Restart=always
 RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 FailureAction=poweroff       # ... and self-deprovision it

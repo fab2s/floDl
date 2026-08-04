@@ -352,7 +352,7 @@ pub struct WorkerSource {
     /// It can be a script committed beside the code (`./ci/node-build.sh`),
     /// so the recipe travels with the source while its invocation stays
     /// here. fdl exports what it resolved: `LIBTORCH_PATH`,
-    /// `FDL_GPU_FEATURE` (say `--features $FDL_GPU_FEATURE` rather than
+    /// `FDL_GPU_FEATURE` (say `--features "$FDL_GPU_FEATURE"` rather than
     /// naming a vendor) and `LD_LIBRARY_PATH`.
     ///
     /// It re-runs on every dial, so it must be cheap when nothing

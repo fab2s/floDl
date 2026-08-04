@@ -470,12 +470,19 @@ pub fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> 
         // What flodl-sys/build.rs reads to find headers and libraries.
         ("LIBTORCH_PATH".to_string(), dir.display().to_string()),
         // The vendor's cargo feature, so a recipe can say
-        // `--features $FDL_GPU_FEATURE` instead of naming a vendor.
-        // Falls back to `cuda` exactly as `fdl run` does for the same
-        // case, so the variable means one thing everywhere in fdl.
+        // `--features "$FDL_GPU_FEATURE"` instead of naming a vendor.
+        // EMPTY for a CPU variant (cargo accepts `--features ""`), and
+        // deliberately NOT `fdl run`'s legacy `cuda` fallback: the
+        // publish gate's whole cheap-mode story is "a CPU libtorch is
+        // enough", and the cuda fallback would make the recommended
+        // recipe build `--features cuda` against a CPU libtorch — a
+        // gate that always fails. One quoted recipe line now serves the
+        // CPU gate and both worker vendors. (Prebuild answers the same
+        // "" for cpu via `variant_feature`, so this is the derivation's
+        // majority spelling, not a third one.)
         (
             "FDL_GPU_FEATURE".to_string(),
-            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_else(|| "cuda".to_string()),
+            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_default(),
         ),
         // Build scripts and the linker both want to find the libs, and
         // on ROCm the ordering is the difference between a working
@@ -485,7 +492,7 @@ pub fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> 
             crate::libtorch::detect::ld_library_path_value(
                 vendor,
                 &lib,
-                &std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string()),
+                &crate::libtorch::detect::local_rocm_lib_dir(),
             ),
         ),
     ]
@@ -580,6 +587,11 @@ mod tests {
         );
         assert_eq!(
             parse("rsync://exa:2222/home/op/train").unwrap(),
+            Source::Rsync(SshTarget { remote: "exa:/home/op/train".into(), port: Some(2222) }),
+        );
+        // The documented grammar's own product, port and scp colon both:
+        assert_eq!(
+            parse("rsync://exa:2222:/home/op/train").unwrap(),
             Source::Rsync(SshTarget { remote: "exa:/home/op/train".into(), port: Some(2222) }),
         );
         assert_eq!(

@@ -61,12 +61,12 @@ commands:
   #
   # Both vendor-dependent bits are derived from the active libtorch
   # variant, so these entries work unchanged on NVIDIA or AMD:
-  #   --features $FDL_GPU_FEATURE   -> cuda / rocm   (fdl exports it)
+  #   --features "$FDL_GPU_FEATURE"   -> cuda / rocm   (fdl exports it)
   #   docker: gpu                   -> the matching container service
   # Pin either explicitly (`docker: cuda`) if you want to override.
   gpu-build:
     description: Build with GPU support
-    run: cargo build --features $FDL_GPU_FEATURE
+    run: cargo build --features "$FDL_GPU_FEATURE"
     docker: gpu
   # Scoping: -p flodl -p flodl-hf — only crates that carry the `cuda`
   # feature have CUDA tests. flodl-cli / flodl-cli-macros are config +
@@ -76,28 +76,28 @@ commands:
   # of `running 0 tests` lines into the output.
   gpu-test:
     description: Run GPU tests (parallel, excludes NCCL/Graph)
-    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE"
     append: -- --nocapture
     docker: gpu
   gpu-test-all:
     description: Full GPU suite (parallel + NCCL isolated + serial)
-    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: gpu
   gpu-test-nccl:
     description: NCCL/DDP tests only (isolated processes)
-    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 graph_distribute
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 graph_distribute
     docker: gpu
   gpu-test-serial:
     description: Serial GPU tests (Graphs, manual_seed, probes)
-    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
     docker: gpu
   gpu-test-graph:
     description: CUDA Graph tests only (exclusive GPU, single-threaded)
-    run: cargo test -p flodl -p flodl-hf --features $FDL_GPU_FEATURE -- --nocapture --ignored --test-threads=1 cuda_graph
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 cuda_graph
     docker: gpu
   gpu-clippy:
     description: Lint with GPU support (all targets incl. tests + examples, workspace + ddp-bench)
-    run: cargo clippy --features $FDL_GPU_FEATURE --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features $FDL_GPU_FEATURE -- -W clippy::all
+    run: cargo clippy --features "$FDL_GPU_FEATURE" --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features "$FDL_GPU_FEATURE" -- -W clippy::all
     docker: gpu
   gpu-shell:
     description: Interactive shell in the GPU container
@@ -168,7 +168,7 @@ commands:
 #   #   from: rsync://flodl@ctrl.example.com:/home/op/my-train
 #   #   cwd: ddp-bench                # project dir inside the tree (default:
 #   #                                 # its root); governs build AND run
-#   #   build: cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench
+#   #   build: cargo build --release --features "$FDL_GPU_FEATURE" --bin ddp-bench
 #   #                                 # default: `cargo build --release`. A
 #   #                                 # shell line, so it can be a script in
 #   #                                 # the tree (./ci/node-build.sh). Gets
@@ -232,8 +232,12 @@ commands:
 #   # cannot fix exits 2 and does NOT re-dial — no GPU, a spec that does not
 #   # parse, a missing toolchain. Source that does not COMPILE is transient
 #   # instead: the fix is a push away, and a box that stopped permanently
-#   # over a typo would be powered off by the recipe below.
-#   # In a unit file, act on the code instead of parsing stderr:
+#   # over a typo would be powered off by the recipe below. (Exception: a
+#   # compile failure with the vendor toolkit headers missing is permanent —
+#   # re-dialing cannot install a package.)
+#   # In a unit file, act on the code instead of parsing stderr. The recipe
+#   # assumes persist: true — one-shot mode passes the agent's own exit code
+#   # through, so a binary exiting 2 would read as permanent:
 #   #   Restart=always
 #   #   RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 #   #   FailureAction=poweroff       # ... and self-deprovision it

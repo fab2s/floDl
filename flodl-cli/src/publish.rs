@@ -164,16 +164,26 @@ fn report(served: &Path, tree: &Path, manifest: &Manifest) {
     if !manifest.args.is_empty() {
         println!("  args:      {}", manifest.args.join(" "));
     }
+    let host = crate::cluster::resolve_local_hostname();
     println!();
-    println!("  Workers pull it with a source spec pointing here:");
+    println!("  Workers pull it with a source spec pointing here. TWO spellings,");
+    println!("  and the key that serves the pull decides which — they do not mix:");
     println!();
+    println!("    # a plain ssh key (no forced command): the absolute path");
     println!("    join:");
     println!("      source:");
+    println!("        from: rsync://{}:{}", host, tree.display());
+    println!();
     println!(
-        "        from: rsync://{}:{}",
-        crate::cluster::resolve_local_hostname(),
-        tree.display(),
+        "    # a guardrailed key, forced command=\"rrsync -ro {}\":",
+        served.display(),
     );
+    println!("    # rrsync re-roots every requested path under its directory,");
+    println!("    # so the worker asks for /{TREE_SUBDIR} — the absolute path would");
+    println!("    # double-root and fail");
+    println!("    join:");
+    println!("      source:");
+    println!("        from: rsync://{host}:/{TREE_SUBDIR}");
     println!();
     println!(
         "  {}",
@@ -187,9 +197,9 @@ fn report(served: &Path, tree: &Path, manifest: &Manifest) {
     println!(
         "  {}",
         style::dim(&format!(
-            "The key that serves this needs a forced command scoped to \
-             it: command=\"rrsync -ro {}\"",
-            served.display(),
+            "Adjust `{host}` to how workers reach this box, and add \
+             `user@` when the serving key lives on a dedicated user \
+             (docs/ddp/02-cluster-guide.md has the key recipes)."
         )),
     );
 }
@@ -261,7 +271,7 @@ mod tests {
         cli.no_build = false;
         cli.build = Some("exit 7".to_string());
         let err = publish(&cli, None).unwrap_err();
-        assert!(err.message().contains("nothing was published"), "got: {err:?}");
+        assert!(err.message().contains("Nothing was published"), "got: {err:?}");
         assert_eq!(Manifest::read(&tree).unwrap(), None, "a failed gate left a manifest");
 
         // And a gate that passes writes it again, with the build recorded.
@@ -288,6 +298,83 @@ mod tests {
         let cli = args("nonsense-with-no-scheme", "out", &base.display().to_string());
         assert!(publish(&cli, None).is_err());
         assert_eq!(Manifest::read(&tree).unwrap(), Some(live), "the live run was cleared");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The report's pairing, proven against the real tool: behind
+    /// `command="rrsync -ro <served>"` a worker's spec path is `/tree`,
+    /// and the absolute spelling double-roots under the served dir and
+    /// fails. This is a COMPOSITION failure — each printed line was
+    /// individually right while the pair was unfollowable — so the
+    /// guard runs the composed recipe, not the pieces. Skipped where
+    /// rrsync is absent (it ships in the rsync package).
+    #[test]
+    #[cfg(unix)]
+    fn the_rrsync_pairing_serves_tree_and_refuses_the_absolute_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if !crate::util::system::has_command("rsync") {
+            return;
+        }
+        // Presence is not runnability: Ubuntu's rrsync is a python3
+        // script, so on a box holding rrsync but not python3 the spawn
+        // "succeeds" and /usr/bin/env exits 127. Probe by running it —
+        // argument errors prove the interpreter is there.
+        match Command::new("rrsync").output() {
+            Err(_) => return,
+            Ok(o) if o.status.code() == Some(127) => return,
+            Ok(_) => {}
+        }
+        let base = std::env::temp_dir().join(format!("fdl-publish-rr-{}", std::process::id()));
+        let served = base.join("served");
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "// code").unwrap();
+        let cli = args(
+            &format!("file://{}", src.display()),
+            "out",
+            &served.display().to_string(),
+        );
+        publish(&cli, None).unwrap();
+        let tree = served.join(TREE_SUBDIR);
+
+        // An ssh stand-in that hands the client's command to rrsync the
+        // way a forced authorized_keys command would.
+        let rsh = base.join("rsh.sh");
+        std::fs::write(
+            &rsh,
+            format!(
+                "#!/bin/sh\nshift\nSSH_ORIGINAL_COMMAND=\"$*\" exec rrsync -ro {}\n",
+                served.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fetch = |path: &str, dest: &str| {
+            Command::new("rsync")
+                .args([
+                    "-a",
+                    "-e",
+                    &rsh.display().to_string(),
+                    &format!("fake:{path}/"),
+                    &base.join(dest).display().to_string(),
+                ])
+                .output()
+                .unwrap()
+        };
+
+        let ok = fetch(&format!("/{TREE_SUBDIR}"), "out-tree");
+        assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+        assert!(
+            base.join("out-tree").join(source::MANIFEST_FILE).is_file(),
+            "the /tree spelling must deliver the manifest with the source",
+        );
+
+        let refused = fetch(&tree.display().to_string(), "out-abs");
+        assert!(
+            !refused.status.success(),
+            "the absolute path must NOT resolve behind rrsync — if this \
+             starts passing, the report's pairing text is stale",
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

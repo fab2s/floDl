@@ -586,7 +586,7 @@ fn child_ld_library_path(libtorch_dir: &Path, variant: &str) -> String {
     let value = crate::libtorch::detect::ld_library_path_value(
         vendor,
         &lib,
-        &std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string()),
+        &crate::libtorch::detect::local_rocm_lib_dir(),
     );
     match std::env::var("LD_LIBRARY_PATH") {
         Ok(cur) if !cur.is_empty() => format!("{value}:{cur}"),

@@ -446,6 +446,17 @@ pub(super) fn build_local_spawn_command(
         // makes index → physical card stable.
         cmd.env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
         cmd.env("CUDA_VISIBLE_DEVICES", phys.to_string());
+        // HIP prefers its own variables over CUDA_VISIBLE_DEVICES (the
+        // first one SET wins), so on ROCm the pin above loses to any
+        // inherited HIP/ROCR mask — every rank then sees the full
+        // device list and trains on device 0, silently. Pin the HIP
+        // variable too, and drop the lower-level masks: HIP indexes
+        // within the ROCR-visible set, so an inherited ROCR mask would
+        // re-map the physical index this pin was derived from. On an
+        // NVIDIA box the extra variable is inert.
+        cmd.env("HIP_VISIBLE_DEVICES", phys.to_string());
+        cmd.env_remove("ROCR_VISIBLE_DEVICES");
+        cmd.env_remove("GPU_DEVICE_ORDINAL");
     }
     cmd
 }

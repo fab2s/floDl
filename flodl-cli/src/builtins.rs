@@ -153,7 +153,8 @@ pub struct StartArgs {
 /// golden-image mode. Source that does not compile counts as transient
 /// on purpose: the fix is a push away at the source, and a box that
 /// stopped permanently over a typo would be powered off by the systemd
-/// recipe.
+/// recipe. Exception: a compile failure with the vendor toolkit headers
+/// missing is permanent, since re-dialing cannot install a package.
 #[derive(crate::FdlArgs, Debug)]
 pub struct JoinArgs {
     /// Controller mux address, `host[:port]` (default port 1337).

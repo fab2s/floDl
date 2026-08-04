@@ -85,6 +85,48 @@ fn dataset_sig_reference_and_mismatch() {
 }
 
 #[test]
+fn a_vendor_mixed_cohort_is_refused_under_an_nccl_data_plane() {
+    // NCCL and RCCL export the same symbols and unique-id format, so
+    // nothing structural rejects a mixed cohort — it hangs at formation
+    // AFTER the window deadline was spent. The window is where the one
+    // piece of information needed to refuse it early already is.
+    let admit = |ledger: &mut MembershipLedger, host: &str, label: &str| {
+        ledger.admit(
+            host,
+            vec![0],
+            vec!["GPU".to_string()],
+            label.to_string(),
+            sig(7),
+            Duration::ZERO,
+        )
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    admit(&mut ledger, "green", "precompiled/cu128").unwrap();
+    let why = admit(&mut ledger, "red", "precompiled/rocm70").unwrap_err();
+    assert!(why.contains("vendor mismatch"), "got: {why}");
+    assert!(why.contains("cpu_sync"), "the fix must be named: {why}");
+    // The refusal names the label that seeded the cohort's vendor.
+    assert!(why.contains("cu128"), "got: {why}");
+    // A refused joiner burns nothing: the same box re-dialing with the
+    // right build (or the right fleet) is welcome.
+    assert_eq!(ledger.joined_ranks(), 1);
+
+    // Labels that classify to no vendor gate nothing, in either order:
+    // fan-out agents may send an empty label, and an out-of-convention
+    // name is not an admission crime.
+    admit(&mut ledger, "bare", "").unwrap();
+    admit(&mut ledger, "odd", "builds/mystery").unwrap();
+    admit(&mut ledger, "green2", "builds/sm61-sm120").unwrap();
+
+    // A CPU data plane genuinely works cross-vendor, so the gate is off.
+    let cpu_plane = JoinConfig { nccl_backend: false, ..test_config() };
+    let mut ledger = MembershipLedger::new(cpu_plane, None).unwrap();
+    admit(&mut ledger, "green", "precompiled/cu128").unwrap();
+    admit(&mut ledger, "red", "precompiled/rocm70").unwrap();
+    assert_eq!(ledger.joined_ranks(), 2);
+}
+
+#[test]
 fn hostile_device_lists_rejected() {
     let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
     let why = admit_host(&mut ledger, "zero", 0).unwrap_err();

@@ -25,7 +25,7 @@ services:
       - FLODL_NET_TIMEOUT_SCALE
       # The cargo feature the active libtorch variant needs, computed by
       # fdl from the variant path. Lets a `run:` line say
-      # `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
       - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
@@ -98,7 +98,7 @@ services:
       - FLODL_NET_TIMEOUT_SCALE
       # The cargo feature the active libtorch variant needs, computed by
       # fdl from the variant path. Lets a `run:` line say
-      # `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
       - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
@@ -199,7 +199,11 @@ services:
       - ./.cargo-cache-rocm:/usr/local/cargo/registry
       - ./.cargo-git-rocm:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
-      - ${LIBTORCH_ROCM_PATH:-./libtorch/precompiled/rocm70}:/usr/local/libtorch:ro
+      # LIBTORCH_HOST_PATH, same as the cuda services: fdl exports it
+      # from the ACTIVE variant, so a `builds/gfx…` install (or a
+      # per-host `arch:` in prebuild docker mode) mounts what fdl
+      # resolved instead of a hardcoded default it silently ignores.
+      - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/rocm70}:/usr/local/libtorch:ro
       - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
     working_dir: /workspace
     stdin_open: true
@@ -217,12 +221,19 @@ services:
       - FLODL_NET_TIMEOUT_SCALE
       # The cargo feature the active libtorch variant needs, computed by
       # fdl from the variant path. Lets a `run:` line say
-      # `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
       - FDL_GPU_FEATURE
       - FLODL_INTERNAL_FULL_CLUSTER_JSON
       - FLODL_INTERNAL_FDL_CMD
       - FDL_ENV
       - FLODL_INTERNAL_PREBUILD_PER_HOST
+      # Same two the cuda service carries, for the same reasons: the
+      # launcher inside this container SSHes to remote hosts (fan-out),
+      # so it needs the host-side user name and the agent socket the
+      # volumes block already mounts — without these a ROCm controller
+      # fails every remote dial with a bare `Permission denied`.
+      - FLODL_INTERNAL_HOST_USER
+      - SSH_AUTH_SOCK=/ssh-agent
 
   cuda-rank:
     image: flodl-cuda:${CUDA_TAG:-12.8}
@@ -345,7 +356,7 @@ services:
       - FLODL_NET_TIMEOUT_SCALE
       # The cargo feature the active libtorch variant needs, computed by
       # fdl from the variant path. Lets a `run:` line say
-      # `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
       - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the

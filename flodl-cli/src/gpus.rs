@@ -195,10 +195,17 @@ pub unsafe fn apply_cuda_visible_devices(devices: &[u8]) {
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    if joined.is_empty() {
-        unsafe { std::env::remove_var("CUDA_VISIBLE_DEVICES") };
-    } else {
-        unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", &joined) };
+    // Both vendors' spellings: HIP prefers its own variable over
+    // CUDA_VISIBLE_DEVICES (first one set wins), so setting only the
+    // CUDA one would leave an AMD box unmasked whenever HIP_VISIBLE_DEVICES
+    // is already in the environment. Inert where the other vendor's
+    // runtime never looks.
+    for key in ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"] {
+        if joined.is_empty() {
+            unsafe { std::env::remove_var(key) };
+        } else {
+            unsafe { std::env::set_var(key, &joined) };
+        }
     }
 }
 

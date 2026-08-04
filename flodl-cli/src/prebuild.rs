@@ -812,13 +812,13 @@ fn runtime_ld_library_path(worker_path: &str, arch: &str) -> String {
         "{path}/libtorch/{arch}/lib",
         path = worker_path.trim_end_matches('/'),
     );
-    // `/opt/rocm` as a literal, not this box's `$ROCM_PATH`: the path is
-    // composed for the REMOTE host, whose ROCm root our environment
-    // knows nothing about.
+    // `/opt/rocm/lib` as a literal, not this box's resolved directory:
+    // the path is composed for the REMOTE host, whose ROCm root (and
+    // lib-vs-lib64 layout) our environment knows nothing about.
     crate::libtorch::detect::ld_library_path_value(
         crate::libtorch::detect::variant_vendor(arch),
         &libtorch_lib,
-        "/opt/rocm",
+        "/opt/rocm/lib",
     )
 }
 

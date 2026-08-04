@@ -648,9 +648,14 @@ fn apply_gpu_selection(spec: &str) -> flodl::tensor::Result<()> {
     let canonical = parts.join(",");
     eprintln!("ddp-bench: --gpus {spec} -> CUDA_VISIBLE_DEVICES={canonical}");
     // SAFETY: we are still in `main`, no threads spawned, no libtorch
-    // touched yet. Setting CUDA_VISIBLE_DEVICES from a single-threaded
-    // context before any FFI call into libtorch is safe.
-    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", &canonical); }
+    // touched yet. Setting the masks from a single-threaded context
+    // before any FFI call into libtorch is safe. HIP prefers its own
+    // variable over CUDA_VISIBLE_DEVICES (first one set wins), so the
+    // AMD spelling rides along; it is inert on an NVIDIA box.
+    unsafe {
+        std::env::set_var("CUDA_VISIBLE_DEVICES", &canonical);
+        std::env::set_var("HIP_VISIBLE_DEVICES", &canonical);
+    }
     Ok(())
 }
 

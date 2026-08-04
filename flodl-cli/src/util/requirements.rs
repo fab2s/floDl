@@ -144,6 +144,61 @@ pub fn packages_for(missing: &[&(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
+/// A vendor toolkit gap on THIS box: the headers a `--features
+/// <vendor>` compile will not find, and the line that installs them.
+#[derive(Debug)]
+pub struct ToolkitGap {
+    /// Toolkit root the check ran against.
+    pub root: std::path::PathBuf,
+    /// Missing headers, as printed to the operator.
+    pub headers: Vec<String>,
+    /// The full install line ([`install_hint`] over the owning
+    /// packages; the NVIDIA arm uses the `cuda-toolkit` metapackage
+    /// since the per-header names carry version placeholders).
+    pub install: String,
+}
+
+/// Resolve the toolkit gap for a vendor, `None` when the headers are
+/// all present — or when the vendor has no known toolkit layout, since
+/// guessing one produces a confidently wrong apt command.
+///
+/// The ROCm root comes from `flodl-hw`'s resolution (env chain +
+/// convention, runtime-verified) so this check and the loader path
+/// cannot disagree about where ROCm lives.
+pub fn toolkit_gap(vendor: flodl_hw::GpuVendor) -> Option<ToolkitGap> {
+    use std::path::PathBuf;
+    let (root, headers, metapackages): (PathBuf, _, Option<&[&str]>) = match vendor {
+        flodl_hw::GpuVendor::Amd => (
+            flodl_hw::rocm_runtime_root()
+                .or_else(|| std::env::var("ROCM_PATH").ok().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/opt/rocm")),
+            ROCM_HEADERS,
+            None,
+        ),
+        flodl_hw::GpuVendor::Nvidia => (
+            PathBuf::from(
+                std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()),
+            ),
+            CUDA_HEADERS,
+            Some(&["cuda-toolkit", "libnccl-dev"]),
+        ),
+        _ => return None,
+    };
+    let missing = missing_headers(&root, headers);
+    if missing.is_empty() {
+        return None;
+    }
+    let packages: Vec<String> = match metapackages {
+        Some(m) => m.iter().map(|p| p.to_string()).collect(),
+        None => packages_for(&missing),
+    };
+    Some(ToolkitGap {
+        root,
+        headers: missing.iter().map(|(h, _)| h.to_string()).collect(),
+        install: install_hint(&packages),
+    })
+}
+
 /// The install line for a package list, contextual to the platform.
 ///
 /// Debian is spelled out because it is the platform the cloud hosts

@@ -601,6 +601,7 @@ fn resolve_session_salt(
 fn derive_join_config(
     knobs: Option<&JoinKnobs>,
     capacity: usize,
+    nccl_backend: bool,
 ) -> Result<crate::distributed::membership::JoinConfig> {
     let defaults = crate::distributed::membership::JoinConfig::default();
     let knobs = knobs.cloned().unwrap_or_default();
@@ -642,6 +643,7 @@ fn derive_join_config(
             .unwrap_or(defaults.max_join_timeout_secs.max(join_timeout_secs)),
         open_admission: knobs.open_admission.unwrap_or(false),
         start_mode: knobs.start.unwrap_or_default(),
+        nccl_backend,
     })
 }
 
@@ -925,9 +927,12 @@ pub fn run_launcher_with_config(
     // Membership window
     // ------------------------------------------------------------------
     let capacity = full.world_size();
+    // The backend rides into admission so the window can refuse a
+    // vendor-mixed cohort exactly when the data plane cannot carry one.
     let join_config = derive_join_config(
         full.controller.join.as_ref(),
         capacity,
+        backend_is_nccl,
     )?;
     // A configured token forces credential-authenticated admission even
     // behind a loopback bind: the sshd guardrail and the token are

@@ -490,6 +490,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 
   cuda:
     build:
@@ -510,6 +516,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
     deploy:
       resources:
         reservations:
@@ -550,6 +562,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 "#
         )
     } else {
@@ -580,6 +598,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 
   cuda:
     build:
@@ -603,6 +627,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
     deploy:
       resources:
         reservations:
@@ -634,13 +664,19 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       - .:/workspace
       - ./.cargo-cache-rocm:/usr/local/cargo/registry
       - ./.cargo-git-rocm:/usr/local/cargo/git
-      - ${{LIBTORCH_ROCM_PATH:-./libtorch/precompiled/rocm70}}:/usr/local/libtorch:ro
+      - ${{LIBTORCH_HOST_PATH:-./libtorch/precompiled/rocm70}}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
     tty: true
     environment:
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 "#
         )
     }
@@ -975,13 +1011,13 @@ commands:
   # so these stay correct if you switch variants.
   gpu-build:
     description: Build with GPU support
-    run: cargo build --features $FDL_GPU_FEATURE{cuda_svc}
+    run: cargo build --features "$FDL_GPU_FEATURE"{cuda_svc}
   gpu-test:
     description: Run GPU tests
-    run: cargo test --features $FDL_GPU_FEATURE -- --nocapture{cuda_svc}
+    run: cargo test --features "$FDL_GPU_FEATURE" -- --nocapture{cuda_svc}
   gpu-run:
     description: cargo run with GPU support
-    run: cargo run --features $FDL_GPU_FEATURE{cuda_svc}
+    run: cargo run --features "$FDL_GPU_FEATURE"{cuda_svc}
 {cuda_shell_block}"#
     )
 }

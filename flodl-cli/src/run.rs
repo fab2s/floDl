@@ -272,7 +272,7 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
         env.push(("LIBTORCH_HOST_PATH".into(), host_path));
 
         // The cargo feature this variant needs, so a `run:` line can say
-        // `--features $FDL_GPU_FEATURE` instead of hardcoding a vendor.
+        // `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
         // Run lines execute under `bash -c` / `sh -c`, so the expansion
         // is the shell's; this just has to be in the child's env.
         //
@@ -280,6 +280,9 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
         // exactly what the hardcoded `--features cuda` did before: a GPU
         // command with no GPU libtorch fails the same way it always has,
         // rather than failing differently in a way nobody recognises.
+        // `source::build_env` (join/publish recipes) deliberately answers
+        // "" for the same case instead — there a CPU variant is the
+        // publish gate's advertised cheap mode, not a misconfiguration.
         env.push((
             "FDL_GPU_FEATURE".into(),
             match crate::libtorch::detect::variant_vendor(&info.path) {
@@ -736,8 +739,25 @@ pub fn exec_script(
                 ("sh", "-c")
             };
 
-            match std::process::Command::new(shell)
-                .args([flag, inner_cmd.as_str()])
+            // The same libtorch env the docker path gets (via the
+            // compose `environment:` passthrough): a native `run:` line
+            // saying `--features "$FDL_GPU_FEATURE"` was silently
+            // getting an empty variable, which broke the scaffolded
+            // gpu-* commands in `fdl init --native` projects — for both
+            // vendors.
+            let env_vars = match libtorch_env(cwd) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("fdl: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut cmd = std::process::Command::new(shell);
+            cmd.args([flag, inner_cmd.as_str()]);
+            for (key, val) in &env_vars {
+                cmd.env(key, val);
+            }
+            match cmd
                 .current_dir(cwd)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -899,9 +919,22 @@ pub fn exec_command(
             eprintln!("fdl: {entry} {}", preview.join(" "));
         }
 
-        match std::process::Command::new(program)
-            .args(entry_args)
-            .args(&args)
+        // Same libtorch env as the docker path — see exec_script's
+        // native arm for why (a native entry saying
+        // `--features "$FDL_GPU_FEATURE"` got nothing before).
+        let env_vars = match libtorch_env(project_root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("fdl: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(entry_args).args(&args);
+        for (key, val) in &env_vars {
+            cmd.env(key, val);
+        }
+        match cmd
             .current_dir(cmd_dir)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())

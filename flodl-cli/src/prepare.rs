@@ -381,6 +381,35 @@ fn build_source(
         if e.is_permanent() {
             return e;
         }
+        // A failed build while the vendor's toolkit headers are missing
+        // is a PROVISIONING fault wearing a compile error: waiting
+        // cannot install a package, and ROCm needs seven -dev packages
+        // with no metapackage, so this is the predicted first-contact
+        // failure on a golden AMD image. Classed at failure time rather
+        // than as a pre-flight, deliberately — fdl passes no feature
+        // flag of its own and cannot know whether the recipe needed the
+        // toolkit (a cpu-feature crate builds fine without it), but a
+        // build that FAILED while the toolkit is demonstrably absent is
+        // the case re-dialing provably cannot fix.
+        if let Some((_, variant)) = libtorch {
+            if let flodl_hw::VariantClass::Vendor(vendor) =
+                flodl_hw::classify_variant_label(variant)
+            {
+                if let Some(gap) = crate::util::requirements::toolkit_gap(vendor) {
+                    return Fail::Permanent(format!(
+                        "{} — and this box is missing the {vendor} toolkit \
+                         headers under {} ({}), which a `--features {}` \
+                         compile needs. Re-dialing cannot install a package: \
+                         {}",
+                        e.message(),
+                        gap.root.display(),
+                        gap.headers.join(", "),
+                        vendor.cargo_feature(),
+                        gap.install,
+                    ));
+                }
+            }
+        }
         // Still transient, with the worker's next step spelled out: this
         // box cannot fix a compile error, and it must not stop over one.
         Fail::Transient(format!(
@@ -891,6 +920,43 @@ mod tests {
         let err = merge_manifest(&local, None).unwrap_err();
         assert!(!err.is_permanent(), "the fix is a publish away: {err:?}");
         assert!(err.message().contains("fdl publish"), "got: {err:?}");
+    }
+
+    #[test]
+    fn a_failed_build_is_classed_by_whether_the_toolkit_could_explain_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdl-prep-toolkit-{}-{}",
+            std::process::id(),
+            next_probe_id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fail = |variant: &str| {
+            let libtorch = (dir.clone(), variant.to_string());
+            build_source(
+                &Recipe { cwd: None, build: Some("exit 3"), bin: "x" },
+                &dir,
+                Some(&libtorch),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+        };
+        // A GPU variant: the verdict follows whether this box actually
+        // has the toolkit (the check probes the real filesystem, so the
+        // expectation is computed, not assumed — a ROCm rig running this
+        // suite has the headers and must stay on the transient side).
+        let err = fail("precompiled/rocm70");
+        match crate::util::requirements::toolkit_gap(flodl_hw::GpuVendor::Amd) {
+            Some(gap) => {
+                assert!(err.is_permanent(), "waiting cannot install a package: {err:?}");
+                assert!(err.message().contains(&gap.install), "the fix must be named: {err:?}");
+            }
+            None => assert!(!err.is_permanent(), "toolkit present, so a compile error stays a push away: {err:?}"),
+        }
+        // A CPU variant wants no toolkit, so the failure stays transient
+        // whatever this box has installed.
+        let err = fail("precompiled/cpu");
+        assert!(!err.is_permanent(), "got: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

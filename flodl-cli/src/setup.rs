@@ -89,11 +89,12 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  Rust:   not found");
     }
 
-    let gpus = system::detect_gpus();
+    let survey = flodl_hw::survey();
+    let gpus = &survey.devices;
     if !gpus.is_empty() {
         println!();
         println!("  GPUs:");
-        for g in &gpus {
+        for g in gpus {
             println!(
                 "    [{}] {} -- {}, {}GB VRAM",
                 g.index,
@@ -105,6 +106,14 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     } else {
         println!();
         println!("  GPU:    not detected (CPU-only mode)");
+        // The sweep's findings, not just its device list: an AMD card
+        // with no ROCm runtime is a common first-contact state, and
+        // "CPU-only" with the explanation discarded sends the operator
+        // away thinking the box has nothing — setup is the entry point,
+        // so it says what probe would say.
+        for note in survey.notes.iter().filter(|n| n.kind.explains_absence()) {
+            println!("          {}", note.message);
+        }
     }
 
     if !has_docker && !has_cargo {
@@ -228,7 +237,7 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
             .filter(|g| g.vendor == system::GpuVendor::Amd)
             .collect();
         if !amd.is_empty() {
-            let covered = download::rocm_covered(&gpus);
+            let covered = download::rocm_covered(gpus);
             if !majors.is_empty() {
                 println!();
                 println!("  AMD GPU(s) detected alongside NVIDIA. One libtorch build");

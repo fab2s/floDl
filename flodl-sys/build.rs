@@ -107,8 +107,15 @@ fn main() {
     }
 
     // Where each vendor's toolkit lives. Read once: both the guard below
-    // and the include setup further down need them.
-    let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+    // and the include setup further down need them. ROCm resolution
+    // mirrors flodl-hw's (`$ROCM_PATH` / `$HIP_PATH` / `$HSA_PATH`, then
+    // the convention) — build.rs cannot depend on that crate, so the
+    // order is kept in sync by hand.
+    let rocm_path = ["ROCM_PATH", "HIP_PATH", "HSA_PATH"]
+        .iter()
+        .filter_map(|k| env::var(k).ok())
+        .find(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "/opt/rocm".to_string());
     let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
     // Vendor toolkit headers, as (header relative to an include dir,
@@ -245,9 +252,15 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=c10_hip");
         println!("cargo:rustc-link-lib=dylib=amdhip64");
 
-        let rocm_path =
-            env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+        let rocm_path = ["ROCM_PATH", "HIP_PATH", "HSA_PATH"]
+            .iter()
+            .filter_map(|k| env::var(k).ok())
+            .find(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "/opt/rocm".to_string());
+        // Both layouts: `lib64` on RHEL/SUSE. A search path that does
+        // not exist is ignored, so emitting both costs nothing.
         println!("cargo:rustc-link-search=native={rocm_path}/lib");
+        println!("cargo:rustc-link-search=native={rocm_path}/lib64");
 
         // dlopen, for the force-load and the allocator probes.
         println!("cargo:rustc-link-lib=dylib=dl");
@@ -280,4 +293,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBTORCH_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=HSA_PATH");
 }

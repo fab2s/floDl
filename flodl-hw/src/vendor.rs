@@ -63,6 +63,55 @@ impl fmt::Display for GpuVendor {
     }
 }
 
+/// What a libtorch variant label says about its backend.
+///
+/// [`Cpu`](VariantClass::Cpu) and [`Unknown`](VariantClass::Unknown) are
+/// separate on purpose: a CPU variant is a positive statement (this
+/// build has no GPU backend), an unrecognized name says nothing — and
+/// the two deserve different policies at every consumer (fdl warns and
+/// assumes on Unknown; admission gates on neither).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantClass {
+    /// `cpu` / `cpu-*`: a build with no GPU backend.
+    Cpu,
+    /// A recognized vendor naming (`cu<N>` / `sm<N>` → NVIDIA,
+    /// `rocm<N>` / `gfx<N>` → AMD).
+    Vendor(GpuVendor),
+    /// A name outside the convention (including an empty label).
+    Unknown,
+}
+
+/// Classify a libtorch variant label (`precompiled/cu128`,
+/// `builds/sm61-sm120`, `rocm70`, …) by its basename.
+///
+/// This is the variant NAMING CONVENTION's single home; policy stays
+/// with the callers (fdl's variant router warns and assumes NVIDIA on
+/// [`VariantClass::Unknown`], the join admission gate treats it as
+/// unclassifiable and lets it pass). A vendor prefix counts only when a
+/// digit follows, so `cpu` cannot be read as a `cu`-something and a
+/// stray directory cannot masquerade.
+pub fn classify_variant_label(label: &str) -> VariantClass {
+    let basename = std::path::Path::new(label)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let tagged = |prefix: &str| {
+        basename
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    if basename == "cpu" || basename.starts_with("cpu-") {
+        return VariantClass::Cpu;
+    }
+    if tagged("cu") || tagged("sm") {
+        return VariantClass::Vendor(GpuVendor::Nvidia);
+    }
+    if tagged("rocm") || tagged("gfx") {
+        return VariantClass::Vendor(GpuVendor::Amd);
+    }
+    VariantClass::Unknown
+}
+
 /// A device's architecture token, in whatever shape its vendor uses.
 ///
 /// Not flattened to a string: NVIDIA's numeric pair is load-bearing
@@ -268,6 +317,28 @@ mod tests {
         assert_eq!(GpuVendor::parse("intel"), None);
         for v in [GpuVendor::Nvidia, GpuVendor::Amd] {
             assert_eq!(GpuVendor::parse(v.as_str()), Some(v));
+        }
+    }
+
+    #[test]
+    fn variant_labels_classify_three_ways() {
+        // Cpu and Unknown are distinct on purpose: a CPU variant is a
+        // positive statement, an unrecognized name says nothing, and
+        // the consumers apply different policies to each.
+        for (label, class) in [
+            ("cpu", VariantClass::Cpu),
+            ("precompiled/cpu", VariantClass::Cpu),
+            ("cpu-static", VariantClass::Cpu),
+            ("precompiled/cu128", VariantClass::Vendor(GpuVendor::Nvidia)),
+            ("builds/sm61-sm120", VariantClass::Vendor(GpuVendor::Nvidia)),
+            ("precompiled/rocm70", VariantClass::Vendor(GpuVendor::Amd)),
+            ("builds/gfx1030", VariantClass::Vendor(GpuVendor::Amd)),
+            // The digit guard: a prefix alone is not a vendor claim.
+            ("builds/gfx", VariantClass::Unknown),
+            ("builds/mybuild", VariantClass::Unknown),
+            ("", VariantClass::Unknown),
+        ] {
+            assert_eq!(classify_variant_label(label), class, "{label:?}");
         }
     }
 

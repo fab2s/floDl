@@ -127,6 +127,15 @@ pub struct JoinConfig {
     pub open_admission: bool,
     /// Who closes the window once quorum is met (default [`StartMode::Auto`]).
     pub start_mode: StartMode,
+    /// Whether the run's collective data plane is NCCL/RCCL. When true,
+    /// admission refuses a cohort mixing GPU vendors: NCCL and RCCL
+    /// export the same symbols and 128-byte unique-id format, so a mixed
+    /// cohort passes every structural check and then hangs (or dies
+    /// opaquely) inside `ncclCommInitRank` at formation — after the
+    /// window deadline was spent. CPU averaging modes genuinely work
+    /// cross-vendor, so `false` disables the gate rather than the
+    /// mixing. Default true, matching the launcher's backend default.
+    pub nccl_backend: bool,
 }
 
 impl Default for JoinConfig {
@@ -138,6 +147,7 @@ impl Default for JoinConfig {
             max_join_timeout_secs: 600,
             open_admission: false,
             start_mode: StartMode::Auto,
+            nccl_backend: true,
         }
     }
 }
@@ -330,6 +340,15 @@ pub(crate) struct MembershipLedger {
     /// behavior); the launcher passes its own signature when it has
     /// one.
     expected_dataset_sig: Option<[u8; 32]>,
+    /// GPU vendor every member must match under an NCCL data plane.
+    /// Seeded by the first member whose libtorch label classifies to a
+    /// vendor (same first-member pattern as the dataset signature): the
+    /// gate is a CONSISTENCY check among joiners, not an authority — a
+    /// coordinator-only controller may legitimately be a CUDA build in
+    /// front of an all-AMD RCCL cohort, so its own build vendor must not
+    /// seed this. An enumerated fan-out rig mixed with walk-ins stays
+    /// prebuild's problem: those hosts never pass through admission.
+    expected_vendor: Option<flodl_hw::GpuVendor>,
     members: Vec<JoinedMember>,
     next_rank: usize,
 }
@@ -344,6 +363,7 @@ impl MembershipLedger {
         Ok(MembershipLedger {
             config,
             expected_dataset_sig,
+            expected_vendor: None,
             members: Vec::new(),
             next_rank: 0,
         })
@@ -412,6 +432,44 @@ impl MembershipLedger {
                 ));
             }
             Some(_) => {}
+        }
+        // Vendor coherence, only where the data plane demands it. NCCL
+        // and RCCL cannot form one communicator, and nothing structural
+        // rejects the attempt (same symbols, same 128-byte id), so a
+        // mixed cohort admitted here hangs at formation AFTER the window
+        // was spent. A label that classifies to no vendor (cpu, unknown,
+        // empty — fan-out agents may send none) gates nothing: refusing
+        // what cannot be classified would turn a naming convention into
+        // an admission requirement.
+        if self.config.nccl_backend {
+            if let flodl_hw::VariantClass::Vendor(vendor) =
+                flodl_hw::classify_variant_label(&libtorch)
+            {
+                match self.expected_vendor {
+                    None => self.expected_vendor = Some(vendor),
+                    Some(expected) if expected != vendor => {
+                        return Err(format!(
+                            "GPU vendor mismatch: this run's cohort is {expected} \
+                             (libtorch {:?}) and {host:?} offers {vendor} \
+                             ({libtorch:?}) — NCCL and RCCL cannot form one \
+                             communicator, so a mixed cohort hangs at formation. \
+                             Use a CPU ElChe mode (cpu_sync / cpu_cadence / \
+                             cpu_async), or a one-vendor fleet",
+                            self.members
+                                .iter()
+                                .map(|m| m.libtorch.as_str())
+                                .find(|l| {
+                                    matches!(
+                                        flodl_hw::classify_variant_label(l),
+                                        flodl_hw::VariantClass::Vendor(v) if v == expected
+                                    )
+                                })
+                                .unwrap_or(""),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
         }
         let ranks: Vec<usize> = (self.next_rank..self.next_rank + rank_count).collect();
         self.next_rank += rank_count;

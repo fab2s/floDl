@@ -182,7 +182,7 @@
             start: Some(StartMode::Manual),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 3);
         assert_eq!(cfg.target_ranks, None);
         assert_eq!(cfg.start_mode, StartMode::Manual);
@@ -194,7 +194,7 @@
             target_ranks: Some(4),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         let msg = cfg.validate().unwrap_err().to_string();
         assert!(msg.contains("manual"), "got: {msg}");
     }
@@ -202,7 +202,7 @@
     #[test]
     fn join_config_derivation_defaults_to_capacity_all_or_nothing() {
         // No knobs: quorum = target = capacity, stock timeouts.
-        let cfg = super::derive_join_config(None, 3).unwrap();
+        let cfg = super::derive_join_config(None, 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 3);
         assert_eq!(cfg.target_ranks, Some(3));
         assert_eq!(cfg.join_timeout_secs, 300);
@@ -211,14 +211,14 @@
 
         // Partial overrides keep the rest derived.
         let knobs = JoinKnobs { min_rank_start: Some(2), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 2);
         assert_eq!(cfg.target_ranks, Some(3));
 
         // An enlarged window stretches the default hard cap instead of
         // tripping the cap >= window validation.
         let knobs = JoinKnobs { join_timeout_secs: Some(900), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.join_timeout_secs, 900);
         assert_eq!(cfg.max_join_timeout_secs, 900);
         cfg.validate().unwrap();
@@ -233,7 +233,7 @@
             min_rank_start: Some(2),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 0, true).unwrap();
         assert_eq!(cfg.min_rank_start, 2);
         assert_eq!(cfg.target_ranks, None);
         cfg.validate().unwrap();
@@ -245,12 +245,12 @@
             target_ranks: Some(4),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 0, true).unwrap();
         assert_eq!(cfg.target_ranks, Some(4));
 
         // Discovery without a quorum is loud — no capacity to derive from.
         let knobs = JoinKnobs { discovery: Some(true), ..Default::default() };
-        let msg = super::derive_join_config(Some(&knobs), 0)
+        let msg = super::derive_join_config(Some(&knobs), 0, true)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("min_rank_start"), "got: {msg}");

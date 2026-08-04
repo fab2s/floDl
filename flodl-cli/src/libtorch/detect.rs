@@ -182,34 +182,21 @@ pub(crate) fn arch_coverage(
 /// unrecognised basename on an AMD box would otherwise be cross-built
 /// for NVIDIA without a word.
 pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
-    let basename = std::path::Path::new(variant)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    // A prefix only counts when a digit follows, so `cpu` cannot be read
-    // as a `cu`-something and a stray directory cannot masquerade.
-    let tagged = |prefix: &str| {
-        basename
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-    };
-
-    if basename == "cpu" || basename.starts_with("cpu-") {
-        return None;
+    // The naming convention has ONE home (flodl-hw, where the join
+    // admission gate also reads it); the warn-and-assume-NVIDIA
+    // fallback is this router's policy, not the convention's.
+    match flodl_hw::classify_variant_label(variant) {
+        flodl_hw::VariantClass::Cpu => None,
+        flodl_hw::VariantClass::Vendor(v) => Some(v),
+        flodl_hw::VariantClass::Unknown => {
+            eprintln!(
+                "fdl: libtorch variant {variant:?} does not match a known naming \
+                 convention (cpu / cu<N> / sm<N> / rocm<N> / gfx<N>); assuming it is \
+                 an NVIDIA build. Rename it to match, or pass the feature explicitly."
+            );
+            Some(GpuVendor::Nvidia)
+        }
     }
-    if tagged("cu") || tagged("sm") {
-        return Some(GpuVendor::Nvidia);
-    }
-    if tagged("rocm") || tagged("gfx") {
-        return Some(GpuVendor::Amd);
-    }
-    eprintln!(
-        "fdl: libtorch variant {variant:?} does not match a known naming \
-         convention (cpu / cu<N> / sm<N> / rocm<N> / gfx<N>); assuming it is \
-         an NVIDIA build. Rename it to match, or pass the feature explicitly."
-    );
-    Some(GpuVendor::Nvidia)
 }
 
 /// The `export` lines a native-build recipe prints for a variant's
@@ -244,10 +231,20 @@ pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
 pub fn ld_library_path_lines(vendor: Option<GpuVendor>, libtorch_lib: &str) -> Vec<String> {
     let tail = "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}";
     match vendor {
-        Some(GpuVendor::Amd) => vec![
-            "export ROCM_PATH=\"${ROCM_PATH:-/opt/rocm}\"".to_string(),
-            format!("export LD_LIBRARY_PATH=\"$ROCM_PATH/lib:{libtorch_lib}{tail}\""),
-        ],
+        Some(GpuVendor::Amd) => {
+            // `lib` vs `lib64` is a distro property (RHEL/SUSE use
+            // lib64), and a recipe naming the wrong one is a path the
+            // loader silently skips — the segfault configuration again.
+            // The recipe runs on THIS host, so probe the actual layout
+            // and keep the `$ROCM_PATH` indirection for the root.
+            let libdir = flodl_hw::rocm_runtime_lib_dir()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "lib".to_string());
+            vec![
+                "export ROCM_PATH=\"${ROCM_PATH:-/opt/rocm}\"".to_string(),
+                format!("export LD_LIBRARY_PATH=\"$ROCM_PATH/{libdir}:{libtorch_lib}{tail}\""),
+            ]
+        }
         _ => vec![format!("export LD_LIBRARY_PATH=\"{libtorch_lib}{tail}\"")],
     }
 }
@@ -269,10 +266,11 @@ pub fn active_variant(root: &Path) -> Option<(PathBuf, String)> {
 /// [`ld_library_path_lines`], which prints the same ordering as a shell
 /// recipe; this one is for setting on a child process.
 ///
-/// `rocm_root` is passed rather than read from the environment because
-/// the two callers describe different filesystems: a locally spawned
-/// child gets this box's `$ROCM_PATH`, while a path composed for a
-/// REMOTE host must use the convention (`/opt/rocm`) since our own
+/// `rocm_lib` is the system runtime's LIBRARY directory, passed rather
+/// than resolved here because the two callers describe different
+/// filesystems: a locally spawned child gets this box's resolved
+/// directory ([`local_rocm_lib_dir`]), while a path composed for a
+/// REMOTE host must use the convention (`/opt/rocm/lib`) since our own
 /// environment says nothing about theirs.
 ///
 /// **On ROCm the system runtime must come FIRST.** libtorch-rocm bundles
@@ -285,13 +283,37 @@ pub fn active_variant(root: &Path) -> Option<(PathBuf, String)> {
 pub fn ld_library_path_value(
     vendor: Option<GpuVendor>,
     libtorch_lib: &str,
-    rocm_root: &str,
+    rocm_lib: &str,
 ) -> String {
     match vendor {
         Some(GpuVendor::Amd) => {
-            format!("{}/lib:{libtorch_lib}", rocm_root.trim_end_matches('/'))
+            format!("{}:{libtorch_lib}", rocm_lib.trim_end_matches('/'))
         }
         _ => libtorch_lib.to_string(),
+    }
+}
+
+/// The system ROCm runtime's library directory on THIS box, for
+/// [`ld_library_path_value`]'s local callers.
+///
+/// `flodl-hw` resolves it properly (`$ROCM_PATH` / `$HIP_PATH` /
+/// `$HSA_PATH` / `/opt/rocm`, probing `lib` and `lib64` for the actual
+/// runtime): detection and the loader path MUST agree, or a box passes
+/// the GPU gate on the runtime detection found and then segfaults on
+/// the path a weaker resolution composed. Falls back to the
+/// `$ROCM_PATH`-or-convention spelling when no runtime is found — the
+/// loader skips a missing path, so the prefix stays harmless.
+pub fn local_rocm_lib_dir() -> String {
+    match flodl_hw::rocm_runtime_lib_dir() {
+        Some(dir) => dir.display().to_string(),
+        None => format!(
+            "{}/lib",
+            std::env::var("ROCM_PATH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "/opt/rocm".to_string())
+                .trim_end_matches('/'),
+        ),
     }
 }
 

@@ -339,7 +339,7 @@ join:
     from: rsync://flodl@ctrl.example.com:/home/op/my-train
     cwd: ddp-bench              # project dir inside the tree; governs
                                 #   the build AND the run
-    build: cargo build --release --features $FDL_GPU_FEATURE --bin ddp-bench
+    build: cargo build --release --features "$FDL_GPU_FEATURE" --bin ddp-bench
     bin: target/release/ddp-bench
 ```
 
@@ -358,8 +358,14 @@ A worker pointed at that tree then needs nothing but the pointer, because
 ```yaml
 join:
   source:
-    from: rsync://flodl@ctrl.example.com:/home/op/.flodl/run/tree
+    from: rsync://flodl@ctrl.example.com:/home/op/.flodl/run/tree   # plain key
+    # from: rsync://flodl-join@ctrl.example.com:/tree               # rrsync'd key
 ```
+
+The two spellings are not interchangeable: behind a guardrailed key's
+`command="rrsync -ro <served>"` the path is re-rooted under the served
+directory, so the worker asks for `/tree` — the guardrail recipe below
+has the pairing, and `fdl publish` prints both.
 
 So chaining runs on a standing fleet is one command: publish again, and
 every box picks the new run up on its next dial with nothing to edit
@@ -424,12 +430,19 @@ grows one (exit **2**, and no re-dial). Without the split a
 misprovisioned instance hot-loops instead of stopping. Source that does
 not COMPILE lands on the transient side, which reads lenient and is not:
 the source is remote, so the fix is a push away, and pairing a compile
-error with the `poweroff` below would let one typo take out a fleet. fdl
-never powers a box off itself - the exit code is how whatever owns the
-instance hears about it:
+error with the `poweroff` below would let one typo take out a fleet.
+One exception: a compile failure on a box whose vendor toolkit headers
+are demonstrably missing goes permanent, because re-dialing cannot
+install a package (ROCm needs seven `-dev` packages and has no
+metapackage; the error names the `apt` line). fdl never powers a box
+off itself - the exit code is how whatever owns the instance hears
+about it. The recipe assumes `persist: true`: there, agent exits
+re-dial inside fdl and only classed preparation failures reach systemd,
+whereas one-shot mode passes the agent's own exit code through and a
+training binary exiting 2 would read as permanent:
 
 ```ini
-# /etc/systemd/system/flodl-join.service
+# /etc/systemd/system/flodl-join.service  (fdl join --persist ...)
 Restart=always
 RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 FailureAction=poweroff       # ... and self-deprovision it
@@ -480,12 +493,17 @@ since it execs `rsync --server` on the far side. So the forced command
 has to say which door this key opens:
 
 ```
-# A. one key for both: `ssh -N` plus a read-only sftp door
+# A. one key, tunnel + data mount: `ssh -N` plus a read-only sftp door
 restrict,port-forwarding,permitopen="127.0.0.1:1337",command="internal-sftp -R -d /flodl/data" ssh-ed25519 AAAA... flodl-join
 
-# B. two keys: the tunnel key above stays nologin-tight, and a second one
-#    is directory-scoped rather than merely read-only
-restrict,command="rrsync -ro /srv/flodl-run" ssh-ed25519 AAAA... flodl-source
+# B. one key, tunnel + SOURCE pull: the `fdl publish` flow's key.
+#    rsync execs the forced rrsync; `ssh -N` requests no command, so the
+#    tunnel is untouched; sftp is refused, so the data root (if any) is
+#    mounted during provisioning and declared as a bare `data_path`.
+restrict,port-forwarding,permitopen="127.0.0.1:1337",command="rrsync -ro /home/op/.flodl/run" ssh-ed25519 AAAA... flodl-join
+
+# C. a second, source-only key — directory-scoped and nothing else
+restrict,command="rrsync -ro /home/op/.flodl/run" ssh-ed25519 AAAA... flodl-source
 ```
 
 A key carries exactly one forced command, so no single key serves both
@@ -494,14 +512,32 @@ makes internal-sftp read-only, but `-d` only sets the *starting*
 directory: the client can still read whatever that user can, so
 containment under A is the dedicated no-shell user plus a daemon-level
 `ChrootDirectory` (which wants a root-owned parent). `rrsync` ships with
-rsync and enforces its directory itself, so B leaves a leaked tunnel key
-worth a forward and nothing more, at the cost of distributing two keys.
-Weigh A by what else that user can read: a compromised join key becomes
-a read of the data root.
+rsync and enforces its directory itself. Weigh A by what else that user
+can read: a compromised join key becomes a read of the data root.
 
-The third option needs no key at all, and is the right one whenever the
-tunnel key should stay tighter than the mount: mount the source root
-during provisioning and declare a bare `data_path`.
+**rrsync re-roots every requested path under its directory**, so a
+worker behind B or C does not ask for the absolute path: it asks for
+`/tree`, and rrsync serves `<dir>/tree`. The absolute spelling
+double-roots (`<dir>/home/op/.flodl/run/tree`) and fails with a
+change_dir error — `fdl publish` prints both spellings, each labelled
+with the key it pairs with:
+
+```yaml
+join:
+  source:
+    from: rsync://flodl-join@ctrl.example.com:/tree   # behind rrsync
+```
+
+One honest caveat on C: `fdl join` carries ONE ssh identity (the
+`join.ssh:` block), used for the tunnel, the data mount and the source
+pull alike — that is why B forces one door per key. C's second key
+therefore serves setups where the source is pulled from a *different
+host* than the tunnel (where `~/.ssh/config` can route it), or tooling
+outside `fdl join`.
+
+The option that needs no key at all remains, and is the right one
+whenever the tunnel key should stay tighter than the mount: mount the
+source root during provisioning and declare a bare `data_path`.
 
 The ephemeral variant of the same recipe is a **dedicated sshd
 instance whose lifetime brackets the run**: its own config, its own

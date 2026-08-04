@@ -357,6 +357,22 @@ fn amd_display_devices(pci_dir: &Path) -> Vec<String> {
 /// directories, which is why the resolution lives here rather than in
 /// the caller.
 pub fn rocm_runtime_root() -> Option<PathBuf> {
+    rocm_runtime_root_from(&rocm_candidates())
+}
+
+/// The runtime's **library directory** (`<root>/lib` or `<root>/lib64`,
+/// whichever holds `libhsa-runtime64`). This is the value
+/// `LD_LIBRARY_PATH` needs, and it is resolved here rather than composed
+/// by callers because `lib` vs `lib64` is a distro property the caller
+/// cannot guess: composing `<root>/lib` on a `lib64` layout produces a
+/// path the loader silently skips, which hands the loader libtorch's
+/// bundled ROCm stack — the exact segfault the ordering fix exists to
+/// prevent.
+pub fn rocm_runtime_lib_dir() -> Option<PathBuf> {
+    rocm_runtime_lib_dir_from(&rocm_candidates())
+}
+
+fn rocm_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = ["ROCM_PATH", "HIP_PATH", "HSA_PATH"]
         .iter()
         .filter_map(|k| std::env::var(k).ok())
@@ -364,21 +380,23 @@ pub fn rocm_runtime_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .collect();
     candidates.push(PathBuf::from("/opt/rocm"));
-    rocm_runtime_root_from(&candidates)
+    candidates
 }
 
 /// [`rocm_runtime_root`] over an explicit candidate list, for tests.
 fn rocm_runtime_root_from(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|root| {
-            ["lib", "lib64"].iter().any(|libdir| {
-                ["libhsa-runtime64.so", "libhsa-runtime64.so.1"]
-                    .iter()
-                    .any(|so| root.join(libdir).join(so).exists())
-            })
+    rocm_runtime_lib_dir_from(candidates).and_then(|lib| lib.parent().map(Path::to_path_buf))
+}
+
+/// [`rocm_runtime_lib_dir`] over an explicit candidate list, for tests.
+fn rocm_runtime_lib_dir_from(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find_map(|root| {
+        ["lib", "lib64"].iter().map(|libdir| root.join(libdir)).find(|lib| {
+            ["libhsa-runtime64.so", "libhsa-runtime64.so.1"]
+                .iter()
+                .any(|so| lib.join(so).exists())
         })
-        .cloned()
+    })
 }
 
 /// Whether this process could open `dev` for read/write, decided from
@@ -905,5 +923,18 @@ mod tests {
     fn no_candidates_is_none() {
         assert_eq!(rocm_runtime_root_from(&[]), None);
         assert_eq!(rocm_runtime_root_from(&[PathBuf::from("/nonexistent")]), None);
+    }
+
+    #[test]
+    fn the_lib_dir_is_the_matched_one_not_a_composed_lib() {
+        // A lib64 layout (RHEL/SUSE) must hand back `<root>/lib64`:
+        // composing `<root>/lib` from the root produces a path the
+        // loader skips, and the D1a ordering silently loses.
+        let s = Scratch::new();
+        let root = rocm_install(s.path(), "lib64", "libhsa-runtime64.so.1");
+        assert_eq!(
+            rocm_runtime_lib_dir_from(std::slice::from_ref(&root)),
+            Some(root.join("lib64")),
+        );
     }
 }

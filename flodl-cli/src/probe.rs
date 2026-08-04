@@ -931,67 +931,71 @@ fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
     // third. A vendor with no entry here has no known toolkit layout, and
     // guessing one would produce a confidently wrong apt command. Say
     // nothing until someone adds real facts.
+    //
+    // The header tables are `util::requirements`'s — the SAME set
+    // flodl-sys/build.rs demands, covering the whole include chain. A
+    // shorter hand-picked list here is the trap this replaced: probe
+    // reports clean, the operator proceeds, and the build fails on a
+    // header the short list never looked for. ROCm has no metapackage,
+    // so its install line must name every package; `cuda-toolkit` IS a
+    // metapackage, so the NVIDIA line stays that plus libnccl-dev
+    // rather than version-placeholder package names.
     let plan = match vendor {
         GpuVendor::Amd => Some((
             "ROCM_PATH",
-            "/opt/rocm",
-            vec!["include/hip/hip_runtime.h", "include/rccl/rccl.h"],
-            "hip-dev rccl-dev",
+            flodl_hw::rocm_runtime_root()
+                .map(|p| p.display().to_string())
+                .or_else(|| std::env::var("ROCM_PATH").ok())
+                .unwrap_or_else(|| "/opt/rocm".to_string()),
+            crate::util::requirements::ROCM_HEADERS,
+            None,
             "rocm",
         )),
         GpuVendor::Nvidia => Some((
             "CUDA_HOME",
-            "/usr/local/cuda",
-            // crt/host_config.h is a separate package from cudart-dev
-            // and cuda_runtime.h includes it on line 82 -- checking only
-            // the obvious header is a false pass.
-            vec![
-                "include/cuda_runtime.h",
-                "include/crt/host_config.h",
-                "include/nccl.h",
-            ],
-            "cuda-toolkit libnccl-dev",
+            std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()),
+            crate::util::requirements::CUDA_HEADERS,
+            Some("cuda-toolkit libnccl-dev"),
             "cuda",
         )),
         _ => None,
     };
-    let Some((root_env, root_default, headers, packages, feature)) = plan else {
+    let Some((root_env, root, headers, metapackages, feature)) = plan else {
         return;
     };
 
-    let root = std::env::var(root_env).unwrap_or_else(|_| root_default.to_string());
     if let Some(w) = gpu_toolkit_warning(
-        &info.path, Path::new(&root), root_env, &headers, packages, feature,
+        &info.path, Path::new(&root), root_env, headers, metapackages, feature,
     ) {
         warnings.push(w);
     }
 }
-
-
-
 
 /// Pure core of [`check_gpu_toolkit`]: the toolkit root is a parameter,
 /// not an env read, so every arm is testable without mutating
 /// process-global state. That matters more than usual here -- this
 /// crate's test binary runs in parallel, and an env-mutating test only
 /// works if every reader takes the same lock, which they do not.
-#[allow(clippy::too_many_arguments)]
+///
+/// `metapackages` overrides the per-header package list in the install
+/// line, for the vendor whose metapackage covers the set.
 fn gpu_toolkit_warning(
     variant: &str,
     root: &Path,
     root_env: &str,
-    headers: &[&str],
-    packages: &str,
+    headers: &[(&str, &str)],
+    metapackages: Option<&str>,
     feature: &str,
 ) -> Option<String> {
-    let missing: Vec<&str> = headers
-        .iter()
-        .copied()
-        .filter(|h| !root.join(h).exists())
-        .collect();
+    let missing = crate::util::requirements::missing_headers(root, headers);
     if missing.is_empty() {
         return None;
     }
+    let packages = match metapackages {
+        Some(m) => m.to_string(),
+        None => crate::util::requirements::packages_for(&missing).join(" "),
+    };
+    let list: Vec<&str> = missing.iter().map(|(h, _)| *h).collect();
     let root = root.display();
     Some(format!(
         "active libtorch is `{}` but its toolkit headers are missing under \
@@ -1000,7 +1004,7 @@ fn gpu_toolkit_warning(
          `sudo apt install {packages}`, or set {root_env} if your install is \
          elsewhere.",
         variant,
-        missing.join(", "),
+        list.join(", "),
     ))
 }
 
@@ -1414,24 +1418,25 @@ mod tests {
 
     // --- GPU toolkit headers -------------------------------------------
 
-    const ROCM_HEADERS: &[&str] =
-        &["include/hip/hip_runtime.h", "include/rccl/rccl.h"];
-
     #[test]
-    fn toolkit_warning_names_every_missing_header() {
+    fn toolkit_warning_names_every_missing_header_and_its_package() {
+        // The REAL requirements table, not a hand-picked subset: probe
+        // reporting clean while the build fails on the eighth header is
+        // exactly the drift this check exists to prevent. (Assumes the
+        // test host has no /usr/include/hip — true of the dev and cuda
+        // containers.)
         let root = PathBuf::from("/nonexistent/flodl-probe-test/rocm");
         let w = gpu_toolkit_warning(
             "precompiled/rocm70", &root, "ROCM_PATH",
-            ROCM_HEADERS, "hip-dev rccl-dev", "rocm",
+            crate::util::requirements::ROCM_HEADERS, None, "rocm",
         )
         .expect("absent toolkit must warn");
-        // Both headers, the variant that implied the vendor, the package
-        // to install, and the override -- the four things that make the
-        // message actionable rather than merely true.
-        assert!(w.contains("hip/hip_runtime.h"), "{w}");
-        assert!(w.contains("rccl/rccl.h"), "{w}");
+        for (header, package) in crate::util::requirements::ROCM_HEADERS {
+            assert!(w.contains(header), "missing header {header}: {w}");
+            assert!(w.contains(package), "missing package {package}: {w}");
+        }
         assert!(w.contains("precompiled/rocm70"), "{w}");
-        assert!(w.contains("sudo apt install hip-dev rccl-dev"), "{w}");
+        assert!(w.contains("sudo apt install"), "{w}");
         assert!(w.contains("ROCM_PATH"), "{w}");
     }
 
@@ -1440,43 +1445,49 @@ mod tests {
         // Severity rationale, pinned: flodl's default workflow builds in
         // the dev container, where host headers are irrelevant. If this
         // sentence goes, the warning starts reading like a broken host.
+        // The metapackage override is NVIDIA's line: cuda-toolkit covers
+        // the set, where the per-header names carry version placeholders.
         let root = PathBuf::from("/nonexistent/flodl-probe-test/cuda");
         let w = gpu_toolkit_warning(
             "precompiled/cu128", &root, "CUDA_HOME",
-            &["include/cuda_runtime.h"], "cuda-toolkit", "cuda",
+            &[("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>")],
+            Some("cuda-toolkit libnccl-dev"), "cuda",
         )
         .unwrap();
         assert!(w.contains("dev container is unaffected"), "{w}");
         assert!(w.contains("--features cuda"), "{w}");
+        assert!(w.contains("sudo apt install cuda-toolkit libnccl-dev"), "{w}");
+        assert!(!w.contains("<M>-<m>"), "placeholders must not reach the user: {w}");
     }
 
     #[test]
-    fn toolkit_present_warns_nothing() {
-        // The repo root has no `include/` at all, so point the check at
-        // a header that does exist to prove the negative case is real
-        // rather than vacuously passing.
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        assert!(root.join("Cargo.toml").is_file());
+    fn toolkit_present_warns_nothing_and_partial_reports_only_the_gap() {
+        // A real include/ layout, because the requirements checker looks
+        // under <root>/include (and the system dirs) exactly as the
+        // compiler will.
+        let root = std::env::temp_dir()
+            .join(format!("fdl-probe-toolkit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("include/hip")).unwrap();
+        std::fs::write(root.join("include/hip/hip_runtime.h"), "//").unwrap();
+
         assert!(
             gpu_toolkit_warning(
                 "precompiled/rocm70", &root, "ROCM_PATH",
-                &["Cargo.toml"], "hip-dev", "rocm",
+                &[("hip/hip_runtime.h", "hip-dev")], None, "rocm",
             )
             .is_none(),
             "a present header must not warn"
         );
-    }
-
-    #[test]
-    fn partial_toolkit_reports_only_what_is_missing() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let w = gpu_toolkit_warning(
             "precompiled/rocm70", &root, "ROCM_PATH",
-            &["Cargo.toml", "include/rccl/rccl.h"], "rccl-dev", "rocm",
+            &[("hip/hip_runtime.h", "hip-dev"), ("rccl/rccl.h", "rccl-dev")],
+            None, "rocm",
         )
         .expect("one missing header is still a warning");
         assert!(w.contains("rccl/rccl.h"), "{w}");
-        assert!(!w.contains("Cargo.toml"), "must not list the header it found: {w}");
+        assert!(!w.contains("hip_runtime"), "must not list the header it found: {w}");
+        assert!(!w.contains("hip-dev"), "nor the package it owns: {w}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

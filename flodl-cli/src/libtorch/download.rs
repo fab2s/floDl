@@ -200,7 +200,18 @@ fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, 
 // ---------------------------------------------------------------------------
 
 fn auto_detect_variant() -> &'static VariantSpec {
-    variant_for_gpus(&system::detect_gpus())
+    let survey = flodl_hw::survey();
+    if survey.devices.is_empty() {
+        // Say WHY before routing to CPU: the sweep deliberately reports
+        // no device for an AMD card with no ROCm runtime, and that
+        // finding names the fix — discarding it turns a provisioning
+        // step ("install ROCm, then re-run") into a silent wrong
+        // variant.
+        for note in survey.notes.iter().filter(|n| n.kind.explains_absence()) {
+            println!("  {}", note.message);
+        }
+    }
+    variant_for_gpus(&survey.devices)
 }
 
 /// Route a detected GPU set to a libtorch variant.

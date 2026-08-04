@@ -101,6 +101,12 @@ pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
         || key == "CUDA_DEVICE_ORDER"
+        // The AMD masks outrank CUDA_VISIBLE_DEVICES for HIP (first one
+        // set wins), so an env-block value would silently defeat the
+        // launcher's per-rank pin — the same reservation, other vendor.
+        || key == "HIP_VISIBLE_DEVICES"
+        || key == "ROCR_VISIBLE_DEVICES"
+        || key == "GPU_DEVICE_ORDINAL"
         || key == ENV_HOST_OVERRIDE
         || key == ENV_FDL_ENV
 }

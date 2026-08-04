@@ -47,7 +47,12 @@ pub fn parse_ssh_target(rest: &str) -> Result<SshTarget, &'static str> {
 
     // Split host from path at whichever delimiter comes first. A `:`
     // followed by digits is a port; a `:` followed by `/` is the scp
-    // separator.
+    // separator — and a port may itself be followed by the scp colon
+    // (`host:2222:/abs/path`), which is exactly what the documented
+    // grammar `[user@]host[:port]:/abs/path` produces when both parts
+    // are used at once. Refusing that spelling would make the docs'
+    // own grammar a parse error precisely on the guardrail recipe's
+    // advice (a non-standard external port).
     let colon = hostpart.find(':');
     let slash = hostpart.find('/');
     let (host, port, path) = match (colon, slash) {
@@ -57,7 +62,8 @@ pub fn parse_ssh_target(rest: &str) -> Result<SshTarget, &'static str> {
                 (&hostpart[..c], None, after)
             } else {
                 let end = after.find('/').ok_or("no remote path")?;
-                let port = after[..end].parse::<u16>().map_err(|_| "port is not a number")?;
+                let port_str = after[..end].strip_suffix(':').unwrap_or(&after[..end]);
+                let port = port_str.parse::<u16>().map_err(|_| "port is not a number")?;
                 (&hostpart[..c], Some(port), &after[end..])
             }
         }
@@ -93,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ssh_target_parses_all_three_spellings() {
+    fn an_ssh_target_parses_all_four_spellings() {
         assert_eq!(
             parse_ssh_target("flodl@exa:/flodl/data").unwrap(),
             SshTarget { remote: "flodl@exa:/flodl/data".into(), port: None },
@@ -104,6 +110,13 @@ mod tests {
         );
         assert_eq!(
             parse_ssh_target("flodl@exa:2222/flodl/data").unwrap(),
+            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
+        );
+        // What the documented grammar `[user@]host[:port]:/abs/path`
+        // literally produces with both parts in play — the spelling an
+        // operator on a non-standard port will type first.
+        assert_eq!(
+            parse_ssh_target("flodl@exa:2222:/flodl/data").unwrap(),
             SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
         );
     }

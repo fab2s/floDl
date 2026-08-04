@@ -93,6 +93,12 @@ pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
         || key == "CUDA_DEVICE_ORDER"
+        // The AMD masks outrank CUDA_VISIBLE_DEVICES for HIP (first one
+        // set wins), so an env-block value would silently defeat the
+        // launcher's per-rank pin — the same reservation, other vendor.
+        || key == "HIP_VISIBLE_DEVICES"
+        || key == "ROCR_VISIBLE_DEVICES"
+        || key == "GPU_DEVICE_ORDINAL"
         || key == ENV_HOST_OVERRIDE
         || key == crate::distributed::launcher::ENV_FDL_ENV
 }
@@ -486,7 +492,18 @@ impl LocalCluster {
         // return `CUDA(0)`; fall back to the envelope when unset or
         // when multi-value (in which case the child sees the same
         // physical layout as the cluster spec).
-        if let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        //
+        // The variable consulted is the one the child's runtime actually
+        // reads: HIP prefers its own masks over CUDA_VISIBLE_DEVICES
+        // (the first one SET wins), so on a ROCm build checking only the
+        // CUDA spelling would miss the mask that scoped the child.
+        let mask_vars: &[&str] = match crate::sys::build_vendor() {
+            Some(flodl_hw::GpuVendor::Amd) => {
+                &["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"]
+            }
+            _ => &["CUDA_VISIBLE_DEVICES"],
+        };
+        if let Some(visible) = mask_vars.iter().find_map(|k| std::env::var(k).ok()) {
             if !visible.is_empty() && !visible.contains(',') {
                 return Ok((worker.ranks[idx], Device::CUDA(0)));
             }
