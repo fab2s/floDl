@@ -76,6 +76,10 @@ pub struct Prepared {
     /// replace whatever this box carried: args must match the run,
     /// because rank children re-enter the binary with them.
     pub args: Option<Vec<String>>,
+    /// The published run's identity nonce, when the manifest carries
+    /// one. Rides the join hello so the window can refuse a cohort
+    /// straddling a publish boundary; `None` gates nothing.
+    pub run_id: Option<String>,
 }
 
 /// Everything this box has to settle before it dials.
@@ -91,6 +95,10 @@ pub struct PrepareSpec<'a> {
     /// Training source to fetch and build. `None` when the operator
     /// named an existing binary.
     pub source: Option<SourceSpec<'a>>,
+    /// Device ids this box will offer (`--devices`); `None` = all
+    /// visible. The arch-coverage gate scopes to these: a half-covered
+    /// box explicitly offering only its covered card is a working box.
+    pub devices: Option<&'a [u8]>,
 }
 
 /// The source half of the join recipe.
@@ -178,15 +186,22 @@ pub fn prepare(spec: &PrepareSpec, notes: &mut Vec<String>) -> Result<Prepared, 
         Some(token) => Some(acquire_libtorch(token, notes)?),
         None => spec.active_libtorch.cloned(),
     };
-    let (bin, args) = match (&spec.source, &fetched) {
+    if let Some(lt) = &libtorch {
+        check_arch_coverage(lt, spec.devices)?;
+    }
+    let (bin, args, run_id) = match (&spec.source, &fetched) {
         (Some(source), Some((tree, manifest))) => {
             let recipe = merge_manifest(source, manifest.as_ref())?;
             let built = build_source(&recipe, tree, libtorch.as_ref(), notes)?;
-            (Some(built), manifest.as_ref().map(|m| m.args.clone()))
+            (
+                Some(built),
+                manifest.as_ref().map(|m| m.args.clone()),
+                manifest.as_ref().and_then(|m| m.run.clone()),
+            )
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
-    Ok(Prepared { data_path, libtorch, bin, args })
+    Ok(Prepared { data_path, libtorch, bin, args, run_id })
 }
 
 /// What to build, once the controller has had its say.
@@ -312,7 +327,8 @@ fn fetch_source(
     let manifest = Manifest::read(&dest)?;
     if let Some(m) = &manifest {
         notes.push(format!(
-            "run manifest: bin {}{}{}{}",
+            "run manifest: {}bin {}{}{}{}",
+            m.run.as_deref().map(|r| format!("run {}… ", &r[..r.len().min(8)])).unwrap_or_default(),
             m.bin,
             m.cwd.as_deref().map(|c| format!(" in {c}")).unwrap_or_default(),
             m.published_epoch
@@ -457,6 +473,63 @@ fn check_gpu_stack() -> Result<(), Fail> {
                  before `fdl join`, not inside its re-dial loop.)"
             ))
         })
+}
+
+/// Refuse a libtorch that ships no kernel for a card this box offers.
+///
+/// [`check_gpu_stack`] proves devices EXIST; this proves the resolved
+/// variant can address them. Without it a Pascal-class box holding a
+/// cu128-only build passes every gate, is admitted into a quorum,
+/// builds successfully, and dies at its FIRST GPU op with `no kernel
+/// image is available` — after the window was spent, taking the
+/// cohort's formation with it. This is the arch-coherence check the
+/// membership design promised, landed where the information lives: the
+/// variant's `.arch` metadata and the device list are both local facts.
+///
+/// Scope, deliberately narrow: only devices of the variant's OWN vendor
+/// are consulted (an unusable other-vendor iGPU beside working cards is
+/// a trainable box — the same lesson as the GPU gate), only devices
+/// this box offers (`--devices` scopes a half-covered box onto its
+/// covered card), and a variant with no `.arch` metadata gates nothing
+/// here — `fdl probe` flags missing metadata as its own issue, and
+/// refusing to dial over it would stop working setups.
+fn check_arch_coverage(
+    libtorch: &(PathBuf, String),
+    offered: Option<&[u8]>,
+) -> Result<(), Fail> {
+    let (dir, label) = libtorch;
+    let flodl_hw::VariantClass::Vendor(vendor) = flodl_hw::classify_variant_label(label)
+    else {
+        return Ok(());
+    };
+    let info = crate::libtorch::detect::libtorch_info_from_dir(label.clone(), dir);
+    let Some(archs) = info.archs.clone() else {
+        return Ok(());
+    };
+    let devices: Vec<_> = flodl_hw::survey_visible()
+        .devices
+        .into_iter()
+        .filter(|d| d.vendor == vendor)
+        .filter(|d| offered.is_none_or(|ids| ids.contains(&d.index)))
+        .collect();
+    if devices.is_empty() {
+        // The variant's vendor has nothing here — whether that is fine
+        // is the training binary's question, not this gate's.
+        return Ok(());
+    }
+    let mut details = Vec::new();
+    let coverage = crate::libtorch::detect::arch_coverage(&info, &devices, &mut details);
+    if coverage.iter().all(|(_, ok)| *ok) {
+        return Ok(());
+    }
+    Err(Fail::Permanent(format!(
+        "libtorch `{label}` (archs `{archs}`) ships no kernel for part of \
+         what this box offers: {} The first GPU op would die with `no \
+         kernel image is available` — after admission counted this host \
+         into a quorum. `libtorch: auto` picks a covering variant when \
+         one exists; `--devices` can scope the offer to covered cards",
+        details.join(" "),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +927,49 @@ mod tests {
             usable,
             "the gate must follow the device list, not the findings",
         );
+    }
+
+    /// Hardware-independent the same way the GPU-gate test is: the
+    /// expectation is computed from the real box, so a GPU-less CI
+    /// runner asserts the pass-through and a real rig asserts the
+    /// refusal.
+    #[test]
+    fn a_variant_covering_none_of_the_offered_cards_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "fdl-prep-arch-{}-{}",
+            std::process::id(),
+            next_probe_id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `0.0` matches no real device arch, so any NVIDIA card on this
+        // box is uncovered by construction.
+        std::fs::write(dir.join(".arch"), "archs=0.0\n").unwrap();
+        let lt = (dir.clone(), "precompiled/cu128".to_string());
+        let nvidia_present = flodl_hw::survey_visible()
+            .devices
+            .iter()
+            .any(|d| d.vendor == flodl_hw::GpuVendor::Nvidia);
+        match check_arch_coverage(&lt, None) {
+            Err(err) => {
+                assert!(nvidia_present, "refused with no matching device: {err:?}");
+                assert!(err.is_permanent(), "kernels do not grow by waiting: {err:?}");
+                assert!(err.message().contains("no kernel image"), "got: {err:?}");
+            }
+            Ok(()) => assert!(
+                !nvidia_present,
+                "an NVIDIA card offered against archs `0.0` must be refused",
+            ),
+        }
+        // A CPU variant, and a variant with no `.arch` metadata, gate
+        // nothing — probe owns the missing-metadata complaint.
+        assert!(check_arch_coverage(&(dir.clone(), "precompiled/cpu".into()), None).is_ok());
+        std::fs::remove_file(dir.join(".arch")).unwrap();
+        assert!(check_arch_coverage(&(dir.clone(), "precompiled/cu128".into()), None).is_ok());
+        // An empty offer gates nothing either: the device scope means
+        // this box deliberately offers none of that vendor's cards.
+        std::fs::write(dir.join(".arch"), "archs=0.0\n").unwrap();
+        assert!(check_arch_coverage(&(dir.clone(), "precompiled/cu128".into()), Some(&[])).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

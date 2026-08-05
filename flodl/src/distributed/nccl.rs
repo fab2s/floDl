@@ -329,6 +329,31 @@ pub const NCCL_UNIQUE_ID_BYTES: usize = 128;
 
 /// Opaque unique ID for NCCL communicator initialization.
 ///
+/// The `(major, minor, patch)` of the NCCL/RCCL library this process
+/// actually loads — LD_PRELOAD-aware (it asks the loaded library, not
+/// the build headers), and no CUDA context is touched, so it is safe
+/// before `Trainer::run`. This is the fact the join hello carries for
+/// the admission skew gate: two libtorches shipping different
+/// major.minor refuse each other's NCCL handshake at formation, which
+/// is exactly too late. `None` on a CPU build (no library to ask) or
+/// when the read fails — an unknown version gates nothing.
+pub(crate) fn runtime_version() -> Option<(u32, u32, u32)> {
+    let mut v: i32 = 0;
+    let err = unsafe { ffi::flodl_nccl_runtime_version(&mut v) };
+    if check_err(err).is_err() || v <= 0 {
+        return None;
+    }
+    let v = v as u32;
+    // NCCL's integer encoding: major*10_000 + minor*100 + patch since
+    // 2.9; major*1_000 + minor*100 + patch before. Everything we can
+    // meet is post-2.9, but decode the old shape rather than misread it.
+    Some(if v >= 20_000 {
+        (v / 10_000, (v % 10_000) / 100, v % 100)
+    } else {
+        (v / 1_000, (v % 1_000) / 100, v % 100)
+    })
+}
+
 /// Generated once on any thread, then shared (via clone) with all ranks.
 /// Each rank passes its copy to [`NcclRankComm::init_rank`].
 #[derive(Clone)]

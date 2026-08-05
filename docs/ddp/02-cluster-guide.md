@@ -409,6 +409,11 @@ commit point: publish clears it before touching the tree and writes it
 only after the build passes, so a box dialing mid-publish finds no
 manifest and waits rather than training something unvalidated. That wait
 is a transient failure, and a failed gate publishes nothing at all.
+And every publish mints a fresh **run identity** (`run:` in the
+manifest) that rides each worker's join hello: the window refuses a
+cohort whose members hold different ids, so two boxes that fetched
+across a publish boundary can never form one world — the stale side
+just picks the new run up on its next dial.
 
 The gate is one build, not N: every worker still compiles its own, since
 a controller producing binaries for each worker variant is the build

@@ -561,6 +561,27 @@ struct FlodlNcclRankComm {
     }
 };
 
+// Version of the NCCL/RCCL library this process actually LOADS — the
+// LD_PRELOAD-aware answer, not the build headers'. Pure library read:
+// no CUDA context is created, so it is safe before any GPU op (the
+// join hello carries it for the admission skew gate).
+extern "C" char* flodl_nccl_runtime_version(int* version_out) {
+    try {
+        int v = 0;
+        ncclResult_t result = ncclGetVersion(&v);
+        if (result != ncclSuccess) {
+            return make_error(std::string("ncclGetVersion failed: ") +
+                              ncclGetErrorString(result));
+        }
+        *version_out = v;
+        return nullptr;
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
 extern "C" char* flodl_nccl_get_unique_id(void* uid_out) {
     try {
         ncclUniqueId id;
@@ -943,6 +964,10 @@ extern "C" int flodl_nccl_size(void* handle) { (void)handle; return 0; }
 
 // --- NCCL Per-Rank (CPU stubs) ---
 
+extern "C" char* flodl_nccl_runtime_version(int* version_out) {
+    (void)version_out;
+    return make_error("NCCL requires a CUDA build");
+}
 extern "C" char* flodl_nccl_get_unique_id(void* uid_out) {
     (void)uid_out;
     return make_error("NCCL requires a CUDA build");

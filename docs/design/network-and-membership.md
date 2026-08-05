@@ -86,13 +86,24 @@ immediately rather than at window close: protocol version, host-name
 uniqueness, device-list sanity, GPU-vendor coherence when the data
 plane is NCCL/RCCL (a mixed NCCL+RCCL cohort passes every structural
 check and hangs at formation, so the libtorch label's vendor is checked
-at the door; CPU averaging modes mix legally), and the dataset
-signature — with one honest caveat: `fdl join` does not yet stamp a
-real dataset signature into the hello (workers send zeros), so that
-check bites only for binaries that set it themselves. As-designed
-per-host prechecks beyond these have NOT been built; a run-identity
-check (the published manifest's token riding the hello) is the planned
-next admission fact.
+at the door; CPU averaging modes mix legally), **run identity** (the
+`.fdl-run.yml` nonce `fdl publish` stamps — a cohort straddling a
+publish boundary holds two different runs, and boxes carrying no id
+gate nothing), **NCCL/RCCL major.minor** (read on each worker from the
+library its binary actually loads; skew refuses the handshake at
+formation, and a walk-in fleet has no roster for a probe to sweep, so
+the window is the only place this check can live), and the dataset
+signature — with one honest caveat on the last: `fdl join` does not yet
+stamp a real dataset signature into the hello (workers send zeros), so
+that check bites only for binaries that set it themselves. Every one of
+these is first-member-seeded consistency among joiners, never an
+authority the controller asserts. As-designed per-host prechecks beyond
+these were deliberately NOT built: the controller cannot reach back
+through a NAT'd tunnel, and the worker has the filesystem — that
+precheck dissolved into `fdl join`'s prepare phase (which also gates
+libtorch↔GPU arch coverage, the other half of the promised coherence,
+where the `.arch` metadata lives). The next admission fact is the
+cohort code signature (param names+shapes at formation).
 
 The join reply carries the **session salt**, the assigned global rank
 ids (one per local GPU, assigned in admission order), and the cluster

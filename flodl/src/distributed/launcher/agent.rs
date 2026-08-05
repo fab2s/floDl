@@ -86,6 +86,12 @@ pub struct AgentSpec {
     /// the rendezvous path.
     #[serde(default)]
     pub dataset_sig_hex: Option<String>,
+    /// Identity of the published run this box prepared (`fdl join` puts
+    /// the `.fdl-run.yml` nonce here). Rides the hello so admission can
+    /// refuse a cohort straddling a publish boundary. `None` (a `--bin`
+    /// box, or a tree published before the field existed) gates nothing.
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// Dataset source root on THIS host, resolved on the box itself
     /// (`fdl join`'s prepare phase mounts it when needed, then puts the
     /// resulting path here). Written into the host block of the
@@ -399,6 +405,11 @@ fn build_hello(spec: &AgentSpec, devices: &[u8], gpus: Vec<String>) -> Result<Jo
         gpus,
         libtorch: spec.libtorch.clone(),
         dataset_sig,
+        run_id: spec.run_id.clone(),
+        // Read from the library this binary actually loads, HERE on the
+        // worker: the whole point is that no other process can answer
+        // for this box. Costs no CUDA context.
+        nccl_version: crate::distributed::nccl::runtime_version(),
     })
 }
 
@@ -831,6 +842,8 @@ mod tests {
             gpus: vec!["T".to_string(), "T".to_string()],
             libtorch: "builds/test".to_string(),
             dataset_sig: [0u8; 32],
+            run_id: None,
+            nccl_version: None,
         }
     }
 
@@ -903,6 +916,7 @@ mod tests {
             controller_port: 1337,
             salt_hex: Some(salt_to_hex(&test_salt())),
             local_devices: Some(vec![0, 1]),
+            run_id: Some("cafe0123".to_string()),
             libtorch: "builds/sm61-sm120".to_string(),
             dataset_sig_hex: None,
             data_path: Some("/flodl/data".to_string()),

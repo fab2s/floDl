@@ -1051,6 +1051,9 @@ pub fn run_launcher_with_config(
             }
             let spec = agent::AgentSpec {
                 host: host.host.clone(),
+                // Fan-out hosts run what the controller dispatched, so
+                // there is no published-run identity to disagree about.
+                run_id: None,
                 controller_host: if host.host == me {
                     // Local workers always reach the mux via loopback.
                     "127.0.0.1".to_string()

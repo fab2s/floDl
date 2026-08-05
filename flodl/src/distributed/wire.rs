@@ -88,7 +88,11 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 /// Wire version of the control-channel protocol. Independent of the
 /// data-channel `PROTOCOL_VERSION` in `controller.rs`. Bump on any
 /// breaking change to [`ControlFrame`] or to the wire-message types.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+// v3: Hello gained `run_id` + `nccl_version` (bincode is not
+// self-describing, so new fields ARE a new protocol; the bump moves a
+// mixed-version cohort's failure to the handshake, named, instead of a
+// decode error mid-join).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Channel-select magics (single-port mux)
@@ -1697,12 +1701,27 @@ pub enum JoinMsgWire {
         /// GPU inventory, one label per device (informational: logged
         /// and surfaced in the membership state, not validated).
         gpus: Vec<String>,
-        /// libtorch variant label (informational, same as `gpus`).
+        /// libtorch variant label. Its VENDOR is validated (a mixed
+        /// NCCL+RCCL cohort hangs at formation); the rest is
+        /// informational, same as `gpus`.
         libtorch: String,
         /// 32-byte dataset signature; must match the controller's own.
         /// A stale worker from a previous run is rejected at the door,
         /// not discovered mid-epoch.
         dataset_sig: [u8; 32],
+        /// Identity of the published run this box prepared (the
+        /// `.fdl-run.yml` nonce `fdl publish` stamps). `None` gates
+        /// nothing: a `--bin` box carries no manifest, and that escape
+        /// hatch stays one. Two boxes holding DIFFERENT ids fetched
+        /// across a publish boundary, and a cohort straddling that
+        /// boundary would train two different runs as one world.
+        run_id: Option<String>,
+        /// `(major, minor, patch)` of the NCCL/RCCL library this box's
+        /// binary actually loads. Skew in major.minor refuses the NCCL
+        /// handshake at formation — after the window was spent — so the
+        /// window checks it instead. `None` (CPU build, read failed)
+        /// gates nothing.
+        nccl_version: Option<(u32, u32, u32)>,
     },
     /// Controller → worker agent: admitted. Carries the assigned global
     /// rank ids (admission order — contiguous by construction).

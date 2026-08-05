@@ -108,6 +108,7 @@ fn publish(cli: &PublishArgs, args_tail: Option<&[String]>) -> Result<(), Fail> 
             origin: Some(spec.to_string()),
             rustc: rustc_version(),
             published_epoch: unix_seconds(),
+            run: Some(run_nonce()),
             built,
         })
     })();
@@ -165,6 +166,9 @@ fn report(served: &Path, tree: &Path, manifest: &Manifest) {
         println!("  args:      {}", manifest.args.join(" "));
     }
     let host = crate::cluster::resolve_local_hostname();
+    if let Some(run) = &manifest.run {
+        println!("  run:       {run} (the join window refuses a cohort mixing ids)");
+    }
     println!();
     println!("  Workers pull it with a source spec pointing here. TWO spellings,");
     println!("  and the key that serves the pull decides which — they do not mix:");
@@ -220,6 +224,31 @@ fn unix_seconds() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
+}
+
+/// A fresh 16-byte hex nonce per publish — the run's identity at the
+/// join window. Not a credential (it travels in a world-readable
+/// manifest), so the entropy bar is "two publishes never collide", not
+/// secrecy: /dev/urandom where it exists, time+pid hashed where it does
+/// not (Windows).
+fn run_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
+    if read.is_err() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            ^ (std::process::id() as u128);
+        bytes[..16].copy_from_slice(&seed.to_le_bytes());
+    }
+    let mut s = String::with_capacity(32);
+    use std::fmt::Write as _;
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 #[cfg(test)]
@@ -280,6 +309,15 @@ mod tests {
         let manifest = Manifest::read(&tree).unwrap().expect("a manifest");
         assert!(manifest.built);
         assert!(manifest.args.is_empty(), "no tail means no args, not the previous ones");
+
+        // Every publish is a NEW run identity — chaining "same args, new
+        // code" is the common re-publish, which any content hash would
+        // call identical. The nonce is what lets the join window refuse
+        // a cohort straddling this boundary.
+        let first_run = manifest.run.clone().expect("a publish stamps a run id");
+        publish(&cli, None).unwrap();
+        let manifest = Manifest::read(&tree).unwrap().expect("a manifest");
+        assert_ne!(manifest.run, Some(first_run), "a re-publish must mint a fresh id");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -400,6 +438,7 @@ mod tests {
             origin: Some("git+https://example.com/o/r#v1".into()),
             rustc: Some("rustc 1.90.0".into()),
             published_epoch: Some(1_780_000_000),
+            run: Some("a1b2c3d4e5f60718".into()),
             built: true,
         };
         manifest.write(&dir).unwrap();

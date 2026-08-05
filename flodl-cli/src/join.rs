@@ -244,6 +244,7 @@ impl Effective {
             },
             libtorch: self.libtorch_spec.as_deref(),
             active_libtorch,
+            devices: self.devices.as_deref(),
             source: match &self.bin {
                 BinSource::Given(_) => None,
                 BinSource::Build(s) => Some(SourceSpec {
@@ -546,6 +547,9 @@ fn agent_spec_hex(
     }
     if let Some(data) = &prepared.data_path {
         spec["data_path"] = serde_json::json!(data.display().to_string());
+    }
+    if let Some(run) = &prepared.run_id {
+        spec["run_id"] = serde_json::json!(run);
     }
     hex_encode(spec.to_string().as_bytes())
 }
@@ -1163,6 +1167,7 @@ mod tests {
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
         let prepared = Prepared {
             data_path: Some(PathBuf::from("/flodl/data")),
+            run_id: Some("a1b2c3d4e5f60718".to_string()),
             ..Prepared::default()
         };
         let hex =
@@ -1179,6 +1184,7 @@ mod tests {
         assert_eq!(spec["local_devices"], serde_json::json!([0, 1]));
         assert_eq!(spec["libtorch"], "builds/sm61-sm120");
         assert_eq!(spec["data_path"], "/flodl/data");
+        assert_eq!(spec["run_id"], "a1b2c3d4e5f60718");
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
@@ -1197,6 +1203,9 @@ mod tests {
         // A box that declares no source root must ship no key at all:
         // an empty string here would point every rank at the process cwd.
         assert!(spec.get("data_path").is_none());
+        // Same rule for the run id: a `--bin` box carries none, and an
+        // absent key is what gates nothing at admission.
+        assert!(spec.get("run_id").is_none());
     }
 
     #[test]

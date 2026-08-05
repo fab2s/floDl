@@ -166,6 +166,7 @@ libtorch surfaces.
 | `origin` | the source spec the controller resolved, for provenance |
 | `rustc` | `rustc -V` on the controller — advisory; a worker reports a mismatch, never enforces it |
 | `published_epoch` | unix seconds at publish, so a box can say how old its run is |
+| `run` | this publish's identity nonce; it rides each worker's join hello, and the window refuses a cohort whose members hold different ids (two boxes that fetched across a publish boundary would train two different runs as one world) |
 | `built` | `false` when `--no-build` skipped the gate; workers say so out loud |
 
 Do not hand-edit it: the next publish overwrites it, and its *presence*

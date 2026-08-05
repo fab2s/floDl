@@ -908,6 +908,10 @@ int flodl_nccl_size(void* handle);
 // Generate a unique ID for NCCL communicator initialization.
 // uid_out: pointer to at least FLODL_NCCL_UNIQUE_ID_BYTES bytes.
 // Called once on any thread; result shared with all ranks.
+// Version of the NCCL/RCCL library this process actually loads
+// (LD_PRELOAD-aware). Writes NCCL's integer code (e.g. 22705 = 2.27.5).
+// No CUDA context is created, so it is safe before any GPU op.
+char* flodl_nccl_runtime_version(int* version_out);
 char* flodl_nccl_get_unique_id(void* uid_out);
 
 // Initialize a single-rank NCCL communicator.

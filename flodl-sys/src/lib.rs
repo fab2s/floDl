@@ -1283,6 +1283,7 @@ unsafe extern "C" {
 
     // --- NCCL Per-Rank Operations ---
 
+    pub fn flodl_nccl_runtime_version(version_out: *mut i32) -> *mut c_char;
     pub fn flodl_nccl_get_unique_id(uid_out: *mut u8) -> *mut c_char;
     pub fn flodl_nccl_init_rank(
         rank: i32, nranks: i32, uid: *const u8, handle_out: *mut *mut c_void,

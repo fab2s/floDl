@@ -23,19 +23,28 @@ fn sig(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
+/// A bare offer: every coherence fact at its "gates nothing" value, so
+/// tests exercising OTHER checks stay independent of the fact set.
+fn offer(host: &str, devices: Vec<u8>, libtorch: &str, dsig: [u8; 32]) -> JoinOffer {
+    JoinOffer {
+        host: host.to_string(),
+        local_devices: devices,
+        gpus: vec![],
+        libtorch: libtorch.to_string(),
+        dataset_sig: dsig,
+        run_id: None,
+        nccl_version: None,
+    }
+}
+
 fn admit_host(
     ledger: &mut MembershipLedger,
     host: &str,
     rank_count: usize,
 ) -> std::result::Result<Vec<usize>, String> {
-    ledger.admit(
-        host,
-        (0..rank_count as u8).collect(),
-        vec!["GPU".to_string(); rank_count],
-        "builds/test".to_string(),
-        sig(7),
-        Duration::from_secs(1),
-    )
+    let mut o = offer(host, (0..rank_count as u8).collect(), "builds/test", sig(7));
+    o.gpus = vec!["GPU".to_string(); rank_count];
+    ledger.admit(o, Duration::from_secs(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -66,21 +75,21 @@ fn dataset_sig_reference_and_mismatch() {
     // No expected sig: the first joiner sets the reference.
     let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
     ledger
-        .admit("a", vec![0], vec![], String::new(), sig(1), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(1)), Duration::ZERO)
         .unwrap();
     let why = ledger
-        .admit("b", vec![0], vec![], String::new(), sig(2), Duration::ZERO)
+        .admit(offer("b", vec![0], "", sig(2)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("dataset signature mismatch"), "got: {why}");
 
     // Expected sig provided: the very first mismatch is rejected.
     let mut ledger = MembershipLedger::new(test_config(), Some(sig(9))).unwrap();
     let why = ledger
-        .admit("a", vec![0], vec![], String::new(), sig(1), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(1)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("dataset signature mismatch"), "got: {why}");
     ledger
-        .admit("a", vec![0], vec![], String::new(), sig(9), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(9)), Duration::ZERO)
         .unwrap();
 }
 
@@ -91,14 +100,7 @@ fn a_vendor_mixed_cohort_is_refused_under_an_nccl_data_plane() {
     // AFTER the window deadline was spent. The window is where the one
     // piece of information needed to refuse it early already is.
     let admit = |ledger: &mut MembershipLedger, host: &str, label: &str| {
-        ledger.admit(
-            host,
-            vec![0],
-            vec!["GPU".to_string()],
-            label.to_string(),
-            sig(7),
-            Duration::ZERO,
-        )
+        ledger.admit(offer(host, vec![0], label, sig(7)), Duration::ZERO)
     };
     let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
     admit(&mut ledger, "green", "precompiled/cu128").unwrap();
@@ -127,23 +129,69 @@ fn a_vendor_mixed_cohort_is_refused_under_an_nccl_data_plane() {
 }
 
 #[test]
+fn a_cohort_straddling_a_publish_boundary_is_refused() {
+    // Two boxes that fetched across a publish boundary hold two
+    // different runs — different args at minimum, and rank children
+    // re-enter the binary with them. Same first-member seeding as the
+    // dataset signature; `--bin` boxes carry no id and gate nothing.
+    let with_run = |host: &str, run: Option<&str>| {
+        let mut o = offer(host, vec![0], "", sig(7));
+        o.run_id = run.map(str::to_string);
+        o
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    ledger.admit(with_run("a", Some("run-aaaa1111")), Duration::ZERO).unwrap();
+    ledger.admit(with_run("bare", None), Duration::ZERO).unwrap();
+    let why = ledger
+        .admit(with_run("b", Some("run-bbbb2222")), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("run identity mismatch"), "got: {why}");
+    assert!(why.contains("run-aaaa"), "the seeded id must be named: {why}");
+    assert!(why.contains("next dial"), "the fix must be named: {why}");
+    assert_eq!(ledger.joined_ranks(), 2);
+    // The matching id keeps joining — the refusal condemned one
+    // attempt, not the window.
+    ledger.admit(with_run("c", Some("run-aaaa1111")), Duration::ZERO).unwrap();
+}
+
+#[test]
+fn nccl_version_skew_is_refused_where_that_plane_forms() {
+    let with_nccl = |host: &str, v: Option<(u32, u32, u32)>| {
+        let mut o = offer(host, vec![0], "", sig(7));
+        o.nccl_version = v;
+        o
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
+    // Patch skew is interoperable, and an unknown version (a CPU build,
+    // a failed read) gates nothing.
+    ledger.admit(with_nccl("b", Some((2, 27, 3))), Duration::ZERO).unwrap();
+    ledger.admit(with_nccl("cpu-build", None), Duration::ZERO).unwrap();
+    let why = ledger
+        .admit(with_nccl("c", Some((2, 26, 2))), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("NCCL version skew"), "got: {why}");
+    assert!(why.contains("2.27"), "got: {why}");
+    assert!(why.contains("fdl nccl build"), "the bridge must be named: {why}");
+    // A CPU data plane has no NCCL handshake to protect: gate off.
+    let cpu = JoinConfig { nccl_backend: false, ..test_config() };
+    let mut ledger = MembershipLedger::new(cpu, None).unwrap();
+    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
+    ledger.admit(with_nccl("b", Some((2, 26, 2))), Duration::ZERO).unwrap();
+    assert_eq!(ledger.joined_ranks(), 2);
+}
+
+#[test]
 fn hostile_device_lists_rejected() {
     let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
     let why = admit_host(&mut ledger, "zero", 0).unwrap_err();
     assert!(why.contains("must be non-empty"), "got: {why}");
     let why = ledger
-        .admit(
-            "huge",
-            vec![0u8; 100_000],
-            vec![],
-            String::new(),
-            sig(7),
-            Duration::ZERO,
-        )
+        .admit(offer("huge", vec![0u8; 100_000], "", sig(7)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("exceeds the per-worker cap"), "got: {why}");
     let why = ledger
-        .admit("dup", vec![0, 0], vec![], String::new(), sig(7), Duration::ZERO)
+        .admit(offer("dup", vec![0, 0], "", sig(7)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("duplicate local device"), "got: {why}");
     let why = admit_host(&mut ledger, "  ", 1).unwrap_err();
@@ -438,6 +486,8 @@ fn join_messages_round_trip_through_control_frames() {
             gpus: vec!["GP106".to_string(), "GP106".to_string()],
             libtorch: "builds/sm61-sm120".to_string(),
             dataset_sig: sig(5),
+            run_id: Some("a1b2c3d4e5f6".to_string()),
+            nccl_version: Some((2, 27, 5)),
         },
         JoinMsgWire::Accept {
             ranks: vec![1, 2],
@@ -585,6 +635,8 @@ fn dial_and_join(
         gpus: vec!["TestGPU".to_string(); rank_count as usize],
         libtorch: "builds/test".to_string(),
         dataset_sig: sig(7),
+        run_id: None,
+        nccl_version: None,
     };
     ControlFrame::encode(key, MsgKind::Join, &hello)
         .unwrap()
@@ -655,6 +707,8 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
         gpus: vec![],
         libtorch: String::new(),
         dataset_sig: sig(7),
+        run_id: None,
+        nccl_version: None,
     };
     ControlFrame::encode(&zero_key, MsgKind::Join, &hello)
         .unwrap()

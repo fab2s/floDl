@@ -329,6 +329,25 @@ pub(crate) enum WindowVerdict {
     Failed(String),
 }
 
+/// One hello's admission-relevant facts, as decoded off the wire.
+///
+/// A struct rather than a parameter list because the fact set GROWS:
+/// each cross-host coherence check the window learns (vendor, run
+/// identity, NCCL version — the code signature is next) is another
+/// field, and admission is the only place a walk-in fleet can be
+/// checked for cross-host consistency (there is no roster to probe,
+/// and the controller cannot reach back through a NAT'd tunnel).
+#[derive(Debug)]
+pub(crate) struct JoinOffer {
+    pub host: String,
+    pub local_devices: Vec<u8>,
+    pub gpus: Vec<String>,
+    pub libtorch: String,
+    pub dataset_sig: [u8; 32],
+    pub run_id: Option<String>,
+    pub nccl_version: Option<(u32, u32, u32)>,
+}
+
 /// Pure membership state machine: admission, rank assignment, window
 /// verdicts, snapshots. Owns no I/O — [`run_join_window`] drives it
 /// against real connections, tests drive it directly.
@@ -349,6 +368,18 @@ pub(crate) struct MembershipLedger {
     /// seed this. An enumerated fan-out rig mixed with walk-ins stays
     /// prebuild's problem: those hosts never pass through admission.
     expected_vendor: Option<flodl_hw::GpuVendor>,
+    /// Identity of the published run the cohort prepared (the
+    /// `.fdl-run.yml` nonce). First-member seeded; a mismatch means a
+    /// publish landed between two boxes' fetches, and a cohort
+    /// straddling that boundary would train two different runs as one
+    /// world. Boxes carrying no id (`--bin`, pre-field trees) gate
+    /// nothing.
+    expected_run_id: Option<String>,
+    /// major.minor of the NCCL/RCCL library the cohort loads. Skew
+    /// refuses the NCCL handshake at formation, so the window refuses
+    /// it first. Only enforced under an NCCL data plane; unknown
+    /// versions gate nothing.
+    expected_nccl: Option<(u32, u32)>,
     members: Vec<JoinedMember>,
     next_rank: usize,
 }
@@ -364,6 +395,8 @@ impl MembershipLedger {
             config,
             expected_dataset_sig,
             expected_vendor: None,
+            expected_run_id: None,
+            expected_nccl: None,
             members: Vec::new(),
             next_rank: 0,
         })
@@ -380,13 +413,12 @@ impl MembershipLedger {
     /// its own attempt, never the run).
     pub fn admit(
         &mut self,
-        host: &str,
-        local_devices: Vec<u8>,
-        gpus: Vec<String>,
-        libtorch: String,
-        dataset_sig: [u8; 32],
+        offer: JoinOffer,
         elapsed: Duration,
     ) -> std::result::Result<Vec<usize>, String> {
+        let JoinOffer { host, local_devices, gpus, libtorch, dataset_sig, run_id, nccl_version } =
+            offer;
+        let host = host.as_str();
         if host.trim().is_empty() {
             return Err("host name must be non-empty".to_string());
         }
@@ -465,6 +497,50 @@ impl MembershipLedger {
                                     )
                                 })
                                 .unwrap_or(""),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Run identity, whatever the data plane: a cohort straddling a
+        // publish boundary holds two different runs — different args at
+        // minimum, and rank children re-enter the binary with them.
+        // First-member seeded like the rest: consistency among joiners,
+        // not an authority the controller asserts.
+        if let Some(run) = &run_id {
+            match &self.expected_run_id {
+                None => self.expected_run_id = Some(run.clone()),
+                Some(expected) if expected != run => {
+                    return Err(format!(
+                        "run identity mismatch: this cohort prepared run \
+                         {}… and {host:?} prepared {}… — a publish landed \
+                         between their fetches, so they hold two different \
+                         runs. The stale side picks the new run up on its \
+                         next dial",
+                        id_prefix(expected),
+                        id_prefix(run),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // NCCL/RCCL version, where that plane will actually form: skew
+        // in major.minor refuses the handshake at formation, after the
+        // window was spent, and a walk-in fleet has no roster for a
+        // probe to sweep — this window is the only place the check can
+        // live.
+        if self.config.nccl_backend {
+            if let Some((maj, min, _)) = nccl_version {
+                match self.expected_nccl {
+                    None => self.expected_nccl = Some((maj, min)),
+                    Some((emaj, emin)) if (emaj, emin) != (maj, min) => {
+                        return Err(format!(
+                            "NCCL version skew: this cohort loads \
+                             {emaj}.{emin}.x and {host:?} loads {maj}.{min}.x \
+                             — NCCL refuses its handshake across major.minor \
+                             skew, at formation. Align the libtorch variants, \
+                             or bridge with `fdl nccl build`",
                         ));
                     }
                     Some(_) => {}
@@ -634,6 +710,12 @@ impl MembershipLedger {
 
 /// Leading 4 bytes of a signature as hex, for reject messages that
 /// should identify without dumping 64 chars.
+/// First 8 chars of a run id, for refusal messages (the full nonce is
+/// noise at the width a log line has).
+fn id_prefix(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
 fn hex_prefix(sig: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(8);
@@ -876,20 +958,30 @@ fn handle_join_dial(
             return Err(why);
         }
     };
-    let JoinMsgWire::Hello { host, local_devices, gpus, libtorch, dataset_sig } = msg
+    let JoinMsgWire::Hello {
+        host,
+        local_devices,
+        gpus,
+        libtorch,
+        dataset_sig,
+        run_id,
+        nccl_version,
+    } = msg
     else {
         let why = "first join-channel message must be Hello".to_string();
         reject(stream, join_key, &why);
         return Err(why);
     };
-    let ranks = match ledger.admit(
-        &host,
+    let offer = JoinOffer {
+        host: host.clone(),
         local_devices,
         gpus,
         libtorch,
         dataset_sig,
-        started.elapsed(),
-    ) {
+        run_id,
+        nccl_version,
+    };
+    let ranks = match ledger.admit(offer, started.elapsed()) {
         Ok(r) => r,
         Err(why) => {
             reject(stream, join_key, &why);

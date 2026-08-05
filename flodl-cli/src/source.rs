@@ -126,6 +126,17 @@ pub struct Manifest {
     /// Unix seconds at publish, so a box can say how old its run is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_epoch: Option<u64>,
+    /// Identity of this publish, a fresh nonce every time (hex). It
+    /// rides each worker's join hello, and the window refuses a cohort
+    /// whose members hold different ids — two boxes that fetched across
+    /// a publish boundary would train two different runs as one world.
+    /// A nonce rather than a content hash on purpose: the common
+    /// re-publish is "same args, new code", which a manifest hash would
+    /// call identical, and hashing the tree buys the same answer for
+    /// the price of reading every file. `None` (an old manifest, a
+    /// hand-built tree) gates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// False when the publish skipped its build gate (`--no-build`), so a
     /// worker can say out loud that nothing has compiled this tree yet.
     #[serde(default)]
