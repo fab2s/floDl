@@ -212,6 +212,9 @@ struct Effective {
     data_path: Option<String>,
     /// Transport that establishes the source root, `<scheme>://<target>`.
     data_source: Option<String>,
+    /// Integrated-GPU host-RAM share of this box; `None` ships nothing
+    /// (the envelope's cluster-scope default, if any, then stands).
+    gpu_ram_share: Option<f64>,
 }
 
 /// Where this box's training binary comes from. `source:` and `bin:` are
@@ -419,6 +422,7 @@ fn resolve_effective(
         libtorch_spec: cli.libtorch.clone().or(block.libtorch),
         data_path: cli.data_path.clone().or(block.data_path),
         data_source: cli.data_source.clone().or(block.data_source),
+        gpu_ram_share: cli.gpu_ram_share.or(block.gpu_ram_share),
     })
 }
 
@@ -550,6 +554,13 @@ fn agent_spec_hex(
     }
     if let Some(run) = &prepared.run_id {
         spec["run_id"] = serde_json::json!(run);
+    }
+    // Host-hardware truth, same as data_path: the agent writes it into
+    // the envelope's host block, overriding any cluster-scope default
+    // the controller stamped. Omitted when undeclared, so that default
+    // stands.
+    if let Some(share) = eff.gpu_ram_share {
+        spec["gpu_ram_share"] = serde_json::json!(share);
     }
     hex_encode(spec.to_string().as_bytes())
 }
@@ -857,6 +868,7 @@ mod tests {
             persist: false,
             data_path: None,
             data_source: None,
+            gpu_ram_share: None,
         }
     }
 
@@ -880,6 +892,7 @@ mod tests {
             args: vec!["--model".into(), "lenet".into()],
             data_path: Some("/flodl/data".into()),
             data_source: Some("sshfs://flodl@ctrl:/srv/data".into()),
+            gpu_ram_share: Some(0.5),
         }
     }
 
@@ -1162,6 +1175,7 @@ mod tests {
             bin: Some("t/bin".into()),
             host: Some("pascal".into()),
             devices: Some("0,1".into()),
+            gpu_ram_share: Some(0.5),
             ..no_flags()
         };
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
@@ -1185,6 +1199,7 @@ mod tests {
         assert_eq!(spec["libtorch"], "builds/sm61-sm120");
         assert_eq!(spec["data_path"], "/flodl/data");
         assert_eq!(spec["run_id"], "a1b2c3d4e5f60718");
+        assert_eq!(spec["gpu_ram_share"], 0.5);
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
@@ -1206,6 +1221,9 @@ mod tests {
         // Same rule for the run id: a `--bin` box carries none, and an
         // absent key is what gates nothing at admission.
         assert!(spec.get("run_id").is_none());
+        // And for the RAM share: an absent key is what lets the
+        // envelope's cluster-scope default stand.
+        assert!(spec.get("gpu_ram_share").is_none());
     }
 
     #[test]

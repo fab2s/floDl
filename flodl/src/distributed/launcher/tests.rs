@@ -575,6 +575,106 @@
         assert_eq!(round.workers[0].data_path.as_deref(), Some("/mnt/corpus"));
     }
 
+    /// The `gpu_ram_share` precedence chain at its one resolution point:
+    /// a per-host declaration wins over the cluster-scope default, a
+    /// silent host inherits the default, and with neither the envelope
+    /// carries no key at all (the training binary keeps its own config).
+    /// The end of the chain is asserted through `LocalCluster`, the
+    /// parser the rank actually runs.
+    #[test]
+    fn gpu_ram_share_resolves_host_over_cluster_default_in_the_envelope() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "gpu_ram_share": 0.5,
+            "workers": [
+                {
+                    "host": "declares",
+                    "ranks": [0],
+                    "local_devices": [0],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl",
+                    "gpu_ram_share": 0.25
+                },
+                {
+                    "host": "silent",
+                    "ranks": [1],
+                    "local_devices": [1],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl"
+                }
+            ]
+        });
+        let full = FullCluster::from_value(&v).unwrap();
+        assert_eq!(full.gpu_ram_share, Some(0.5));
+
+        let declares = full.workers.iter().find(|w| w.host == "declares").unwrap();
+        let silent = full.workers.iter().find(|w| w.host == "silent").unwrap();
+        let a = build_slim_envelope_for(&full, declares, &full.controller.host, false);
+        let b = build_slim_envelope_for(&full, silent, &full.controller.host, false);
+        let a = crate::distributed::LocalCluster::from_value(&a).unwrap();
+        let b = crate::distributed::LocalCluster::from_value(&b).unwrap();
+        assert_eq!(a.gpu_ram_share(), Some(0.25), "the host declaration must win");
+        assert_eq!(b.gpu_ram_share(), Some(0.5), "a silent host inherits the default");
+
+        // No default, no declaration: no key, so a cluster that never
+        // mentions APUs is byte-identical to before the field existed.
+        let mut v = v;
+        v.as_object_mut().unwrap().remove("gpu_ram_share");
+        v["workers"][0].as_object_mut().unwrap().remove("gpu_ram_share");
+        let full = FullCluster::from_value(&v).unwrap();
+        let env = build_slim_envelope_for(
+            &full,
+            &full.workers[0],
+            &full.controller.host,
+            false,
+        );
+        assert!(env["worker"].get("gpu_ram_share").is_none());
+        let parsed = crate::distributed::LocalCluster::from_value(&env).unwrap();
+        assert_eq!(parsed.gpu_ram_share(), None);
+
+        // And the round-trip half: both scopes survive to_json.
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "gpu_ram_share": 0.5,
+            "workers": [{
+                "host": "h",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/opt/flodl",
+                "gpu_ram_share": 0.25
+            }]
+        });
+        let round = FullCluster::from_value(&FullCluster::from_value(&v).unwrap().to_json())
+            .unwrap();
+        assert_eq!(round.gpu_ram_share, Some(0.5));
+        assert_eq!(round.workers[0].gpu_ram_share, Some(0.25));
+    }
+
+    /// Negative and non-number are refused loudly at parse in both
+    /// positions; above 1.0 must PASS — the knob is legal there for a
+    /// platform whose MemTotal under-states what the APU can address,
+    /// so a stricter yml rule would fork the API's semantics.
+    #[test]
+    fn gpu_ram_share_refuses_negatives_but_keeps_above_one_legal() {
+        let mut v = canonical_full_json();
+        v["gpu_ram_share"] = json!(-0.1);
+        let err = FullCluster::from_value(&v).unwrap_err().to_string();
+        assert!(
+            err.contains("cluster.gpu_ram_share") && err.contains("non-negative"),
+            "got: {err}"
+        );
+
+        let mut v = canonical_full_json();
+        v["workers"][0]["gpu_ram_share"] = json!("half");
+        let err = FullCluster::from_value(&v).unwrap_err().to_string();
+        assert!(err.contains("gpu_ram_share"), "got: {err}");
+
+        let mut v = canonical_full_json();
+        v["gpu_ram_share"] = json!(1.2);
+        assert_eq!(FullCluster::from_value(&v).unwrap().gpu_ram_share, Some(1.2));
+    }
+
     #[test]
     fn slim_envelope_emits_explicit_local_devices_when_present() {
         let full = FullCluster::from_value(&canonical_full_json()).unwrap();

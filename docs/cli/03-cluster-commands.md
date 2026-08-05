@@ -149,11 +149,30 @@ else `/opt/rocm` — resolved ahead of libtorch's bundled copy), `--to
 <dir>` (the served directory, default `~/.flodl/run`; the guardrail
 key's `rrsync -ro` scopes to exactly this, so pick it deliberately),
 `--identity <key>` (for an `rsync://` source the controller itself pulls
-over ssh) and `--no-build` (skip the gate — recorded in the manifest,
-loudly). One deliberate asymmetry with `fdl join`: publish owns the
-whole command so its flags are bare (`--cwd`), while join prefixes its
-source flags (`--source-cwd`) because join also carries data, tunnel and
-libtorch surfaces.
+over ssh), `--no-build` (skip the gate — recorded in the manifest,
+loudly), `--gate <variant>` (extra check-builds, below) and `--json`
+(the report as JSON on stdout, notes on stderr — the machine twin of the
+human report, same data). One deliberate asymmetry with `fdl join`:
+publish owns the whole command so its flags are bare (`--cwd`), while
+join prefixes its source flags (`--source-cwd`) because join also
+carries data, tunnel and libtorch surfaces.
+
+**A standing `publish:` block** in fdl.yml (or the active env overlay)
+carries all of the above, so re-publishing a run is one bare `fdl
+publish`. Flags win field by field, and a `--` tail replaces the block's
+`args:` outright — even an empty tail, because the args belong to the
+run and "explicitly none" must be sayable. `--no-build` has no block
+field on purpose: a standing config that skips the gate would ship every
+future typo to the fleet.
+
+```yaml
+publish:
+  source: file:///home/op/rdl
+  cwd: ddp-bench
+  build: cargo build --release --features "$FDL_GPU_FEATURE" --bin ddp-bench
+  bin: target/release/ddp-bench
+  args: [--model, olmo-graph, --epochs, "1"]
+```
 
 **The manifest is `.fdl-run.yml`**, at the tree root:
 
@@ -194,6 +213,16 @@ logs nobody is watching. It proves the tree for the *controller's*
 variant only: a break that exists solely under `--features rocm` passes
 a CUDA gate and lands on a worker. `--no-build` skips it and the
 manifest records that nothing has compiled this tree.
+
+`--gate <variant>` closes that per-vendor hole from the controller:
+each one runs the same recipe as an extra check-build against a named
+libtorch variant (`--gate precompiled/rocm70` on a CUDA controller, and
+vice versa), under its own `CARGO_TARGET_DIR` so every variant's
+incremental cache stays warm. No GPU is needed — linking is the proof —
+but a flodl-linking crate does need that vendor's *dev headers* on the
+controller (libtorch bundles runtime libraries, not headers); a gate on
+a box without them fails loudly with the exact package line to install.
+A failed check-build publishes nothing, exactly like the primary gate.
 
 **The manifest's presence is the commit point.** `fdl publish` removes
 it before it touches the tree and writes it only once the build has
@@ -289,6 +318,12 @@ source on its next re-dial, with no reprovisioning.
   root is mounted during provisioning and `--data-path` is declared
   bare. Both are in the [guardrail
   recipe](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window).
+- **The integrated-GPU RAM share**, when `--gpu-ram-share` (or
+  `join.gpu_ram_share:`) declares one: shipped to this box's ranks the
+  same way `--data-path` is, where it overrides any cluster-scope
+  default the controller declared and fills the training binary's
+  config when that left the knob unset. APU boxes only; discrete GPUs
+  ignore it.
 - **The local directories.** `~/.flodl/data` (the across-run dataset
   cache) and the temp dir (the within-run disk stage) are proven writable
   by writing. RAM-backed (`tmpfs`) or nearly-full volumes are reported,

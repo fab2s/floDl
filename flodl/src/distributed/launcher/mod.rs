@@ -681,6 +681,11 @@ fn synthesize_world<'a>(
                 // writes it into this envelope on arrival
                 // (`AgentSpec::data_path`).
                 data_path: None,
+                // Same class of fact, same road: None here lets the
+                // cluster-scope default flow into the slim envelope,
+                // and the box's own `join.gpu_ram_share:` overrides it
+                // at localization.
+                gpu_ram_share: None,
                 ssh: None,
                 // On a loopback-bound mux a walk-in can only have
                 // arrived through an sshd forward, so its rank children
@@ -697,6 +702,7 @@ fn synthesize_world<'a>(
         workers,
         salt,
         env: config.env.clone(),
+        gpu_ram_share: config.gpu_ram_share,
     }
 }
 
@@ -1066,9 +1072,10 @@ pub fn run_launcher_with_config(
                 libtorch: host.arch.clone().unwrap_or_default(),
                 dataset_sig_hex: None,
                 // Fan-out: the roster already carries this host's source
-                // root into its envelope, so the agent has nothing to
-                // localize.
+                // root and resolved RAM share into its envelope, so the
+                // agent has nothing to localize.
                 data_path: None,
+                gpu_ram_share: None,
             };
             if host.host == me {
                 // Merged env for the local children (cluster-scope

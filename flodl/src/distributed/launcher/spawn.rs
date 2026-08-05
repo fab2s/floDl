@@ -895,6 +895,14 @@ pub(super) fn build_slim_envelope_for(
     if let Some(d) = &worker.data_path {
         host_obj.insert("data_path".into(), Value::String(d.clone()));
     }
+    // Integrated-GPU host-RAM share: the per-host declaration wins over
+    // the cluster-scope default. This is the ONE resolution point — a
+    // walk-in's synthesized entry carries None, so the default flows to
+    // it too, and its own `join.gpu_ram_share:` (host truth) overwrites
+    // the value at envelope localization on its box.
+    if let Some(g) = worker.gpu_ram_share.or(full.gpu_ram_share) {
+        host_obj.insert("gpu_ram_share".into(), Value::from(g));
+    }
 
     let mut controller_obj = serde_json::Map::new();
     controller_obj.insert(

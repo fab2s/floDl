@@ -107,6 +107,17 @@
 #     nothing travels and the binary keeps its own default, so the
 #     `/flodl/data` convention below is what `fdl probe` checks against,
 #     never something a run is silently pointed at.
+#   - `gpu_ram_share:` (optional) integrated-GPU host-RAM share for
+#     this host: the fraction of its physical RAM the APU's GPU
+#     aperture claims, e.g. 0.5 (the library's `gpu_ram_share` knob;
+#     discrete-GPU hosts ignore it, and above 1.0 is legal where the
+#     platform under-states the aperture). Host-hardware truth like
+#     `data_path:` -- it rides the same envelope and fills the training
+#     binary's config when that left the knob unset (an explicit
+#     `with_gpu_ram_share` in code still wins). A cluster-scope
+#     `gpu_ram_share:` (sibling of `env:`, below) sets a fleet default
+#     for the identical-APU-farm case; the per-host value overrides it,
+#     and a walk-in's own `join.gpu_ram_share:` overrides both.
 #
 # `controller.port:` defaults to 1337 when omitted (replaces
 # PyTorch's MASTER_PORT default of 29500). This single port carries
@@ -207,6 +218,7 @@ cluster:
                                       # rank binary runs directly over SSH. Omit when
                                       # this worker runs flodl natively.
       # data_path: /flodl/data        # dataset source root; declaring it feeds every rank
+      # gpu_ram_share: 0.5            # APU hosts only: fraction of host RAM the GPU claims
 
     - host: node-b
       ssh:                            # optional sub-block; omit entirely to use defaults
@@ -244,6 +256,13 @@ cluster:
   # Per-worker `env:` blocks override matching keys.
   # env:
   #   NCCL_DEBUG: INFO
+
+  # Cluster-scope APU default: the integrated-GPU host-RAM share every
+  # host gets unless its own entry (or a walk-in's `join.gpu_ram_share:`)
+  # overrides it. Discrete-GPU hosts ignore it, so it is legal on a
+  # mixed fleet; the case it exists for is a farm of identical APU
+  # boxes, where one line covers walk-ins never enumerated here.
+  # gpu_ram_share: 0.5
 
 # ---------------------------------------------------------------------------
 # commands: which commands fan out to the cluster.

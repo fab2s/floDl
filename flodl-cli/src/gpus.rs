@@ -167,10 +167,12 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
             tunnel: false,
             arch: None,
             data_path: None,
+            gpu_ram_share: None,
             docker: None,
             env: std::collections::BTreeMap::new(),
         }],
         env: std::collections::BTreeMap::new(),
+        gpu_ram_share: None,
     })
 }
 

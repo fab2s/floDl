@@ -100,6 +100,19 @@ pub struct ClusterConfig {
     /// keys.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Cluster-scope default for the integrated-GPU host-RAM share: the
+    /// fraction of `MemTotal` an APU host's GPU aperture claims (the
+    /// library's `gpu_ram_share` knob). Discrete-GPU hosts ignore it,
+    /// which is what makes a fleet-wide default legal on a mixed fleet;
+    /// the case it exists for is a farm of identical APU boxes, where
+    /// one line here covers walk-ins the controller never enumerates.
+    /// Per-worker [`ClusterWorker::gpu_ram_share`] overrides it, and a
+    /// walk-in's own `join.gpu_ram_share:` overrides both (host truth
+    /// wins). Non-negative fraction of `MemTotal` (above 1.0 is legal
+    /// where the platform under-states the aperture); unset ships
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ram_share: Option<f64>,
 }
 
 /// Controller-side cluster config. Holds the rendezvous bind point and
@@ -306,6 +319,17 @@ pub struct WorkerJoin {
     /// writes it, so the kernel, not a convention, enforces that.
     #[serde(default)]
     pub data_source: Option<String>,
+    /// Integrated-GPU host-RAM share for THIS box: the fraction of
+    /// `MemTotal` its GPU aperture claims (the library's
+    /// `gpu_ram_share` knob; discrete GPUs ignore it). Same role as a
+    /// fan-out host's `cluster.workers[].gpu_ram_share`, riding the
+    /// same envelope road: the agent writes it into this host's block
+    /// at join time, where it overrides any cluster-scope default the
+    /// controller stamped. Non-negative fraction of `MemTotal` (above
+    /// 1.0 is legal where the platform under-states the aperture);
+    /// unset ships nothing.
+    #[serde(default)]
+    pub gpu_ram_share: Option<f64>,
     /// Arguments for the training binary (the binary's own training
     /// flags). A `--` tail on the command line replaces this list.
     #[serde(default)]
@@ -369,6 +393,45 @@ pub struct WorkerSource {
     /// it here for a box the operator drives by hand.
     #[serde(default)]
     pub bin: Option<String>,
+}
+
+/// Top-level `publish:` block — the controller's standing answers for
+/// `fdl publish`, so re-publishing a run is one bare command. Every
+/// field mirrors a flag 1:1 and the FLAG WINS when both are given; a
+/// `--` tail replaces `args:` outright (even an empty tail, because
+/// "explicitly none" must be sayable — the args belong to the RUN).
+///
+/// `--no-build` has no field here ON PURPOSE: a standing config that
+/// silently skips the gate would ship every future typo to the fleet.
+/// The escape hatch stays a per-invocation decision.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishBlock {
+    /// Source to publish, same grammar as `join.source.from:`
+    /// (`file://`, `rsync://`, `git+https://…#<ref>`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Built artifact, relative to the project directory — what workers
+    /// run (`--bin`).
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// Project directory inside the tree (`--cwd`; default: its root).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Build recipe for the gate, a shell line (`--build`; default
+    /// `cargo build --release`).
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Served directory (`--to`; default `~/.flodl/run`).
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Identity file for a source pulled over ssh (`--identity`).
+    #[serde(default)]
+    pub identity: Option<String>,
+    /// The run's own arguments — what rank children re-enter the binary
+    /// with. A command-line `--` tail replaces this list.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// CUDA device indices on a host. Either explicit (a list of indices) or
@@ -596,6 +659,18 @@ pub struct ClusterWorker {
     /// directory most hosts do not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share for THIS host: the fraction of
+    /// `MemTotal` its GPU aperture claims (the library's
+    /// `gpu_ram_share` knob; discrete GPUs ignore it). Host-hardware
+    /// truth like `data_path`: it travels to this host's ranks through
+    /// the launcher envelope and fills the training binary's config
+    /// when that left the knob unset (an explicit `with_gpu_ram_share`
+    /// in code still wins). Overrides the cluster-scope
+    /// [`ClusterConfig::gpu_ram_share`] default. Non-negative fraction
+    /// of `MemTotal` (above 1.0 is legal where the platform
+    /// under-states the aperture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ram_share: Option<f64>,
     /// Names the docker compose service that provides this host's
     /// runtime environment (e.g. `cuda`, `dev`). It does NOT wrap the
     /// training exec: cluster fan-out runs each rank's binary directly

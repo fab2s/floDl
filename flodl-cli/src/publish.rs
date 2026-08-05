@@ -38,9 +38,33 @@ const TREE_SUBDIR: &str = "tree";
 /// Run `fdl publish`. `args_tail` is everything after a standalone `--`:
 /// the training binary's own arguments, which belong to the RUN and
 /// therefore to the manifest rather than to any worker's config.
+///
+/// A top-level `publish:` block in fdl.yml (or the active env overlay)
+/// supplies standing answers so re-publishing a run is one bare
+/// command; flags win field by field, and a `--` tail replaces the
+/// block's `args:` outright.
 pub fn run(cli: &PublishArgs, args_tail: Option<&[String]>) -> i32 {
-    match publish(cli, args_tail) {
-        Ok(()) => 0,
+    let block = match load_publish_block() {
+        Ok(block) => block,
+        Err(e) => {
+            crate::cli_error!("{e}");
+            return 1;
+        }
+    };
+    let (cli, tail) = with_block_defaults(cli, args_tail, block);
+    match publish(&cli, tail.as_deref()) {
+        Ok((served, tree, manifest)) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report_value(&served, &tree, &manifest))
+                        .expect("a report value serializes"),
+                );
+            } else {
+                report(&served, &tree, &manifest);
+            }
+            0
+        }
         Err(fail) => {
             crate::cli_error!("{}", fail.message());
             1
@@ -48,20 +72,70 @@ pub fn run(cli: &PublishArgs, args_tail: Option<&[String]>) -> i32 {
     }
 }
 
-fn publish(cli: &PublishArgs, args_tail: Option<&[String]>) -> Result<(), Fail> {
+/// The top-level `publish:` block from the project config, honoring the
+/// active env overlay — the same walk `fdl join` does for its block.
+/// `Ok(None)` when no project (or no block) exists: flags then carry
+/// everything. A present-but-broken config is a loud error, never a
+/// silent fallback.
+fn load_publish_block() -> Result<Option<crate::config::PublishBlock>, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("cannot read the current directory: {e}"))?;
+    let Some(config_path) = crate::config::find_project_config(&cwd) else {
+        return Ok(None);
+    };
+    let env_name = std::env::var("FDL_ENV").ok().filter(|s| !s.trim().is_empty());
+    let project = crate::config::load_project_with_env(&config_path, env_name.as_deref())
+        .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
+    Ok(project.publish)
+}
+
+/// Fill flag gaps from the block. Flags win field by field; the `--`
+/// tail replaces `args:` outright, EVEN WHEN EMPTY — the args belong to
+/// the run, so "explicitly none" must be sayable. `--no-build` stays
+/// flag-only on purpose: a standing config that skips the gate would
+/// ship every future typo to the fleet.
+fn with_block_defaults(
+    cli: &PublishArgs,
+    args_tail: Option<&[String]>,
+    block: Option<crate::config::PublishBlock>,
+) -> (PublishArgs, Option<Vec<String>>) {
+    let block = block.unwrap_or_default();
+    let merged = PublishArgs {
+        source: cli.source.clone().or(block.source),
+        bin: cli.bin.clone().or(block.bin),
+        cwd: cli.cwd.clone().or(block.cwd),
+        build: cli.build.clone().or(block.build),
+        to: cli.to.clone().or(block.to),
+        no_build: cli.no_build,
+        identity: cli.identity.clone().or(block.identity),
+        json: cli.json,
+        gate: cli.gate.clone(),
+    };
+    let tail = match args_tail {
+        Some(t) => Some(t.to_vec()),
+        None => (!block.args.is_empty()).then_some(block.args),
+    };
+    (merged, tail)
+}
+
+fn publish(
+    cli: &PublishArgs,
+    args_tail: Option<&[String]>,
+) -> Result<(PathBuf, PathBuf, Manifest), Fail> {
     let Some(spec) = cli.source.as_deref() else {
         return Err(Fail::Permanent(
             "fdl publish needs a source to publish, e.g. `fdl publish \
-             file:///home/op/my-train --bin target/release/my-train`"
+             file:///home/op/my-train --bin target/release/my-train` — or \
+             a standing `publish:` block in fdl.yml carrying both"
                 .to_string(),
         ));
     };
     let Some(bin) = cli.bin.as_deref() else {
         return Err(Fail::Permanent(
             "fdl publish needs `--bin <path relative to the project dir>` \
-             — it is what workers run, and it cannot be guessed (a \
-             workspace member's build lands in the WORKSPACE target/, not \
-             the member's)"
+             (or `publish.bin:` in fdl.yml) — it is what workers run, and \
+             it cannot be guessed (a workspace member's build lands in the \
+             WORKSPACE target/, not the member's)"
                 .to_string(),
         ));
     };
@@ -95,9 +169,20 @@ fn publish(cli: &PublishArgs, args_tail: Option<&[String]>) -> Result<(), Fail> 
                  worker to fetch it is where a broken build will surface"
                     .to_string(),
             );
+            if !cli.gate.is_empty() {
+                notes.push(
+                    "--no-build also skips the --gate check-builds — they \
+                     are builds"
+                        .to_string(),
+                );
+            }
             false
         } else {
             build_gate(&tree, cli, bin, &mut notes)?;
+            let root = Context::resolve().root;
+            for variant in &cli.gate {
+                check_gate_variant(&root, &tree, cli, variant, &mut notes)?;
+            }
             true
         };
         Ok(Manifest {
@@ -115,9 +200,7 @@ fn publish(cli: &PublishArgs, args_tail: Option<&[String]>) -> Result<(), Fail> 
     crate::prepare::print_notes("publish", &notes);
     let manifest = result?;
     manifest.write(&tree)?;
-
-    report(&served, &tree, &manifest);
-    Ok(())
+    Ok((served, tree, manifest))
 }
 
 /// Compile the tree once, against this box's own libtorch.
@@ -150,6 +233,76 @@ fn build_gate(
                 e.message(),
             ))
         })
+}
+
+/// One `--gate <variant>` check-build: the same recipe against a named
+/// libtorch variant, so a break that exists only under the other
+/// vendor's feature dies here instead of on a worker. Linking needs no
+/// GPU — a CPU-only controller proves both vendors this way — but a
+/// flodl-linking crate still needs the vendor's dev headers on this
+/// box: libtorch bundles runtime libraries, not headers, and flodl-sys'
+/// pre-flight fails the gate loudly with the exact package line.
+///
+/// The compile runs under its own `CARGO_TARGET_DIR` so each variant's
+/// incremental cache stays warm (a shared target/ would rebuild the
+/// world on every `LIBTORCH_PATH` flip) — which also moves the artifact
+/// away from the `bin:` convention, so success alone is the verdict
+/// (`source::check_build`).
+fn check_gate_variant(
+    root: &Path,
+    tree: &Path,
+    cli: &PublishArgs,
+    variant: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), Fail> {
+    let dir = root.join("libtorch").join(variant);
+    if !dir.join("lib").is_dir() {
+        return Err(Fail::Permanent(format!(
+            "--gate {variant}: no libtorch at {} — `fdl libtorch download` \
+             can fetch it (a check-build needs no GPU, only the libraries \
+             to link against)",
+            dir.display(),
+        )));
+    }
+    let mut env = source::build_env(Some(&(dir, variant.to_string())));
+    env.push((
+        "CARGO_TARGET_DIR".to_string(),
+        format!("target/gate/{}", variant.replace('/', "-")),
+    ));
+    notes.push(format!("gate: check-building against {variant}"));
+    source::check_build(tree, cli.cwd.as_deref(), cli.build.as_deref(), &env, notes).map_err(
+        |e| {
+            Fail::Permanent(format!(
+                "--gate {variant}: {}. Nothing was published, so the fleet \
+                 keeps running whatever it had",
+                e.message(),
+            ))
+        },
+    )
+}
+
+/// The report as data — the single source both renderers draw from, so
+/// the JSON twin cannot drift from the human text. `worker_specs`
+/// carries BOTH source-spec spellings because which one is right is a
+/// property of the serving key (plain ssh vs rrsync-guardrailed), which
+/// only the reader knows.
+fn report_value(served: &Path, tree: &Path, manifest: &Manifest) -> serde_json::Value {
+    let host = crate::cluster::resolve_local_hostname();
+    serde_json::json!({
+        "tree": tree.display().to_string(),
+        "served": served.display().to_string(),
+        "built": manifest.built,
+        "toolchain": manifest.rustc,
+        "args": manifest.args,
+        "run": manifest.run,
+        "origin": manifest.origin,
+        "published_epoch": manifest.published_epoch,
+        "host": host,
+        "worker_specs": {
+            "plain": format!("rsync://{}:{}", host, tree.display()),
+            "rrsync": format!("rsync://{host}:/{TREE_SUBDIR}"),
+        },
+    })
 }
 
 /// What the operator needs to hand a worker, and what the run now is.
@@ -264,6 +417,8 @@ mod tests {
             build: None,
             no_build: true,
             identity: None,
+            json: false,
+            gate: Vec::new(),
         }
     }
 
@@ -413,6 +568,124 @@ mod tests {
             "the absolute path must NOT resolve behind rrsync — if this \
              starts passing, the report's pairing text is stale",
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The flags-over-block contract, on a literal block (no file IO —
+    /// the loader is `fdl join`'s own walk, already covered there).
+    #[test]
+    fn the_publish_block_fills_gaps_and_flags_win() {
+        let block = crate::config::PublishBlock {
+            source: Some("file:///srv/train".into()),
+            bin: Some("target/release/train".into()),
+            cwd: Some("member".into()),
+            build: Some("./ci/build.sh".into()),
+            to: Some("/srv/run".into()),
+            identity: Some("/etc/flodl/pub_key".into()),
+            args: vec!["--model".into(), "olmo".into()],
+        };
+
+        // Bare `fdl publish`: the block carries everything.
+        let bare = PublishArgs {
+            source: None,
+            bin: None,
+            to: None,
+            cwd: None,
+            build: None,
+            no_build: false,
+            identity: None,
+            json: false,
+            gate: Vec::new(),
+        };
+        let (merged, tail) = with_block_defaults(&bare, None, Some(block.clone()));
+        assert_eq!(merged.source.as_deref(), Some("file:///srv/train"));
+        assert_eq!(merged.bin.as_deref(), Some("target/release/train"));
+        assert_eq!(merged.cwd.as_deref(), Some("member"));
+        assert_eq!(merged.build.as_deref(), Some("./ci/build.sh"));
+        assert_eq!(merged.to.as_deref(), Some("/srv/run"));
+        assert_eq!(merged.identity.as_deref(), Some("/etc/flodl/pub_key"));
+        assert_eq!(tail.as_deref(), Some(&["--model".to_string(), "olmo".to_string()][..]));
+
+        // Flags win field by field, and an EMPTY `--` tail replaces the
+        // block's args — explicitly none is a sayable answer.
+        let flags = PublishArgs {
+            source: Some("rsync://exa:/home/op/tree".into()),
+            bin: None,
+            to: None,
+            cwd: None,
+            build: None,
+            no_build: false,
+            identity: None,
+            json: false,
+            gate: Vec::new(),
+        };
+        let empty: Vec<String> = Vec::new();
+        let (merged, tail) = with_block_defaults(&flags, Some(&empty), Some(block));
+        assert_eq!(merged.source.as_deref(), Some("rsync://exa:/home/op/tree"));
+        assert_eq!(merged.bin.as_deref(), Some("target/release/train"));
+        assert_eq!(tail.as_deref(), Some(&[][..]), "an empty tail must replace, not defer");
+
+        // No block at all: flags and tail pass through untouched.
+        let (merged, tail) = with_block_defaults(&bare, None, None);
+        assert_eq!(merged.source, None);
+        assert_eq!(tail, None);
+    }
+
+    /// The report's two renderings draw from one value; this pins the
+    /// machine twin's shape (the dashboard contract).
+    #[test]
+    fn the_json_report_carries_both_worker_spellings() {
+        let manifest = Manifest {
+            bin: "target/release/train".into(),
+            args: vec!["--model".into(), "olmo".into()],
+            run: Some("a1b2c3d4e5f60718".into()),
+            rustc: Some("rustc 1.90.0".into()),
+            built: true,
+            ..Default::default()
+        };
+        let v = report_value(Path::new("/srv/run"), Path::new("/srv/run/tree"), &manifest);
+        assert_eq!(v["tree"], "/srv/run/tree");
+        assert_eq!(v["served"], "/srv/run");
+        assert_eq!(v["built"], true);
+        assert_eq!(v["run"], "a1b2c3d4e5f60718");
+        assert_eq!(v["args"], serde_json::json!(["--model", "olmo"]));
+        let host = crate::cluster::resolve_local_hostname();
+        assert_eq!(v["worker_specs"]["plain"], format!("rsync://{host}:/srv/run/tree"));
+        assert_eq!(v["worker_specs"]["rrsync"], format!("rsync://{host}:/tree"));
+    }
+
+    /// `--gate <variant>`: a missing variant names the fetch, a present
+    /// one runs the recipe with that variant's env (the rocm feature
+    /// derivation and the per-variant CARGO_TARGET_DIR are what the
+    /// probe recipe asserts), and a recipe failure publishes nothing.
+    #[test]
+    fn a_gate_variant_check_builds_with_that_variants_env() {
+        let base = std::env::temp_dir().join(format!("fdl-publish-gate-{}", std::process::id()));
+        let (root, tree) = (base.join("root"), base.join("tree"));
+        std::fs::create_dir_all(&tree).unwrap();
+        let mut cli = args("file:///unused", "out", "/unused");
+
+        // Absent variant: permanent, names the fetch.
+        let err = check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![])
+            .unwrap_err();
+        assert!(err.message().contains("fdl libtorch download"), "got: {err:?}");
+
+        // Present variant: the recipe sees the rocm feature and its own
+        // target dir, and success needs no artifact anywhere.
+        std::fs::create_dir_all(root.join("libtorch/precompiled/rocm7.0/lib")).unwrap();
+        cli.build = Some(
+            "test \"$FDL_GPU_FEATURE\" = rocm && \
+             test \"$CARGO_TARGET_DIR\" = target/gate/precompiled-rocm7.0"
+                .to_string(),
+        );
+        check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![])
+            .expect("the env probe recipe must pass");
+
+        // A failing check-build reports as "nothing was published".
+        cli.build = Some("exit 3".to_string());
+        let err = check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![])
+            .unwrap_err();
+        assert!(err.message().contains("Nothing was published"), "got: {err:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

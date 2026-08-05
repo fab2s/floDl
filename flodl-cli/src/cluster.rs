@@ -978,6 +978,7 @@ commands:
             },
             workers: Vec::new(),
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let err = prepare_cluster_env(&cluster, None, "train").unwrap_err();
         assert!(err.contains("controller.host"), "got: {err}");
@@ -1021,10 +1022,12 @@ commands:
                 tunnel: false,
                 arch: None,
                 data_path: None,
+                gpu_ram_share: None,
                 docker: None,
                 env: std::collections::BTreeMap::new(),
             }],
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
         assert!(
@@ -1059,10 +1062,12 @@ commands:
                 tunnel: false,
                 arch: None,
                 data_path: None,
+                gpu_ram_share: None,
                 docker: None,
                 env: std::collections::BTreeMap::new(),
             }],
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
         assert!(

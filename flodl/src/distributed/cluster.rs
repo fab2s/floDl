@@ -244,6 +244,17 @@ pub struct WorkerBlock {
     /// [`LocalCluster::data_path`] rather than this field, so
     /// single-host runs take the same code path.
     pub data_path: Option<String>,
+
+    /// Integrated-GPU host-RAM share for this host: the fraction of
+    /// `MemTotal` the GPU aperture claims (same knob as
+    /// `DataLoaderBuilder::gpu_ram_share`; discrete GPUs ignore it).
+    /// Already resolved by the controller (per-host declaration over
+    /// cluster-scope default) and overwritten by a walk-in's own
+    /// `join.gpu_ram_share:` at envelope localization. The trainer
+    /// fills `DdpRunConfig::gpu_ram_share` from it only when the
+    /// binary's config left it `None` — explicit code keeps the last
+    /// word, like a passed `--data-dir` does for `data_path`.
+    pub gpu_ram_share: Option<f64>,
 }
 
 /// This process's dataset source root, or `None` when nothing declared
@@ -440,6 +451,14 @@ impl LocalCluster {
         self.worker.data_path.as_deref()
     }
 
+    /// This host's integrated-GPU RAM share, when anything declared one
+    /// (per-host entry, cluster-scope default, or a walk-in's own join
+    /// config — resolved in that reverse order before the envelope
+    /// reached this process). See [`WorkerBlock::gpu_ram_share`].
+    pub fn gpu_ram_share(&self) -> Option<f64> {
+        self.worker.gpu_ram_share
+    }
+
     /// Consistency check: resolved hostname must match the envelope's
     /// `worker.host`. If they mismatch, the launcher shipped this envelope to
     /// the wrong host -- loud error.
@@ -586,6 +605,18 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         .and_then(Value::as_str)
         .map(String::from);
 
+    // Emitted by the controller as a plain JSON number; anything else
+    // (or out of range) means a corrupt envelope, not user input — the
+    // yml-side validation already happened at topology parse.
+    let gpu_ram_share = match obj.get("gpu_ram_share") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| {
+            TensorError::new(&format!(
+                "cluster.worker ({name:?}): gpu_ram_share must be a number, got {v}"
+            ))
+        })?),
+    };
+
     Ok(WorkerBlock {
         host: name,
         ranks,
@@ -594,6 +625,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         path,
         arch,
         data_path,
+        gpu_ram_share,
     })
 }
 

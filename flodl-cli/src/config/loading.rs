@@ -236,7 +236,44 @@ pub fn load_project_with_env(
         )
     })?;
     reject_user_ranks(&cfg, base_path)?;
+    validate_gpu_ram_shares(&cfg, base_path)?;
     Ok(cfg)
+}
+
+/// Range-check every `gpu_ram_share` at load time: a non-negative,
+/// finite fraction of host RAM. Values above 1.0 are deliberately legal
+/// (the knob exists partly for platforms whose `MemTotal` under-states
+/// what the APU can address), so only a negative or non-finite value is
+/// refused — loud here, where the file and key can be named, not at
+/// launch.
+fn validate_gpu_ram_shares(cfg: &ProjectConfig, base_path: &Path) -> Result<(), String> {
+    let bad = |s: Option<f64>| s.is_some_and(|f| !f.is_finite() || f < 0.0);
+    let err = |key: &str, got: f64| {
+        Err(format!(
+            "{}: {key} must be a non-negative fraction of host RAM \
+             (e.g. 0.5), got {got}",
+            base_path.display(),
+        ))
+    };
+    if let Some(cluster) = &cfg.cluster {
+        if bad(cluster.gpu_ram_share) {
+            return err("cluster.gpu_ram_share", cluster.gpu_ram_share.unwrap());
+        }
+        for (i, w) in cluster.workers.iter().enumerate() {
+            if bad(w.gpu_ram_share) {
+                return err(
+                    &format!("cluster.workers[{i}] ({:?}) gpu_ram_share", w.host),
+                    w.gpu_ram_share.unwrap(),
+                );
+            }
+        }
+    }
+    if let Some(join) = &cfg.join {
+        if bad(join.gpu_ram_share) {
+            return err("join.gpu_ram_share", join.gpu_ram_share.unwrap());
+        }
+    }
+    Ok(())
 }
 
 /// Reject `ranks:` in user-authored worker blocks. The key looks

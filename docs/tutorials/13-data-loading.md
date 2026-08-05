@@ -539,7 +539,13 @@ Two cases need the knob:
   nothing.
 
 The same knob is on the DDP path: `TrainerConfig::with_gpu_ram_share` and
-`DdpRunConfig::with_gpu_ram_share`.
+`DdpRunConfig::with_gpu_ram_share`. On a cluster it is also declarable in
+config, because it is host-hardware truth the binary cannot know per box:
+`cluster.workers[].gpu_ram_share` for a fan-out host, `join.gpu_ram_share`
+in a walk-in's own yml, and a cluster-scope `cluster.gpu_ram_share` as the
+fleet default for a farm of identical APU boxes. A declared value fills the
+config only when the binary left the knob unset; explicit code wins (see
+the [cluster guide](../ddp/02-cluster-guide.md)).
 
 Under DDP the same memory knobs exist on the trainer — `TrainerConfig::with_vram_max_usage` / `with_ram_max_usage` / `with_sample_cache` / `with_disk_stage` / `with_disk_stage_dir` (or the chained `DdpBuilder` twins) — and govern each rank's prefetch channel, device sample pool, and staging tiers with the same defaults and clamps. One sizing policy serves both paths; co-hosted ranks split the host-RAM share in proportion to their schedule, each rank's disk stage writes its own pid-unique pack file, and `FLODL_VRAM_POOL=off` now disables the device sample pool on the solo loader path too (previously DDP-only).
 

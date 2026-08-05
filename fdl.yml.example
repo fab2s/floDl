@@ -226,6 +226,17 @@ commands:
 #   # data_source: sshfs://flodl@ctrl.example.com:/flodl/data
 #   #                               # or sshfs://host:2222/flodl/data
 #
+#   # --- integrated-GPU RAM share on THIS box ------------------------------
+#   # APU boxes only (GPU and system RAM are one pool; discrete GPUs ignore
+#   # it): the fraction of physical RAM the GPU aperture claims, e.g. 0.5
+#   # (above 1.0 is legal where the platform under-states the aperture).
+#   # Host-hardware truth like data_path, riding the same road: the agent
+#   # writes it into this host's envelope block, where it overrides any
+#   # cluster-scope default the controller declared, and it fills the
+#   # training binary's config when that left the knob unset (an explicit
+#   # with_gpu_ram_share in code still wins).
+#   # gpu_ram_share: 0.5
+#
 #   # Preparation (GPU stack, data source root, writable stage dirs, then
 #   # libtorch and the built binary) runs before every dial, so a --persist
 #   # box picks up a changed source on its next re-dial. A failure retrying
@@ -241,3 +252,21 @@ commands:
 #   #   Restart=always
 #   #   RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
 #   #   FailureAction=poweroff       # ... and self-deprovision it
+
+# ---------------------------------------------------------------------------
+# publish: controller-side standing answers for `fdl publish`, so
+# chaining runs on a fleet is one bare `fdl publish`. Every field
+# mirrors a flag 1:1 and the flag wins; a `--` tail on the command line
+# replaces `args:` outright (even an empty tail — the args belong to
+# the run, so "explicitly none" must be sayable). `--no-build` has no
+# field here ON PURPOSE: a standing config that skips the gate would
+# ship every future typo to the fleet.
+# ---------------------------------------------------------------------------
+# publish:
+#   source: file:///home/op/my-train  # or rsync://…, git+https://…#<ref>
+#   bin: target/release/my-train      # what workers run, relative to cwd
+#   # cwd: member-crate               # project dir inside the tree
+#   # build: ./ci/build.sh            # gate recipe (default: cargo build --release)
+#   # to: /srv/flodl/run              # served dir (default: ~/.flodl/run)
+#   # identity: ~/.ssh/publish_key    # key for an ssh-pulled source
+#   # args: [--model, olmo, --epochs, "3"]   # the RUN's args (manifest-bound)

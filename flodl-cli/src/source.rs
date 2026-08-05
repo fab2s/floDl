@@ -526,6 +526,42 @@ pub fn build(
     env: &[(String, String)],
     notes: &mut Vec<String>,
 ) -> Result<Built, Fail> {
+    let dir = run_recipe(tree, cwd, cmd, env, notes)?;
+    let path = dir.join(bin);
+    if !path.is_file() {
+        return Err(Fail::Permanent(format!(
+            "the build succeeded but `bin: {bin}` is not there ({}) — it \
+             is the artifact path relative to `cwd:`, e.g. \
+             `target/release/<name>`",
+            path.display(),
+        )));
+    }
+    Ok(Built { bin: path, cwd: dir })
+}
+
+/// Run the recipe for the compile alone, no artifact check — the shape
+/// an extra publish gate wants: its `CARGO_TARGET_DIR` points somewhere
+/// the `bin:` convention does not, and success IS its whole verdict.
+pub fn check_build(
+    tree: &Path,
+    cwd: Option<&str>,
+    cmd: Option<&str>,
+    env: &[(String, String)],
+    notes: &mut Vec<String>,
+) -> Result<(), Fail> {
+    run_recipe(tree, cwd, cmd, env, notes).map(|_| ())
+}
+
+/// The shared compile step: resolve the project dir, run the recipe in
+/// it with fdl's resolved env, classify the failure. Returns the dir so
+/// [`build`] can anchor its artifact check on it.
+fn run_recipe(
+    tree: &Path,
+    cwd: Option<&str>,
+    cmd: Option<&str>,
+    env: &[(String, String)],
+    notes: &mut Vec<String>,
+) -> Result<PathBuf, Fail> {
     let dir = match cwd {
         Some(sub) => tree.join(sub),
         None => tree.to_path_buf(),
@@ -572,17 +608,7 @@ pub fn build(
              output above"
         )));
     }
-
-    let path = dir.join(bin);
-    if !path.is_file() {
-        return Err(Fail::Permanent(format!(
-            "the build succeeded but `bin: {bin}` is not there ({}) — it \
-             is the artifact path relative to `cwd:`, e.g. \
-             `target/release/<name>`",
-            path.display(),
-        )));
-    }
-    Ok(Built { bin: path, cwd: dir })
+    Ok(dir)
 }
 
 #[cfg(test)]

@@ -223,6 +223,11 @@ pub struct JoinArgs {
     /// already mounted, e.g. `sshfs://user@ctrl:/flodl/data`.
     #[option]
     pub data_source: Option<String>,
+    /// Integrated-GPU host-RAM share of this box, a fraction of its
+    /// physical RAM, e.g. 0.5 (APU boxes only; discrete GPUs ignore
+    /// it). Ships to this host's ranks like `--data-path` does.
+    #[option]
+    pub gpu_ram_share: Option<f64>,
 }
 
 /// Publish a training run for a fleet to pull.
@@ -278,6 +283,19 @@ pub struct PublishArgs {
     /// Identity file for a source pulled over ssh (`rsync -e ssh -i`).
     #[option]
     pub identity: Option<String>,
+    /// Emit the report as JSON on stdout (notes stay on stderr). The
+    /// machine twin of the human report, for dashboards and scripts.
+    #[option]
+    pub json: bool,
+    /// Extra check-build against another libtorch variant (a subpath
+    /// under `<project>/libtorch/`, e.g. `precompiled/rocm70`).
+    /// Repeatable. The primary gate proves only this box's variant, so
+    /// a break that exists only under the other vendor's feature would
+    /// land on a worker. Needs no GPU; a flodl-linking crate still
+    /// needs that vendor's dev headers here (a package install, and
+    /// the failure names the exact one).
+    #[option]
+    pub gate: Vec<String>,
 }
 
 impl PublishArgs {

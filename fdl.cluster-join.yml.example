@@ -93,6 +93,13 @@ cluster:
 
   workers: []                          # deliberately empty -- walk-ins fill it
 
+  # Fleet default for an identical-APU farm: the fraction of host RAM
+  # each box's integrated GPU claims. It reaches every walk-in through
+  # its envelope (no roster needed); a box that knows better declares
+  # `join.gpu_ram_share:` in its own yml and wins. Discrete-GPU boxes
+  # ignore it. Leave commented on a discrete-GPU fleet.
+  # gpu_ram_share: 0.5
+
 commands:
   # The controller still enters the launcher path to OPEN the window, so the
   # command it hosts is marked `cluster: true` exactly as in fdl.cluster.yml.

@@ -83,6 +83,18 @@ Conventions:
 - `tunnel:` (optional) routes this worker's training traffic through
   its fan-out SSH session instead of a direct TCP connection - see
   below.
+- `gpu_ram_share:` (optional, APU hosts only) the fraction of this
+  host's physical RAM its integrated GPU's aperture claims, e.g. `0.5`
+  (the library's `gpu_ram_share` knob; discrete-GPU hosts ignore it,
+  and above `1.0` is legal where the platform under-states the
+  aperture).
+  Host-hardware truth like `data_path:`: it rides the envelope and
+  fills the training binary's config when that left the knob unset -
+  an explicit `with_gpu_ram_share` in code still wins. A cluster-scope
+  `gpu_ram_share:` (sibling of the cluster `env:` block) sets a fleet
+  default for the identical-APU-farm case; a host entry overrides it,
+  and a walk-in's own `join.gpu_ram_share:` overrides both, because
+  each later road knows the box better.
 
 ## Dial-in membership: the join window
 
@@ -353,6 +365,14 @@ unset; declare neither and nothing is checked or shipped.
 The mount authenticates with the `ssh:` block's own key, so a
 guardrailed join sshd has to permit sftp for it to come up at all - see
 the recipe below, which is where that costs a decision.
+
+`join.gpu_ram_share:` is the same class of fact for an APU box: the
+fraction of its RAM the integrated GPU claims, which only this box
+knows. It rides the same envelope rewrite as `data_path`, overriding
+the cluster-scope default the controller may have declared for the
+whole farm (`cluster.gpu_ram_share:` in the controller's overlay - the
+one-line answer for a fleet of identical APU boxes). Discrete-GPU
+boxes need neither.
 
 ### Compiling on the node
 

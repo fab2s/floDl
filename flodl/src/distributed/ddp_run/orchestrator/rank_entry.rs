@@ -461,6 +461,15 @@ impl DdpHandle {
             eval_dataset,
             outer_optimizer_factory,
         } = rank_callbacks;
+        // The envelope's integrated-GPU RAM share fills an unset config,
+        // never overrides a set one — an explicit `with_gpu_ram_share`
+        // in the binary keeps the last word, exactly like a passed
+        // `--data-dir` does over the envelope's `data_path`. This is
+        // the one consumption point: both the managed and cooperative
+        // entries route through here before anything reads the field
+        // (`check_apu_sizing` included).
+        let mut config = config;
+        config.gpu_ram_share = config.gpu_ram_share.or(cluster.gpu_ram_share());
         let save_path = config.save_path.clone();
         let total_samples = pick_space(dataset.len(), config.augment);
 
