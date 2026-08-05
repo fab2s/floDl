@@ -277,6 +277,16 @@ pub struct JoinConfigArgs {
     /// never is.
     #[option]
     pub install_key: bool,
+    /// Also emit a cloud-init user-data file: the worker yml, private
+    /// key and systemd unit embedded, so a cloud instance boots
+    /// straight into `fdl join`. A SECRET artifact (key + token
+    /// inside).
+    #[option]
+    pub cloud_init: bool,
+    /// The instance user the cloud-init variant provisions for
+    /// (default: ubuntu).
+    #[option]
+    pub cloud_init_user: Option<String>,
     /// Skip the authorized_keys install (print + notes only).
     #[option]
     pub no_install_key: bool,

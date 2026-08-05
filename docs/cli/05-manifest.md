@@ -354,8 +354,42 @@ Typical overlay files:
 - `fdl.dev.yml` - fast iteration (shorter epochs, smaller batches).
 - `fdl.ci.yml` - CPU-only, minimal epochs, strict validation.
 - `fdl.prod.yml` - full runs, checkpoint to cloud storage.
+- `fdl.<farm>.yml` - a walk-in cluster farm (scaffolded by
+  [`fdl join-config`](03-cluster-commands.md#fdl-join-config)).
 
 Use `fdl config show <env>` to preview the resolved merged config.
+
+### `inherit-from`
+
+Any config file (the base or an overlay) can name a parent to merge
+under with a top-level `inherit-from: <path>`:
+
+```yaml
+# fdl.b300-run.yml — a mostly-empty specialization
+inherit-from: ~/.flodl/farms/b300.yml
+cluster:
+  controller:
+    join:
+      min_rank_start: 4        # this run wants a bigger quorum
+```
+
+The cascade stays CSS-like: the more specific file wins, and the cwd
+`fdl.yml` (when present) is the root the whole chain merges onto. The
+effective layer order is `fdl.yml` → deepest ancestor → … → the file
+itself, and `fdl config show` annotates every line with the layer it
+came from.
+
+Rules: paths resolve relative to the *declaring file* (`~/` names the
+invoking user's home, the natural spot for a base shared between
+projects); chains may nest and a cycle is a loud error listing the full
+loop; the `inherit-from` key itself never reaches the merged config. A
+`://`-shaped value is refused by name: a remote parent is config that
+could change under a standing fleet between two invocations, so it
+stays reserved until pinning is designed.
+
+This is what lets a controller in an ephemeral working directory carry
+a two-line farm file while the shared definition lives wherever you
+keep it: a home directory, a NAS mount, a dotfiles checkout.
 
 ## Preset sub-commands
 

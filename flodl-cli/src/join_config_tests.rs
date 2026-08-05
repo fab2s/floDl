@@ -224,9 +224,32 @@ fn no_flags() -> JoinConfigArgs {
         regen: false,
         install_key: false,
         no_install_key: false,
+        cloud_init: false,
+        cloud_init_user: None,
         yes: false,
         json: false,
     }
+}
+
+#[test]
+fn cloud_init_embeds_the_artifacts_and_the_failure_taxonomy() {
+    let yml = "join:\n  token: t\n  persist: true\n";
+    let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+    let ci = render_cloud_init("b300", "ubuntu", yml, key);
+    assert!(ci.starts_with("#cloud-config\n"));
+    assert!(ci.contains("SECRET ARTIFACT"));
+    // Both payloads land indented under their write_files entries.
+    assert!(ci.contains("      -----BEGIN OPENSSH PRIVATE KEY-----"), "got:\n{ci}");
+    assert!(ci.contains("      join:"), "got:\n{ci}");
+    assert!(ci.contains("path: /home/ubuntu/.ssh/flodl-join"));
+    assert!(ci.contains("permissions: \"0600\""));
+    // The failure taxonomy rides the unit: re-dial transient, stop on
+    // permanent, self-deprovision.
+    assert!(ci.contains("Restart=always"));
+    assert!(ci.contains("RestartPreventExitStatus=2"));
+    assert!(ci.contains("FailureAction=poweroff"));
+    assert!(ci.contains("User=ubuntu"));
+    assert!(ci.contains("systemctl enable --now flodl-join.service"));
 }
 
 #[test]

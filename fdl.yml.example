@@ -120,6 +120,12 @@ commands:
 # so a boot-time `fdl join` needs no flags; every field is overridable
 # on the command line (flags win). See docs/ddp/02-cluster-guide.md
 # "Walking in".
+#
+# `fdl join-config <label>` (on the controller) GENERATES this block
+# ready to paste (keys, token, guardrailed authorized_keys line and a
+# cloud-init variant included) and scaffolds the matching controller
+# overlay fdl.<label>.yml. Assemble by hand only when the wizard's
+# doors don't fit.
 # ---------------------------------------------------------------------------
 # join:
 #   controller: 10.0.0.1:1337       # controller mux address, host[:port]

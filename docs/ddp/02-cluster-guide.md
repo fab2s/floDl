@@ -507,6 +507,14 @@ FailureAction=poweroff       # ... and self-deprovision it
 
 ### Guardrailing the join sshd
 
+Everything this section asks you to assemble — the keypair, the token,
+the composed `authorized_keys` line, the worker yml, the cloud-init
+variant — is produced in one pass by
+[`fdl join-config`](../cli/03-cluster-commands.md#fdl-join-config),
+which can also install its own line into your `authorized_keys`
+(consent-gated). The recipe below is the rationale and the manual
+path.
+
 When workers arrive from outside the
 private network, the sshd their tunnels land on is the trust boundary
 - under `tunnel_only` it is the ONLY door, which is the point. The

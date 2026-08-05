@@ -416,6 +416,75 @@ FailureAction=poweroff       # ... and self-deprovision it
 Full protocol walkthrough, trust model, and the join-sshd guardrail
 recipe: [DDP reference](../ddp/02-cluster-guide.md#dial-in-membership-the-join-window).
 
+## `fdl join-config`
+
+The once-per-farm wizard: everything the guardrail recipe asks an
+operator to assemble by hand, produced in one pass on the controller.
+
+```bash
+fdl join-config b300                       # interactive: prompts have defaults
+fdl join-config b300 --controller flodl-join@ctrl.example.com:2222 \
+                     --install-key --cloud-init --yes    # scripted
+fdl @b300 join-config --regen              # new farm instantiation: rotate credentials
+```
+
+A **farm is an env overlay**: the wizard scaffolds `fdl.<label>.yml`
+(discovery window, `start: manual`, the admission token stamped) and
+`fdl @<label> <cmd>` targets it afterwards with the machinery that
+already exists: deep-merge onto the base fdl.yml, `inherit-from:` for
+[sharing a base between farms](05-manifest.md#inherit-from), `fdl
+config show` provenance. On an existing overlay the wizard only ever
+touches the `token:` line (byte-preserving), and a user-authored
+overlay without one is never edited; the snippet is printed instead.
+
+One invocation produces, under `./.fdl/<label>/` (which gitignores
+itself, since it holds keys):
+
+- **an ed25519 join key**, born per farm so it cannot be shared across
+  clusters by construction (a config referencing an identity outside
+  the farm dir draws a warning), plus a fresh 32-hex token;
+- **the composed `authorized_keys` line** for the chosen door
+  (`--door b` rrsync source pull, the publish-then-join default; `a`
+  read-only sftp data mount; `nologin` tunnel-only) and the sshd
+  `Match` hardening block, saved to `install-notes.md`;
+- **the paste-ready worker `fdl.yml`** speaking that door's dialect,
+  `libtorch: auto`, `persist: true`, the token inside;
+- **a publish recipe derived from the training crate's own manifest**:
+  a path dep on flodl walks the `source:` up to the dep root with
+  `cwd:` pointing back down (what stops the dep dangling outside the
+  fetched tree); a registry dep ships the crate dir alone;
+  `--features "$FDL_GPU_FEATURE"` appears only when the manifest
+  declares `cuda`/`rocm`; a workspace above the crate earns an explicit
+  `bin:` caveat instead of a silent wrong guess;
+- **a freshness report**: whether `Cargo.lock` still describes the
+  source about to ship;
+- with `--cloud-init`, **a user-data file** embedding the worker yml,
+  the private key and the systemd recipe (`Restart=always`,
+  `RestartPreventExitStatus=2`, `FailureAction=poweroff`), so an
+  instance boots straight into `fdl join`. A SECRET artifact (key and
+  token inside), written 0600 and never printed.
+
+The wizard also **offers to install** its `authorized_keys` line into
+the invoking user's own `~/.ssh/authorized_keys`, because the composed
+guardrail line is the artifact most likely to be mangled by hand.
+Consent is explicit only: the prompt, or `--install-key` (`--yes`
+deliberately does not count; it accepts ordinary defaults, and a
+security-relevant mutation is not one). Only the wizard's own line is
+ever touched (identity is the public key material; foreign lines are
+preserved byte for byte), permissions are reported with the exact
+`chmod` and fixed on confirm, the rewrite is atomic, and `/etc/ssh` is
+never edited: the dedicated-user hardening stays in the notes. After
+installing, the wizard checks something is listening where workers will
+dial and says so if not (on macOS: Remote Login).
+
+Credentials are reused on re-runs; `--regen` (or the prompt) rotates
+key and token together for a new farm instantiation, after which
+workers holding the old ones stop being admitted. `--json` emits the
+machine twin; secrets appear as file paths, never payloads.
+
+Exit code: **0** with the report, **1** on any refusal (contradictory
+flags, a decision needed without a tty, an unfixable permission).
+
 ## `fdl nccl`
 
 Build NVIDIA's `libnccl` from source. Required for heterogeneous-rig
