@@ -222,6 +222,8 @@ fn no_flags() -> JoinConfigArgs {
         data_path: None,
         gpu_ram_share: None,
         regen: false,
+        install_key: false,
+        no_install_key: false,
         yes: false,
         json: false,
     }
@@ -294,6 +296,91 @@ fn the_scaffolded_overlay_loads_through_the_real_config_path() {
     assert_eq!(join.start.as_deref(), Some("manual"));
     assert!(cluster.workers.is_empty(), "walk-ins fill the roster");
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// ── authorized_keys upsert ──────────────────────────────────────────────
+
+const OUR_LINE: &str = "restrict,port-forwarding,permitopen=\"127.0.0.1:1337\",\
+    command=\"rrsync -ro /srv/run\" ssh-ed25519 AAAAour flodl-join-b300";
+
+#[test]
+fn key_material_skips_quote_aware_options() {
+    // The options field carries quoted spaces AND commas; the scan must
+    // still land on the key type.
+    assert_eq!(
+        key_material(OUR_LINE),
+        Some(("ssh-ed25519", "AAAAour")),
+    );
+    // A bare line (no options) and other key types.
+    assert_eq!(
+        key_material("ssh-rsa AAAAbare user@host"),
+        Some(("ssh-rsa", "AAAAbare")),
+    );
+    assert_eq!(
+        key_material("sk-ecdsa-sha2-nistp256@openssh.com AAAAsk c"),
+        Some(("sk-ecdsa-sha2-nistp256@openssh.com", "AAAAsk")),
+    );
+    // Comments, blanks, and garbage are not keys.
+    assert_eq!(key_material("# a comment"), None);
+    assert_eq!(key_material(""), None);
+    assert_eq!(key_material("options-only-no-key"), None);
+}
+
+#[test]
+fn upsert_appends_replaces_or_leaves_identical() {
+    // Empty file: appended, trailing newline included.
+    let (out, o) = upsert_authorized_line("", OUR_LINE).unwrap();
+    assert_eq!(o, UpsertOutcome::Appended);
+    assert_eq!(out, format!("{OUR_LINE}\n"));
+
+    // Foreign lines are preserved byte for byte, ours appended after.
+    let foreign = "ssh-ed25519 AAAAforeign someone@laptop\n# a comment\n";
+    let (out, o) = upsert_authorized_line(foreign, OUR_LINE).unwrap();
+    assert_eq!(o, UpsertOutcome::Appended);
+    assert!(out.starts_with(foreign), "foreign content must be untouched");
+    assert!(out.ends_with(&format!("{OUR_LINE}\n")));
+
+    // The same key under DIFFERENT options: replaced in place, the
+    // neighbours untouched.
+    let mixed = "ssh-ed25519 AAAAforeign a@b\nssh-ed25519 AAAAour old-comment\n# tail\n";
+    let (out, o) = upsert_authorized_line(mixed, OUR_LINE).unwrap();
+    assert_eq!(o, UpsertOutcome::Replaced);
+    assert!(out.contains("ssh-ed25519 AAAAforeign a@b\n"));
+    assert!(out.contains(&format!("{OUR_LINE}\n")));
+    assert!(!out.contains("old-comment"));
+    assert!(out.ends_with("# tail\n"));
+
+    // Byte-identical line already present: a no-op that says so.
+    let installed = format!("{OUR_LINE}\n");
+    let (out, o) = upsert_authorized_line(&installed, OUR_LINE).unwrap();
+    assert_eq!(o, UpsertOutcome::Identical);
+    assert_eq!(out, installed);
+}
+
+/// The non-interactive contract: without explicit consent the install
+/// is a skip that says why, never a silent mutation; the two explicit
+/// flags contradict loudly.
+#[test]
+fn install_needs_explicit_consent() {
+    let mut cli = no_flags();
+    cli.yes = true; // --yes is NOT consent for a security mutation
+    let line = OUR_LINE;
+    match install_authorized_line(&cli, line, 1).unwrap() {
+        InstallAction::Skipped(why) => {
+            assert!(why.contains("--install-key"), "got: {why}")
+        }
+        other => panic!("--yes alone must not install, got {other:?}"),
+    }
+    let mut cli = no_flags();
+    cli.no_install_key = true;
+    assert!(matches!(
+        install_authorized_line(&cli, line, 1).unwrap(),
+        InstallAction::Skipped(_),
+    ));
+    let mut cli = no_flags();
+    cli.install_key = true;
+    cli.no_install_key = true;
+    assert!(install_authorized_line(&cli, line, 1).is_err());
 }
 
 #[test]

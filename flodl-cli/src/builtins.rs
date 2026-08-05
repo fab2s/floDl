@@ -271,8 +271,18 @@ pub struct JoinConfigArgs {
     /// holding the old ones stop being admitted.
     #[option]
     pub regen: bool,
+    /// Install the guardrailed line into this user's own
+    /// `~/.ssh/authorized_keys` without asking (the wizard's default
+    /// offer). Only the wizard's own line is ever touched; `/etc/ssh`
+    /// never is.
+    #[option]
+    pub install_key: bool,
+    /// Skip the authorized_keys install (print + notes only).
+    #[option]
+    pub no_install_key: bool,
     /// Accept every default without prompting (non-interactive; reuses
-    /// existing credentials unless `--regen`).
+    /// existing credentials unless `--regen`, installs the key unless
+    /// `--no-install-key`).
     #[option]
     pub yes: bool,
     /// Report as JSON on stdout. Secrets appear as file paths, never

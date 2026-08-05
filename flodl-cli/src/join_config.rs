@@ -118,6 +118,7 @@ struct Report {
     freshness: Option<String>,
     notes_path: PathBuf,
     controller: Endpoint,
+    install: InstallAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +278,9 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     fs::write(&notes_path, notes)
         .map_err(|e| format!("cannot write {}: {e}", notes_path.display()))?;
 
+    // ── The install offer ───────────────────────────────────────────────
+    let install = install_authorized_line(cli, &authorized_line, controller.port)?;
+
     Ok(Report {
         label,
         farm_dir,
@@ -296,7 +300,272 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
         freshness,
         notes_path,
         controller,
+        install,
     })
+}
+
+// ── authorized_keys install ─────────────────────────────────────────────
+
+/// What the install offer decided and did. `Skipped` carries the why so
+/// the report can say it; refusals are ordinary `Err`s (the wizard has
+/// already produced every artifact, but a half-touched authorized_keys
+/// must be loud).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallAction {
+    Installed,
+    Replaced,
+    AlreadyPresent,
+    Skipped(String),
+}
+
+/// The confirm-gated install: append (or replace) the wizard's own line
+/// in the INVOKING user's `~/.ssh/authorized_keys`. Only that line is
+/// ever touched — identity is the public key material itself — and
+/// `/etc/ssh` never is (the dedicated-user hardening stays in the
+/// notes). The friction this removes is real: the composed guardrail
+/// line is the artifact most likely to be mangled by hand, by exactly
+/// the audience least equipped to debug an sshd refusal.
+fn install_authorized_line(
+    cli: &JoinConfigArgs,
+    line: &str,
+    sshd_port: u16,
+) -> Result<InstallAction, String> {
+    if cli.install_key && cli.no_install_key {
+        return Err("--install-key and --no-install-key contradict each other".into());
+    }
+    // Consent to touch authorized_keys is EXPLICIT: the tty prompt or
+    // `--install-key`. `--yes` deliberately does not count — it accepts
+    // ordinary defaults, and a security-relevant mutation is not one.
+    let wanted = if cli.install_key {
+        true
+    } else if cli.no_install_key {
+        false
+    } else if cli.yes || !prompt::has_tty() {
+        return Ok(InstallAction::Skipped(
+            "installing needs explicit consent: the prompt, or --install-key"
+                .to_string(),
+        ));
+    } else {
+        prompt::ask_yn(
+            "install the guardrailed line into this user's \
+             ~/.ssh/authorized_keys now? (only the wizard's own line is \
+             ever touched)",
+            true,
+        )
+    };
+    if !wanted {
+        return Ok(InstallAction::Skipped("declined".to_string()));
+    }
+
+    let ssh_dir = home_dir().join(".ssh");
+    let ak_path = ssh_dir.join("authorized_keys");
+    if !ssh_dir.is_dir() {
+        fs::create_dir_all(&ssh_dir)
+            .map_err(|e| format!("cannot create {}: {e}", ssh_dir.display()))?;
+        set_mode(&ssh_dir, 0o700)?;
+    } else {
+        fix_perms_confirmed(cli, &ssh_dir, 0o700)?;
+    }
+    // sshd refuses to follow surprises here and so does the wizard: a
+    // symlinked authorized_keys is someone's deliberate setup, not a
+    // file to rewrite through.
+    if ak_path.is_symlink() {
+        return Err(format!(
+            "{} is a symlink — install the line manually (it is in the \
+             install notes)",
+            ak_path.display(),
+        ));
+    }
+
+    let content = if ak_path.is_file() {
+        fix_perms_confirmed(cli, &ak_path, 0o600)?;
+        fs::read_to_string(&ak_path)
+            .map_err(|e| format!("cannot read {}: {e}", ak_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let (new_content, outcome) = upsert_authorized_line(&content, line)?;
+    if outcome == UpsertOutcome::Identical {
+        return Ok(InstallAction::AlreadyPresent);
+    }
+    if outcome == UpsertOutcome::Replaced {
+        let confirmed = cli.install_key
+            || (prompt::has_tty()
+                && prompt::ask_yn(
+                    "the key is already installed with DIFFERENT options — \
+                     replace that line with the wizard's?",
+                    true,
+                ));
+        if !confirmed {
+            return Ok(InstallAction::Skipped(
+                "the key is present with different options; left alone".to_string(),
+            ));
+        }
+    }
+
+    // Atomic in place: temp file beside it (same filesystem), 0600
+    // before any bytes land, rename over. A crash cannot leave a
+    // half-written authorized_keys behind.
+    let tmp = ssh_dir.join(".authorized_keys.fdl-tmp");
+    fs::write(&tmp, &new_content).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    set_mode(&tmp, 0o600)?;
+    fs::rename(&tmp, &ak_path)
+        .map_err(|e| format!("cannot move the new authorized_keys into place: {e}"))?;
+
+    // Best-effort floor check: the door is installed, but is anyone
+    // listening where workers will knock?
+    if !sshd_listening(sshd_port) {
+        let hint = if cfg!(target_os = "macos") {
+            " (on macOS: System Settings > General > Sharing > Remote Login)"
+        } else {
+            ""
+        };
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "fdl join-config: nothing seems to be listening on port \
+                 {sshd_port} — the line is installed, but workers cannot \
+                 dial until sshd is up{hint}",
+            )),
+        );
+    }
+
+    Ok(match outcome {
+        UpsertOutcome::Appended => InstallAction::Installed,
+        UpsertOutcome::Replaced => InstallAction::Replaced,
+        UpsertOutcome::Identical => unreachable!("handled above"),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpsertOutcome {
+    Appended,
+    Replaced,
+    Identical,
+}
+
+/// Append `line`, or replace the one existing line that carries the
+/// same public key material. Identity is `keytype + base64` — options
+/// and comment may differ, the key bytes cannot. Every other line is
+/// preserved byte for byte.
+fn upsert_authorized_line(content: &str, line: &str) -> Result<(String, UpsertOutcome), String> {
+    let wanted = key_material(line)
+        .ok_or("the composed authorized_keys line carries no key material")?;
+    let mut out = String::with_capacity(content.len() + line.len() + 2);
+    let mut outcome = UpsertOutcome::Appended;
+    for existing in content.lines() {
+        if key_material(existing) == Some(wanted) {
+            if existing.trim() == line.trim() {
+                return Ok((content.to_string(), UpsertOutcome::Identical));
+            }
+            out.push_str(line);
+            outcome = UpsertOutcome::Replaced;
+        } else {
+            out.push_str(existing);
+        }
+        out.push('\n');
+    }
+    if outcome == UpsertOutcome::Appended {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok((out, outcome))
+}
+
+/// The `keytype base64` pair of an authorized_keys line, skipping any
+/// leading options field. Options may contain quoted commas
+/// (`command="a,b"`), so the scan is quote-aware: the key type is the
+/// first whitespace-separated token outside quotes that looks like one.
+fn key_material(line: &str) -> Option<(&str, &str)> {
+    let mut rest = line.trim();
+    if rest.is_empty() || rest.starts_with('#') {
+        return None;
+    }
+    loop {
+        let mut fields = rest.splitn(2, char::is_whitespace);
+        let first = fields.next()?;
+        let tail = fields.next().unwrap_or("").trim_start();
+        if first.starts_with("ssh-") || first.starts_with("ecdsa-") || first.starts_with("sk-") {
+            let key = tail.split_whitespace().next()?;
+            return Some((first, key));
+        }
+        // `first` is the options field — but splitn cut it at the first
+        // space, which may sit INSIDE quotes. Walk to the real end of
+        // the options (first unquoted whitespace) and retry from there.
+        let mut in_quotes = false;
+        let mut cut = None;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                c if c.is_whitespace() && !in_quotes => {
+                    cut = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        rest = rest[cut?..].trim_start();
+    }
+}
+
+/// Report a wrong mode with the exact fix and apply it on confirm —
+/// never silently. `--install-key` is standing consent for what the
+/// install needs; a non-tty run without it refuses loudly rather than
+/// leaving a lax authorized_keys in play.
+#[cfg(unix)]
+fn fix_perms_confirmed(cli: &JoinConfigArgs, path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let current = fs::metadata(path)
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if current == mode {
+        return Ok(());
+    }
+    let question = format!(
+        "{} is mode {current:03o}, sshd wants {mode:03o} — apply `chmod \
+         {mode:o} {}`?",
+        path.display(),
+        path.display(),
+    );
+    let apply = cli.install_key || (prompt::has_tty() && prompt::ask_yn(&question, true));
+    if !apply {
+        return Err(format!(
+            "{} stays mode {current:03o} — sshd will refuse the key until \
+             it is {mode:03o}",
+            path.display(),
+        ));
+    }
+    set_mode(path, mode)
+}
+
+#[cfg(not(unix))]
+fn fix_perms_confirmed(_cli: &JoinConfigArgs, _path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("cannot chmod {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+/// Is anything accepting on the sshd port workers will dial? Loopback
+/// suffices as a heuristic — sshd binds all interfaces by default.
+fn sshd_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
 }
 
 fn resolve_label(cli: &JoinConfigArgs) -> Result<String, String> {
@@ -675,8 +944,8 @@ fn derive_publish(crate_dir: &Path) -> Result<Option<PublishDerivation>, String>
     Ok(Some(PublishDerivation { from_root, cwd_rel, bin, build, bin_caveat }))
 }
 
-/// `[package] name = "..."` — first `name =` line inside the [package]
-/// table.
+/// `[package] name = "..."` — first `name =` line inside the
+/// `[package]` table.
 fn package_name(manifest: &str) -> Option<String> {
     let mut in_package = false;
     for line in manifest.lines() {
@@ -1019,6 +1288,15 @@ impl Report {
         push(&mut out, &format!("  join key:  {} ({key})", self.key_path.display()));
         push(&mut out, &format!("  worker yml: {}", self.worker_yml_path.display()));
         push(&mut out, &format!("  notes:     {}", self.notes_path.display()));
+        let install = match &self.install {
+            InstallAction::Installed => "line appended to ~/.ssh/authorized_keys".to_string(),
+            InstallAction::Replaced => {
+                "line REPLACED in ~/.ssh/authorized_keys (options updated)".to_string()
+            }
+            InstallAction::AlreadyPresent => "already in ~/.ssh/authorized_keys".to_string(),
+            InstallAction::Skipped(why) => format!("NOT installed ({why}) — see notes"),
+        };
+        push(&mut out, &format!("  sshd:      {install}"));
         if let Some(w) = &self.reuse_warning {
             push(&mut out, "");
             push(&mut out, &format!("  WARNING: {w}"));
@@ -1104,6 +1382,16 @@ impl Report {
             ),
             "worker_yml_path": self.worker_yml_path.display().to_string(),
             "notes_path": self.notes_path.display().to_string(),
+            "install": match &self.install {
+                InstallAction::Installed => serde_json::json!({"action": "installed"}),
+                InstallAction::Replaced => serde_json::json!({"action": "replaced"}),
+                InstallAction::AlreadyPresent => {
+                    serde_json::json!({"action": "already_present"})
+                }
+                InstallAction::Skipped(why) => {
+                    serde_json::json!({"action": "skipped", "why": why})
+                }
+            },
             "publish_block": self.publish_block,
             "bin_caveat": self.bin_caveat,
             "freshness": self.freshness,

@@ -31,7 +31,7 @@ fn read_line(tty: &mut dyn BufRead) -> String {
     buf.trim().to_string()
 }
 
-/// Detect a usable controlling terminal, mirroring [`open_tty`]'s
+/// Detect a usable controlling terminal, mirroring `open_tty`'s
 /// platform paths — so callers can error loudly BEFORE a prompt would
 /// silently fall back to its default.
 pub fn has_tty() -> bool {
