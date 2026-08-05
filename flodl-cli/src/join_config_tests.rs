@@ -1,0 +1,306 @@
+use super::*;
+
+fn tempdir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "fdl-join-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0),
+    ));
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+// ── Doors and endpoints ─────────────────────────────────────────────────
+
+#[test]
+fn door_defaults_to_b_and_refuses_c_by_name() {
+    assert_eq!(Door::parse(None).unwrap(), Door::B);
+    assert_eq!(Door::parse(Some("a")).unwrap(), Door::A);
+    assert_eq!(Door::parse(Some("nologin")).unwrap(), Door::Nologin);
+    let err = Door::parse(Some("c")).unwrap_err();
+    assert!(err.contains("second, source-only key"), "got: {err}");
+    let err = Door::parse(Some("z")).unwrap_err();
+    assert!(err.contains("unknown door"), "got: {err}");
+}
+
+#[test]
+fn endpoint_parses_the_compact_spec() {
+    let e = Endpoint::parse(Some("flodl-join@ctrl.example.com:2222")).unwrap();
+    assert_eq!(e.user, "flodl-join");
+    assert_eq!(e.host, "ctrl.example.com");
+    assert_eq!(e.port, 2222);
+    let e = Endpoint::parse(Some("ctrl")).unwrap();
+    assert_eq!(e.host, "ctrl");
+    assert_eq!(e.port, 22);
+    assert!(Endpoint::parse(Some("user@:22")).is_err());
+    assert!(Endpoint::parse(Some("host:notaport")).is_err());
+}
+
+#[test]
+fn labels_are_filename_safe() {
+    assert!(validate_label("b300").is_ok());
+    assert!(validate_label("farm_a-2").is_ok());
+    assert!(validate_label("").is_err());
+    assert!(validate_label("a/b").is_err());
+    assert!(validate_label("a b").is_err());
+}
+
+// ── Token line surgery ──────────────────────────────────────────────────
+
+#[test]
+fn token_surgery_preserves_every_other_byte() {
+    let yml = "\
+# a farm, mostly comments
+cluster:
+  controller:
+    join:
+      # the credential
+      token: aaaabbbbccccddddaaaabbbbccccdddd
+      start: manual
+";
+    assert_eq!(
+        find_token_line(yml).as_deref(),
+        Some("aaaabbbbccccddddaaaabbbbccccdddd"),
+    );
+    let new = replace_token_line(yml, "ffff0000ffff0000ffff0000ffff0000").unwrap();
+    assert!(new.contains("token: ffff0000ffff0000ffff0000ffff0000"));
+    // Everything else is byte-identical: comments, indentation, order.
+    assert!(new.contains("# a farm, mostly comments"));
+    assert!(new.contains("      # the credential"));
+    assert!(new.contains("      start: manual"));
+    // A commented token line is not a token.
+    assert_eq!(find_token_line("# token: dead\n"), None);
+}
+
+// ── Manifest scanning ───────────────────────────────────────────────────
+
+#[test]
+fn manifest_scan_reads_name_path_dep_and_features() {
+    let m = "\
+[package]
+name = \"my-train\"
+version = \"0.1.0\"
+
+[dependencies]
+flodl = { path = \"../rdl/flodl\", features = [\"x\"] }
+serde = \"1\"
+
+[features]
+cuda = [\"flodl/cuda\"]
+rocm = [\"flodl/rocm\"]
+";
+    assert_eq!(package_name(m).as_deref(), Some("my-train"));
+    assert_eq!(flodl_path_dep(m).as_deref(), Some("../rdl/flodl"));
+    assert!(declares_gpu_features(m));
+
+    let table_form = "\
+[package]
+name = \"t\"
+
+[dependencies.flodl]
+path = \"../flodl\"
+";
+    assert_eq!(flodl_path_dep(table_form).as_deref(), Some("../flodl"));
+
+    let registry = "[package]\nname = \"t\"\n\n[dependencies]\nflodl = \"=0.7.0\"\n";
+    assert_eq!(flodl_path_dep(registry), None);
+    assert!(!declares_gpu_features(registry));
+}
+
+#[test]
+fn path_dep_walks_up_to_the_dep_root() {
+    // <tmp>/proj/train crate depends on <tmp>/proj/rdl/flodl: the
+    // fetched root must be <tmp>/proj, with cwd pointing back down.
+    let tmp = tempdir();
+    let train = tmp.join("proj/train");
+    fs::create_dir_all(&train).unwrap();
+    fs::create_dir_all(tmp.join("proj/rdl/flodl")).unwrap();
+    fs::write(
+        train.join("Cargo.toml"),
+        "[package]\nname = \"train\"\n\n[dependencies]\nflodl = { path = \"../rdl/flodl\" }\n",
+    )
+    .unwrap();
+    let d = derive_publish(&train).unwrap().expect("a crate");
+    assert_eq!(d.from_root, tmp.join("proj").canonicalize().unwrap());
+    assert_eq!(d.cwd_rel.as_deref(), Some("train"));
+    assert_eq!(d.bin, "target/release/train");
+    assert!(!d.build.contains("FDL_GPU_FEATURE"), "no features declared");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn registry_dep_ships_the_crate_dir_alone() {
+    let tmp = tempdir();
+    let train = tmp.join("train");
+    fs::create_dir_all(&train).unwrap();
+    fs::write(
+        train.join("Cargo.toml"),
+        "[package]\nname = \"train\"\n\n[dependencies]\nflodl = \"=0.7.0\"\n\n\
+         [features]\ncuda = [\"flodl/cuda\"]\nrocm = [\"flodl/rocm\"]\n",
+    )
+    .unwrap();
+    let d = derive_publish(&train).unwrap().expect("a crate");
+    assert_eq!(d.from_root, train.canonicalize().unwrap());
+    assert_eq!(d.cwd_rel, None);
+    assert!(
+        d.build.contains("--features \"$FDL_GPU_FEATURE\""),
+        "declared vendor features must ride the recipe: {}",
+        d.build,
+    );
+    assert!(d.bin_caveat.is_none());
+    // No crate at all: a note-shaped absence, not an error.
+    assert!(derive_publish(&tmp.join("nowhere")).unwrap().is_none());
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn a_workspace_above_the_crate_earns_the_bin_caveat() {
+    let tmp = tempdir();
+    let member = tmp.join("ws/member");
+    fs::create_dir_all(&member).unwrap();
+    fs::create_dir_all(tmp.join("ws/flodl")).unwrap();
+    fs::write(
+        tmp.join("ws/Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\n\n[dependencies]\nflodl = { path = \"../flodl\" }\n",
+    )
+    .unwrap();
+    let d = derive_publish(&member).unwrap().expect("a crate");
+    let caveat = d.bin_caveat.expect("the workspace must be flagged");
+    assert!(caveat.contains("WORKSPACE target/"), "got: {caveat}");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn normalize_and_common_ancestor_do_pure_path_math() {
+    assert_eq!(
+        normalize(Path::new("/a/b/c/../../d")),
+        PathBuf::from("/a/d"),
+    );
+    assert_eq!(
+        common_ancestor(Path::new("/a/b/c"), Path::new("/a/b/d/e")),
+        PathBuf::from("/a/b"),
+    );
+}
+
+// ── Freshness ───────────────────────────────────────────────────────────
+
+#[test]
+fn freshness_flags_a_stale_lockfile() {
+    let tmp = tempdir();
+    fs::write(tmp.join("Cargo.lock"), "x").unwrap();
+    // No lockfile case first.
+    let empty = tempdir();
+    assert!(freshness_report(&empty).contains("no Cargo.lock"));
+    // A source file newer than the lock (mtimes are second-resolution
+    // on some filesystems, so set the lock visibly old).
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    let lock = fs::File::options().write(true).open(tmp.join("Cargo.lock")).unwrap();
+    lock.set_modified(old).unwrap();
+    fs::write(tmp.join("main.rs"), "fn main() {}").unwrap();
+    let report = freshness_report(&tmp);
+    assert!(report.contains("predates"), "got: {report}");
+    let _ = fs::remove_dir_all(&tmp);
+    let _ = fs::remove_dir_all(&empty);
+}
+
+// ── Renders ─────────────────────────────────────────────────────────────
+
+fn no_flags() -> JoinConfigArgs {
+    JoinConfigArgs {
+        label: None,
+        controller: None,
+        door: None,
+        crate_dir: None,
+        data_path: None,
+        gpu_ram_share: None,
+        regen: false,
+        yes: false,
+        json: false,
+    }
+}
+
+#[test]
+fn the_worker_yml_speaks_each_doors_dialect() {
+    let ep = Endpoint { user: "flodl-join".into(), host: "ctrl".into(), port: 2222 };
+    let cli = no_flags();
+
+    let b = render_worker_yml("b300", &ep, "aa".repeat(16).as_str(), Door::B, &cli);
+    assert!(b.contains("from: rsync://flodl-join@ctrl:/tree"), "got:\n{b}");
+    assert!(b.contains(&format!("token: {}", "aa".repeat(16))));
+    assert!(b.contains("port: 2222"));
+    assert!(b.contains("identity_file: ~/.ssh/flodl-join"));
+    assert!(b.contains("libtorch: auto"));
+    assert!(b.contains("persist: true"));
+
+    let a = render_worker_yml("b300", &ep, "tok", Door::A, &cli);
+    assert!(a.contains("data_source: sshfs://flodl-join@ctrl:/flodl/data"), "got:\n{a}");
+    assert!(!a.contains("from: rsync"), "door `a` cannot pull a source");
+
+    let n = render_worker_yml("b300", &ep, "tok", Door::Nologin, &cli);
+    assert!(!n.contains("data_source:"));
+    assert!(!n.contains("from: rsync"));
+
+    let mut cli = no_flags();
+    cli.gpu_ram_share = Some(0.5);
+    let apu = render_worker_yml("b300", &ep, "tok", Door::B, &cli);
+    assert!(apu.contains("gpu_ram_share: 0.5"), "got:\n{apu}");
+}
+
+#[test]
+fn the_authorized_line_composes_restrictions_and_the_doors_command() {
+    let pub_line = "ssh-ed25519 AAAAtest flodl-join-b300";
+    let served = PathBuf::from("/home/op/.flodl/run");
+    let cli = no_flags();
+
+    let b = authorized_keys_line(Door::B, &served, &cli, pub_line);
+    assert!(b.starts_with("restrict,port-forwarding,permitopen=\"127.0.0.1:1337\","));
+    assert!(b.contains("command=\"rrsync -ro /home/op/.flodl/run\""), "got: {b}");
+    assert!(b.ends_with(pub_line));
+
+    let a = authorized_keys_line(Door::A, &served, &cli, pub_line);
+    assert!(a.contains("command=\"internal-sftp -R -d /flodl/data\""), "got: {a}");
+
+    let n = authorized_keys_line(Door::Nologin, &served, &cli, pub_line);
+    assert!(n.contains("command=\"/usr/sbin/nologin\""), "got: {n}");
+}
+
+/// The scaffold is not just plausible yml: it must load through the
+/// REAL config loader as an overlay and surface the token where the
+/// launcher reads it.
+#[test]
+fn the_scaffolded_overlay_loads_through_the_real_config_path() {
+    let tmp = tempdir();
+    let base = tmp.join("fdl.yml");
+    fs::write(&base, "# base\n").unwrap();
+    let token = fresh_token();
+    fs::write(
+        tmp.join("fdl.b300.yml"),
+        render_overlay_scaffold("b300", &token, &tmp),
+    )
+    .unwrap();
+    let project = crate::config::load_project_with_env(&base, Some("b300")).unwrap();
+    let cluster = project.cluster.expect("the overlay carries a cluster block");
+    let join = cluster.controller.join.expect("a join block");
+    assert_eq!(join.token.as_deref(), Some(token.as_str()));
+    assert_eq!(join.discovery, Some(true));
+    assert_eq!(join.start.as_deref(), Some("manual"));
+    assert!(cluster.workers.is_empty(), "walk-ins fill the roster");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn fresh_tokens_are_32_hex_and_unique() {
+    let a = fresh_token();
+    let b = fresh_token();
+    assert_eq!(a.len(), 32);
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, b);
+}

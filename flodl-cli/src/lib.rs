@@ -99,6 +99,10 @@ pub mod status;
 /// bootstrap-spec synthesis, training-binary supervision.
 pub mod join;
 
+/// The once-per-farm wizard (`fdl join-config`): farm overlay,
+/// credentials, guardrail artifacts, worker yml, publish recipe.
+pub mod join_config;
+
 /// Training preparation for a dial-in worker: the GPU gate, the dataset
 /// source root, libtorch, the training binary, and the node-local
 /// directories the data plane writes. Runs before this box dials in,

@@ -108,25 +108,9 @@ fn resolve_interactive() -> Result<(bool, bool), String> {
     }
 }
 
-/// Detect a usable controlling terminal. Mirrors `util::prompt::open_tty`'s
-/// platform paths so the error message arrives BEFORE the prompt is
-/// drawn (instead of silently falling back to the default choice).
+/// Detect a usable controlling terminal — see [`prompt::has_tty`].
 fn has_tty() -> bool {
-    #[cfg(unix)]
-    {
-        std::fs::File::open("/dev/tty").is_ok()
-    }
-    #[cfg(windows)]
-    {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open("CONIN$")
-            .is_ok()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        true
-    }
+    prompt::has_tty()
 }
 
 /// Append `flodl-hf` to the root `Cargo.toml` `[dependencies]` table.

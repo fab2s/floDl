@@ -230,6 +230,57 @@ pub struct JoinArgs {
     pub gpu_ram_share: Option<f64>,
 }
 
+/// Provision a walk-in farm in one pass: the farm overlay
+/// (`fdl.<label>.yml`, token stamped), an ed25519 join key born in
+/// `./.fdl/<label>/` so it cannot be shared across farms by
+/// construction, the guardrailed `authorized_keys` line for the chosen
+/// door, the paste-ready worker yml, a publish recipe derived from the
+/// training crate's own manifest, and a build-freshness report. A farm
+/// IS an env overlay: `fdl @<label> <cmd>` targets it afterwards.
+/// Regenerating credentials for a new farm instantiation is
+/// `fdl join-config <label> --regen`.
+#[derive(crate::FdlArgs, Debug)]
+pub struct JoinConfigArgs {
+    /// Farm label — names `fdl.<label>.yml` and `.fdl/<label>/`.
+    /// Defaults to the active env (`fdl @<label> join-config`).
+    #[arg]
+    pub label: Option<String>,
+    /// How workers reach the join sshd: `[user@]host[:port]` (default:
+    /// this box's hostname, the invoking user, port 22).
+    #[option]
+    pub controller: Option<String>,
+    /// Guardrail door the join key opens: `b` (rrsync source pull, the
+    /// publish-then-join default), `a` (read-only sftp data mount), or
+    /// `nologin` (tunnel only).
+    #[option(choices = &["b", "a", "nologin"])]
+    pub door: Option<String>,
+    /// Training crate to derive the publish recipe from (default: the
+    /// current directory; no crate there is fine — a farm can be
+    /// config-only).
+    #[option]
+    pub crate_dir: Option<String>,
+    /// Dataset source root workers read; under door `a` it is also the
+    /// sshfs mountpoint (default /flodl/data there).
+    #[option]
+    pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share stamped into the worker yml
+    /// (APU fleets; discrete GPUs ignore it).
+    #[option]
+    pub gpu_ram_share: Option<f64>,
+    /// Regenerate credentials (key and token) without asking. Workers
+    /// holding the old ones stop being admitted.
+    #[option]
+    pub regen: bool,
+    /// Accept every default without prompting (non-interactive; reuses
+    /// existing credentials unless `--regen`).
+    #[option]
+    pub yes: bool,
+    /// Report as JSON on stdout. Secrets appear as file paths, never
+    /// payloads.
+    #[option]
+    pub json: bool,
+}
+
 /// Publish a training run for a fleet to pull.
 ///
 /// The controller side of compiling on the node: resolves a source spec
@@ -625,6 +676,13 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(JoinArgs::schema),
         },
         BuiltinSpec {
+            path: &["join-config"],
+            description: Some(
+                "Provision a walk-in farm: overlay, credentials, worker yml",
+            ),
+            schema_fn: Some(JoinConfigArgs::schema),
+        },
+        BuiltinSpec {
             path: &["install"],
             description: Some("Install or update fdl globally"),
             schema_fn: Some(InstallArgs::schema),
@@ -776,9 +834,9 @@ mod tests {
         // documents the coupling explicitly.
         let dispatched = [
             "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "start", "publish", "join", "api-ref", "init", "add", "install",
-            "skill", "schema", "completions", "autocomplete", "config",
-            "version",
+            "start", "publish", "join", "join-config", "api-ref", "init",
+            "add", "install", "skill", "schema", "completions",
+            "autocomplete", "config", "version",
         ];
         for name in &dispatched {
             assert!(
@@ -797,9 +855,9 @@ mod tests {
             names,
             vec![
                 "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "start", "publish", "join", "install",
-                "skill", "api-ref", "config", "schema", "completions",
-                "autocomplete",
+                "probe", "status", "start", "publish", "join",
+                "join-config", "install", "skill", "api-ref", "config",
+                "schema", "completions", "autocomplete",
             ]
         );
     }

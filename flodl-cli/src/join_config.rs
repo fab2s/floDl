@@ -1,0 +1,1117 @@
+//! `fdl join-config` — the once-per-farm wizard.
+//!
+//! The controller side of provisioning a walk-in fleet, assembled in one
+//! pass instead of from guide prose: the farm overlay (`fdl.<label>.yml`,
+//! token stamped), an ed25519 join key born in `./.fdl/<label>/` so it
+//! cannot be shared across farms by construction, the guardrailed
+//! `authorized_keys` line for the chosen door, the paste-ready worker
+//! yml, a publish recipe derived from the training crate's own manifest,
+//! and a build-freshness report.
+//!
+//! A farm IS an env overlay: `fdl @<label> <cmd>` targets it with the
+//! machinery that already exists (deep-merge onto the base fdl.yml,
+//! `inherit-from:` for shared bases, `fdl config show` provenance).
+//! The wizard only ever *scaffolds* an overlay or replaces a `token:`
+//! value textually — a user's yml is mostly comments, and a serde
+//! round-trip would delete every one of them.
+//!
+//! Secret hygiene: the private key goes ONLY to 0600 files under the
+//! farm dir (which self-gitignores); stdout gets the public line and the
+//! worker yml. `--json` reports secrets as file paths, never payloads.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::builtins::JoinConfigArgs;
+use crate::context::home_dir;
+use crate::style;
+use crate::util::prompt;
+
+/// Key file basename inside `<farm>/keys/`.
+const KEY_NAME: &str = "flodl-join";
+/// Where the worker yml tells the box to keep its private key. The
+/// wizard cannot know the worker's home, so the yml uses `~` and the
+/// operator (or cloud-init) lands the file there.
+const WORKER_KEY_PATH: &str = "~/.ssh/flodl-join";
+/// Default served dir on the controller (`fdl publish`'s default),
+/// relative to the controller user's home.
+const SERVED_SUBDIR: &str = ".flodl/run";
+
+pub fn run(cli: &JoinConfigArgs) -> i32 {
+    match wizard(cli) {
+        Ok(report) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report.to_json())
+                        .expect("a report value serializes"),
+                );
+            } else {
+                print!("{}", report.render_human());
+            }
+            0
+        }
+        Err(e) => {
+            crate::cli_error!("{e}");
+            1
+        }
+    }
+}
+
+/// Which forced-command door the join key opens. Mirrors the guide's
+/// recipe lettering; `C` (a second source-only key for cross-host
+/// routing) stays a manual composition and is named in the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Door {
+    /// `rrsync -ro <served>`: tunnel + source pull — the publish-then-
+    /// join flagship, and the default.
+    B,
+    /// `internal-sftp -R -d <data>`: tunnel + read-only data mount;
+    /// the source is then provisioned or pulled through another road.
+    A,
+    /// `/usr/sbin/nologin`: tunnel only; source and data both
+    /// provisioned.
+    Nologin,
+}
+
+impl Door {
+    fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s.unwrap_or("b") {
+            "b" | "B" => Ok(Door::B),
+            "a" | "A" => Ok(Door::A),
+            "nologin" => Ok(Door::Nologin),
+            "c" | "C" => Err(
+                "door `c` (a second, source-only key) serves cross-host \
+                 routing that fdl join's single identity cannot express — \
+                 compose it manually from the guide's recipe \
+                 (docs/ddp/02-cluster-guide.md), or use door `b`"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "unknown door `{other}` — one of `b` (rrsync source pull, \
+                 the publish-then-join default), `a` (sftp data mount), \
+                 `nologin` (tunnel only)"
+            )),
+        }
+    }
+}
+
+/// Everything one wizard pass decided and produced — the pure render
+/// core's input, so the human text and the JSON twin cannot drift.
+struct Report {
+    label: String,
+    farm_dir: PathBuf,
+    overlay_path: PathBuf,
+    overlay_action: OverlayAction,
+    key_path: PathBuf,
+    pub_line: String,
+    key_action: KeyAction,
+    reuse_warning: Option<String>,
+    authorized_line: String,
+    match_block: String,
+    door: Door,
+    worker_yml_path: PathBuf,
+    worker_yml: String,
+    publish_block: Option<String>,
+    bin_caveat: Option<String>,
+    freshness: Option<String>,
+    notes_path: PathBuf,
+    controller: Endpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayAction {
+    Scaffolded,
+    TokenReplaced,
+    TokenReused,
+    /// The overlay exists but is user-authored with no token: the
+    /// wizard prints the snippet instead of editing prose it does not
+    /// own.
+    SnippetPrinted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    Generated,
+    Regenerated,
+    Reused,
+}
+
+/// `[user@]host[:port]` — how workers reach the join sshd.
+#[derive(Debug, Clone)]
+struct Endpoint {
+    user: String,
+    host: String,
+    port: u16,
+}
+
+impl Endpoint {
+    fn parse(spec: Option<&str>) -> Result<Self, String> {
+        let default_user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "op".to_string());
+        let Some(spec) = spec else {
+            return Ok(Endpoint {
+                user: default_user,
+                host: crate::cluster::resolve_local_hostname(),
+                port: 22,
+            });
+        };
+        let (user, rest) = match spec.split_once('@') {
+            Some((u, r)) if !u.is_empty() => (u.to_string(), r),
+            Some(_) => return Err(format!("--controller `{spec}`: empty user before `@`")),
+            None => (default_user, spec),
+        };
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (
+                h.to_string(),
+                p.parse::<u16>()
+                    .map_err(|_| format!("--controller `{spec}`: bad port `{p}`"))?,
+            ),
+            None => (rest.to_string(), 22),
+        };
+        if host.is_empty() {
+            return Err(format!("--controller `{spec}`: empty host"));
+        }
+        Ok(Endpoint { user, host, port })
+    }
+}
+
+fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
+    let label = resolve_label(cli)?;
+    validate_label(&label)?;
+    let door = Door::parse(cli.door.as_deref())?;
+    let controller = Endpoint::parse(cli.controller.as_deref())?;
+
+    // The farm sits beside a base fdl.yml (overlays are siblings). No
+    // project at all gets a minimal base, confirm-gated — the /training
+    // shape, an operator working next to their script.
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
+    let root = match crate::config::find_project_config(&cwd) {
+        Some(p) => p.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone()),
+        None => {
+            let target = cwd.join("fdl.yml");
+            if !confirm(
+                cli,
+                &format!(
+                    "no fdl.yml here — create a minimal one at {} so the farm \
+                     overlay has a base?",
+                    target.display()
+                ),
+            )? {
+                return Err("a farm overlay needs a base fdl.yml to merge onto".into());
+            }
+            fs::write(
+                &target,
+                "# fdl.yml — created by `fdl join-config` so farm overlays\n\
+                 # (fdl.<label>.yml) have a base to merge onto. Project\n\
+                 # config goes here as it grows.\n",
+            )
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+            cwd.clone()
+        }
+    };
+
+    let farm_dir = root.join(".fdl").join(&label);
+    let keys_dir = farm_dir.join("keys");
+    fs::create_dir_all(&keys_dir)
+        .map_err(|e| format!("cannot create {}: {e}", keys_dir.display()))?;
+    // The farm dir holds private keys, so it removes ITSELF from git:
+    // a `*` gitignore inside covers everything including the ignore.
+    let self_ignore = root.join(".fdl").join(".gitignore");
+    if !self_ignore.is_file() {
+        fs::write(&self_ignore, "*\n")
+            .map_err(|e| format!("cannot write {}: {e}", self_ignore.display()))?;
+    }
+
+    // ── Keys ────────────────────────────────────────────────────────────
+    let key_path = keys_dir.join(KEY_NAME);
+    let key_action = ensure_key(cli, &key_path, &label)?;
+    let pub_line = fs::read_to_string(key_path.with_extension("pub"))
+        .map_err(|e| format!("cannot read the generated public key: {e}"))?
+        .trim()
+        .to_string();
+
+    // ── Token + overlay ─────────────────────────────────────────────────
+    let overlay_path = root.join(format!("fdl.{label}.yml"));
+    let (token, overlay_action) = ensure_overlay(cli, &overlay_path, &label, &root)?;
+
+    // A yml-referenced identity outside the farm dir is a key shared
+    // with something else — legal, but exactly the reuse a per-farm key
+    // exists to prevent, so it gets said out loud.
+    let reuse_warning = foreign_identity_warning(&root, &label, &farm_dir);
+
+    // ── Guardrail artifacts ─────────────────────────────────────────────
+    let served_abs = home_dir().join(SERVED_SUBDIR);
+    let authorized_line = authorized_keys_line(door, &served_abs, cli, &pub_line);
+    let match_block = sshd_match_block(&controller.user);
+
+    // ── The training crate: publish recipe + freshness ──────────────────
+    let crate_dir = match &cli.crate_dir {
+        Some(d) => {
+            let p = PathBuf::from(d);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        }
+        None => cwd.clone(),
+    };
+    let (publish_block, bin_caveat, freshness) = match derive_publish(&crate_dir) {
+        Ok(Some(d)) => (
+            Some(render_publish_block(&d)),
+            d.bin_caveat.clone(),
+            Some(freshness_report(&d.from_root)),
+        ),
+        Ok(None) => (None, None, None),
+        Err(e) => (None, Some(e), None),
+    };
+
+    // ── Worker yml ──────────────────────────────────────────────────────
+    let worker_yml = render_worker_yml(&label, &controller, &token, door, cli);
+    let worker_yml_path = farm_dir.join("worker.yml");
+    fs::write(&worker_yml_path, &worker_yml)
+        .map_err(|e| format!("cannot write {}: {e}", worker_yml_path.display()))?;
+
+    // ── Install notes ───────────────────────────────────────────────────
+    let notes_path = farm_dir.join("install-notes.md");
+    let notes = render_notes(&label, &authorized_line, &match_block, &controller, door);
+    fs::write(&notes_path, notes)
+        .map_err(|e| format!("cannot write {}: {e}", notes_path.display()))?;
+
+    Ok(Report {
+        label,
+        farm_dir,
+        overlay_path,
+        overlay_action,
+        key_path,
+        pub_line,
+        key_action,
+        reuse_warning,
+        authorized_line,
+        match_block,
+        door,
+        worker_yml_path,
+        worker_yml,
+        publish_block,
+        bin_caveat,
+        freshness,
+        notes_path,
+        controller,
+    })
+}
+
+fn resolve_label(cli: &JoinConfigArgs) -> Result<String, String> {
+    if let Some(l) = &cli.label {
+        return Ok(l.clone());
+    }
+    if let Ok(env) = std::env::var("FDL_ENV") {
+        if !env.trim().is_empty() {
+            return Ok(env.trim().to_string());
+        }
+    }
+    Err("a farm needs a label: `fdl join-config <label>` (or target an \
+         existing overlay: `fdl @<label> join-config`)"
+        .to_string())
+}
+
+/// Labels become filenames (`fdl.<label>.yml`, `.fdl/<label>/`), so the
+/// charset is the portable-filename one.
+fn validate_label(label: &str) -> Result<(), String> {
+    let ok = !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "farm label `{label}` — letters, digits, `-` and `_` only (it \
+             names fdl.<label>.yml and .fdl/<label>/)"
+        ))
+    }
+}
+
+/// Ask, honoring the flag twins: `--regen` answers yes to regeneration
+/// prompts, `--yes` accepts every default, and a non-tty run without
+/// the deciding flag errors loudly instead of hanging.
+fn confirm(cli: &JoinConfigArgs, question: &str) -> Result<bool, String> {
+    if cli.yes {
+        return Ok(true);
+    }
+    if !prompt::has_tty() {
+        return Err(format!(
+            "non-interactive run needs a decision: {question} \
+             (pass --yes to accept, or run in a terminal)"
+        ));
+    }
+    Ok(prompt::ask_yn(question, true))
+}
+
+fn ensure_key(cli: &JoinConfigArgs, key_path: &Path, label: &str) -> Result<KeyAction, String> {
+    let exists = key_path.is_file() && key_path.with_extension("pub").is_file();
+    if exists {
+        // --yes reuses (regeneration is opt-in, never a default) and a
+        // non-tty run cannot be asked, so both fall through to reuse.
+        let regen = if cli.regen {
+            true
+        } else if cli.yes || !prompt::has_tty() {
+            false
+        } else {
+            prompt::ask_yn(
+                &format!(
+                    "a join key already exists for `{label}` — regenerate it \
+                     for a new farm instantiation? (workers holding the old \
+                     key stop being admitted)"
+                ),
+                false,
+            )
+        };
+        if !regen {
+            return Ok(KeyAction::Reused);
+        }
+        fs::remove_file(key_path).ok();
+        fs::remove_file(key_path.with_extension("pub")).ok();
+        generate_key(key_path, label)?;
+        return Ok(KeyAction::Regenerated);
+    }
+    generate_key(key_path, label)?;
+    Ok(KeyAction::Generated)
+}
+
+fn generate_key(key_path: &Path, label: &str) -> Result<(), String> {
+    let out = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C"])
+        .arg(format!("flodl-join-{label}"))
+        .arg("-f")
+        .arg(key_path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "cannot run ssh-keygen ({e}) — it ships with OpenSSH, which \
+                 the join sshd needs anyway"
+            )
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    // ssh-keygen writes 0600/0644 itself; assert the private side anyway
+    // so a weird umask cannot leave a lax key behind.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Token + overlay state machine. Returns the effective token and what
+/// happened to the overlay file.
+fn ensure_overlay(
+    cli: &JoinConfigArgs,
+    overlay_path: &Path,
+    label: &str,
+    root: &Path,
+) -> Result<(String, OverlayAction), String> {
+    if !overlay_path.is_file() {
+        let token = fresh_token();
+        let scaffold = render_overlay_scaffold(label, &token, root);
+        fs::write(overlay_path, scaffold)
+            .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
+        return Ok((token, OverlayAction::Scaffolded));
+    }
+    let content = fs::read_to_string(overlay_path)
+        .map_err(|e| format!("cannot read {}: {e}", overlay_path.display()))?;
+    match find_token_line(&content) {
+        Some(old) => {
+            let regen = if cli.regen {
+                true
+            } else if cli.yes || !prompt::has_tty() {
+                false
+            } else {
+                prompt::ask_yn(
+                    &format!(
+                        "`{label}` already carries a token — mint a fresh one \
+                         for a new farm instantiation? (workers holding the \
+                         old one stop being admitted)"
+                    ),
+                    false,
+                )
+            };
+            if !regen {
+                return Ok((old, OverlayAction::TokenReused));
+            }
+            let token = fresh_token();
+            let replaced = replace_token_line(&content, &token)
+                .ok_or("token line vanished between read and replace")?;
+            fs::write(overlay_path, replaced)
+                .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
+            Ok((token, OverlayAction::TokenReplaced))
+        }
+        None => {
+            // A user-authored overlay without a token: the wizard does
+            // not edit prose it does not own — nested surgical inserts
+            // into hand-written yml guess too much. The snippet is in
+            // the report.
+            Ok((fresh_token(), OverlayAction::SnippetPrinted))
+        }
+    }
+}
+
+/// A fresh 32-hex credential, same construction as the publish nonce
+/// but this one IS secret (it is the admission token).
+fn fresh_token() -> String {
+    let mut bytes = [0u8; 16];
+    let read = fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
+    if read.is_err() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            ^ (std::process::id() as u128);
+        bytes[..16].copy_from_slice(&seed.to_le_bytes());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// First `token:` line's value, however deep it sits. The wizard only
+/// ever needs the join token and a farm overlay carries exactly one.
+fn find_token_line(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("token:") {
+            let v = rest.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Replace the first uncommented `token:` value, byte-preserving
+/// everything else (indentation, comments, the rest of the file).
+fn replace_token_line(content: &str, new_token: &str) -> Option<String> {
+    let mut out = String::with_capacity(content.len());
+    let mut replaced = false;
+    for line in content.lines() {
+        let t = line.trim_start();
+        if !replaced && !t.starts_with('#') && t.strip_prefix("token:").is_some_and(|r| !r.trim().is_empty()) {
+            let indent = &line[..line.len() - t.len()];
+            out.push_str(indent);
+            out.push_str("token: ");
+            out.push_str(new_token);
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    replaced.then_some(out)
+}
+
+/// The scaffolded farm overlay: the cluster-join recipe with this
+/// farm's token inline. Deliberately compact — per-key documentation
+/// lives in fdl.cluster-join.yml.example and the guide.
+fn render_overlay_scaffold(label: &str, token: &str, root: &Path) -> String {
+    format!(
+        "# fdl.{label}.yml — farm overlay, generated by `fdl join-config`.\n\
+         # Activate with `fdl @{label} <cmd>`. Regenerate credentials with\n\
+         # `fdl @{label} join-config --regen`. Keys + worker yml live in\n\
+         # .fdl/{label}/. Deep-merges onto fdl.yml; see\n\
+         # fdl.cluster-join.yml.example for per-key docs, and `inherit-from:`\n\
+         # for sharing a base between farms.\n\
+         \n\
+         cluster:\n\
+         \x20 controller:\n\
+         \x20   host: 127.0.0.1                # loopback; tunnel_only forces it anyway\n\
+         \x20   port: 1337\n\
+         \x20   path: {root}\n\
+         \x20   join:\n\
+         \x20     discovery: true              # the window defines the world\n\
+         \x20     min_rank_start: 1            # RAISE to your fleet's quorum (in ranks)\n\
+         \x20     start: manual                # hold at quorum; `fdl start` fires it\n\
+         \x20     join_timeout: 600\n\
+         \x20     max_join_timeout: 1200\n\
+         \x20     tunnel_only: true            # sshd forward is the only road in (CPU modes)\n\
+         \x20     token: {token}\n\
+         \n\
+         \x20 workers: []                      # walk-ins fill it\n",
+        label = label,
+        token = token,
+        root = root.display(),
+    )
+}
+
+/// Warn when the merged config's join identity points outside the farm
+/// dir — a key shared with something else, which per-farm keys exist to
+/// prevent.
+fn foreign_identity_warning(root: &Path, label: &str, farm_dir: &Path) -> Option<String> {
+    let base = crate::config::find_project_config(root)?;
+    let project = crate::config::load_project_with_env(&base, Some(label)).ok()?;
+    let identity = project.join.as_ref()?.ssh.as_ref()?.identity_file.clone()?;
+    let p = PathBuf::from(&identity);
+    if p.starts_with(farm_dir) || identity.contains(&format!(".fdl/{label}/")) {
+        return None;
+    }
+    Some(format!(
+        "the merged config's join.ssh.identity_file ({identity}) lives \
+         outside .fdl/{label}/ — a key reused across farms (or anything \
+         else) widens what one leaked worker can reach. Per-farm keys are \
+         the point of this wizard.",
+    ))
+}
+
+fn authorized_keys_line(
+    door: Door,
+    served_abs: &Path,
+    cli: &JoinConfigArgs,
+    pub_line: &str,
+) -> String {
+    let forced = match door {
+        Door::B => format!("command=\"rrsync -ro {}\"", served_abs.display()),
+        Door::A => format!(
+            "command=\"internal-sftp -R -d {}\"",
+            cli.data_path.as_deref().unwrap_or(crate::config::DEFAULT_DATA_PATH),
+        ),
+        Door::Nologin => "command=\"/usr/sbin/nologin\"".to_string(),
+    };
+    format!(
+        "restrict,port-forwarding,permitopen=\"127.0.0.1:1337\",{forced} {pub_line}"
+    )
+}
+
+fn sshd_match_block(user: &str) -> String {
+    format!(
+        "Match User {user}\n    \
+         AllowTcpForwarding local\n    \
+         PermitOpen 127.0.0.1:1337\n    \
+         PermitTTY no\n    \
+         X11Forwarding no\n    \
+         AllowAgentForwarding no"
+    )
+}
+
+// ── The training crate: publish recipe derivation ───────────────────────
+
+/// What one manifest scan decided.
+struct PublishDerivation {
+    from_root: PathBuf,
+    cwd_rel: Option<String>,
+    bin: String,
+    build: String,
+    bin_caveat: Option<String>,
+}
+
+/// Derive the publish recipe from the crate's own Cargo.toml. `Ok(None)`
+/// when there is no crate here — a farm can be config-only, so absence
+/// is a note, not an error.
+fn derive_publish(crate_dir: &Path) -> Result<Option<PublishDerivation>, String> {
+    let manifest_path = crate_dir.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let name = package_name(&manifest).ok_or_else(|| {
+        format!(
+            "{} has no [package] name — a workspace root? Point --crate at \
+             the training crate itself",
+            manifest_path.display()
+        )
+    })?;
+
+    // A path dep on flodl decides the fetched root: the tree must
+    // contain the dep or the worker's build dangles on a path outside
+    // what it fetched.
+    let crate_abs = crate_dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", crate_dir.display()))?;
+    let (from_root, cwd_rel) = match flodl_path_dep(&manifest) {
+        Some(rel) => {
+            let dep_abs = normalize(&crate_abs.join(&rel));
+            let root = common_ancestor(&crate_abs, &dep_abs);
+            let cwd_rel = crate_abs
+                .strip_prefix(&root)
+                .ok()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string());
+            (root, cwd_rel)
+        }
+        None => (crate_abs.clone(), None),
+    };
+
+    // The artifact convention: `cargo build` in the crate dir writes to
+    // the crate's own target/ unless a WORKSPACE above claims it. The
+    // wizard states the guess and the caveat instead of over-guessing —
+    // membership is glob-shaped and a wrong silent answer costs a
+    // permanent walk-in failure.
+    let bin = format!("target/release/{name}");
+    let bin_caveat = workspace_above(&crate_abs, &from_root).map(|ws| {
+        format!(
+            "{} declares [workspace] above the crate — if it claims the \
+             crate as a member, the artifact lands in the WORKSPACE \
+             target/, so `bin:` must point there (e.g. \
+             `{}target/release/{name}`)",
+            ws.join("Cargo.toml").display(),
+            "../".repeat(
+                crate_abs.strip_prefix(&ws).map(|p| p.components().count()).unwrap_or(1),
+            ),
+        )
+    });
+
+    let features = declares_gpu_features(&manifest);
+    let build = if features {
+        format!("cargo build --release --features \"$FDL_GPU_FEATURE\" --bin {name}")
+    } else {
+        format!("cargo build --release --bin {name}")
+    };
+
+    Ok(Some(PublishDerivation { from_root, cwd_rel, bin, build, bin_caveat }))
+}
+
+/// `[package] name = "..."` — first `name =` line inside the [package]
+/// table.
+fn package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(rest) = t.strip_prefix("name") {
+                let rest = rest.trim_start();
+                if let Some(v) = rest.strip_prefix('=') {
+                    return Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `path = "..."` of a `flodl` dependency, if any — the line-level
+/// scan handles both the inline-table form (`flodl = { path = ".." }`)
+/// and the `[dependencies.flodl]` table form.
+fn flodl_path_dep(manifest: &str) -> Option<String> {
+    let mut in_flodl_table = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_flodl_table = t == "[dependencies.flodl]"
+                || t == "[dev-dependencies.flodl]"
+                || t == "[dependencies.flodl-hf]";
+            continue;
+        }
+        let inline = t
+            .strip_prefix("flodl")
+            .map(|r| r.trim_start())
+            .and_then(|r| r.strip_prefix('='))
+            .map(|r| r.trim());
+        if let Some(spec) = inline {
+            if let Some(p) = extract_path_value(spec) {
+                return Some(p);
+            }
+            continue;
+        }
+        if in_flodl_table {
+            if let Some(rest) = t.strip_prefix("path") {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    return Some(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `path = "..."` inside an inline table value.
+fn extract_path_value(spec: &str) -> Option<String> {
+    let idx = spec.find("path")?;
+    let rest = spec[idx + 4..].trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let quoted = rest.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    Some(quoted[..end].to_string())
+}
+
+/// Whether the crate declares the vendor features the recipe would
+/// forward — `cuda` or `rocm` keys under `[features]`.
+fn declares_gpu_features(manifest: &str) -> bool {
+    let mut in_features = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_features = t == "[features]";
+            continue;
+        }
+        if in_features {
+            let key = t.split('=').next().unwrap_or("").trim();
+            if key == "cuda" || key == "rocm" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve `..` components without touching the filesystem (the dep
+/// path may or may not exist yet on this box).
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for (ca, cb) in a.components().zip(b.components()) {
+        if ca == cb {
+            out.push(ca);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Nearest ancestor between the crate and the fetched root (exclusive
+/// of the crate itself) whose Cargo.toml declares `[workspace]`.
+fn workspace_above(crate_abs: &Path, from_root: &Path) -> Option<PathBuf> {
+    let mut dir = crate_abs.parent()?;
+    loop {
+        let m = dir.join("Cargo.toml");
+        if m.is_file() {
+            if let Ok(content) = fs::read_to_string(&m) {
+                if content.lines().any(|l| l.trim() == "[workspace]") {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+        if dir == from_root {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn render_publish_block(d: &PublishDerivation) -> String {
+    let mut out = String::from("publish:\n");
+    out.push_str(&format!("  source: file://{}\n", d.from_root.display()));
+    if let Some(cwd) = &d.cwd_rel {
+        out.push_str(&format!("  cwd: {cwd}\n"));
+    }
+    out.push_str(&format!("  build: {}\n", d.build));
+    out.push_str(&format!("  bin: {}\n", d.bin));
+    out.push_str("  # args: [--model, ..., --epochs, ...]   # the RUN's args\n");
+    out
+}
+
+/// Does the lockfile still describe the source about to ship? The
+/// honest form of "is the compiled version right".
+fn freshness_report(from_root: &Path) -> String {
+    let lock = from_root.join("Cargo.lock");
+    let Ok(lock_meta) = fs::metadata(&lock) else {
+        return format!(
+            "no Cargo.lock at {} yet — the publish gate build will create \
+             the verified pin",
+            from_root.display(),
+        );
+    };
+    let lock_mtime = lock_meta.modified().ok();
+    let newest = newest_source_mtime(from_root);
+    match (lock_mtime, newest) {
+        (Some(l), Some((n, path))) if n > l => format!(
+            "Cargo.lock predates the newest source edit ({}) — the next \
+             gate build refreshes the pin; publish before pointing workers \
+             at this tree",
+            path.display(),
+        ),
+        (Some(_), Some(_)) => "Cargo.lock is current with the source".to_string(),
+        _ => "freshness undetermined (no readable source mtimes)".to_string(),
+    }
+}
+
+fn newest_source_mtime(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if matches!(name.as_ref(), "target" | ".git" | ".fdl" | "libtorch") {
+                    continue;
+                }
+                stack.push(path);
+            } else if name != "Cargo.lock" {
+                if let Ok(m) = entry.metadata() {
+                    if let Ok(t) = m.modified() {
+                        if newest.as_ref().is_none_or(|(n, _)| t > *n) {
+                            newest = Some((t, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+// ── Renders ─────────────────────────────────────────────────────────────
+
+/// The paste-ready worker fdl.yml.
+fn render_worker_yml(
+    label: &str,
+    controller: &Endpoint,
+    token: &str,
+    door: Door,
+    cli: &JoinConfigArgs,
+) -> String {
+    let mut out = format!(
+        "# fdl.yml for a `{label}` farm worker — generated by `fdl join-config`.\n\
+         # Land the private key at {WORKER_KEY_PATH} (0600) and run:\n\
+         #   fdl join\n\
+         # (persist: true makes exits re-dial; the systemd recipe in\n\
+         # fdl.yml.example turns exit 2 into self-deprovisioning.)\n\
+         \n\
+         join:\n\
+         \x20 controller: 127.0.0.1:1337       # the tunnel's loopback end\n\
+         \x20 ssh:\n\
+         \x20   target: {host}\n",
+        label = label,
+        host = controller.host,
+    );
+    if controller.port != 22 {
+        out.push_str(&format!("    port: {}\n", controller.port));
+    }
+    out.push_str(&format!(
+        "    user: {user}\n\
+         \x20   identity_file: {WORKER_KEY_PATH}\n\
+         \x20 token: {token}\n\
+         \x20 libtorch: auto                   # routes on THIS box's devices\n",
+        user = controller.user,
+        token = token,
+    ));
+    match door {
+        Door::B => {
+            out.push_str(&format!(
+                "  source:\n\
+                 \x20   from: rsync://{user}@{host}:/tree   # rrsync re-roots under the served dir\n",
+                user = controller.user,
+                host = controller.host,
+            ));
+        }
+        Door::A => {
+            let data_path = cli.data_path.as_deref().unwrap_or(crate::config::DEFAULT_DATA_PATH);
+            out.push_str(&format!(
+                "  data_path: {data_path}\n\
+                 \x20 data_source: sshfs://{user}@{host}:{data_path}\n\
+                 \x20 # door `a` serves the DATA mount; the training binary must be\n\
+                 \x20 # provisioned (`bin:`) or pulled through another road.\n\
+                 \x20 # bin: /path/to/train\n",
+                user = controller.user,
+                host = controller.host,
+            ));
+        }
+        Door::Nologin => {
+            out.push_str(
+                "  # door `nologin` is tunnel-only: provision the binary and any\n\
+                 \x20 # data root, then declare them here.\n\
+                 \x20 # bin: /path/to/train\n\
+                 \x20 # data_path: /flodl/data\n",
+            );
+        }
+    }
+    if door != Door::A {
+        if let Some(dp) = &cli.data_path {
+            out.push_str(&format!("  data_path: {dp}\n"));
+        }
+    }
+    if let Some(share) = cli.gpu_ram_share {
+        out.push_str(&format!(
+            "  gpu_ram_share: {share}            # this box's APU aperture share\n"
+        ));
+    }
+    out.push_str("  persist: true\n");
+    out
+}
+
+fn render_notes(
+    label: &str,
+    authorized_line: &str,
+    match_block: &str,
+    controller: &Endpoint,
+    door: Door,
+) -> String {
+    let door_name = match door {
+        Door::B => "B (rrsync source pull — publish-then-join)",
+        Door::A => "A (read-only sftp data mount)",
+        Door::Nologin => "nologin (tunnel only)",
+    };
+    format!(
+        "# Farm `{label}` — controller-side install notes\n\n\
+         Door: {door_name}\n\n\
+         ## 1. authorized_keys ({user}@{host})\n\n\
+         Append to `~{user}/.ssh/authorized_keys` (one line):\n\n\
+         ```\n{authorized_line}\n```\n\n\
+         ## 2. Hardening (optional, recommended for a permanent setup)\n\n\
+         A dedicated no-shell user plus the daemon-level mirror of the key\n\
+         restrictions, so a mistake in either layer is caught by the other:\n\n\
+         ```\n{match_block}\n```\n\n\
+         ## 3. The worker side\n\n\
+         Copy `keys/{KEY_NAME}` to each worker at `{WORKER_KEY_PATH}` (0600)\n\
+         and `worker.yml` to its `fdl.yml`, then `fdl join`. Workers reach\n\
+         this box at `{host}:{port}`.\n\n\
+         Full recipe rationale: docs/ddp/02-cluster-guide.md.\n",
+        label = label,
+        door_name = door_name,
+        user = controller.user,
+        host = controller.host,
+        port = controller.port,
+        authorized_line = authorized_line,
+        match_block = match_block,
+    )
+}
+
+impl Report {
+    fn render_human(&self) -> String {
+        let mut out = String::new();
+        let push = |out: &mut String, s: &str| {
+            out.push_str(s);
+            out.push('\n');
+        };
+        push(&mut out, "");
+        push(&mut out, &format!("  farm:      {}", self.label));
+        push(&mut out, &format!("  dir:       {}", self.farm_dir.display()));
+        let overlay = match self.overlay_action {
+            OverlayAction::Scaffolded => "created",
+            OverlayAction::TokenReplaced => "token regenerated",
+            OverlayAction::TokenReused => "token reused",
+            OverlayAction::SnippetPrinted => "NOT edited (user-authored, no token)",
+        };
+        push(
+            &mut out,
+            &format!("  overlay:   {} ({overlay})", self.overlay_path.display()),
+        );
+        let key = match self.key_action {
+            KeyAction::Generated => "generated",
+            KeyAction::Regenerated => "REGENERATED (old key no longer admits)",
+            KeyAction::Reused => "reused",
+        };
+        push(&mut out, &format!("  join key:  {} ({key})", self.key_path.display()));
+        push(&mut out, &format!("  worker yml: {}", self.worker_yml_path.display()));
+        push(&mut out, &format!("  notes:     {}", self.notes_path.display()));
+        if let Some(w) = &self.reuse_warning {
+            push(&mut out, "");
+            push(&mut out, &format!("  WARNING: {w}"));
+        }
+        if self.overlay_action == OverlayAction::SnippetPrinted {
+            push(&mut out, "");
+            push(&mut out, "  Your overlay carries no token; add under `cluster.controller.join:`:");
+            push(&mut out, "");
+            push(&mut out, "      token: <generated — see worker.yml, they must match>");
+        }
+        push(&mut out, "");
+        push(&mut out, "  ── authorized_keys line (controller sshd, one line) ──");
+        push(&mut out, "");
+        push(&mut out, &format!("  {}", self.authorized_line));
+        push(&mut out, "");
+        push(&mut out, &format!("  ── worker fdl.yml ({}) ──", self.worker_yml_path.display()));
+        push(&mut out, "");
+        for line in self.worker_yml.lines() {
+            push(&mut out, &format!("  {line}"));
+        }
+        if let Some(p) = &self.publish_block {
+            push(&mut out, "");
+            push(&mut out, "  ── publish recipe for the base fdl.yml (then: `fdl publish`) ──");
+            push(&mut out, "");
+            for line in p.lines() {
+                push(&mut out, &format!("  {line}"));
+            }
+        }
+        if let Some(c) = &self.bin_caveat {
+            push(&mut out, "");
+            push(&mut out, &format!("  note: {c}"));
+        }
+        if let Some(f) = &self.freshness {
+            push(&mut out, "");
+            push(&mut out, &format!("  freshness: {f}"));
+        }
+        push(&mut out, "");
+        push(
+            &mut out,
+            &style::dim(&format!(
+                "  Install steps + hardening: {}. The private key is the \
+                 worker-bound secret; it never prints here.",
+                self.notes_path.display(),
+            )),
+        );
+        push(&mut out, "");
+        out
+    }
+
+    /// The machine twin: paths and states, secrets as file paths only.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "farm_dir": self.farm_dir.display().to_string(),
+            "overlay": {
+                "path": self.overlay_path.display().to_string(),
+                "action": match self.overlay_action {
+                    OverlayAction::Scaffolded => "scaffolded",
+                    OverlayAction::TokenReplaced => "token_replaced",
+                    OverlayAction::TokenReused => "token_reused",
+                    OverlayAction::SnippetPrinted => "snippet_printed",
+                },
+            },
+            "key": {
+                "private_path": self.key_path.display().to_string(),
+                "public_line": self.pub_line,
+                "action": match self.key_action {
+                    KeyAction::Generated => "generated",
+                    KeyAction::Regenerated => "regenerated",
+                    KeyAction::Reused => "reused",
+                },
+            },
+            "door": match self.door {
+                Door::B => "b",
+                Door::A => "a",
+                Door::Nologin => "nologin",
+            },
+            "authorized_keys_line": self.authorized_line,
+            "sshd_match_block": self.match_block,
+            "controller": format!(
+                "{}@{}:{}",
+                self.controller.user, self.controller.host, self.controller.port,
+            ),
+            "worker_yml_path": self.worker_yml_path.display().to_string(),
+            "notes_path": self.notes_path.display().to_string(),
+            "publish_block": self.publish_block,
+            "bin_caveat": self.bin_caveat,
+            "freshness": self.freshness,
+            "reuse_warning": self.reuse_warning,
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "join_config_tests.rs"]
+mod tests;

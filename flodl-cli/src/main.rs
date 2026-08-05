@@ -8,13 +8,13 @@
 
 use flodl_cli::{
     add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
-    join, overlay, parse_or_schema_from, probe, publish, run, setup, skill, status, style,
-    update_check,
+    join, join_config, overlay, parse_or_schema_from, probe, publish, run, setup, skill,
+    status, style, update_check,
 };
 
 use builtins::{
-    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, ProbeArgs,
-    PublishArgs, SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
+    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, JoinConfigArgs,
+    ProbeArgs, PublishArgs, SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
 };
 
 use std::env;
@@ -222,6 +222,11 @@ fn main() -> ExitCode {
             };
             let cli: JoinArgs = parse_sub("fdl join", &head[1..]);
             let code = join::run(&cli, tail);
+            ExitCode::from(code.clamp(0, 255) as u8)
+        }
+        "join-config" => {
+            let cli: JoinConfigArgs = parse_sub("fdl join-config", &args[1..]);
+            let code = join_config::run(&cli);
             ExitCode::from(code.clamp(0, 255) as u8)
         }
         "api-ref" => {
