@@ -90,7 +90,7 @@ fn global_root() -> PathBuf {
         .unwrap_or_else(|_| home_dir().join(".flodl"))
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
         .map(PathBuf::from)

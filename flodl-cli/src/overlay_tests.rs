@@ -610,6 +610,42 @@
         assert_eq!(chain[0].0, canon(&parent));
     }
 
+    /// `~/` names the invoking user's home, not a path under the
+    /// declaring file — the shape a global farm base under `~/.flodl`
+    /// needs. Proven by routing rather than by redirecting HOME (which
+    /// is process-global): a `~/` parent must NOT resolve relative to
+    /// the declaring file's directory.
+    #[test]
+    fn resolve_chain_expands_tilde_against_home() {
+        let tmp = tempdir();
+        let child = tmp.path().join("child.yml");
+        std::fs::write(&child, "inherit-from: ~/definitely-not-here-fdl.yml\nb: 2\n")
+            .unwrap();
+        let err = resolve_chain(&child).unwrap_err();
+        // The failure must point at a HOME-anchored path, not the temp dir.
+        assert!(
+            !err.contains(&tmp.path().display().to_string()),
+            "a ~/ parent resolved against the declaring dir: {err}"
+        );
+        assert!(err.contains("definitely-not-here-fdl.yml"), "got: {err}");
+    }
+
+    /// A scheme-shaped parent is reserved grammar: refused by name, not
+    /// left to fail as a nonexistent local path.
+    #[test]
+    fn resolve_chain_refuses_remote_parents_loudly() {
+        let tmp = tempdir();
+        let child = tmp.path().join("child.yml");
+        std::fs::write(
+            &child,
+            "inherit-from: rsync://host:/srv/farms/b300.yml\nb: 2\n",
+        )
+        .unwrap();
+        let err = resolve_chain(&child).unwrap_err();
+        assert!(err.contains("remote parents are not supported"), "got: {err}");
+        assert!(err.contains("rsync://host:/srv/farms/b300.yml"), "got: {err}");
+    }
+
     #[test]
     fn resolve_chain_self_inheritance_errors() {
         let tmp = tempdir();
