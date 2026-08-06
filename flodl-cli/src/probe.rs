@@ -664,6 +664,11 @@ pub fn probe_local(
     // libtorch-rocm's own `lib/` -- so on an AMD-only host there is
     // nothing to discover and a "libnccl not found" issue would be pure
     // noise telling the operator to install the wrong thing.
+    //
+    // The asymmetry is the distributions', not ours, and it is measured:
+    // the published 2.10.0+rocm7.0 archive carries `lib/librccl.so`
+    // (~340 MB), while the CUDA archives bundle no libnccl at all, which
+    // is exactly why that one is worth probing for and this one is not.
     let nccl = if !has_nvidia {
         NcclStatus { library_path: None, all_found: vec![], via_docker: None }
     } else {

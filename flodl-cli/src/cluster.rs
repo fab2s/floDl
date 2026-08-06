@@ -356,9 +356,10 @@ fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Str
         };
         if count == 0 {
             return Err(format!(
-                "cluster.workers[{i}] ({:?}): probed 0 CUDA devices \
+                "cluster.workers[{i}] ({:?}): probed 0 GPUs \
                  (local_devices: all). Either the host has no GPUs visible \
-                 (check nvidia-smi + CUDA_VISIBLE_DEVICES) or it's a \
+                 (NVIDIA: `nvidia-smi` and the visibility masks; AMD: \
+                 `/dev/kfd` and a loaded amdgpu driver) or it's a \
                  misconfiguration — provide an explicit `local_devices: [...]` \
                  list instead.",
                 w.host,
@@ -454,10 +455,19 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         "ConnectTimeout=5",
     ]);
     cmd.arg(target);
-    // Pipe to wc -l for a one-line numeric output; nvidia-smi's
-    // error stream is silenced so a missing driver produces "0" cleanly
-    // rather than a parse failure on stderr noise.
-    cmd.arg("nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l");
+    // Both vendors in one round trip, because "how many GPUs" is not an
+    // NVIDIA question: counting only nvidia-smi made an AMD worker probe
+    // 0 and abort the fan-out, with an error naming a tool that host
+    // does not have. Each count is piped to `wc -l` for a numeric line
+    // and each error stream is silenced, so an absent driver or an
+    // unmatched glob produces "0" rather than parse noise. The AMD side
+    // reads the KFD topology's `vendor_id 4098` (0x1002), which is
+    // flodl-hw's primary AMD gate and mask-proof by construction.
+    cmd.arg(
+        "n=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l); \
+         a=$(grep -l '^vendor_id 4098$' /sys/class/kfd/kfd/topology/nodes/*/properties \
+         2>/dev/null | wc -l); echo \"$n $a\"",
+    );
 
     let output = cmd
         .output()
@@ -470,13 +480,54 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let count_str = stdout.trim();
-    count_str.parse::<usize>().map_err(|e| {
-        format!(
-            "could not parse nvidia-smi output as device count: {e:?} \
-             (got {count_str:?})"
-        )
-    })
+    let counts = stdout.trim();
+    let (nvidia, amd) = parse_gpu_counts(counts)
+        .ok_or_else(|| format!("could not parse the remote GPU counts (got {counts:?})"))?;
+    pick_worker_count(nvidia, amd, worker.arch.as_deref(), target)
+}
+
+/// Split the two-number reply of the remote count probe.
+///
+/// Reads the LAST non-empty line: the probe echoes one, but a remote
+/// profile script that prints anything would otherwise shift the fields
+/// and turn a working host into a parse error.
+fn parse_gpu_counts(text: &str) -> Option<(usize, usize)> {
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let mut it = line.split_whitespace();
+    let nvidia = it.next()?.parse().ok()?;
+    let amd = it.next()?.parse().ok()?;
+    Some((nvidia, amd))
+}
+
+/// Reduce the per-vendor counts to the number of ranks this worker owns.
+///
+/// A libtorch build serves one vendor, so a host's rank count is the
+/// count for the vendor it will actually run, which its declared
+/// `arch:` names. Without that declaration a single-vendor host is still
+/// unambiguous, and a host reporting both is genuinely undecidable here:
+/// the controller cannot know which build that box will load, and
+/// guessing assigns ranks to devices nobody will address.
+fn pick_worker_count(
+    nvidia: usize,
+    amd: usize,
+    arch: Option<&str>,
+    target: &str,
+) -> Result<usize, String> {
+    match arch.and_then(crate::libtorch::detect::variant_vendor) {
+        Some(crate::util::system::GpuVendor::Nvidia) => return Ok(nvidia),
+        Some(crate::util::system::GpuVendor::Amd) => return Ok(amd),
+        _ => {}
+    }
+    match (nvidia, amd) {
+        (0, a) => Ok(a),
+        (n, 0) => Ok(n),
+        (n, a) => Err(format!(
+            "{target:?} reports {n} NVIDIA and {a} AMD GPU(s), and one \
+             libtorch build serves one vendor, so which of them this host \
+             trains on cannot be inferred. Declare the host's `arch:` (the \
+             libtorch variant it uses) or pin `local_devices: [...]`."
+        )),
+    }
 }
 
 /// Resolve each cluster worker's `host` to an IP via the controller's
@@ -743,6 +794,46 @@ pub fn resolve_local_hostname() -> String {
 mod tests {
     use super::*;
     use crate::util::test_env::env_lock;
+
+    #[test]
+    fn remote_gpu_counts_parse_as_a_vendor_pair() {
+        assert_eq!(parse_gpu_counts("2 0"), Some((2, 0)));
+        assert_eq!(parse_gpu_counts(" 0   8 "), Some((0, 8)));
+        // A host answering with anything else must be a loud parse
+        // failure, never a silent zero that reads as "no GPUs".
+        assert_eq!(parse_gpu_counts("2"), None);
+        assert_eq!(parse_gpu_counts(""), None);
+        assert_eq!(parse_gpu_counts("bash: nvidia-smi: not found"), None);
+        // A remote profile script that prints must not shift the fields:
+        // the counts are the last line, not the first two tokens.
+        assert_eq!(parse_gpu_counts("Welcome to node 7\n0 8"), Some((0, 8)));
+        assert_eq!(parse_gpu_counts("2 0\n"), Some((2, 0)));
+    }
+
+    #[test]
+    fn a_workers_rank_count_follows_the_vendor_it_declares() {
+        // The bug this guards: the probe counted nvidia-smi only, so an
+        // AMD worker with `local_devices: all` probed 0 and aborted the
+        // fan-out, quoting a tool that host does not have.
+        assert_eq!(pick_worker_count(0, 8, Some("precompiled/rocm70"), "h"), Ok(8));
+        assert_eq!(pick_worker_count(2, 0, Some("precompiled/cu128"), "h"), Ok(2));
+        // A declared arch outranks the other vendor's cards being present.
+        assert_eq!(pick_worker_count(2, 8, Some("precompiled/rocm71"), "h"), Ok(8));
+        assert_eq!(pick_worker_count(2, 8, Some("builds/sm61-sm120"), "h"), Ok(2));
+    }
+
+    #[test]
+    fn an_undeclared_single_vendor_host_still_resolves() {
+        assert_eq!(pick_worker_count(4, 0, None, "h"), Ok(4));
+        assert_eq!(pick_worker_count(0, 4, None, "h"), Ok(4));
+        assert_eq!(pick_worker_count(0, 0, None, "h"), Ok(0));
+        // Both vendors and nothing declared: undecidable HERE (the
+        // controller cannot know which build that box loads), so it must
+        // say so rather than assign ranks to devices nobody addresses.
+        let err = pick_worker_count(2, 8, None, "mixed-host").unwrap_err();
+        assert!(err.contains("2 NVIDIA and 8 AMD"), "got {err}");
+        assert!(err.contains("arch:"), "got {err}");
+    }
 
     #[test]
     fn net_timeout_scale_validation_mirrors_library_rule() {

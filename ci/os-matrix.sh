@@ -67,13 +67,32 @@ find_fdl() {
 # grammar offline; this covers what they cannot -- that the URL this
 # host resolves still exists.
 url_live() {
-    local flag="$1" url code
+    local flag="$1" url code rc err
     # shellcheck disable=SC2086
     url=$("$FDL" libtorch download $flag --dry-run | sed -n 's/.*URL:[[:space:]]*//p' | head -1)
     [ -n "$url" ] || fail "$flag resolved no URL"
-    code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 60 \
-                --retry 3 --retry-delay 5 -r 0-0 "$url")
-    printf '%-14s HTTP %s  %s\n' "$flag" "$code" "$url"
+    err=$(mktemp)
+    # -sS keeps stdout to the write-out code while stderr carries the
+    # reason, because a check that cannot say WHY it failed sends the
+    # next reader guessing: this printed an empty code once and the
+    # cause was unrecoverable from the log.
+    code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 120 \
+                --retry 3 --retry-delay 5 --retry-all-errors -r 0-0 "$url" 2>"$err")
+    rc=$?
+    printf '%-14s HTTP %s  %s\n' "$flag" "${code:-none}" "$url"
+    # An answer we did not like and no answer at all are different
+    # findings. Upstream saying 404 means the bucket is gone, which is
+    # the thing this check exists to catch, so it stays a hard failure.
+    # curl never completing (killed, DNS, TLS, a CDN hiccup, code 000 or
+    # empty) is OUR side of the wire failing: it is no evidence about
+    # the URL, and a third-party CDN must not be able to redden a
+    # portability gate on a bad minute.
+    if [ "$rc" -ne 0 ] || [ -z "$code" ] || [ "$code" = "000" ]; then
+        soft "$flag: no answer from the CDN, availability UNVERIFIED (curl exit $rc, code '${code:-none}'): $(tr '\n' ' ' <"$err" | head -c 200)"
+        rm -f "$err"
+        return 0
+    fi
+    rm -f "$err"
     case "$code" in 200|206) ;; *) fail "$flag -> HTTP $code" ;; esac
 }
 
