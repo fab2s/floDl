@@ -219,7 +219,12 @@ mod tests {
     fn deprecated_aliases_forward_to_their_replacements() {
         assert_eq!(cuda_available(), gpu_available());
         assert_eq!(cuda_device_count(), gpu_device_count());
-        assert_eq!(current_cuda_device(), current_gpu_device());
+        // `current_gpu_device` asks the driver directly; on a GPU-feature
+        // build running without a driver that is a fatal C++ exception,
+        // not an error return. Everything else here degrades to 0/empty.
+        if gpu_available() {
+            assert_eq!(current_cuda_device(), current_gpu_device());
+        }
         assert_eq!(cuda_devices().len(), gpu_devices().len());
         assert_eq!(usable_cuda_devices().len(), usable_gpu_devices().len());
     }

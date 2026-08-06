@@ -53,6 +53,33 @@ probe_json() { "$FDL" probe --json 2>/dev/null || true; }
 probe_text() { "$FDL" probe 2>&1 || true; }
 has()        { printf '%s' "$1" | grep -qF "$2"; }
 
+# `fdl` is `fdl.exe` under Git Bash.
+find_fdl() {
+    FDL=target/release/fdl
+    [ -f "$FDL" ] || FDL=target/release/fdl.exe
+}
+
+# Resolve the URL a variant flag produces and assert it is live upstream
+# (range request only, nothing downloads). Unit tests cover the URL
+# grammar offline; this covers what they cannot -- that the URL this
+# host resolves still exists.
+url_live() {
+    local flag="$1" url code
+    # shellcheck disable=SC2086
+    url=$("$FDL" libtorch download $flag --dry-run | sed -n 's/.*URL:[[:space:]]*//p' | head -1)
+    [ -n "$url" ] || fail "$flag resolved no URL"
+    code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 60 \
+                --retry 3 --retry-delay 5 -r 0-0 "$url")
+    printf '%-14s HTTP %s  %s\n' "$flag" "$code" "$url"
+    case "$code" in 200|206) ;; *) fail "$flag -> HTTP $code" ;; esac
+}
+
+# Run a command with every libtorch-locating variable scrubbed, so what
+# executes sees the machine the way a fresh user's shell does.
+scrubbed() {
+    env -u LIBTORCH_PATH -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH -u LIBRARY_PATH "$@"
+}
+
 SOFT_FAIL=0
 # Stop at the first hard failure so it is the last thing in the log:
 # Actions folds each ::group::, so anything after an error scrolls it out
@@ -171,9 +198,7 @@ esac
 
 note "host $HOST${LT_FLAG:+ -> installs '$LT_FLAG' ($LT_DIR)}"
 
-# `fdl` is `fdl.exe` under Git Bash.
-FDL=target/release/fdl
-[ -f "$FDL" ] || FDL=target/release/fdl.exe
+find_fdl
 
 # =====================================================================
 group "Test (flodl-cli + flodl-hw, no libtorch)"
@@ -193,8 +218,7 @@ endgroup
 
 group "Build fdl"
 cargo build --release -p flodl-cli || { fail "$HOST: fdl build"; exit 1; }
-FDL=target/release/fdl
-[ -f "$FDL" ] || FDL=target/release/fdl.exe
+find_fdl
 endgroup
 
 # =====================================================================
@@ -227,38 +251,21 @@ fi
 endgroup
 
 # =====================================================================
-if [ -n "$LT_FLAG" ]; then
-group "libtorch URL resolves and is live"
-# The URL grammar differs per OS (macOS has its own filename, Windows
-# carries a `-win-` infix) and unit tests cover the grammar offline.
-# This covers what they cannot: that the URL this host resolves is live
-# upstream. `--dry-run` prints it and stops, so nothing downloads.
-URL=$("$FDL" libtorch download $LT_FLAG --dry-run | sed -n 's/.*URL:[[:space:]]*//p' | head -1)
-if [ -z "$URL" ]; then
-    fail "$HOST: --dry-run printed no URL"
-else
-    echo "resolved: $URL"
-    CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 60 \
-                --retry 3 --retry-delay 5 -r 0-0 "$URL")
-    case "$CODE" in
-        200|206) pass "$HOST URL is live (HTTP $CODE)" ;;
-        *)       fail "$HOST: $URL -> HTTP $CODE" ;;
-    esac
-fi
-endgroup
-fi
-
 if [ "$ALL_VARIANTS" = 1 ]; then
 group "Every variant URL is live"
-# The vendor rotation installs one variant per run; this keeps the
-# others from rotting silently upstream. Range requests only.
+# The URL grammar differs per OS (macOS has its own filename, Windows
+# carries a `-win-` infix). The vendor rotation installs one variant per
+# run; checking the whole list here keeps the others from rotting
+# silently upstream, and it covers this run's own flag too.
 for FLAG in "--cpu" "--cuda 12.6" "--cuda 12.8" "--rocm 7.0"; do
-    U=$("$FDL" libtorch download $FLAG --dry-run | sed -n 's/.*URL:[[:space:]]*//p' | head -1)
-    if [ -z "$U" ]; then fail "$FLAG resolved no URL"; continue; fi
-    C=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 60 --retry 3 --retry-delay 5 -r 0-0 "$U")
-    printf '%-14s HTTP %s  %s\n' "$FLAG" "$C" "$U"
-    case "$C" in 200|206) ;; *) fail "$FLAG -> HTTP $C" ;; esac
+    url_live "$FLAG"
 done
+pass "every variant URL is live on $HOST"
+endgroup
+elif [ -n "$LT_FLAG" ]; then
+group "libtorch URL resolves and is live"
+url_live "$LT_FLAG"
+pass "$HOST URL is live"
 endgroup
 fi
 
@@ -494,6 +501,66 @@ elif [ "$COMPILE_ADVISORY" = 1 ]; then
     soft "$HOST: flodl build/clippy failed (never compiled on this host before)"
 else
     fail "$HOST: flodl build/clippy"
+fi
+endgroup
+fi
+
+# =====================================================================
+if [ "$COMPILE" = 1 ] && [ -n "$LT_DIR" ] && [ -d "libtorch/precompiled/$LT_DIR" ]; then
+group "Scaffold smoke: fdl init --native -> build -> run"
+# A user's real first session, end to end: scaffold a project, build it,
+# train the template -- against THIS checkout's flodl, not the registry.
+#
+# Three regression guards live here and nowhere else:
+#   - the dependency line must be a registry pin, never the floating git
+#     fallback (the crates.io probe once sent no User-Agent, got policy-
+#     rejected, and EVERY scaffold silently carried the git dep);
+#   - the scaffold's printed next steps must be true without hand
+#     exports: native fdl commands fill LIBTORCH_PATH / LD_LIBRARY_PATH
+#     from the project's active variant, so the runs go through
+#     `scrubbed` (a dev box leaks LIBTORCH_PATH from .bashrc, and a
+#     build that links through the leak validates nothing);
+#   - the template trains on CPU.
+#
+# The libtorch symlink stands in for the scaffold's own
+# `./fdl libtorch download` -- same .active resolution through the
+# project root, no second multi-GB download. The vendor variants carry
+# the CPU libraries too, so the no-feature build links on any rotation.
+FDL_ABS="$PWD/$FDL"
+SCAF_ROOT=$(mktemp -d)
+SCAF="$SCAF_ROOT/fdl-ci-scaffold"
+SCAF_OK=1
+(cd "$SCAF_ROOT" && "$FDL_ABS" init fdl-ci-scaffold --native < /dev/null) || SCAF_OK=0
+
+if [ "$SCAF_OK" = 1 ]; then
+    if grep -Eq '^flodl = "[0-9]' "$SCAF/Cargo.toml"; then
+        pass "scaffold dependency is a registry pin: $(grep '^flodl' "$SCAF/Cargo.toml")"
+    else
+        SCAF_OK=0
+        echo "dep line is not a registry pin: $(grep '^flodl' "$SCAF/Cargo.toml" || echo '<missing>')"
+    fi
+    if grep -q 'git *=' "$SCAF/Cargo.toml"; then
+        SCAF_OK=0; echo "scaffold fell back to a git dependency"
+    fi
+fi
+
+if [ "$SCAF_OK" = 1 ]; then
+    # sed -i.bak: the one -i spelling GNU and BSD sed agree on.
+    sed -i.bak 's|^flodl = ".*"$|flodl = { path = "'"$PWD"'/flodl" }|' "$SCAF/Cargo.toml"
+    ln -s "$PWD/libtorch" "$SCAF/libtorch"
+    (cd "$SCAF" && scrubbed "$FDL_ABS" build) || SCAF_OK=0
+fi
+if [ "$SCAF_OK" = 1 ]; then
+    (cd "$SCAF" && scrubbed "$FDL_ABS" run) || SCAF_OK=0
+fi
+rm -rf "$SCAF_ROOT"
+
+if [ "$SCAF_OK" = 1 ]; then
+    pass "$HOST scaffolded, built and trained a native project"
+elif [ "$COMPILE_ADVISORY" = 1 ]; then
+    soft "$HOST: scaffold smoke failed (flodl has never compiled on this host)"
+else
+    fail "$HOST: scaffold smoke (init -> build -> run)"
 fi
 endgroup
 fi

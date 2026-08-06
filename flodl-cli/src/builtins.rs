@@ -297,8 +297,8 @@ pub struct JoinConfigArgs {
     #[option]
     pub no_install_key: bool,
     /// Accept every default without prompting (non-interactive; reuses
-    /// existing credentials unless `--regen`, installs the key unless
-    /// `--no-install-key`).
+    /// existing credentials unless `--regen`). Never consents to the
+    /// authorized_keys install: that takes the prompt or `--install-key`.
     #[option]
     pub yes: bool,
     /// Report as JSON on stdout. Secrets appear as file paths, never

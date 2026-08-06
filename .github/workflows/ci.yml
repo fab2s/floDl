@@ -102,6 +102,50 @@ jobs:
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
         run: cargo test leakcheck -- --test-threads=1 --nocapture
 
+      # The model-sig probe is a wire contract consumed by `fdl join`: it
+      # re-runs the training binary under FLODL_INTERNAL_MODEL_SIG_PROBE
+      # and scans stdout for one `flodl-model-sig: <hex>` line. Nothing
+      # else in CI pins that line's shape, so this runs a real example
+      # twice and asserts the contract: the line appears, the process
+      # exits 0 without training, and the hex is identical across runs
+      # (the signature is a pure function of the constructed model).
+      - name: Model-sig probe contract
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: |
+          cargo build -p flodl --example auto_promote
+          bin=target/debug/examples/auto_promote
+          out1=$(FLODL_INTERNAL_MODEL_SIG_PROBE=1 "$bin")
+          out2=$(FLODL_INTERNAL_MODEL_SIG_PROBE=1 "$bin")
+          sig1=$(printf '%s\n' "$out1" | sed -n 's/^flodl-model-sig: //p')
+          sig2=$(printf '%s\n' "$out2" | sed -n 's/^flodl-model-sig: //p')
+          echo "run 1: $sig1"
+          echo "run 2: $sig2"
+          printf '%s' "$sig1" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::no 64-hex flodl-model-sig line in probe stdout"; exit 1; }
+          [ "$sig1" = "$sig2" ] \
+            || { echo "::error::model-sig probe is not deterministic across runs"; exit 1; }
+
+      # join-config's --cloud-init artifact is consumed by cloud-init's
+      # own YAML parser, and it embeds a private key and a worker yml
+      # INSIDE yaml -- quoting that only a real parser validates. The
+      # credentials minted here are throwaway and never leave the runner;
+      # --json reports secrets as file paths, never payloads, so printing
+      # the report is safe.
+      - name: cloud-init artifact parses as YAML
+        run: |
+          python3 -c "import yaml" 2>/dev/null \
+            || python3 -m pip install --break-system-packages --quiet pyyaml
+          smoke=$(mktemp -d)
+          report=$(cd "$smoke" && "$GITHUB_WORKSPACE/target/debug/fdl" join-config ci-smoke \
+            --controller ci@localhost --no-install-key --yes --cloud-init --json)
+          printf '%s\n' "$report"
+          ci_path=$(printf '%s' "$report" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["cloud_init_path"])')
+          python3 -c "import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); assert isinstance(d,dict) and 'write_files' in d, sorted(d); print('cloud-init parses; top-level keys:', sorted(d))" "$ci_path"
+
       - name: Clippy
         env:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
@@ -198,6 +242,24 @@ jobs:
             flodl-cuda-ci \
             cargo build --features cuda --tests
           df -h /
+
+      # The step above linked every test binary; this RUNS the flodl lib
+      # suite on a runner with no GPU driver. Not a degenerate case: it is
+      # exactly what a `--features cuda` binary sees on a CPU-only box or
+      # a driverless container, and one class of bug lives only here -- a
+      # device query that treats "no driver" as a fatal C++ exception
+      # instead of an empty answer (the deprecated-alias sweep did, and
+      # 2000+ tests on driver-present boxes never saw it). Serial, because
+      # an abort kills the whole binary and only a serial run names the
+      # culprit test.
+      - name: Run the flodl suite without a GPU
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-cuda-ci \
+            cargo test -p flodl --features cuda --lib -- --test-threads=1 --skip leakcheck
 
       - name: Clippy with CUDA feature
         run: |
@@ -321,9 +383,10 @@ jobs:
             cargo build -p flodl-sys -p flodl --features rocm
 
       # ONE separate integration-test binary, linked but never run (no AMD
-      # GPU on this runner). This is the only place in CI where ld sees the
-      # HIP link set, so it is where a wrong `FLODL_TORCH_GPU_LIB`
-      # force-load target or a bad gpu_compat.h mapping surfaces.
+      # GPU on this runner). A SEPARATE binary is the only place a wrong
+      # `FLODL_TORCH_GPU_LIB` force-load target or a bad gpu_compat.h
+      # mapping surfaces at link time -- the lib test binary the next step
+      # runs keeps passing through that hole by construction.
       #
       # It must be an INTEGRATION test, not flodl's lib test: `flodl` has
       # no tests/ dir, so its whole suite is one lib-test binary -- exactly
@@ -339,6 +402,21 @@ jobs:
             -w /workspace \
             flodl-rocm-ci \
             cargo build --features rocm -p flodl-hf --test bert_cuda_smoke
+          df -h /
+
+      # The CUDA job's driverless-run rationale, ROCm edition -- and here
+      # it also covers the libtorch_hip force-load dlopen'ing against the
+      # sparse .so-only tree with no /dev/kfd. Costs one more linked
+      # binary (flodl's lib test), which is why it is the ONLY suite this
+      # job runs; the disk ceiling that keeps `--tests` out still stands.
+      - name: Run the flodl suite without a GPU (ROCm)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo test -p flodl --features rocm --lib -- --test-threads=1 --skip leakcheck
           df -h /
 
       - name: Clippy with ROCm feature

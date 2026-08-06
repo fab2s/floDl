@@ -115,11 +115,15 @@ mod tests {
 
     #[test]
     fn test_cuda_event_create_cpu() {
-        if test_device().is_cuda() {
-            return; // skip on GPU — it should succeed there
+        if cfg!(any(feature = "cuda", feature = "rocm")) {
+            // at::cuda::CUDAEvent is lazy: the driver event is created at
+            // first record(), so construction succeeds on a GPU build even
+            // on a box with no driver. Only the CPU stub errors here.
+            assert!(GpuEvent::new(GpuEventFlags::Default).is_ok());
+        } else {
+            let result = GpuEvent::new(GpuEventFlags::Default);
+            assert!(result.is_err(), "GpuEvent::new() should fail on a CPU build");
         }
-        let result = GpuEvent::new(GpuEventFlags::Default);
-        assert!(result.is_err(), "GpuEvent::new() should fail on CPU");
     }
 
     use std::sync::Mutex;
