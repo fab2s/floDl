@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use crate::util::prompt;
 
@@ -208,27 +207,20 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The scaffold's flodl dependency line: the latest published version
+/// when crates.io answers (through the update check's probe — the one
+/// client that sends the User-Agent crates.io's data-access policy
+/// requires; a bare curl gets a policy rejection, which for a long time
+/// silently routed EVERY scaffold to a fallback), and fdl's own version
+/// otherwise — fdl and flodl are workspace-versioned twins, so the pin
+/// is right whenever this fdl came from crates.io itself. Always a
+/// pinnable registry version, never a git dependency: a default branch
+/// floats under the scaffold, and `fdl add flodl-hf` refuses git deps
+/// by design ("needs a pinnable crates.io version").
 fn resolve_flodl_dep() -> String {
-    // Try crates.io for the latest version
-    if let Some(version) = crates_io_version() {
-        format!("flodl = \"{}\"", version)
-    } else {
-        "flodl = { git = \"https://github.com/flodl-labs/flodl.git\" }".into()
-    }
-}
-
-fn crates_io_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-sL", "https://crates.io/api/v1/crates/flodl"])
-        .output()
-        .ok()?;
-    let body = String::from_utf8_lossy(&output.stdout);
-    // Extract "max_stable_version":"X.Y.Z"
-    let marker = "\"max_stable_version\":\"";
-    let start = body.find(marker)? + marker.len();
-    let end = start + body[start..].find('"')?;
-    let version = &body[start..end];
-    if version.is_empty() { None } else { Some(version.to_string()) }
+    let version = crate::update_check::probe_crates_io("flodl")
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    format!("flodl = \"{version}\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -958,11 +950,11 @@ fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
          # `libtorch/.active` automatically; missing libtorch surfaces as a\n\
          # clean linker error, with `./fdl setup` one call away."
     } else {
-        "# Native mode: commands run on the host. Make sure libtorch is\n\
-         # installed (`./fdl libtorch download --cpu` or `--cuda 12.8`)\n\
-         # and that `$LIBTORCH` / `$LD_LIBRARY_PATH` are exported so\n\
-         # cargo can link. `./fdl libtorch info` prints the commands you\n\
-         # need after a download."
+        "# Native mode: commands run on the host. Install libtorch first\n\
+         # (`./fdl libtorch download --cpu` or `--cuda 12.8`); `./fdl`\n\
+         # commands then export `LIBTORCH_PATH` / `LD_LIBRARY_PATH` from\n\
+         # the active variant automatically. Bypassing fdl (bare cargo)\n\
+         # needs them by hand — `./fdl libtorch info` prints the exports."
     };
 
     let shell_block = if use_docker {

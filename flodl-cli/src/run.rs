@@ -269,7 +269,40 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     ));
 
     if let Some((info, host_path)) = resolve_libtorch(project_root)? {
-        env.push(("LIBTORCH_HOST_PATH".into(), host_path));
+        env.push(("LIBTORCH_HOST_PATH".into(), host_path.clone()));
+
+        // Native commands: fill what the docker services get from their
+        // compose env, so the scaffold's printed next steps
+        // (`./fdl libtorch download --cpu` then `./fdl build` then
+        // `./fdl run`) are true without hand exports. `LIBTORCH_PATH`
+        // is what flodl-sys's build.rs consumes (fill-when-absent: the
+        // inherited value is build.rs's documented manual override and
+        // keeps the last word); `LD_LIBRARY_PATH` is what lets the
+        // linked binary load at runtime, vendor-ordered — on ROCm the
+        // system runtime must precede libtorch's bundled copy.
+        let abs_path = if Path::new(&host_path).is_relative() {
+            project_root.join(&host_path).display().to_string()
+        } else {
+            host_path
+        };
+        if std::env::var_os("LIBTORCH_PATH").is_none() {
+            env.push(("LIBTORCH_PATH".into(), abs_path.clone()));
+        }
+        let lib = format!("{abs_path}/lib");
+        let inherited = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        if !inherited.split(':').any(|p| p == lib) {
+            let value = crate::libtorch::detect::ld_library_path_value(
+                crate::libtorch::detect::variant_vendor(&info.path),
+                &lib,
+                &crate::libtorch::detect::local_rocm_lib_dir(),
+            );
+            let composed = if inherited.is_empty() {
+                value
+            } else {
+                format!("{value}:{inherited}")
+            };
+            env.push(("LD_LIBRARY_PATH".into(), composed));
+        }
 
         // The cargo feature this variant needs, so a `run:` line can say
         // `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
