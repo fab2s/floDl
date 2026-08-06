@@ -716,7 +716,7 @@ fn id_prefix(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-fn hex_prefix(sig: &[u8; 32]) -> String {
+pub(crate) fn hex_prefix(sig: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(8);
     for b in &sig[..4] {

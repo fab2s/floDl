@@ -134,6 +134,9 @@ impl DdpHandle {
             // Inert on this thread-based GpuWorker path (no TCP inbound loop).
             coord_liveness_timeout_secs:
                 crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            // Thread-based path: no control handshake reads it, and a
+            // single process has nothing to disagree with itself about.
+            model_sig: [0u8; 32],
         };
 
         // Keep the worker channels: `run_epoch_plan` calls `worker.report_epoch`
@@ -361,6 +364,9 @@ impl DdpHandle {
             save_path: None,
             coord_liveness_timeout_secs:
                 crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            // Thread-based path: no control handshake reads it, and a
+            // single process has nothing to disagree with itself about.
+            model_sig: [0u8; 32],
         };
 
         // The worker holds the sender ends; the cooperative Worker never drains

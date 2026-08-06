@@ -72,11 +72,23 @@ where
 
 /// Single-rank relay handshake toward the coordinator: send the
 /// channel-select magic and a `Hello` for `[rank_id]`, expect
-/// `HelloAck`.
+/// `HelloAck`. Announces no model signature (gates nothing).
 pub(super) fn relay_hello(
     stream: &mut TcpStream,
     salt: &SessionSalt,
     rank_id: u32,
+) -> Result<()> {
+    relay_hello_sigs(stream, salt, rank_id, vec![])
+}
+
+/// [`relay_hello`] with explicit model signatures for the announced
+/// rank (formation-refusal tests drive the coordinator's comparison
+/// through this).
+pub(super) fn relay_hello_sigs(
+    stream: &mut TcpStream,
+    salt: &SessionSalt,
+    rank_id: u32,
+    model_sigs: Vec<[u8; 32]>,
 ) -> Result<()> {
     crate::distributed::wire::write_channel_magic(
         stream,
@@ -85,6 +97,7 @@ pub(super) fn relay_hello(
     MuxRecord::control(RelayControlMsg::Hello {
         host: format!("test-r{rank_id}"),
         ranks: vec![rank_id],
+        model_sigs,
     })
     .write_to(stream, salt)?;
     match MuxRecord::read_from(stream, salt)? {
@@ -456,6 +469,7 @@ fn handshake_rejects_wrong_salt_full_path() {
         let _ = MuxRecord::control(RelayControlMsg::Hello {
             host: "rogue".into(),
             ranks: vec![0],
+            model_sigs: vec![],
         })
         .write_to(&mut s, &bad_salt);
         // Read until the server drops us.
@@ -490,7 +504,7 @@ fn read_handshake_rank_rejects_wrong_salt_direct() {
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ).unwrap();
         // Send a handshake keyed by the wrong salt.
-        write_handshake_rank(&mut s, 0, 1, &bad_salt).unwrap();
+        write_handshake_rank(&mut s, 0, 1, &[0u8; 32], &bad_salt).unwrap();
         // Don't expect an ack; the coordinator should drop us.
         drop(s);
     });

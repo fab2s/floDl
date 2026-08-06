@@ -83,7 +83,7 @@
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            write_handshake_rank(&mut stream, rank, ws, &TEST_SALT).unwrap();
+            write_handshake_rank(&mut stream, rank, ws, &[0u8; 32], &TEST_SALT).unwrap();
             read_handshake_ack(&mut stream, &TEST_SALT).unwrap();
             // Hold the stream open briefly so the coord can register
             // before we drop.
@@ -115,7 +115,7 @@
 
         let rank = thread::spawn(move || {
             let mut s = TcpStream::connect_timeout(&relay_addr, Duration::from_secs(5)).unwrap();
-            let _ = write_handshake_rank(&mut s, 0, world_size as u32, &bad_salt);
+            let _ = write_handshake_rank(&mut s, 0, world_size as u32, &[0u8; 32], &bad_salt);
             let _ = read_handshake_ack(&mut s, &bad_salt);
         });
         let err = match relay_rx.recv().unwrap() {
@@ -324,6 +324,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -526,6 +527,7 @@
                     // Production callers using auto_with auto-route here
                     // when save_path is set on DdpRunConfig.
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -736,6 +738,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Cadence,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -1068,6 +1071,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };

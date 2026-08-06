@@ -119,6 +119,7 @@ fn test_worker_config_clone() {
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        model_sig: [0u8; 32],
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -224,6 +225,7 @@ pub(super) fn make_test_worker_customized(
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        model_sig: [0u8; 32],
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };

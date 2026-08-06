@@ -121,6 +121,10 @@ pub enum RelayControlMsg {
         /// Global ranks carried by this connection (the host's local
         /// rank set, in ascending order).
         ranks: Vec<u32>,
+        /// Per-rank model signatures, aligned with `ranks`. Empty on
+        /// the data channel (its bare handshake carries none); the
+        /// coordinator compares only what arrives non-empty.
+        model_sigs: Vec<[u8; 32]>,
     },
     /// Controller → relay handshake acknowledgement.
     HelloAck,

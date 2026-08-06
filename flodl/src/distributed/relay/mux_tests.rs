@@ -56,6 +56,7 @@ fn control_hello_round_trips() {
     let rec = MuxRecord::control(RelayControlMsg::Hello {
         host: "exa".into(),
         ranks: vec![0, 3, 4],
+        model_sigs: vec![],
     });
     let buf = write_one(&rec, &SALT_A);
     let mut cursor = &buf[..];
@@ -113,6 +114,7 @@ fn multiple_records_stream_back_in_order() {
         MuxRecord::control(RelayControlMsg::Hello {
             host: "pascal".into(),
             ranks: vec![1, 2],
+            model_sigs: vec![],
         }),
         MuxRecord::data(1, vec![0xAA; 5]),
         MuxRecord::data(2, vec![0xBB; 9]),
@@ -309,6 +311,7 @@ fn record_is_written_atomically_single_write() {
     MuxRecord::control(RelayControlMsg::Hello {
         host: "h".into(),
         ranks: vec![0, 1],
+        model_sigs: vec![],
     })
     .write_to(&mut w, &SALT_A)
     .unwrap();

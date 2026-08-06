@@ -41,6 +41,7 @@ pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;
 pub mod max_failure;
 pub(crate) mod membership;
+pub(crate) mod model_sig;
 pub mod nccl;
 pub mod outer_optimizer;
 pub(crate) mod port_mux;

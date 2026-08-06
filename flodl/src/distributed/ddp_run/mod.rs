@@ -1647,6 +1647,13 @@ pub struct WorkerConfig {
     /// [`crate::distributed::cluster_worker`]'s TCP inbound loop reads it.
     /// Defaults to [`DEFAULT_COORD_LIVENESS_TIMEOUT_SECS`].
     pub coord_liveness_timeout_secs: u64,
+    /// Model signature (see `distributed::model_sig`) of the model
+    /// this rank constructed, carried into the control-channel
+    /// handshake so the coordinator can refuse a mixed-model formation
+    /// by name. Only the cluster rank path computes it; the thread-based
+    /// single-process path leaves it zeroed (all ranks share one
+    /// process, so there is nothing to disagree about).
+    pub model_sig: [u8; 32],
 }
 
 /// Default coordinator-liveness deadline (seconds), matching the

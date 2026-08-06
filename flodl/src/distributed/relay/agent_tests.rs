@@ -268,7 +268,7 @@ fn data_rank_handshake(stream: &mut TcpStream, rank: u32, world_size: u32) {
 /// channels.
 fn spawn_fake_controller(
     controller: TcpListener,
-    hello_tx: mpsc::Sender<Vec<u32>>,
+    hello_tx: mpsc::Sender<(Vec<u32>, Vec<[u8; 32]>)>,
     data_tx: mpsc::Sender<(u32, Vec<u8>)>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -282,8 +282,10 @@ fn spawn_fake_controller(
         )
         .unwrap();
         match MuxRecord::read_from(&mut up, &SALT).unwrap().unwrap() {
-            MuxRecord::Control(RelayControlMsg::Hello { ranks, .. }) => {
-                hello_tx.send(ranks).unwrap();
+            MuxRecord::Control(RelayControlMsg::Hello {
+                ranks, model_sigs, ..
+            }) => {
+                hello_tx.send((ranks, model_sigs)).unwrap();
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -706,8 +708,9 @@ fn relay_channel_control_channel_end_to_end() {
     let rank_thread = thread::spawn(move || {
         let mut s = TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
         s.set_nodelay(true).unwrap();
-        // Control-channel handshake is salt-authenticated.
-        write_handshake_rank(&mut s, 1, 2, &SALT).unwrap();
+        // Control-channel handshake is salt-authenticated and carries
+        // the model signature the relay must forward upstream.
+        write_handshake_rank(&mut s, 1, 2, &[0xCD; 32], &SALT).unwrap();
         let mut ack = [0u8; 16];
         s.read_exact(&mut ack).unwrap();
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -727,7 +730,11 @@ fn relay_channel_control_channel_end_to_end() {
     )
     .unwrap();
 
-    assert_eq!(hello_rx.recv_timeout(READ_TIMEOUT).unwrap(), vec![1]);
+    assert_eq!(
+        hello_rx.recv_timeout(READ_TIMEOUT).unwrap(),
+        (vec![1], vec![[0xCD; 32]]),
+        "the rank's model signature must ride the relay's upstream Hello"
+    );
     assert_eq!(
         data_rx.recv_timeout(READ_TIMEOUT).unwrap(),
         (1u32, vec![0x01, 0x02, 0x03])

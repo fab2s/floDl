@@ -223,6 +223,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             &mut handshake_stream,
             rank_id,
             config.world_size as u32,
+            &config.model_sig,
             &salt,
         )?;
         read_handshake_ack(&mut handshake_stream, &salt)?;

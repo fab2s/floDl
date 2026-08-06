@@ -554,6 +554,14 @@ impl DdpHandle {
         )?;
         let initial_buffers_local: Vec<Tensor> = tmp_model
             .buffers().iter().map(|b| b.get()).collect();
+        // Hashed while the constructed model is still in hand: the
+        // coordinator refuses a formation whose ranks disagree on this
+        // (names/shapes/dtypes), instead of hanging at the first
+        // collective.
+        let model_sig = crate::distributed::model_sig::model_sig(
+            &tmp_model.parameters(),
+            &tmp_model.buffers(),
+        );
         // Model-derived frame ceiling for this rank's length-prefixed readers,
         // installed BEFORE the first framed read (the bootstrap consensus).
         {
@@ -682,6 +690,7 @@ impl DdpHandle {
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 ),
             ),
+            model_sig,
         };
 
         // ClusterWorker bridges set up heartbeat + NCCL watchdog + inbound
