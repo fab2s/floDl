@@ -54,6 +54,23 @@ const CU128_SPEC: VariantSpec = VariantSpec {
     arch_variant: "cu128",
 };
 
+/// gfx targets the ROCm archives ship rocBLAS Tensile kernels for.
+///
+/// Read out of the published archives rather than inferred: both ROCm
+/// buckets of a given libtorch version carry the same set, and a target
+/// is only listed when the archive holds `.hsaco` or `TensileLibrary*`
+/// payload for it. Targets with nothing but MIOpen performance
+/// databases (`gfx900`, `gfx906`) are deliberately absent -- rocBLAS has
+/// no kernels to load for them, so listing one would let the
+/// arch-coverage gate admit a box that dies at its first BLAS call,
+/// which is the death that gate exists to move before the dial.
+///
+/// Verifiable without downloading the archive: its central directory is
+/// reachable with HTTP range requests (a few MB against ~5 GB), and the
+/// host answers 403 without a User-Agent.
+const ROCM_ARCHS: &str = "gfx908 gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1101 \
+                          gfx1102 gfx1150 gfx1151 gfx1200 gfx1201";
+
 const ROCM70_SPEC: VariantSpec = VariantSpec {
     label: "ROCm 7.0",
     // `rocm70` (no dot) matches the cu128 style and satisfies
@@ -63,13 +80,23 @@ const ROCM70_SPEC: VariantSpec = VariantSpec {
     // The vendor is carried by the variant path, which is what
     // `variant_vendor` and prebuild's feature derivation read.
     arch_cuda: "none",
-    // gfx targets covered by the bundled rocBLAS Tensile kernels.
-    arch_archs: "gfx906 gfx908 gfx90a gfx942 gfx1030 gfx1100 gfx1101 gfx1102 gfx1200 gfx1201",
+    arch_archs: ROCM_ARCHS,
     // Doubles as the URL bucket AND the `+<variant>` filename suffix,
     // exactly like `cu128` -- PyTorch dropped the `cxx11-abi-` filename
     // prefix, so the ROCm archives follow the same pattern as CUDA's and
     // need no special-casing in the URL builder.
     arch_variant: "rocm7.0",
+};
+
+const ROCM71_SPEC: VariantSpec = VariantSpec {
+    label: "ROCm 7.1",
+    dir_name: "rocm71",
+    arch_cuda: "none",
+    // Identical hardware reach to 7.0: the two buckets ship the same
+    // gfx targets, so this variant exists for runtime matching, not for
+    // coverage.
+    arch_archs: ROCM_ARCHS,
+    arch_variant: "rocm7.1",
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +108,7 @@ pub enum Variant {
     Cuda126,
     Cuda128,
     Rocm70,
+    Rocm71,
     Auto,
 }
 
@@ -139,7 +167,11 @@ fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, 
     match (os, arch) {
         ("linux", "x86_64") => {}
         ("macos", "aarch64") => {
-            if spec.arch_cuda != "none" {
+            // `cuda=none` stopped meaning "CPU build" when a second
+            // vendor arrived: a ROCm spec carries it too, and without
+            // the second clause it resolves to the macOS CPU archive
+            // and installs it under a ROCm directory name.
+            if spec.arch_cuda != "none" || spec.arch_variant.starts_with("rocm") {
                 return Err("macOS only supports CPU libtorch".into());
             }
         }
@@ -290,13 +322,13 @@ fn variant_for_gpus(gpus: &[system::GpuInfo]) -> &'static VariantSpec {
 /// the wizard came to skip AMD boxes in silence.
 pub fn rocm_covered(gpus: &[system::GpuInfo]) -> Vec<&system::GpuInfo> {
     gpus.iter()
-        .filter(|g| g.vendor == GpuVendor::Amd && g.covered_by(ROCM70_SPEC.arch_archs))
+        .filter(|g| g.vendor == GpuVendor::Amd && g.covered_by(ROCM_ARCHS))
         .collect()
 }
 
-/// The gfx targets the ROCm variant covers, for diagnostics.
+/// The gfx targets the ROCm variants cover, for diagnostics.
 pub fn rocm_archs() -> &'static str {
-    ROCM70_SPEC.arch_archs
+    ROCM_ARCHS
 }
 
 /// Pick between the ROCm variant and CPU for a set of AMD devices.
@@ -304,10 +336,21 @@ pub fn rocm_archs() -> &'static str {
 /// The ROCm archive carries pre-built rocBLAS Tensile kernels for a
 /// fixed gfx list; a target outside it has no kernels, so the variant is
 /// only worth downloading when it covers at least one device present.
+///
+/// Which ROCm bucket is not a hardware question: they cover the same
+/// targets, so this routes to the OLDEST offered one on purpose. The
+/// HIP runtime ordering rule puts the host's own ROCm ahead of the
+/// bundle, and within a major version that ABI grows, so a bundle older
+/// than the host loads while a newer one can fail on a symbol the host
+/// runtime does not have. 7.0 therefore serves every 7.x host, where
+/// 7.1 would drop the 7.0 ones. Picking the newest bundle that the
+/// detected host runtime can satisfy is the better rule and needs the
+/// ROCm version resolver; until then, oldest-serves-most. A host that
+/// wants the exact match asks for it: `fdl libtorch download --rocm 7.1`.
 fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
     let (covered, uncovered): (Vec<_>, Vec<_>) = amd
         .iter()
-        .partition(|g| g.covered_by(ROCM70_SPEC.arch_archs));
+        .partition(|g| g.covered_by(ROCM_ARCHS));
 
     let describe = |gs: &[&&system::GpuInfo]| {
         gs.iter()
@@ -318,20 +361,20 @@ fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
 
     if covered.is_empty() {
         println!(
-            "  Detected AMD GPU(s) ({}) outside the ROCm 7.0 build's gfx\n  \
+            "  Detected AMD GPU(s) ({}) outside the ROCm build's gfx\n  \
              targets, so the CPU variant is selected.\n  \
              Covered targets: {}.",
             describe(&uncovered),
-            ROCM70_SPEC.arch_archs,
+            ROCM_ARCHS,
         );
         return &CPU_SPEC;
     }
     if !uncovered.is_empty() {
         println!(
-            "  Note: {} is not covered by the ROCm 7.0 build and will be\n  \
+            "  Note: {} is not covered by the ROCm build and will be\n  \
              unusable. Covered targets: {}.",
             describe(&uncovered),
-            ROCM70_SPEC.arch_archs,
+            ROCM_ARCHS,
         );
     }
     println!("  Detected AMD GPU(s) ({}). Using ROCm 7.0.", describe(&covered));
@@ -344,6 +387,7 @@ fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
         Variant::Cuda126 => &CU126_SPEC,
         Variant::Cuda128 => &CU128_SPEC,
         Variant::Rocm70 => &ROCM70_SPEC,
+        Variant::Rocm71 => &ROCM71_SPEC,
         Variant::Auto => auto_detect_variant(),
     }
 }
@@ -672,22 +716,47 @@ mod tests {
 
     #[test]
     fn windows_rejects_rocm() {
-        // The rocm7.0 bucket is Linux-only upstream; a `-win-` URL there is
+        // The ROCm buckets are Linux-only upstream; a `-win-` URL there is
         // a 404, so refuse before downloading rather than after.
-        let err = download_url_for(&ROCM70_SPEC, "windows", "x86_64").unwrap_err();
-        assert!(err.contains("not available for Windows"), "got {err}");
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let err = download_url_for(spec, "windows", "x86_64").unwrap_err();
+            assert!(err.contains("not available for Windows"), "got {err}");
+        }
     }
 
     #[test]
     fn linux_accepts_rocm() {
-        let url = download_url_for(&ROCM70_SPEC, "linux", "x86_64").unwrap();
-        assert_eq!(
-            url,
-            format!(
-                "https://download.pytorch.org/libtorch/rocm7.0/\
-                 libtorch-shared-with-deps-{LIBTORCH_VERSION}%2Brocm7.0.zip"
-            )
-        );
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let url = download_url_for(spec, "linux", "x86_64").unwrap();
+            let bucket = spec.arch_variant;
+            assert_eq!(
+                url,
+                format!(
+                    "https://download.pytorch.org/libtorch/{bucket}/\
+                     libtorch-shared-with-deps-{LIBTORCH_VERSION}%2B{bucket}.zip"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_rocm_variants_differ_only_in_runtime_version() {
+        // Same hardware reach, different bundled HIP runtime: the second
+        // variant exists so a host can match its own ROCm, not so it can
+        // reach a card the other one cannot.
+        assert_eq!(ROCM70_SPEC.arch_archs, ROCM71_SPEC.arch_archs);
+        assert_ne!(ROCM70_SPEC.arch_variant, ROCM71_SPEC.arch_variant);
+        assert_ne!(ROCM70_SPEC.dir_name, ROCM71_SPEC.dir_name);
+        // `variant_vendor` reads the directory basename, so both must
+        // still say AMD to the feature derivation.
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            assert_eq!(
+                detect::variant_vendor(&format!("precompiled/{}", spec.dir_name)),
+                Some(GpuVendor::Amd),
+                "{} must derive the AMD feature",
+                spec.dir_name
+            );
+        }
     }
 
     #[test]
@@ -703,6 +772,18 @@ mod tests {
 
         let err = download_url_for(&CU128_SPEC, "macos", "aarch64").unwrap_err();
         assert!(err.contains("only supports CPU"), "got {err}");
+    }
+
+    #[test]
+    fn macos_rejects_rocm_rather_than_serving_the_cpu_archive() {
+        // A ROCm spec has no CUDA version either, so the CUDA-shaped
+        // guard passed it through and the macOS filename branch handed
+        // back the CPU archive: a CPU libtorch installed as `rocm70`,
+        // with nothing anywhere saying so.
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let err = download_url_for(spec, "macos", "aarch64").unwrap_err();
+            assert!(err.contains("only supports CPU"), "got {err}");
+        }
     }
 
     #[test]
@@ -752,10 +833,41 @@ mod tests {
     fn a_covered_amd_gpu_routes_to_rocm() {
         // The bug this guards: a gfx target the ROCm archive ships kernels
         // for was routed to the CPU variant, so an AMD box trained on CPU.
-        for arch in ["gfx906", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1201"] {
+        // gfx950 (MI350 class) and gfx1150/gfx1151 (Strix APUs) are in the
+        // archive and were missing from the covered list.
+        for arch in [
+            "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1151", "gfx1201",
+        ] {
             let v = variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]);
             assert_eq!(v.arch_variant, "rocm7.0", "{arch} should route to ROCm");
         }
+    }
+
+    #[test]
+    fn a_perf_db_only_target_is_not_covered() {
+        // gfx900 and gfx906 appear in the archive with MIOpen performance
+        // databases and no rocBLAS kernels at all. Calling that "covered"
+        // admits a box that dies at its first BLAS call instead of being
+        // told, here, that CPU is what this build can honestly offer.
+        for arch in ["gfx900", "gfx906"] {
+            let v = variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]);
+            assert_eq!(v.arch_variant, "cpu", "{arch} ships no kernels");
+            assert!(rocm_covered(&[gpu(GpuVendor::Amd, arch)]).is_empty());
+        }
+    }
+
+    #[test]
+    fn auto_never_picks_the_newer_rocm_bundle() {
+        // Deliberate: the host's ROCm loads ahead of the bundle, so the
+        // oldest offered bundle is the one that serves every 7.x host.
+        // Reaching 7.1 is an explicit request, not a detection outcome.
+        for arch in ["gfx942", "gfx950", "gfx1151"] {
+            assert_eq!(
+                variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]).arch_variant,
+                "rocm7.0"
+            );
+        }
+        assert_eq!(resolve_variant(&Variant::Rocm71).arch_variant, "rocm7.1");
     }
 
     #[test]

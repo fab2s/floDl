@@ -271,7 +271,7 @@ group "Every variant URL is live"
 # carries a `-win-` infix). The vendor rotation installs one variant per
 # run; checking the whole list here keeps the others from rotting
 # silently upstream, and it covers this run's own flag too.
-for FLAG in "--cpu" "--cuda 12.6" "--cuda 12.8" "--rocm 7.0"; do
+for FLAG in "--cpu" "--cuda 12.6" "--cuda 12.8" "--rocm 7.0" "--rocm 7.1"; do
     url_live "$FLAG"
 done
 pass "every variant URL is live on $HOST"

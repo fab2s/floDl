@@ -206,7 +206,7 @@ commands:
 #   # which on a walk-in is often a read-only mount) and make it active.
 #   # `auto` routes on the devices THIS box has, so one golden image serves
 #   # NVIDIA and AMD instances. Unset leaves the box on what it already has.
-#   # libtorch: auto                  # or cpu / cu126 / cu128 / rocm7.0
+#   # libtorch: auto                  # or cpu / cu126 / cu128 / rocm7.0 / rocm7.1
 #
 #   # --- the dataset source root on THIS box -------------------------------
 #   # data_path is the LOCAL path this box's ranks read their training data

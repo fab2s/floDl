@@ -87,7 +87,8 @@ pub struct Prepared {
 pub struct PrepareSpec<'a> {
     pub data: DataSpec<'a>,
     /// libtorch variant to acquire: `auto`, `cpu`, `cu126`, `cu128`,
-    /// `rocm7.0`. `None` leaves this box on whatever it already has.
+    /// `rocm7.0`, `rocm7.1`. `None` leaves this box on whatever it
+    /// already has.
     pub libtorch: Option<&'a str>,
     /// This box's already-active libtorch, when fdl found one. Used when
     /// no variant is acquired, and it is what the build links against.
@@ -303,10 +304,12 @@ fn parse_libtorch_token(token: &str) -> Result<crate::libtorch::download::Varian
         "cu126" | "12.6" => Ok(Variant::Cuda126),
         "cu128" | "12.8" => Ok(Variant::Cuda128),
         "rocm7.0" | "rocm70" | "7.0" => Ok(Variant::Rocm70),
+        "rocm7.1" | "rocm71" | "7.1" => Ok(Variant::Rocm71),
         other => Err(Fail::Permanent(format!(
             "unknown libtorch variant `{other}` — fdl ships `auto`, `cpu`, \
-             `cu126`, `cu128` and `rocm7.0`. `auto` picks from the devices \
-             this box has, which is what lets one image serve both vendors"
+             `cu126`, `cu128`, `rocm7.0` and `rocm7.1`. `auto` picks from the \
+             devices this box has, which is what lets one image serve both \
+             vendors"
         ))),
     }
 }

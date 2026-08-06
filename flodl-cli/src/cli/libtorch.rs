@@ -186,6 +186,7 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
     } else if cli.rocm.is_some() {
         match cli.rocm.as_deref() {
             Some("7.0") => Variant::Rocm70,
+            Some("7.1") => Variant::Rocm71,
             _ => unreachable!("validated by #[option(choices = ...)]"),
         }
     } else {
@@ -287,7 +288,7 @@ fn print_libtorch_usage() {
     println!("    download           Download pre-built libtorch");
     println!("        --cpu          Force CPU variant");
     println!("        --cuda <ver>   Specific CUDA version (12.6, 12.8)");
-    println!("        --rocm <ver>   AMD ROCm build instead of CUDA (7.0)");
+    println!("        --rocm <ver>   AMD ROCm build instead of CUDA (7.0, 7.1)");
     println!("        --path <dir>   Install here (default: project libtorch/)");
     println!("        --no-activate  Do not activate after download");
     println!("        --dry-run      Print the resolved URL and stop");

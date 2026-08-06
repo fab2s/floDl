@@ -235,7 +235,7 @@ fn no_flags() -> JoinConfigArgs {
 fn cloud_init_embeds_the_artifacts_and_the_failure_taxonomy() {
     let yml = "join:\n  token: t\n  persist: true\n";
     let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
-    let ci = render_cloud_init("b300", "ubuntu", yml, key);
+    let ci = render_cloud_init("b300", "ubuntu", Door::B, yml, key);
     assert!(ci.starts_with("#cloud-config\n"));
     assert!(ci.contains("SECRET ARTIFACT"));
     // Both payloads land indented under their write_files entries.
@@ -244,12 +244,68 @@ fn cloud_init_embeds_the_artifacts_and_the_failure_taxonomy() {
     assert!(ci.contains("path: /home/ubuntu/.ssh/flodl-join"));
     assert!(ci.contains("permissions: \"0600\""));
     // The failure taxonomy rides the unit: re-dial transient, stop on
-    // permanent, self-deprovision.
+    // permanent, halt.
     assert!(ci.contains("Restart=always"));
     assert!(ci.contains("RestartPreventExitStatus=2"));
     assert!(ci.contains("FailureAction=poweroff"));
     assert!(ci.contains("User=ubuntu"));
     assert!(ci.contains("systemctl enable --now flodl-join.service"));
+    // A halt is not a deprovision everywhere, and the file has to say so
+    // where the bill keeps running.
+    assert!(ci.contains("NOT the meter"), "got:\n{ci}");
+}
+
+#[test]
+fn cloud_init_installs_what_the_instance_does_not_have() {
+    let yml = "join:\n  token: t\n";
+    let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+    let ci = render_cloud_init("b300", "ubuntu", Door::B, yml, key);
+    // fdl is not on a stock cloud image, and the unit starts in the same
+    // boot: fetch it first, and let a baked-in one win.
+    assert!(ci.contains("command -v fdl >/dev/null ||"), "got:\n{ci}");
+    assert!(ci.contains("https://flodl.dev/fdl"));
+    let fdl_at = ci.find("command -v fdl").unwrap();
+    let enable_at = ci.find("systemctl enable --now").unwrap();
+    assert!(fdl_at < enable_at, "fdl must be installed before the unit starts");
+}
+
+#[test]
+fn cloud_init_provisions_only_what_the_door_reaches_for() {
+    let yml = "join:\n  token: t\n";
+    let key = "k\n";
+    let b = render_cloud_init("b300", "ubuntu", Door::B, yml, key);
+    // Door `b` fetches a source tree and builds it on the box.
+    assert!(b.contains("command -v cargo >/dev/null ||"), "got:\n{b}");
+    assert!(b.contains(" - build-essential\n"), "got:\n{b}");
+    assert!(b.contains(" - rsync\n"));
+    // Installed as the service user, or cargo cannot write its registry.
+    assert!(b.contains("su -l ubuntu -c"), "got:\n{b}");
+    assert!(b.contains("Environment=PATH=/home/ubuntu/.cargo/bin:"), "got:\n{b}");
+
+    // Door `a` mounts the data root instead; a missing sshfs is classed
+    // permanent, which under this unit means exit 2 and a halt.
+    let a = render_cloud_init("b300", "ubuntu", Door::A, yml, key);
+    assert!(a.contains(" - sshfs\n"), "got:\n{a}");
+    assert!(!a.contains("cargo"), "door `a` builds nothing");
+
+    let n = render_cloud_init("b300", "ubuntu", Door::Nologin, yml, key);
+    assert!(!n.contains("cargo"));
+    assert!(!n.contains("sshfs"));
+    assert!(n.contains(" - curl\n"), "every door still fetches fdl");
+}
+
+#[test]
+fn a_root_instance_gets_root_s_actual_home() {
+    let yml = "join:\n  token: t\n";
+    let key = "k\n";
+    let ci = render_cloud_init("b300", "root", Door::B, yml, key);
+    // /home/root exists on no image, so composing the path from the name
+    // alone puts the key where sshd will never look for it.
+    assert!(ci.contains("path: /root/.ssh/flodl-join"), "got:\n{ci}");
+    assert!(ci.contains("path: /root/training/fdl.yml"));
+    assert!(ci.contains("WorkingDirectory=/root/training"));
+    assert!(ci.contains("Environment=PATH=/root/.cargo/bin:"));
+    assert!(!ci.contains("/home/root"), "got:\n{ci}");
 }
 
 #[test]

@@ -198,7 +198,8 @@ pub struct JoinArgs {
     #[option]
     pub source_bin: Option<String>,
     /// libtorch variant to acquire into `~/.flodl/libtorch/` before
-    /// building or running: `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`.
+    /// building or running: `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`,
+    /// `rocm7.1`.
     /// `auto` routes on this box's own devices, so one image serves
     /// both vendors. Default: whatever is already active here.
     #[option]
@@ -290,7 +291,8 @@ pub struct JoinConfigArgs {
     #[option]
     pub cloud_init: bool,
     /// The instance user the cloud-init variant provisions for
-    /// (default: ubuntu).
+    /// (default: ubuntu). Images that log in as root want `root`;
+    /// DigitalOcean and the AMD Developer Cloud are that shape.
     #[option]
     pub cloud_init_user: Option<String>,
     /// Skip the authorized_keys install (print + notes only).
@@ -490,8 +492,10 @@ pub struct LibtorchDownloadArgs {
     /// Pick a specific CUDA version (instead of auto-detect).
     #[option(choices = &["12.6", "12.8"])]
     pub cuda: Option<String>,
-    /// Pick an AMD ROCm build instead of CUDA.
-    #[option(choices = &["7.0"])]
+    /// Pick an AMD ROCm build instead of CUDA. Both cover the same gfx
+    /// targets; pick the one matching this host's own ROCm, since the
+    /// host runtime loads ahead of the bundled one.
+    #[option(choices = &["7.0", "7.1"])]
     pub rocm: Option<String>,
     /// Install libtorch to this directory (default: project libtorch/).
     #[option]
