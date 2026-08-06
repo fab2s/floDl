@@ -199,24 +199,77 @@ pub fn toolkit_gap(vendor: flodl_hw::GpuVendor) -> Option<ToolkitGap> {
     })
 }
 
+/// Debian package name in the RHEL-family spelling.
+///
+/// Both vendors ship the same packages to their Debian and RHEL repos
+/// with identical stems and two dev-suffix conventions, so this is a
+/// transform rather than a second table -- every result was verified by
+/// repoquery against the cuda-rhel9 and rocm rhel9 repositories.
+/// `g++` is the one host tool whose rpm goes by a different name.
+/// Kept in sync by hand with `flodl-sys/build.rs`'s `rpm` closure.
+pub fn rpm_name(deb: &str) -> String {
+    if deb == "g++" {
+        return "gcc-c++".to_string();
+    }
+    match deb.strip_suffix("-dev") {
+        Some(stem) => format!("{stem}-devel"),
+        None => deb.replace("-dev-", "-devel-"),
+    }
+}
+
+/// Whether an os-release body describes a RHEL-family system (RHEL,
+/// Rocky, Alma, CentOS, Fedora): `ID` or any `ID_LIKE` token matches.
+/// Pure so the parse is testable; [`rhel_family`] supplies the file.
+fn is_rhel_family(os_release: &str) -> bool {
+    const FAMILY: &[&str] = &["rhel", "fedora", "centos"];
+    os_release
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("ID=")
+                .or_else(|| l.strip_prefix("ID_LIKE="))
+        })
+        .flat_map(|v| v.trim_matches('"').split_whitespace())
+        .any(|token| FAMILY.contains(&token) || token == "rocky" || token == "almalinux")
+}
+
+/// Whether this host is RHEL-family, from `/etc/os-release`. Absent or
+/// unreadable (macOS, containers stripped bare) means no.
+fn rhel_family() -> bool {
+    std::fs::read_to_string("/etc/os-release")
+        .map(|c| is_rhel_family(&c))
+        .unwrap_or(false)
+}
+
 /// The install line for a package list, contextual to the platform.
 ///
-/// Debian is spelled out because it is the platform the cloud hosts
-/// use; the others get a direction rather than a fabricated command,
-/// which is the honest thing when the package names are not verified.
+/// Debian and RHEL-family are spelled out because those are the
+/// platforms cloud hosts use (package names verified on both); the
+/// others get a direction rather than a fabricated command, which is
+/// the honest thing when the names are not verified.
 pub fn install_hint(packages: &[String]) -> String {
     if packages.is_empty() {
         return String::new();
     }
-    let list = packages.join(" ");
     if cfg!(target_os = "macos") {
-        format!("brew install {list}   (names may differ on macOS)")
+        format!(
+            "brew install {}   (names may differ on macOS)",
+            packages.join(" ")
+        )
     } else if cfg!(target_os = "windows") {
         "no native Windows build is supported; use WSL2 \
          (https://flodl.dev/guide/windows-wsl)"
             .to_string()
+    } else if rhel_family() {
+        let list = packages.iter().map(|p| rpm_name(p)).collect::<Vec<_>>();
+        format!(
+            "sudo dnf install {}   (or your distribution's equivalent)",
+            list.join(" ")
+        )
     } else {
-        format!("sudo apt install {list}   (or your distribution's equivalent)")
+        format!(
+            "sudo apt install {}   (or your distribution's equivalent)",
+            packages.join(" ")
+        )
     }
 }
 
@@ -309,7 +362,43 @@ mod tests {
         if cfg!(target_os = "windows") {
             assert!(h.contains("WSL2"), "{h}");
         } else {
-            assert!(h.contains("curl") && h.contains("g++"), "{h}");
+            // The compiler package is spelled per family (g++ on
+            // Debian, gcc-c++ on RHEL), so assert either.
+            assert!(h.contains("curl"), "{h}");
+            assert!(h.contains("g++") || h.contains("gcc-c++"), "{h}");
         }
+    }
+
+    #[test]
+    fn rpm_names_match_the_verified_rhel_spellings() {
+        // Every pair was checked by repoquery against the vendors'
+        // rhel9 repositories; unversioned names pass through untouched.
+        for (deb, rpm) in [
+            ("hip-dev", "hip-devel"),
+            ("rccl-dev", "rccl-devel"),
+            ("hipblas-common-dev", "hipblas-common-devel"),
+            ("hipblaslt-dev", "hipblaslt-devel"),
+            ("cuda-cudart-dev-<M>-<m>", "cuda-cudart-devel-<M>-<m>"),
+            ("libcublas-dev-<M>-<m>", "libcublas-devel-<M>-<m>"),
+            ("libnccl-dev", "libnccl-devel"),
+            ("cuda-crt-<M>-<m>", "cuda-crt-<M>-<m>"),
+            ("cuda-toolkit", "cuda-toolkit"),
+            ("g++", "gcc-c++"),
+            ("curl", "curl"),
+            ("unzip", "unzip"),
+        ] {
+            assert_eq!(rpm_name(deb), rpm, "{deb}");
+        }
+    }
+
+    #[test]
+    fn rhel_family_detection_reads_id_and_id_like() {
+        let rocky = "NAME=\"Rocky Linux\"\nID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n";
+        let fedora = "ID=fedora\n";
+        let ubuntu = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n";
+        assert!(is_rhel_family(rocky));
+        assert!(is_rhel_family(fedora));
+        assert!(!is_rhel_family(ubuntu));
+        assert!(!is_rhel_family(""));
     }
 }

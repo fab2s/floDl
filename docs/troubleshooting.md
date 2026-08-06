@@ -73,6 +73,9 @@ host:
 # Ubuntu/Debian
 sudo apt-get install gcc g++ pkg-config
 
+# RHEL / Rocky / Alma / Fedora
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config
+
 # macOS
 xcode-select --install
 ```

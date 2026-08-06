@@ -14,7 +14,10 @@
 # fdl rather than something to work around.
 #
 # Local use:  bash ci/os-matrix.sh
-# Env:        FDL_CI_VARIANT=cuda|rocm   force the Linux GPU vendor
+# Env:        FDL_CI_VARIANT=cuda|rocm|cpu   force the Linux variant
+#                            rotate-alt = rotate on the opposite phase,
+#                            so a second Linux leg covers the other
+#                            vendor in the same run
 #             FDL_CI_SKIP_INSTALL=1      skip the sudo apt steps
 #             FDL_CI_SKIP_LIBTORCH=1     skip the download/install phase,
 #                                        so a local run never mutates an
@@ -146,10 +149,20 @@ case "$HOST" in
         # path instead. Vendor alternates per run so steady-state cost
         # stays at one toolkit install; deterministic, so a re-run
         # repeats the same variant rather than testing something else.
+        #
+        # os.yml runs this leg twice per push: the ubuntu matrix host on
+        # `rotate`, the rockylinux:9 container on `rotate-alt` -- the
+        # opposite phase, so every run covers BOTH vendors, one per
+        # distro family, and the dnf spelling of the toolkit advice gets
+        # exercised as routinely as the apt one. `cpu` stays available
+        # for dispatch and local runs: the cheapest full pass (no
+        # toolkit phase, and with it no sudo -- what a root container
+        # needs), installing the cpu variant through fdl.
         GPU=1; COMPILE=1; ALL_VARIANTS=1
         VARIANT="${FDL_CI_VARIANT:-}"
-        if [ -z "$VARIANT" ] || [ "$VARIANT" = rotate ]; then
-            case $(( ${GITHUB_RUN_NUMBER:-0} % 2 )) in
+        if [ -z "$VARIANT" ] || [ "$VARIANT" = rotate ] || [ "$VARIANT" = rotate-alt ]; then
+            PHASE=0; [ "$VARIANT" = rotate-alt ] && PHASE=1
+            case $(( (${GITHUB_RUN_NUMBER:-0} + PHASE) % 2 )) in
                 0) VARIANT=cuda ;;
                 1) VARIANT=rocm ;;
             esac
@@ -157,6 +170,7 @@ case "$HOST" in
         case "$VARIANT" in
             cuda) LT_FLAG="--cuda 12.8"; LT_DIR=cu128  ;;
             rocm) LT_FLAG="--rocm 7.0";  LT_DIR=rocm70 ;;
+            cpu)  LT_FLAG="--cpu";       LT_DIR=cpu; GPU=0 ;;
             *)    echo "unknown FDL_CI_VARIANT: $VARIANT"; exit 1 ;;
         esac
         LT_LIB="lib/libtorch.so"
@@ -422,30 +436,65 @@ elif [ "$RC" -ne 0 ]; then
     # not written here: the phase tests that the advice a user is given
     # works. It also keeps this from drifting, since the list already
     # exists in flodl-sys/build.rs and flodl-cli's util/requirements.rs.
-    PKGS=$(printf '%s\n' "$OUT" | sed -n 's/.*sudo apt install //p' | head -1)
+    # build.rs prints one install line per distro family; parse the one
+    # this host's package manager can execute.
+    if command -v dnf >/dev/null 2>&1; then
+        PKG_MGR=dnf
+        PKGS=$(printf '%s\n' "$OUT" | sed -n 's/.*sudo dnf install //p' | head -1)
+    else
+        PKG_MGR=apt
+        PKGS=$(printf '%s\n' "$OUT" | sed -n 's/.*sudo apt install //p' | head -1)
+    fi
     # build.rs cannot know which CUDA release is wanted, so its message
     # carries <M>-<m> placeholders. The version this run installed is the
     # one thing the script legitimately knows and the tool does not.
     PKGS=$(printf '%s' "$PKGS" | sed 's/<M>-<m>/12-8/g')
-    [ -n "$PKGS" ] || fail "$HOST: no package list in build.rs's message"
-    note "installing exactly what fdl asked for: $PKGS"
-    if [ "$FEATURE" = rocm ]; then
-        sudo mkdir -p --mode=0755 /etc/apt/keyrings
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
-            | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0 noble main" \
-            | sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
-        sudo apt-get update -qq
+    [ -n "$PKGS" ] || fail "$HOST: no $PKG_MGR package list in build.rs's message"
+    note "installing exactly what fdl asked for ($PKG_MGR): $PKGS"
+    # Root (the rocky container) has no sudo and needs none.
+    SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=""
+    if [ "$PKG_MGR" = dnf ]; then
+        # RHEL-family repo setup. NVIDIA ships a .repo carrying its own
+        # gpgkey; AMD publishes the key URL for the .repo to reference,
+        # so neither needs a separate import step.
+        if [ "$FEATURE" = rocm ]; then
+            $SUDO tee /etc/yum.repos.d/rocm.repo >/dev/null <<'ROCMREPO'
+[ROCm]
+name=ROCm
+baseurl=https://repo.radeon.com/rocm/rhel9/7.0/main
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+ROCMREPO
+        else
+            $SUDO dnf install -y -q dnf-plugins-core
+            $SUDO dnf config-manager --add-repo \
+                https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+        fi
+        # Weak deps stay on for the same reason recommends do below: the
+        # devel packages pull their runtimes, and dodging that would
+        # validate a configuration no user has.
+        # shellcheck disable=SC2086
+        $SUDO dnf install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
     else
-        curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-        sudo dpkg -i cuda-keyring_1.1-1_all.deb
-        sudo apt-get update -qq
+        if [ "$FEATURE" = rocm ]; then
+            $SUDO mkdir -p --mode=0755 /etc/apt/keyrings
+            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+                | $SUDO gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/7.0 noble main" \
+                | $SUDO tee /etc/apt/sources.list.d/rocm.list >/dev/null
+            $SUDO apt-get update -qq
+        else
+            curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            $SUDO dpkg -i cuda-keyring_1.1-1_all.deb
+            $SUDO apt-get update -qq
+        fi
+        # No --no-install-recommends: these -dev packages hard-Depend on
+        # their runtimes (hipblaslt alone is ~4 GB of Tensile kernels), and
+        # dodging that would validate a configuration no user has.
+        # shellcheck disable=SC2086
+        $SUDO apt-get install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
     fi
-    # No --no-install-recommends: these -dev packages hard-Depend on
-    # their runtimes (hipblaslt alone is ~4 GB of Tensile kernels), and
-    # dodging that would validate a configuration no user has.
-    # shellcheck disable=SC2086
-    sudo apt-get install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
 fi
 endgroup
 fi
@@ -477,16 +526,11 @@ if [ "$GPU" = 1 ]; then
 else
     BUILD_CMD="cargo build -p flodl-sys -p flodl"
     CLIPPY_CMD="cargo clippy -p flodl-sys -p flodl --all-targets -- -W clippy::all"
-    # KNOWN GAP: the CPU legs still do not link libtorch either. The
-    # `cargo test` near the top of this script covers flodl-cli and
-    # flodl-hw, both of which are libtorch-free by design, and the two
-    # commands above stop at rlib and at metadata. So the OS-specific
-    # link step -- Mach-O on macOS, MSVC .lib on Windows, the exact place
-    # a per-OS build is most likely to break -- is unvalidated on the
-    # legs whose whole purpose is per-OS validation. Left as-is rather
-    # than fixed blind: unlike the GPU leg above, nobody has yet
-    # confirmed these hosts can link at all, and turning an untested
-    # capability into a gate belongs in its own change.
+    # No separate link command on the CPU legs: the two commands above
+    # stop at rlib and at metadata, and the OS-specific link + load +
+    # run now happens in the scaffold smoke below, which builds a real
+    # binary against libtorch and trains it. Windows stays the gap --
+    # COMPILE=0 there, so neither this phase nor the smoke runs.
     LINK_CMD=":"
 fi
 

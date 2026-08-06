@@ -174,11 +174,25 @@ fn main() {
         if !missing.is_empty() {
             let mut pkgs: Vec<&str> = missing.iter().map(|(_, p)| *p).collect();
             pkgs.dedup();
+            // Both vendors ship the same packages to Debian and
+            // RHEL-family repos with identical stems and two dev-suffix
+            // conventions (verified by repoquery against cuda-rhel9 and
+            // rocm/rhel9), so the rpm spelling is a transform, not a
+            // second table. Kept in sync by hand with flodl-cli's
+            // util/requirements.rs `rpm_name`.
+            let rpm = |deb: &str| -> String {
+                match deb.strip_suffix("-dev") {
+                    Some(stem) => format!("{stem}-devel"),
+                    None => deb.replace("-dev-", "-devel-"),
+                }
+            };
+            let rpm_pkgs: Vec<String> = pkgs.iter().map(|p| rpm(p)).collect();
             eprintln!(
                 "\nflodl-sys: `--features {feature}` needs vendor toolkit headers\n\
                  that are missing under `{root}`:\n\n{}\n\n\
                  libtorch bundles the runtime libraries but not these headers.\n\n\
                  \x20 Ubuntu/Debian:  sudo apt install {}\n\
+                 \x20 RHEL/Fedora:    sudo dnf install {}\n\
                  \x20 Other Linux:    install the vendor SDK\n\
                  \x20 macOS/Windows:  no GPU libtorch exists; on Windows use WSL2\n\n\
                  Set {root_env} if your install is not at {root_default}.\n",
@@ -188,6 +202,7 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join("\n"),
                 pkgs.join(" "),
+                rpm_pkgs.join(" "),
             );
             std::process::exit(1);
         }

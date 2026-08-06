@@ -13,7 +13,11 @@ name: OS Matrix
 # So this file carries only what genuinely cannot be a shell script:
 # the checkout, the Rust toolchain, and the cargo cache. The matrix is a
 # list of runner images -- the script identifies its own host from
-# `uname`, the way a user's machine does.
+# `uname`, the way a user's machine does. The rockylinux:9 job sits
+# outside the matrix and drives the same script through `docker run`
+# rather than a `container:` -- steps inside a container cannot run the
+# host free-disk sweep, and the rocm rotation needs it (a 12 GB libtorch
+# tree plus the Tensile-heavy devel packages).
 #
 # The script is native throughout: no Docker, no container toolchain. A
 # vendor install adds HEADERS (libtorch already ships every library the
@@ -43,10 +47,10 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: 'Force the Linux GPU vendor (rotate = alternate by run number)'
+        description: 'Force the Linux variant (rotate = alternate by run number; rocky runs the opposite phase)'
         type: choice
         default: rotate
-        options: [rotate, cuda, rocm]
+        options: [rotate, cuda, rocm, cpu]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -109,3 +113,66 @@ jobs:
         env:
           FDL_CI_VARIANT: ${{ github.event.inputs.variant || 'rotate' }}
         run: bash ci/os-matrix.sh
+
+  # The RHEL-family leg. A dnf system is what an AMD cloud rental is
+  # likelier to hand out than Ubuntu, and it is where apt-flavoured
+  # assumptions surface -- so it runs the SAME vendor rotation as the
+  # ubuntu matrix host, on the opposite phase: every run covers both
+  # vendors, one per distro family, and the dnf spelling of build.rs's
+  # toolkit advice is exercised as routinely as the apt one.
+  rocky:
+    name: rockylinux-9
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same sweep as the matrix legs, same reason: a vendor rotation
+      # means a multi-GB libtorch plus its toolkit packages.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean || true
+          df -h /
+
+      # Rust lives inside the container (mounted from cached host dirs),
+      # not on the runner: the toolchain must be the one a rocky user
+      # would run, glibc and all.
+      - name: Cache cargo + rustup + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rocky/cargo
+            ~/.rocky/rustup
+            target
+          key: os-rocky9-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: os-rocky9-
+
+      # The dnf list is deliberately minimal: what checkout, rustup and
+      # the shim's C++ compile need, plus the two tools the script
+      # itself calls (find, awk). Anything fdl is supposed to detect and
+      # advise about stays out, so the probe assertions run against an
+      # honest baseline. GITHUB_RUN_NUMBER rides in for the rotation,
+      # GITHUB_ACTIONS for the ::group:: folds.
+      - name: ci/os-matrix.sh in a rockylinux:9 container
+        env:
+          FDL_CI_VARIANT: ${{ (github.event.inputs.variant == '' || github.event.inputs.variant == 'rotate') && 'rotate-alt' || github.event.inputs.variant }}
+        run: |
+          mkdir -p ~/.rocky/cargo ~/.rocky/rustup
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.rocky/cargo:/root/.cargo" \
+            -v "$HOME/.rocky/rustup:/root/.rustup" \
+            -w /workspace \
+            -e FDL_CI_VARIANT -e GITHUB_ACTIONS -e GITHUB_RUN_NUMBER \
+            rockylinux:9 bash -c '
+              set -e
+              dnf install -y -q git gcc gcc-c++ unzip tar gzip findutils gawk
+              if [ ! -x /root/.cargo/bin/cargo ]; then
+                curl -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component clippy
+              fi
+              . /root/.cargo/env
+              git config --global --add safe.directory /workspace
+              bash ci/os-matrix.sh'
