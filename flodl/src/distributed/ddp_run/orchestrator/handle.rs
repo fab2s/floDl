@@ -189,6 +189,40 @@ impl DdpHandle {
         Ok(())
     }
 
+    /// Model-signature probe short-circuit: when `fdl join` re-invoked
+    /// this binary with [`ENV_MODEL_SIG_PROBE`] set, build the model on
+    /// CPU (no CUDA context — the probe runs on a box that has not been
+    /// admitted anywhere), print the signature and exit. Checked FIRST
+    /// in `launch` and `into_worker`, before auto-promote: a probe
+    /// process on a 2-GPU box must never fan out.
+    ///
+    /// [`ENV_MODEL_SIG_PROBE`]: crate::distributed::launcher::ENV_MODEL_SIG_PROBE
+    fn maybe_model_sig_probe<F, M>(model_factory: &F) -> Result<()>
+    where
+        F: Fn(Device) -> Result<M>,
+        M: Module,
+    {
+        if std::env::var_os(crate::distributed::launcher::ENV_MODEL_SIG_PROBE).is_none() {
+            return Ok(());
+        }
+        let model = model_factory(Device::CPU).map_err(|e| {
+            crate::tensor::TensorError::new(&format!(
+                "model-sig probe: CPU model construction failed: {e}"
+            ))
+        })?;
+        let sig = crate::distributed::model_sig::model_sig(
+            &model.parameters(),
+            &model.buffers(),
+        );
+        let hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+        // The line IS the protocol (fdl scans stdout for the prefix, so
+        // main-body prints above it stay harmless).
+        println!("flodl-model-sig: {hex}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        crate::distributed::ddp_run::clean_process_exit(0);
+    }
+
     /// Internal launcher shared by the builder (`DdpBuilder::run`).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn launch<F, M, G, O, T>(
@@ -238,6 +272,7 @@ impl DdpHandle {
         //
         // `detect_gpus()` respects `CUDA_VISIBLE_DEVICES`, so production
         // callers that want to scope down also have that lever.
+        Self::maybe_model_sig_probe(&model_factory)?;
         Self::maybe_auto_promote()?;
         crate::distributed::ddp_run::check_epoch_geometry(
             crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),
@@ -288,10 +323,20 @@ impl DdpHandle {
                 // leaves the schema unset (consensus checkpoints degrade to
                 // meta-only); it does not abort the launch.
                 let mut model_schema: Option<crate::distributed::ModelSchema> = None;
+                // The same CPU probe seeds the join window's model-
+                // signature check: the launcher's model is the run's
+                // truth, so a walk-in building something else is
+                // refused at admission instead of first-member luck.
+                let mut expected_model_sig: Option<[u8; 32]> = None;
                 match model_factory(Device::CPU) {
                     Ok(probe) => {
                         model_schema =
                             Some(crate::distributed::ModelSchema::from_module(&probe));
+                        expected_model_sig =
+                            Some(crate::distributed::model_sig::model_sig(
+                                &probe.parameters(),
+                                &probe.buffers(),
+                            ));
                         // Model-derived frame ceiling: the same CPU probe
                         // yields the exact wire footprint, replacing the
                         // 1 GiB default reject-threshold on every
@@ -423,6 +468,7 @@ impl DdpHandle {
                             full,
                             Some(coord_spec),
                             outer_optimizer,
+                            expected_model_sig,
                             abort_for_driver,
                         )
                     })
@@ -631,6 +677,7 @@ impl DdpHandle {
         O: Optimizer + 'static,
         T: Fn(&M, &[Tensor]) -> Result<Variable> + Send + Sync + 'static,
     {
+        Self::maybe_model_sig_probe(&model_factory)?;
         Self::maybe_auto_promote()?;
         crate::distributed::ddp_run::check_epoch_geometry(
             crate::distributed::ddp_run::pick_space(dataset.len(), config.augment),

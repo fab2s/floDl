@@ -22,6 +22,7 @@ exact configuration (see [Benchmarks](benchmark.md)):
 | `fdl init`, `fdl setup` | yes | no |
 | Build, test, train | yes | no |
 | CUDA, multi-GPU, NCCL / DDP | yes | no |
+| Cluster ops (`join`, `publish`, `join-config`) | yes | no |
 
 `fdl.exe` exists as a **libtorch fetcher** for people consuming libtorch
 directly from Windows (C++ LibTorch, `tch-rs`, or a PyTorch install that

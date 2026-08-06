@@ -149,7 +149,7 @@ sequenceDiagram
     OP->>CTRL: fdl @cluster-x train …
     activate CTRL
     Note over CTRL: join window opens<br/>(status: waiting)
-    FJ->>FJ: prepare: GPU gate, source root,<br/>writable stage dirs
+    FJ->>FJ: prepare: GPU gate, source root,<br/>writable stage dirs, model-sig probe
     FJ->>SSHD: ssh -L ⟶ forward to 127.0.0.1:1337
     FJ->>AG: exec binary in agent role<br/>(spec in env, never argv)
     AG->>CTRL: dial + hello (HMAC: token / salt)

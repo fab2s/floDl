@@ -305,7 +305,7 @@ fn the_scaffolded_overlay_loads_through_the_real_config_path() {
     let tmp = tempdir();
     let base = tmp.join("fdl.yml");
     fs::write(&base, "# base\n").unwrap();
-    let token = fresh_token();
+    let token = fresh_token().unwrap();
     fs::write(
         tmp.join("fdl.b300.yml"),
         render_overlay_scaffold("b300", &token, &tmp),
@@ -408,8 +408,8 @@ fn install_needs_explicit_consent() {
 
 #[test]
 fn fresh_tokens_are_32_hex_and_unique() {
-    let a = fresh_token();
-    let b = fresh_token();
+    let a = fresh_token().unwrap();
+    let b = fresh_token().unwrap();
     assert_eq!(a.len(), 32);
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     assert_ne!(a, b);

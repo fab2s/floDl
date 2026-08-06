@@ -375,6 +375,22 @@ source on its next re-dial, with no reprovisioning.
   failure, not a permanent one: publishing is exactly what fixes it, and
   that includes the window a publish opens deliberately while its build
   runs.
+- **The model signature** (default on, `--no-sig-probe` or
+  `join.sig_probe: false` to skip). The resolved binary is re-run once,
+  CPU-only, to print the signature of the model it builds (parameter
+  names, shapes and dtypes); the signature rides the join hello and
+  admission refuses a box whose model differs from the cohort's — at
+  the door, where the refusal costs only this box's own dial and
+  `--persist` re-dials once it is fixed. The probe's outcome is cached
+  across re-dials, keyed on the binary's identity and the run's
+  arguments, so an idle `--persist` box pays it once per actual change
+  (a rebuild or a re-publish re-probes), not once per backoff tick. Without it the mismatch is
+  still caught, but at formation, where it takes the whole cohort's
+  attempt down. The probe is best-effort: a probe that fails or times
+  out joins without a signature and says so. One probe outcome deserves
+  attention beyond its warning: a binary that exits non-zero under the
+  probe will usually fail the same way when rank children re-enter it
+  with the same arguments after admission.
 
 A source your provisioning already mounts needs no scheme at all: name
 its path in `--data-path`. Nothing is checked and nothing is shipped
@@ -484,6 +500,17 @@ machine twin; secrets appear as file paths, never payloads.
 
 Exit code: **0** with the report, **1** on any refusal (contradictory
 flags, a decision needed without a tty, an unfixable permission).
+
+Platform notes: the token comes from OS entropy (cross-platform; the
+wizard refuses rather than degrade if the system call fails) and the
+key from `ssh-keygen`, which Linux and macOS ship natively (on macOS,
+Remote Login is the sshd) and Windows carries with its OpenSSH
+feature — though for cluster work on Windows the supported path stays
+[WSL2](../windows-wsl.md), where the permission checks also actually
+mean something. Running the wizard inside a container works for
+*generation* — the farm lands in the mounted project — but the
+`authorized_keys` install step must run where the workers' sshd
+actually lives, which is not the container's `~/.ssh`.
 
 ## `fdl nccl`
 

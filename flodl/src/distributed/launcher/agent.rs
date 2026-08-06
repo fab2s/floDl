@@ -112,6 +112,16 @@ pub struct AgentSpec {
     /// `None` leaves the envelope's value alone.
     #[serde(default)]
     pub gpu_ram_share: Option<f64>,
+    /// Model signature (64-char hex) probed from the training binary by
+    /// `fdl join` before the dial (see
+    /// [`super::ENV_MODEL_SIG_PROBE`]). Rides the hello so admission
+    /// can refuse a box building a different model while the refusal
+    /// still condemns only that box's own attempt. `None` (probe
+    /// skipped, failed, or a fan-out host — the controller dispatched
+    /// its binary) gates nothing; the formation-time handshake check is
+    /// the backstop.
+    #[serde(default)]
+    pub model_sig_hex: Option<String>,
 }
 
 impl AgentSpec {
@@ -418,6 +428,17 @@ fn build_hello(spec: &AgentSpec, devices: &[u8], gpus: Vec<String>) -> Result<Jo
             })?
         }
     };
+    let model_sig: Option<[u8; 32]> = match &spec.model_sig_hex {
+        None => None,
+        Some(hex) => {
+            let bytes = crate::distributed::cluster::hex_decode(hex.trim()).map_err(|e| {
+                TensorError::new(&format!("cluster agent: model_sig hex-decode: {e}"))
+            })?;
+            Some(bytes.try_into().map_err(|_| {
+                TensorError::new("cluster agent: model_sig must be 32 bytes (64 hex chars)")
+            })?)
+        }
+    };
     Ok(JoinMsgWire::Hello {
         host: spec.host.clone(),
         local_devices: devices.to_vec(),
@@ -429,6 +450,7 @@ fn build_hello(spec: &AgentSpec, devices: &[u8], gpus: Vec<String>) -> Result<Jo
         // worker: the whole point is that no other process can answer
         // for this box. Costs no CUDA context.
         nccl_version: crate::distributed::nccl::runtime_version(),
+        model_sig,
     })
 }
 
@@ -865,6 +887,7 @@ mod tests {
             dataset_sig: [0u8; 32],
             run_id: None,
             nccl_version: None,
+            model_sig: None,
         }
     }
 
@@ -942,6 +965,7 @@ mod tests {
             dataset_sig_hex: None,
             data_path: Some("/flodl/data".to_string()),
             gpu_ram_share: Some(0.5),
+            model_sig_hex: Some("ab".repeat(32)),
         };
         let hex = spec.to_env_hex().unwrap();
         let bytes = crate::distributed::cluster::hex_decode(&hex).unwrap();
@@ -962,6 +986,9 @@ mod tests {
         // the integrated-GPU share.
         assert_eq!(minimal.data_path, None);
         assert_eq!(minimal.gpu_ram_share, None);
+        // No probe ran on that box: the hello gates nothing and the
+        // formation-time handshake check stays the backstop.
+        assert_eq!(minimal.model_sig_hex, None);
     }
 
     #[test]

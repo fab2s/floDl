@@ -95,7 +95,9 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 // v4: the rank handshake carries the 32-byte model signature and
 // `RelayControlMsg::Hello` forwards the per-rank signatures, so the
 // coordinator can refuse a mixed-model formation by name instead of
-// letting the first collective hang on mismatched shapes.
+// letting the first collective hang on mismatched shapes. The join
+// hello gained the same signature as an `Option` (probed by `fdl join`
+// before the dial), moving the refusal to admission for walk-ins.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1735,13 @@ pub enum JoinMsgWire {
         /// window checks it instead. `None` (CPU build, read failed)
         /// gates nothing.
         nccl_version: Option<(u32, u32, u32)>,
+        /// Model signature of the model this box's binary constructs
+        /// (see `distributed::model_sig`), probed by `fdl join` before
+        /// the dial. Admission refuses a mismatch so the box condemns
+        /// only its own attempt; the formation-time handshake check
+        /// remains the backstop for boxes that carry `None` (probe
+        /// skipped or failed — gates nothing).
+        model_sig: Option<[u8; 32]>,
     },
     /// Controller → worker agent: admitted. Carries the assigned global
     /// rank ids (admission order — contiguous by construction).

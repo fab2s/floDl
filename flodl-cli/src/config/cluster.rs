@@ -330,6 +330,18 @@ pub struct WorkerJoin {
     /// unset ships nothing.
     #[serde(default)]
     pub gpu_ram_share: Option<f64>,
+    /// Probe the training binary for its model signature before each
+    /// dial (default: on). The probe re-runs the binary with
+    /// `FLODL_INTERNAL_MODEL_SIG_PROBE` set; it builds its model on
+    /// CPU, prints the signature and exits, and admission can then
+    /// refuse a box building a different model without costing the
+    /// run. `false` skips it — the formation-time check remains — for
+    /// a binary whose startup is too heavy to run twice per dial, or
+    /// one built against a flodl that predates the probe (which would
+    /// otherwise run its whole `main` until the probe timeout kills
+    /// it).
+    #[serde(default)]
+    pub sig_probe: Option<bool>,
     /// Arguments for the training binary (the binary's own training
     /// flags). A `--` tail on the command line replaces this list.
     #[serde(default)]

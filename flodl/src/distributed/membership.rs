@@ -333,10 +333,10 @@ pub(crate) enum WindowVerdict {
 ///
 /// A struct rather than a parameter list because the fact set GROWS:
 /// each cross-host coherence check the window learns (vendor, run
-/// identity, NCCL version — the code signature is next) is another
-/// field, and admission is the only place a walk-in fleet can be
-/// checked for cross-host consistency (there is no roster to probe,
-/// and the controller cannot reach back through a NAT'd tunnel).
+/// identity, NCCL version, model signature) is another field, and
+/// admission is the only place a walk-in fleet can be checked for
+/// cross-host consistency (there is no roster to probe, and the
+/// controller cannot reach back through a NAT'd tunnel).
 #[derive(Debug)]
 pub(crate) struct JoinOffer {
     pub host: String,
@@ -346,6 +346,7 @@ pub(crate) struct JoinOffer {
     pub dataset_sig: [u8; 32],
     pub run_id: Option<String>,
     pub nccl_version: Option<(u32, u32, u32)>,
+    pub model_sig: Option<[u8; 32]>,
 }
 
 /// Pure membership state machine: admission, rank assignment, window
@@ -380,6 +381,13 @@ pub(crate) struct MembershipLedger {
     /// it first. Only enforced under an NCCL data plane; unknown
     /// versions gate nothing.
     expected_nccl: Option<(u32, u32)>,
+    /// Model signature (see `distributed::model_sig`) the cohort must
+    /// agree on. Controller-seeded when the launcher could build the
+    /// model on CPU (its model IS the run's truth — unlike the vendor,
+    /// where a coordinator-only controller legitimately differs);
+    /// first-member seeded otherwise. `None` in a hello gates nothing:
+    /// the formation-time handshake check is the backstop.
+    expected_model_sig: Option<[u8; 32]>,
     members: Vec<JoinedMember>,
     next_rank: usize,
 }
@@ -389,6 +397,7 @@ impl MembershipLedger {
     pub fn new(
         config: JoinConfig,
         expected_dataset_sig: Option<[u8; 32]>,
+        expected_model_sig: Option<[u8; 32]>,
     ) -> Result<Self> {
         config.validate()?;
         Ok(MembershipLedger {
@@ -397,6 +406,7 @@ impl MembershipLedger {
             expected_vendor: None,
             expected_run_id: None,
             expected_nccl: None,
+            expected_model_sig,
             members: Vec::new(),
             next_rank: 0,
         })
@@ -416,8 +426,16 @@ impl MembershipLedger {
         offer: JoinOffer,
         elapsed: Duration,
     ) -> std::result::Result<Vec<usize>, String> {
-        let JoinOffer { host, local_devices, gpus, libtorch, dataset_sig, run_id, nccl_version } =
-            offer;
+        let JoinOffer {
+            host,
+            local_devices,
+            gpus,
+            libtorch,
+            dataset_sig,
+            run_id,
+            nccl_version,
+            model_sig,
+        } = offer;
         let host = host.as_str();
         if host.trim().is_empty() {
             return Err("host name must be non-empty".to_string());
@@ -545,6 +563,30 @@ impl MembershipLedger {
                     }
                     Some(_) => {}
                 }
+            }
+        }
+        // Model signature, whatever the data plane: mismatched parameter
+        // manifests corrupt CPU averaging exactly as they hang NCCL.
+        // Refusing here (instead of at the formation handshake, which
+        // stays the backstop) means the box condemns only its own dial
+        // and `--persist` re-dials once it is fixed. `None` gates
+        // nothing: not every road can probe a model before the hello.
+        if let Some(sig) = &model_sig {
+            match &self.expected_model_sig {
+                None => self.expected_model_sig = Some(*sig),
+                Some(expected) if expected != sig => {
+                    return Err(format!(
+                        "model mismatch: the model this box builds ({}…) \
+                         differs from the cohort's ({}…) — parameter names, \
+                         shapes or dtypes disagree, so the boxes would \
+                         corrupt each other at the first averaging step. A \
+                         stale source tree or a wrong `bin:` is the usual \
+                         cause",
+                        hex_prefix(sig),
+                        hex_prefix(expected),
+                    ));
+                }
+                Some(_) => {}
             }
         }
         let ranks: Vec<usize> = (self.next_rank..self.next_rank + rank_count).collect();
@@ -764,16 +806,19 @@ pub(crate) struct FormedWorld {
 /// publishes the refreshed snapshot to `status` (the `state.json`
 /// source — see [`crate::distributed::status`]); `abort` stops the
 /// window promptly (launcher failure path).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_join_window(
     source: &StreamSource,
     config: &JoinConfig,
     salt: &SessionSalt,
     pre_shared_salt: bool,
     expected_dataset_sig: Option<[u8; 32]>,
+    expected_model_sig: Option<[u8; 32]>,
     abort: &AtomicBool,
     status: &crate::distributed::status::StatusBoard,
 ) -> Result<FormedWorld> {
-    let mut ledger = MembershipLedger::new(config.clone(), expected_dataset_sig)?;
+    let mut ledger =
+        MembershipLedger::new(config.clone(), expected_dataset_sig, expected_model_sig)?;
     let join_key = join_frame_key(!pre_shared_salt, salt);
     let window = Duration::from_secs(scaled_deadline_secs(config.join_timeout_secs));
     let cap = Duration::from_secs(scaled_deadline_secs(config.max_join_timeout_secs));
@@ -966,6 +1011,7 @@ fn handle_join_dial(
         dataset_sig,
         run_id,
         nccl_version,
+        model_sig,
     } = msg
     else {
         let why = "first join-channel message must be Hello".to_string();
@@ -980,6 +1026,7 @@ fn handle_join_dial(
         dataset_sig,
         run_id,
         nccl_version,
+        model_sig,
     };
     let ranks = match ledger.admit(offer, started.elapsed()) {
         Ok(r) => r,

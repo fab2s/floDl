@@ -243,6 +243,18 @@ commands:
 #   # with_gpu_ram_share in code still wins).
 #   # gpu_ram_share: 0.5
 #
+#   # Model-signature probe (default on): the binary is re-run CPU-only to
+#   # print the signature of the model it builds (parameter names, shapes,
+#   # dtypes), and admission refuses a box whose model differs from the
+#   # cohort's — at the door, where the refusal costs only this box's
+#   # attempt. The outcome is cached across --persist re-dials (keyed on
+#   # the binary + the run's args; a rebuild or re-publish re-probes).
+#   # Disable for a binary whose startup is too heavy even for that, or
+#   # one built against a flodl that predates the probe (it would run its
+#   # whole main until the probe timeout kills it, once per change); the
+#   # formation-time check remains either way.
+#   # sig_probe: false
+#
 #   # Preparation (GPU stack, data source root, writable stage dirs, then
 #   # libtorch and the built binary) runs before every dial, so a --persist
 #   # box picks up a changed source on its next re-dial. A failure retrying

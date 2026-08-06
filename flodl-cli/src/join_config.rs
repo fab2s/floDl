@@ -765,7 +765,7 @@ fn ensure_overlay(
     root: &Path,
 ) -> Result<(String, OverlayAction), String> {
     if !overlay_path.is_file() {
-        let token = fresh_token();
+        let token = fresh_token()?;
         let scaffold = render_overlay_scaffold(label, &token, root);
         fs::write(overlay_path, scaffold)
             .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
@@ -792,7 +792,7 @@ fn ensure_overlay(
             if !regen {
                 return Ok((old, OverlayAction::TokenReused));
             }
-            let token = fresh_token();
+            let token = fresh_token()?;
             let replaced = replace_token_line(&content, &token)
                 .ok_or("token line vanished between read and replace")?;
             fs::write(overlay_path, replaced)
@@ -804,26 +804,21 @@ fn ensure_overlay(
             // not edit prose it does not own — nested surgical inserts
             // into hand-written yml guess too much. The snippet is in
             // the report.
-            Ok((fresh_token(), OverlayAction::SnippetPrinted))
+            Ok((fresh_token()?, OverlayAction::SnippetPrinted))
         }
     }
 }
 
-/// A fresh 32-hex credential, same construction as the publish nonce
-/// but this one IS secret (it is the admission token).
-fn fresh_token() -> String {
+/// A fresh 32-hex credential from OS entropy. Same shape as the publish
+/// nonce, but this one IS secret (it is the admission token), so there
+/// is no fallback: a credential mint with no entropy has nothing honest
+/// to fall back to, and the syscall failing is a refusal, not a
+/// degradation.
+fn fresh_token() -> Result<String, String> {
     let mut bytes = [0u8; 16];
-    let read = fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
-    if read.is_err() {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-            ^ (std::process::id() as u128);
-        bytes[..16].copy_from_slice(&seed.to_le_bytes());
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut bytes)
+        .map_err(|e| format!("cannot draw OS entropy for the token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// First `token:` line's value, however deep it sits. The wizard only

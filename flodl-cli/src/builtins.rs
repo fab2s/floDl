@@ -228,6 +228,12 @@ pub struct JoinArgs {
     /// it). Ships to this host's ranks like `--data-path` does.
     #[option]
     pub gpu_ram_share: Option<f64>,
+    /// Skip the pre-dial model-signature probe (a short CPU-only
+    /// re-run of the training binary; admission uses the signature to
+    /// refuse a box building a different model). Skip it for a binary
+    /// whose startup is too heavy to run twice per dial.
+    #[option]
+    pub no_sig_probe: bool,
 }
 
 /// Provision a walk-in farm in one pass: the farm overlay

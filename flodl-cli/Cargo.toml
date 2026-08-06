@@ -15,6 +15,11 @@ categories = ["command-line-utilities", "development-tools"]
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 serde_json = "1"
+# OS entropy for the credentials fdl mints (the join token). The one
+# dependency class not worth hand-rolling: cross-platform (getrandom(2)
+# / getentropy / BCryptGenRandom), no build script, and the workspace
+# lock already carries it transitively.
+getrandom = "0.3"
 flodl-cli-macros = { path = "../flodl-cli-macros", version = "=0.7.0" }
 # Dependency-free hardware detection, shared with `flodl` so the GPU
 # struct + nvidia-smi parse cannot drift between the two. Does NOT pull

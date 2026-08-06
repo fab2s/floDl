@@ -131,6 +131,13 @@ pub const ENV_RELAY_JSON: &str = "FLODL_INTERNAL_RELAY_JSON";
 /// other role env var.
 pub const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
 
+/// Model-signature probe marker (`fdl join` sets it on a short-lived
+/// re-invocation of the training binary, before the dial): when
+/// present, `Trainer::run` / `into_worker` build the model on CPU,
+/// print `flodl-model-sig: <64 hex>` on stdout and exit — before
+/// auto-promote, before any cluster role, touching no CUDA context.
+pub const ENV_MODEL_SIG_PROBE: &str = "FLODL_INTERNAL_MODEL_SIG_PROBE";
+
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
 /// fdl-cli when invoking the user binary as a launcher; required by the
@@ -783,10 +790,16 @@ fn abort_worker_links(
 /// `coord` carries the controller-scope coordinator wiring (see
 /// [`CoordSpec`]); `None` preserves the legacy no-coordinator NCCL
 /// routing (no relays, ranks dial the controller directly).
+///
+/// `expected_model_sig` seeds the join window's model-signature check
+/// (the launcher's own CPU-built model is the run's truth); `None`
+/// falls back to first-member seeding among the walk-ins that carry
+/// one.
 pub fn run_launcher_with_config(
     full: FullCluster,
     coord: Option<CoordSpec>,
     outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
+    expected_model_sig: Option<[u8; 32]>,
     abort: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use crate::distributed::membership;
@@ -972,6 +985,7 @@ pub fn run_launcher_with_config(
                 &gate_salt,
                 !open_admission,
                 None,
+                expected_model_sig,
                 &gate_abort,
                 &gate_status,
             )
@@ -1076,6 +1090,10 @@ pub fn run_launcher_with_config(
                 // agent has nothing to localize.
                 data_path: None,
                 gpu_ram_share: None,
+                // Fan-out hosts run what the controller dispatched, so
+                // there is no model identity to probe; the controller's
+                // own seed covers the ledger.
+                model_sig_hex: None,
             };
             if host.host == me {
                 // Merged env for the local children (cluster-scope

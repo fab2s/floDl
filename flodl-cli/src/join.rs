@@ -131,12 +131,20 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     // environment already provides the libs.
     let libtorch = resolve_local_libtorch(project_root.as_deref());
 
+    // Model-sig probe cache, living exactly as long as the persist loop:
+    // one slot, keyed by a digest of the probe recipe (binary identity +
+    // args). An idle fleet re-dials every BACKOFF_MAX forever, and
+    // without this every re-dial would rebuild the model on CPU — or,
+    // for a binary that predates the probe, pay the full probe timeout
+    // — for an unchanged binary.
+    let mut sig_cache: Option<(u64, Option<String>)> = None;
+
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
         // What happened, phrased for the re-dial line. Every branch that
         // is not re-dialable returns from here.
-        let outcome = match attempt(&eff, libtorch.as_ref()) {
+        let outcome = match attempt(&eff, libtorch.as_ref(), &mut sig_cache) {
             Ok(code) => {
                 if !eff.persist {
                     return code;
@@ -215,6 +223,9 @@ struct Effective {
     /// Integrated-GPU host-RAM share of this box; `None` ships nothing
     /// (the envelope's cluster-scope default, if any, then stands).
     gpu_ram_share: Option<f64>,
+    /// Probe the binary for its model signature before each dial
+    /// (default true; `--no-sig-probe` / `join.sig_probe: false`).
+    sig_probe: bool,
 }
 
 /// Where this box's training binary comes from. `source:` and `bin:` are
@@ -423,6 +434,9 @@ fn resolve_effective(
         data_path: cli.data_path.clone().or(block.data_path),
         data_source: cli.data_source.clone().or(block.data_source),
         gpu_ram_share: cli.gpu_ram_share.or(block.gpu_ram_share),
+        // The flag only disables; `sig_probe: false` in yml is the
+        // standing form of the same choice. Default on.
+        sig_probe: !cli.no_sig_probe && block.sig_probe.unwrap_or(true),
     })
 }
 
@@ -536,6 +550,7 @@ fn agent_spec_hex(
     dial: (&str, u16),
     libtorch_label: &str,
     prepared: &Prepared,
+    model_sig_hex: Option<&str>,
 ) -> String {
     let mut spec = serde_json::json!({
         "host": eff.host,
@@ -561,6 +576,12 @@ fn agent_spec_hex(
     // stands.
     if let Some(share) = eff.gpu_ram_share {
         spec["gpu_ram_share"] = serde_json::json!(share);
+    }
+    // Probed from the binary itself, so admission can refuse a box
+    // building a different model while it still costs only this box's
+    // own attempt. Omitted when the probe was skipped or failed.
+    if let Some(sig) = model_sig_hex {
+        spec["model_sig_hex"] = serde_json::json!(sig);
     }
     hex_encode(spec.to_string().as_bytes())
 }
@@ -627,57 +648,12 @@ fn child_ld_library_path(libtorch_dir: &Path, variant: &str) -> String {
 fn attempt(
     eff: &Effective,
     active_libtorch: Option<&(PathBuf, String)>,
+    sig_cache: &mut Option<(u64, Option<String>)>,
 ) -> Result<i32, Fail> {
     let mut notes = Vec::new();
     let prepared = prepare::prepare(&eff.prepare_spec(active_libtorch), &mut notes);
     prepare::print_notes("join", &notes);
     let prepared = prepared?;
-
-    let mut tunnel: Option<Child> = None;
-    let dial: (String, u16) = match &eff.ssh {
-        Some(ssh) => {
-            let local_port = pick_local_port().map_err(Fail::Transient)?;
-            let argv = build_tunnel_argv(
-                ssh,
-                local_port,
-                &eff.controller_host,
-                eff.controller_port,
-            );
-            eprintln!(
-                "fdl join: opening tunnel {} -> {}:{} (local port {local_port})",
-                ssh.target.as_deref().unwrap_or("?"),
-                eff.controller_host,
-                eff.controller_port,
-            );
-            let mut child = Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::null())
-                .spawn()
-                .map_err(|e| {
-                    // No ssh on the box is a provisioning fact, not a
-                    // passing condition.
-                    Fail::Permanent(format!("spawn ssh tunnel: {e}"))
-                })?;
-            // Auth failure and an unreachable host are both possible
-            // here and ssh does not let us tell them apart, so this
-            // stays re-dialable: a wrong key hits the backoff cap and
-            // keeps saying so, once a minute, loudly.
-            if let Err(e) = wait_tunnel_ready(&mut child, local_port) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Fail::Transient(e));
-            }
-            tunnel = Some(child);
-            ("127.0.0.1".to_string(), local_port)
-        }
-        None => (eff.controller_host.clone(), eff.controller_port),
-    };
-
-    // Preparation is the authority on libtorch: it either acquired a
-    // variant or carried the active one through, and the label it settles
-    // on is what the join hello announces.
-    let libtorch_label = prepared.libtorch.as_ref().map(|(_, l)| l.as_str()).unwrap_or("");
-    let spec_hex = agent_spec_hex(eff, (&dial.0, dial.1), libtorch_label, &prepared);
 
     // A built binary runs in the project directory inside the fetched
     // tree, which is where its own relative paths resolve; a given one
@@ -724,6 +700,95 @@ fn attempt(
         None => &eff.bin_args,
     };
 
+    // Model-signature probe, before the tunnel like everything else in
+    // preparation: admission starts a window deadline, and the probe
+    // runs the binary's whole main up to `Trainer::run`. Cached by
+    // recipe digest across re-dials — the OUTCOME is cached, a failed
+    // probe included, so an unchanged binary pays the probe (or its
+    // timeout) once, not once per backoff tick. A rebuild changes the
+    // mtime and a re-publish changes the args, so staleness invalidates
+    // itself; the libtorch variant is deliberately not in the recipe
+    // (the manifest — names, shapes, dtypes — is device-independent).
+    let model_sig_hex = if eff.sig_probe {
+        match probe_recipe_digest(&bin, args) {
+            Some(digest) => match sig_cache {
+                Some((key, cached)) if *key == digest => cached.clone(),
+                _ => {
+                    let sig = model_sig_probe(
+                        &bin,
+                        bin_cwd.as_deref(),
+                        args,
+                        prepared.libtorch.as_ref(),
+                    );
+                    *sig_cache = Some((digest, sig.clone()));
+                    sig
+                }
+            },
+            // The binary un-stat-able between resolution and here is a
+            // race with a rebuild: probe uncached, next attempt keys.
+            None => model_sig_probe(
+                &bin,
+                bin_cwd.as_deref(),
+                args,
+                prepared.libtorch.as_ref(),
+            ),
+        }
+    } else {
+        None
+    };
+
+    let mut tunnel: Option<Child> = None;
+    let dial: (String, u16) = match &eff.ssh {
+        Some(ssh) => {
+            let local_port = pick_local_port().map_err(Fail::Transient)?;
+            let argv = build_tunnel_argv(
+                ssh,
+                local_port,
+                &eff.controller_host,
+                eff.controller_port,
+            );
+            eprintln!(
+                "fdl join: opening tunnel {} -> {}:{} (local port {local_port})",
+                ssh.target.as_deref().unwrap_or("?"),
+                eff.controller_host,
+                eff.controller_port,
+            );
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .spawn()
+                .map_err(|e| {
+                    // No ssh on the box is a provisioning fact, not a
+                    // passing condition.
+                    Fail::Permanent(format!("spawn ssh tunnel: {e}"))
+                })?;
+            // Auth failure and an unreachable host are both possible
+            // here and ssh does not let us tell them apart, so this
+            // stays re-dialable: a wrong key hits the backoff cap and
+            // keeps saying so, once a minute, loudly.
+            if let Err(e) = wait_tunnel_ready(&mut child, local_port) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Fail::Transient(e));
+            }
+            tunnel = Some(child);
+            ("127.0.0.1".to_string(), local_port)
+        }
+        None => (eff.controller_host.clone(), eff.controller_port),
+    };
+
+    // Preparation is the authority on libtorch: it either acquired a
+    // variant or carried the active one through, and the label it settles
+    // on is what the join hello announces.
+    let libtorch_label = prepared.libtorch.as_ref().map(|(_, l)| l.as_str()).unwrap_or("");
+    let spec_hex = agent_spec_hex(
+        eff,
+        (&dial.0, dial.1),
+        libtorch_label,
+        &prepared,
+        model_sig_hex.as_deref(),
+    );
+
     let mut cmd = Command::new(&bin);
     cmd.args(args)
         .env(ENV_AGENT_JSON, &spec_hex)
@@ -749,6 +814,158 @@ fn attempt(
         let _ = t.wait();
     }
     Ok(status?.code().unwrap_or(1))
+}
+
+/// Digest of the probe recipe — everything the probe's answer depends
+/// on: the binary's identity (path, mtime, size) and the arguments the
+/// run enters it with. One u64 via std's SipHash rather than a
+/// cryptographic hash: flodl-cli is zero-dep, the key lives one process
+/// and guards a cache on a box that is trusted (not proven), and a
+/// collision's worst case — a stale signature in the hello — lands on
+/// the formation-time backstop. `None` when the binary cannot be
+/// stat'ed (a race with a rebuild): probe uncached, key next attempt.
+fn probe_recipe_digest(bin: &Path, args: &[String]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(bin).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bin.hash(&mut h);
+    meta.len().hash(&mut h);
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .hash(&mut h);
+    args.hash(&mut h);
+    Some(h.finish())
+}
+
+/// Probe-run marker env (flodl's launcher contract: with it set,
+/// `Trainer::run` builds the model on CPU, prints the signature line
+/// and exits — before auto-promote, before any cluster role).
+const ENV_MODEL_SIG_PROBE: &str = "FLODL_INTERNAL_MODEL_SIG_PROBE";
+
+/// Stdout line the probe scans for (main-body prints above it are
+/// harmless — the prefix is the protocol, not the whole stream).
+const MODEL_SIG_LINE: &str = "flodl-model-sig: ";
+
+/// Ceiling on the probe re-run. A current flodl answers in the time its
+/// main takes to reach `Trainer::run`; a binary built against a flodl
+/// that predates the probe ignores the env and runs its whole main,
+/// which is exactly what this bounds.
+const MODEL_SIG_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Re-run the training binary as a model-signature probe and return the
+/// 64-hex signature it prints.
+///
+/// Best-effort BY DESIGN: every failure degrades to `None` — the hello
+/// then gates nothing and the formation-time handshake check stays the
+/// backstop — but each failure mode says so, because one of them
+/// (a non-zero exit) predicts the rank children failing the same way
+/// after formation, with the same binary and the same arguments.
+fn model_sig_probe(
+    bin: &Path,
+    cwd: Option<&Path>,
+    args: &[String],
+    libtorch: Option<&(PathBuf, String)>,
+) -> Option<String> {
+    eprintln!(
+        "{}",
+        style::dim("fdl join: probing the binary for its model signature \
+                    (--no-sig-probe skips this)"),
+    );
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .env(ENV_MODEL_SIG_PROBE, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    if let Some((dir, variant)) = libtorch {
+        cmd.env("LD_LIBRARY_PATH", child_ld_library_path(dir, variant));
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "fdl join: model-sig probe could not run {}: {e}; joining \
+                 without a signature",
+                bin.display(),
+            );
+            return None;
+        }
+    };
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let mut sig = None;
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(rest) = line.strip_prefix(MODEL_SIG_LINE) {
+                sig = Some(rest.trim().to_string());
+            }
+        }
+        sig
+    });
+    let deadline = Instant::now() + MODEL_SIG_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let sig = reader
+        .join()
+        .ok()
+        .flatten()
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    match (&status, &sig) {
+        (Some(st), Some(_)) if st.success() => sig,
+        (None, _) => {
+            eprintln!(
+                "fdl join: model-sig probe killed after {}s — a binary built \
+                 against a flodl that predates the probe runs its whole main \
+                 here; joining without a signature (`--no-sig-probe` or \
+                 `join.sig_probe: false` silences this)",
+                MODEL_SIG_PROBE_TIMEOUT.as_secs(),
+            );
+            None
+        }
+        (Some(st), _) if !st.success() => {
+            // The loud one: rank children re-enter this binary with these
+            // arguments, so this failure is what the cohort would see
+            // AFTER formation.
+            eprintln!(
+                "fdl join: WARNING: the training binary exited with {} under \
+                 the model-sig probe — rank children re-enter it with the \
+                 same arguments after admission, so if this failure is real \
+                 it takes the cohort's formation with it. Check: {} {}",
+                st.code().map_or("a signal".to_string(), |c| c.to_string()),
+                bin.display(),
+                args.join(" "),
+            );
+            None
+        }
+        _ => {
+            eprintln!(
+                "fdl join: model-sig probe exited cleanly without printing a \
+                 signature (a flodl that predates the probe?); joining \
+                 without one — the formation-time check still applies",
+            );
+            None
+        }
+    }
 }
 
 /// Reserve a loopback port for the tunnel's local end: bind :0, read
@@ -869,6 +1086,7 @@ mod tests {
             data_path: None,
             data_source: None,
             gpu_ram_share: None,
+            no_sig_probe: false,
         }
     }
 
@@ -893,6 +1111,7 @@ mod tests {
             data_path: Some("/flodl/data".into()),
             data_source: Some("sshfs://flodl@ctrl:/srv/data".into()),
             gpu_ram_share: Some(0.5),
+            sig_probe: None,
         }
     }
 
@@ -1166,6 +1385,75 @@ mod tests {
 
     /// The JSON field names are flodl's `AgentSpec` wire contract —
     /// this test IS the cross-crate compatibility lock (flodl-cli is
+    /// The cache key binds exactly what the probe's answer depends on:
+    /// same binary + same args is a hit; touched binary, different
+    /// args, or a missing file is not.
+    #[test]
+    fn probe_recipe_digest_binds_binary_identity_and_args() {
+        let dir = std::env::temp_dir()
+            .join(format!("fdl-sig-digest-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("train");
+        std::fs::write(&bin, b"v1").unwrap();
+        let args = vec!["--model".to_string(), "lenet".to_string()];
+        let base = probe_recipe_digest(&bin, &args).unwrap();
+        assert_eq!(probe_recipe_digest(&bin, &args).unwrap(), base);
+        assert_ne!(
+            probe_recipe_digest(&bin, &["--model".to_string(), "resnet".to_string()])
+                .unwrap(),
+            base,
+            "args are part of the recipe (a re-publish must re-probe)"
+        );
+        // A rebuild: same path, new content — size or mtime moves.
+        std::fs::write(&bin, b"v2 longer").unwrap();
+        assert_ne!(
+            probe_recipe_digest(&bin, &args).unwrap(),
+            base,
+            "a rebuilt binary must re-probe"
+        );
+        assert_eq!(probe_recipe_digest(&dir.join("absent"), &args), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe's child-process contract, driven with shell-script
+    /// stand-ins for the training binary: the prefixed line is found
+    /// among main-body noise, and every failure mode (no line, bad
+    /// line, non-zero exit) degrades to `None` rather than erroring —
+    /// the hello then gates nothing and formation stays the backstop.
+    /// (The timeout path is deliberately not exercised: it is a 120s
+    /// wait by construction.)
+    #[cfg(unix)]
+    #[test]
+    fn model_sig_probe_parses_the_line_and_absorbs_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join(format!("fdl-sig-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            p
+        };
+        let sig = "ab".repeat(32);
+        let good = script(
+            "good.sh",
+            &format!("#!/bin/sh\necho main noise\necho '{MODEL_SIG_LINE}{sig}'\n"),
+        );
+        assert_eq!(model_sig_probe(&good, None, &[], None), Some(sig));
+        let quiet = script("quiet.sh", "#!/bin/sh\nexit 0\n");
+        assert_eq!(model_sig_probe(&quiet, None, &[], None), None);
+        let failing = script("failing.sh", "#!/bin/sh\nexit 3\n");
+        assert_eq!(model_sig_probe(&failing, None, &[], None), None);
+        let garbled = script(
+            "garbled.sh",
+            &format!("#!/bin/sh\necho '{MODEL_SIG_LINE}not-hex-at-all'\n"),
+        );
+        assert_eq!(model_sig_probe(&garbled, None, &[], None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// zero-dep on flodl by design, so the shape is asserted literally;
     /// flodl's `agent_spec_round_trips_through_hex` holds the other end).
     #[test]
@@ -1185,7 +1473,13 @@ mod tests {
             ..Prepared::default()
         };
         let hex =
-            agent_spec_hex(&eff, ("127.0.0.1", 40123), "builds/sm61-sm120", &prepared);
+            agent_spec_hex(
+                &eff,
+                ("127.0.0.1", 40123),
+                "builds/sm61-sm120",
+                &prepared,
+                Some(&"cd".repeat(32)),
+            );
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -1200,12 +1494,13 @@ mod tests {
         assert_eq!(spec["data_path"], "/flodl/data");
         assert_eq!(spec["run_id"], "a1b2c3d4e5f60718");
         assert_eq!(spec["gpu_ram_share"], 0.5);
+        assert_eq!(spec["model_sig_hex"], "cd".repeat(32));
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
             let cli = JoinArgs { bin: Some("t/bin".into()), ..no_flags() };
             let eff = resolve_effective(&cli, None, None, "cloud-1").unwrap();
-            agent_spec_hex(&eff, ("10.0.0.1", 1337), "", &Prepared::default())
+            agent_spec_hex(&eff, ("10.0.0.1", 1337), "", &Prepared::default(), None)
         };
         let bytes: Vec<u8> = (0..open.len())
             .step_by(2)

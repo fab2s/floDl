@@ -382,13 +382,12 @@ fn unix_seconds() -> Option<u64> {
 /// A fresh 16-byte hex nonce per publish — the run's identity at the
 /// join window. Not a credential (it travels in a world-readable
 /// manifest), so the entropy bar is "two publishes never collide", not
-/// secrecy: /dev/urandom where it exists, time+pid hashed where it does
-/// not (Windows).
+/// secrecy: OS entropy, and time+pid when even that fails — uniqueness
+/// survives the fallback, which is why the nonce keeps one while the
+/// wizard's token (a secret) refuses instead.
 fn run_nonce() -> String {
     let mut bytes = [0u8; 16];
-    let read = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
-    if read.is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
