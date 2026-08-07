@@ -106,30 +106,32 @@ impl ChannelKind {
     }
 
     /// Terminate one rank's handshake on `stream` exactly as the
-    /// controller would, returning the announced `rank_id`. The
-    /// handshake is a fixed-size exchange (no length framing); the
-    /// length-framed blob protocol begins only after this returns.
+    /// controller would, returning the announced `rank_id` and, on the
+    /// control channel, the rank's model signature (the data channel's
+    /// bare handshake carries none). The handshake is a fixed-size
+    /// exchange (no length framing); the length-framed blob protocol
+    /// begins only after this returns.
     fn terminate_handshake(
         self,
         stream: &mut TcpStream,
         world_size: usize,
         salt: &SessionSalt,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<[u8; 32]>)> {
         match self {
             ChannelKind::Data => {
                 let rank =
                     crate::distributed::controller::read_handshake(stream, world_size)?;
                 crate::distributed::controller::write_handshake_ack(stream)?;
-                Ok(rank as u32)
+                Ok((rank as u32, None))
             }
             ChannelKind::Control => {
-                let rank = crate::distributed::wire::read_handshake_rank(
+                let (rank, model_sig) = crate::distributed::wire::read_handshake_rank(
                     stream,
                     world_size as u32,
                     salt,
                 )?;
                 crate::distributed::wire::write_handshake_ack(stream, salt)?;
-                Ok(rank)
+                Ok((rank, Some(model_sig)))
             }
         }
     }
@@ -183,6 +185,7 @@ impl RelayChannel {
         // Phase 1: accept + terminate each local rank's handshake.
         let expected: HashSet<u32> = ranks.iter().copied().collect();
         let mut rank_streams: Vec<(u32, TcpStream)> = Vec::with_capacity(ranks.len());
+        let mut rank_sigs: Vec<(u32, [u8; 32])> = Vec::with_capacity(ranks.len());
         while rank_streams.len() < ranks.len() {
             let (mut stream, _peer) = listener.accept().map_err(|e| {
                 TensorError::new(&format!("relay: loopback accept failed: {e}"))
@@ -193,7 +196,8 @@ impl RelayChannel {
             // (its per-write failures are already tolerated).
             let _ = stream
                 .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
-            let rank = kind.terminate_handshake(&mut stream, world_size, &salt)?;
+            let (rank, model_sig) =
+                kind.terminate_handshake(&mut stream, world_size, &salt)?;
             if !expected.contains(&rank) {
                 return Err(TensorError::new(&format!(
                     "relay: rank {rank} connected but is not in this host's rank set {ranks:?}"
@@ -204,8 +208,16 @@ impl RelayChannel {
                     "relay: duplicate rank {rank} connected on loopback"
                 )));
             }
+            if let Some(sig) = model_sig {
+                rank_sigs.push((rank, sig));
+            }
             rank_streams.push((rank, stream));
         }
+        // Signatures aligned with the sorted `ranks` announced upstream;
+        // empty on the data channel (its handshake carries none).
+        rank_sigs.sort_unstable_by_key(|(r, _)| *r);
+        let model_sigs: Vec<[u8; 32]> =
+            rank_sigs.into_iter().map(|(_, sig)| sig).collect();
 
         // Phase 2: connect upstream + relay handshake.
         let mut upstream = crate::distributed::wire::connect_with_retry(
@@ -233,6 +245,7 @@ impl RelayChannel {
         MuxRecord::control(RelayControlMsg::Hello {
             host,
             ranks: ranks.clone(),
+            model_sigs,
         })
         .write_to(&mut upstream, &salt)?;
         match MuxRecord::read_from(&mut upstream, &salt)? {

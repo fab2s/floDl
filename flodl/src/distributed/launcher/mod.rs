@@ -131,6 +131,13 @@ pub const ENV_RELAY_JSON: &str = "FLODL_INTERNAL_RELAY_JSON";
 /// other role env var.
 pub const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
 
+/// Model-signature probe marker (`fdl join` sets it on a short-lived
+/// re-invocation of the training binary, before the dial): when
+/// present, `Trainer::run` / `into_worker` build the model on CPU,
+/// print `flodl-model-sig: <64 hex>` on stdout and exit — before
+/// auto-promote, before any cluster role, touching no CUDA context.
+pub const ENV_MODEL_SIG_PROBE: &str = "FLODL_INTERNAL_MODEL_SIG_PROBE";
+
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
 /// fdl-cli when invoking the user binary as a launcher; required by the
@@ -601,6 +608,7 @@ fn resolve_session_salt(
 fn derive_join_config(
     knobs: Option<&JoinKnobs>,
     capacity: usize,
+    nccl_backend: bool,
 ) -> Result<crate::distributed::membership::JoinConfig> {
     let defaults = crate::distributed::membership::JoinConfig::default();
     let knobs = knobs.cloned().unwrap_or_default();
@@ -642,6 +650,7 @@ fn derive_join_config(
             .unwrap_or(defaults.max_join_timeout_secs.max(join_timeout_secs)),
         open_admission: knobs.open_admission.unwrap_or(false),
         start_mode: knobs.start.unwrap_or_default(),
+        nccl_backend,
     })
 }
 
@@ -672,6 +681,18 @@ fn synthesize_world<'a>(
                 nccl_socket_ifname: String::new(),
                 path: String::new(),
                 arch: None,
+                // The controller has nothing to say about the source
+                // root of a host it never configured. A walk-in learns
+                // its own from the join config on its box, which is
+                // where the path is actually resolvable, and its agent
+                // writes it into this envelope on arrival
+                // (`AgentSpec::data_path`).
+                data_path: None,
+                // Same class of fact, same road: None here lets the
+                // cluster-scope default flow into the slim envelope,
+                // and the box's own `join.gpu_ram_share:` overrides it
+                // at localization.
+                gpu_ram_share: None,
                 ssh: None,
                 // On a loopback-bound mux a walk-in can only have
                 // arrived through an sshd forward, so its rank children
@@ -688,6 +709,7 @@ fn synthesize_world<'a>(
         workers,
         salt,
         env: config.env.clone(),
+        gpu_ram_share: config.gpu_ram_share,
     }
 }
 
@@ -768,10 +790,16 @@ fn abort_worker_links(
 /// `coord` carries the controller-scope coordinator wiring (see
 /// [`CoordSpec`]); `None` preserves the legacy no-coordinator NCCL
 /// routing (no relays, ranks dial the controller directly).
+///
+/// `expected_model_sig` seeds the join window's model-signature check
+/// (the launcher's own CPU-built model is the run's truth); `None`
+/// falls back to first-member seeding among the walk-ins that carry
+/// one.
 pub fn run_launcher_with_config(
     full: FullCluster,
     coord: Option<CoordSpec>,
     outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
+    expected_model_sig: Option<[u8; 32]>,
     abort: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use crate::distributed::membership;
@@ -918,9 +946,12 @@ pub fn run_launcher_with_config(
     // Membership window
     // ------------------------------------------------------------------
     let capacity = full.world_size();
+    // The backend rides into admission so the window can refuse a
+    // vendor-mixed cohort exactly when the data plane cannot carry one.
     let join_config = derive_join_config(
         full.controller.join.as_ref(),
         capacity,
+        backend_is_nccl,
     )?;
     // A configured token forces credential-authenticated admission even
     // behind a loopback bind: the sshd guardrail and the token are
@@ -954,6 +985,7 @@ pub fn run_launcher_with_config(
                 &gate_salt,
                 !open_admission,
                 None,
+                expected_model_sig,
                 &gate_abort,
                 &gate_status,
             )
@@ -1039,6 +1071,9 @@ pub fn run_launcher_with_config(
             }
             let spec = agent::AgentSpec {
                 host: host.host.clone(),
+                // Fan-out hosts run what the controller dispatched, so
+                // there is no published-run identity to disagree about.
+                run_id: None,
                 controller_host: if host.host == me {
                     // Local workers always reach the mux via loopback.
                     "127.0.0.1".to_string()
@@ -1050,6 +1085,15 @@ pub fn run_launcher_with_config(
                 local_devices: host.local_devices.clone(),
                 libtorch: host.arch.clone().unwrap_or_default(),
                 dataset_sig_hex: None,
+                // Fan-out: the roster already carries this host's source
+                // root and resolved RAM share into its envelope, so the
+                // agent has nothing to localize.
+                data_path: None,
+                gpu_ram_share: None,
+                // Fan-out hosts run what the controller dispatched, so
+                // there is no model identity to probe; the controller's
+                // own seed covers the ledger.
+                model_sig_hex: None,
             };
             if host.host == me {
                 // Merged env for the local children (cluster-scope

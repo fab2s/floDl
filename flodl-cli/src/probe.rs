@@ -29,7 +29,9 @@ use crate::cluster::resolve_local_hostname;
 use crate::config::{self, ClusterWorker, DEFAULT_DATA_PATH};
 use crate::context::Context;
 use crate::libtorch::detect::{self, LibtorchInfo};
+use crate::util::requirements;
 use crate::util::system::{self, GpuInfo};
+use flodl_hw::{GpuArch, GpuVendor};
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -324,14 +326,36 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
         for g in gpus {
             let index = g.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
             let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sm = g.get("sm").and_then(|v| v.as_str()).unwrap_or("sm_0");
-            let (sm_major, sm_minor) = parse_sm(sm);
             let total_memory_mb = g.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
+            // `vendor` + `arch` are the vendor-plural pair. `sm` is the
+            // legacy NVIDIA-only key, still read so a probe against an
+            // older remote fdl keeps working.
+            let vendor = g
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .and_then(GpuVendor::parse)
+                .unwrap_or(GpuVendor::Nvidia);
+            let token = g
+                .get("arch")
+                .and_then(|v| v.as_str())
+                .or_else(|| g.get("sm").and_then(|v| v.as_str()))
+                .unwrap_or_default();
+            let Some(arch) = GpuArch::parse(vendor, token) else {
+                // A device we cannot place is worse than one we drop: an
+                // unparsed arch would silently compare as incompatible
+                // against every libtorch variant. Say so instead.
+                report.warnings.push(format!(
+                    "host {:?}: GPU {index} reports an unrecognized {vendor} arch \
+                     {token:?}; skipping it in the report",
+                    worker.host,
+                ));
+                continue;
+            };
             report.gpus.push(GpuInfo {
                 index,
+                vendor,
                 name,
-                sm_major,
-                sm_minor,
+                arch,
                 total_memory_mb,
             });
         }
@@ -431,22 +455,6 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
     }
 
     Ok(report)
-}
-
-fn parse_sm(s: &str) -> (u32, u32) {
-    // "sm_NNN" → (sm_major, sm_minor). sm_NN concatenates the two
-    // digits; reverse by treating last digit as minor when total
-    // string after "sm_" is 2 chars, else split major/minor on the
-    // canonical 2-digit minor convention NVIDIA uses (sm_120 = 12.0).
-    let n = s.trim_start_matches("sm_");
-    if let Ok(v) = n.parse::<u32>() {
-        // sm_120 -> 12.0; sm_61 -> 6.1; sm_90 -> 9.0; sm_86 -> 8.6.
-        // NVIDIA convention: last digit is minor.
-        let major = v / 10;
-        let minor = v % 10;
-        return (major, minor);
-    }
-    (0, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,9 +615,38 @@ pub fn probe_local(
     data_path_explicit: bool,
 ) -> ProbeReport {
     let host = resolve_local_hostname();
-    let gpus = system::detect_gpus();
     let mut issues: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+
+    // The full sweep, not just its device list. A survey's findings are
+    // the part a device list cannot express, and the case that matters
+    // most for a second vendor has NO device at all: a card physically
+    // present whose stack is not installed. `probe` exists to tell an
+    // operator why a host is not ready, so it is the one command that
+    // must never drop them.
+    let sweep = flodl_hw::survey();
+    for note in &sweep.notes {
+        if note.kind.explains_absence() {
+            issues.push(note.to_string());
+        } else {
+            warnings.push(note.to_string());
+        }
+    }
+    // Read the vendor facts before `devices` is moved out.
+    //
+    // The NCCL scan looks for `libnccl.so`, an NVIDIA artifact, so it is
+    // only meaningful when this host actually has an NVIDIA GPU. On an
+    // AMD host the collective library is RCCL, which ships INSIDE
+    // libtorch-rocm's own `lib/`; on a GPU-less host nothing collective
+    // can run at all, and the "no usable GPUs" issue below already says
+    // so. Either way "Install libnccl matching your CUDA version" points
+    // the operator at the wrong thing.
+    //
+    // Note this reads the PHYSICAL sweep, not the masked one, so a rig
+    // whose GPUs are temporarily hidden by CUDA_VISIBLE_DEVICES still
+    // gets its NCCL install checked.
+    let has_nvidia = sweep.has_vendor(GpuVendor::Nvidia);
+    let gpus = sweep.devices;
 
     let libtorch = match libtorch_path_override {
         Some(p) => check_libtorch_at(&p, &gpus, &mut issues),
@@ -622,15 +659,47 @@ pub fn probe_local(
         &mut issues,
         &mut warnings,
     );
-    let nccl = check_nccl(via_docker, &mut issues);
+    // The NCCL scan looks for `libnccl.so`, which is an NVIDIA artifact.
+    // AMD's collective library is RCCL, and it ships INSIDE
+    // libtorch-rocm's own `lib/` -- so on an AMD-only host there is
+    // nothing to discover and a "libnccl not found" issue would be pure
+    // noise telling the operator to install the wrong thing.
+    //
+    // The asymmetry is the distributions', not ours, and it is measured:
+    // the published 2.10.0+rocm7.0 archive carries `lib/librccl.so`
+    // (~340 MB), while the CUDA archives bundle no libnccl at all, which
+    // is exactly why that one is worth probing for and this one is not.
+    let nccl = if !has_nvidia {
+        NcclStatus { library_path: None, all_found: vec![], via_docker: None }
+    } else {
+        check_nccl(via_docker, &mut issues)
+    };
 
     if gpus.is_empty() {
+        // Say what was actually looked for. The old text named
+        // nvidia-smi unconditionally, which is simply false on a host
+        // whose GPU is AMD -- and that host is exactly the one whose
+        // operator most needs an accurate message. Any vendor-specific
+        // reason already rode in as a survey note above.
         issues.push(
-            "no CUDA GPUs detected — nvidia-smi missing or driver \
-             unhealthy. Single-host CPU training will still work; \
-             multi-rank NCCL requires a working GPU stack."
+            "no usable GPUs detected. Single-host CPU training will still \
+             work; multi-rank training requires a working GPU stack."
                 .into(),
         );
+    }
+
+    check_gpu_toolkit(libtorch.info.as_ref(), &mut warnings);
+
+    // Host tools are a hard issue: without them `fdl` cannot download or
+    // unpack anything, whatever the build strategy.
+    let tools = requirements::missing_host_tools();
+    if !tools.is_empty() {
+        issues.push(format!(
+            "missing host tools `fdl` needs: {}. Install with `sudo apt install {}` \
+             (or the equivalent for your distribution).",
+            tools.join(", "),
+            tools.join(" "),
+        ));
     }
 
     ProbeReport {
@@ -649,6 +718,33 @@ pub fn probe_local(
 /// pointer-file shape of [`check_libtorch_at`]; mirrors the
 /// arch-check and valid-dir logic from [`check_libtorch`] without
 /// duplicating its `.active` walk.
+/// Report a variant the dynamic linker cannot satisfy on this host.
+///
+/// A libtorch archive is built against some baseline C library and the
+/// baseline differs per variant: measured on 2.10.0, cpu and cu128 want
+/// `GLIBC_2.29` while rocm7.0 wants `GLIBC_2.35`. RHEL 9 ships 2.34 and
+/// cannot go further, so that pair compiles, links, and then dies in the
+/// loader quoting symbol versions. Naming it here costs one `ldd`.
+///
+/// Called from every arm that produces a [`LibtorchStatus`]: the first
+/// version of this check lived in one of them, and the explicit
+/// `--libtorch-path` arm builds its status inline, so a real RHEL box
+/// reported nothing at all.
+fn push_loader_issue(variant_dir: &Path, label: &str, issues: &mut Vec<String>) {
+    let unmet = detect::unmet_loader_requirements(variant_dir);
+    if unmet.is_empty() {
+        return;
+    }
+    issues.push(format!(
+        "libtorch variant `{label}` cannot load on this host: the dynamic \
+         linker is missing {}. The archive was built against a newer C \
+         library than this distribution ships, so it compiles and links and \
+         then fails to start. Use a variant with an older baseline (cpu and \
+         cu128 need less than the rocm archives) or a newer distribution.",
+        unmet.join(", "),
+    ));
+}
+
 fn libtorch_status_from_info(
     info: Option<LibtorchInfo>,
     libtorch_root: &Path,
@@ -659,6 +755,9 @@ fn libtorch_status_from_info(
         Some(i) => libtorch_root.join(&i.path).join("lib").is_dir(),
         None => false,
     };
+    if let Some(i) = &info {
+        push_loader_issue(&libtorch_root.join(&i.path), &i.path, issues);
+    }
     let archs_match = match &info {
         Some(i) => detect::arch_coverage(i, gpus, issues),
         None => {
@@ -725,6 +824,7 @@ fn check_libtorch_at(
     }
     let info = detect::libtorch_info_from_dir(dir.display().to_string(), dir);
     let archs_match = detect::arch_coverage(&info, gpus, issues);
+    push_loader_issue(dir, &info.path, issues);
     LibtorchStatus { info: Some(info), valid_dir: true, archs_match }
 }
 
@@ -841,6 +941,116 @@ fn check_data_path(
     DataPathStatus { path, exists, readable, fs_type, skipped: false }
 }
 
+/// Report a missing vendor toolkit for the ACTIVE libtorch variant.
+///
+/// The active variant is what declares intent: `precompiled/rocm70` says
+/// this project builds ROCm, so it will need HIP headers. That is the
+/// same signal `$FDL_GPU_FEATURE` is derived from, so the two cannot
+/// disagree about which vendor is in play.
+///
+/// Only headers are checked: libtorch bundles every library the link
+/// needs, so headers are the whole gap.
+///
+/// A warning rather than an issue: the default workflow builds in the
+/// dev container, where host headers are irrelevant. It applies to
+/// native builds, and the text says so.
+///
+/// `flodl-sys/build.rs` guards the same requirement at compile time;
+/// this reports it before a build is attempted.
+fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
+    let Some(info) = info else { return };
+    let Some(vendor) = detect::variant_vendor(&info.path) else {
+        return; // CPU variant: no toolkit to want.
+    };
+
+    // `GpuVendor` is #[non_exhaustive] on purpose -- Intel is the planned
+    // third. A vendor with no entry here has no known toolkit layout, and
+    // guessing one would produce a confidently wrong apt command. Say
+    // nothing until someone adds real facts.
+    //
+    // The header tables are `util::requirements`'s — the SAME set
+    // flodl-sys/build.rs demands, covering the whole include chain. A
+    // shorter hand-picked list here is the trap this replaced: probe
+    // reports clean, the operator proceeds, and the build fails on a
+    // header the short list never looked for. ROCm has no metapackage,
+    // so its install line must name every package; `cuda-toolkit` IS a
+    // metapackage, so the NVIDIA line stays that plus libnccl-dev
+    // rather than version-placeholder package names.
+    let plan = match vendor {
+        GpuVendor::Amd => Some((
+            "ROCM_PATH",
+            flodl_hw::rocm_runtime_root()
+                .map(|p| p.display().to_string())
+                .or_else(|| std::env::var("ROCM_PATH").ok())
+                .unwrap_or_else(|| "/opt/rocm".to_string()),
+            crate::util::requirements::ROCM_HEADERS,
+            None,
+            "rocm",
+        )),
+        GpuVendor::Nvidia => Some((
+            "CUDA_HOME",
+            std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string()),
+            crate::util::requirements::CUDA_HEADERS,
+            Some("cuda-toolkit libnccl-dev"),
+            "cuda",
+        )),
+        _ => None,
+    };
+    let Some((root_env, root, headers, metapackages, feature)) = plan else {
+        return;
+    };
+
+    if let Some(w) = gpu_toolkit_warning(
+        &info.path, Path::new(&root), root_env, headers, metapackages, feature,
+    ) {
+        warnings.push(w);
+    }
+}
+
+/// Pure core of [`check_gpu_toolkit`]: the toolkit root is a parameter,
+/// not an env read, so every arm is testable without mutating
+/// process-global state. That matters more than usual here -- this
+/// crate's test binary runs in parallel, and an env-mutating test only
+/// works if every reader takes the same lock, which they do not.
+///
+/// `metapackages` overrides the per-header package list in the install
+/// line, for the vendor whose metapackage covers the set.
+fn gpu_toolkit_warning(
+    variant: &str,
+    root: &Path,
+    root_env: &str,
+    headers: &[(&str, &str)],
+    metapackages: Option<&str>,
+    feature: &str,
+) -> Option<String> {
+    let missing = crate::util::requirements::missing_headers(root, headers);
+    if missing.is_empty() {
+        return None;
+    }
+    let packages: Vec<String> = match metapackages {
+        Some(m) => m.split_whitespace().map(str::to_string).collect(),
+        None => crate::util::requirements::packages_for(&missing),
+    };
+    let list: Vec<&str> = missing.iter().map(|(h, _)| *h).collect();
+    let root = root.display();
+    // Through `install_hint`, so the command names this family's package
+    // manager and its own spelling of the packages. Hardcoding apt here
+    // told a RHEL box to run `sudo apt install hip-dev`, which is two
+    // kinds of wrong at once.
+    let install = crate::util::requirements::install_hint(&packages);
+    // No backticks around the install line: it carries its own trailing
+    // caveat ("or your distribution's equivalent"), and quoting the pair
+    // as one span invites a copy-paste that dnf rejects on the paren.
+    Some(format!(
+        "active libtorch is `{}` but its toolkit headers are missing under \
+         `{root}` ({}). Native builds with `--features {feature}` will fail; \
+         building in the dev container is unaffected. Install them with: \
+         {install}. Set {root_env} if your install is elsewhere.",
+        variant,
+        list.join(", "),
+    ))
+}
+
 fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatus {
     // Docker-served host: NCCL lives inside the container image, not
     // on the host. Skip the host scan entirely — scanning would
@@ -912,10 +1122,58 @@ fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatu
     NcclStatus { library_path: found.first().cloned(), all_found: found, via_docker: None }
 }
 
+/// What is mounted AT `path` exactly: `(source, fs_type)` from
+/// `/proc/mounts`, e.g. `("flodl@exa:/flodl/data", "fuse.sshfs")`.
+/// `None` when `path` is not itself a mount point — which is how
+/// [`crate::prepare`] tells "already mounted, nothing to do" from "mount
+/// it now" without shelling out to `mountpoint(1)`. Contrast
+/// [`detect_fs_type`], which walks toward the root and therefore always
+/// answers something.
+pub(crate) fn mounted_at(path: &Path) -> Option<(String, String)> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // Last match wins: a mount point can be stacked, and the effective
+    // filesystem is the one mounted most recently.
+    let mut found = None;
+    for line in mounts.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 && Path::new(cols[1]) == abs {
+            found = Some((unescape_mount(cols[0]), cols[2].to_string()));
+        }
+    }
+    found
+}
+
+/// `/proc/mounts` octal-escapes space, tab, newline and backslash in
+/// the source and mount-point columns. Only the source is user-facing
+/// here (it goes into a mismatch warning), and a path with a space in it
+/// would otherwise print as `exa:/flodl\040data`.
+fn unescape_mount(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let digits: String = chars.clone().take(3).collect();
+        match u8::from_str_radix(&digits, 8) {
+            Ok(byte) if digits.len() == 3 => {
+                out.push(byte as char);
+                for _ in 0..3 {
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Best-effort filesystem-type lookup via `/proc/mounts`. Walks toward
 /// the root looking for the closest mount-point that contains `path`.
 /// Returns `None` on non-Linux or when `/proc/mounts` is unavailable.
-fn detect_fs_type(path: &Path) -> Option<String> {
+pub(crate) fn detect_fs_type(path: &Path) -> Option<String> {
     let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut best: Option<(usize, String)> = None;
@@ -952,7 +1210,7 @@ fn print_report(r: &ProbeReport) {
             "  [{}] {} — {}, {} MB",
             g.index,
             g.short_name(),
-            g.sm_version(),
+            g.arch_label(),
             g.total_memory_mb
         );
     }
@@ -965,7 +1223,17 @@ fn print_report(r: &ProbeReport) {
             if let Some(t) = &info.torch_version {
                 println!("  torch : {}", t);
             }
-            if let Some(c) = &info.cuda_version {
+            // Same reason as `fdl diagnose`: `cuda=` is a CUDA toolkit
+            // version, absent (`none`) on both ROCm and CPU builds, so
+            // the vendor comes from the variant path instead. The JSON
+            // arm below keeps emitting the raw `cuda` field -- it is
+            // cluster wire format that remote hosts are parsed back out
+            // of, so its shape is not a display decision.
+            match detect::variant_vendor(&info.path) {
+                Some(v) => println!("  vendor: {}", v),
+                None => println!("  vendor: CPU-only"),
+            }
+            if let Some(c) = info.cuda_version.as_deref().filter(|c| *c != "none") {
                 println!("  cuda  : {}", c);
             }
             if let Some(a) = &info.archs {
@@ -1076,10 +1344,15 @@ fn report_to_json_object(r: &ProbeReport) -> String {
         if i > 0 { b.push(','); }
         let _ = write!(
             b,
-            "{{\"index\":{},\"name\":\"{}\",\"sm\":\"{}\",\"vram_mb\":{}}}",
+            "{{\"index\":{},\"name\":\"{}\",\"vendor\":\"{}\",\"arch\":\"{}\",\"sm\":\"{}\",\"vram_mb\":{}}}",
             g.index,
             system::escape_json(&g.name),
-            g.sm_version(),
+            g.vendor.as_str(),
+            g.arch_label(),
+            // Legacy NVIDIA-only key: an older `fdl` on the controller
+            // side reads this one. Empty on a non-NVIDIA device, which
+            // such a reader would have mis-handled anyway.
+            g.sm_version().unwrap_or_default(),
             g.total_memory_mb
         );
     }
@@ -1186,6 +1459,104 @@ fn report_to_json_object(r: &ProbeReport) -> String {
 mod tests {
     use super::*;
 
+    // --- GPU toolkit headers -------------------------------------------
+
+    #[test]
+    fn toolkit_warning_names_every_missing_header_and_its_package() {
+        // The REAL requirements table, not a hand-picked subset: probe
+        // reporting clean while the build fails on the eighth header is
+        // exactly the drift this check exists to prevent. (Assumes the
+        // test host has no /usr/include/hip — true of the dev and cuda
+        // containers.)
+        let root = PathBuf::from("/nonexistent/flodl-probe-test/rocm");
+        let w = gpu_toolkit_warning(
+            "precompiled/rocm70", &root, "ROCM_PATH",
+            crate::util::requirements::ROCM_HEADERS, None, "rocm",
+        )
+        .expect("absent toolkit must warn");
+        for (header, _) in crate::util::requirements::ROCM_HEADERS {
+            assert!(w.contains(header), "missing header {header}: {w}");
+        }
+        assert!(w.contains("precompiled/rocm70"), "{w}");
+        assert!(w.contains("ROCM_PATH"), "{w}");
+        // The install line is whatever THIS platform's is: apt names,
+        // dnf names, brew with a caveat, or a WSL2 pointer that names no
+        // package at all. Asserting one family's spelling is how a green
+        // ubuntu run shipped a warning that failed on rocky, macOS and
+        // windows at once; the spellings themselves are pinned where they
+        // are decided, in `requirements::install_hint`.
+        let packages = crate::util::requirements::packages_for(
+            &crate::util::requirements::ROCM_HEADERS.iter().collect::<Vec<_>>(),
+        );
+        let hint = crate::util::requirements::install_hint(&packages);
+        assert!(w.contains(&hint), "install line not `{hint}`: {w}");
+    }
+
+    #[test]
+    fn toolkit_warning_says_the_container_path_is_unaffected() {
+        // Severity rationale, pinned: flodl's default workflow builds in
+        // the dev container, where host headers are irrelevant. If this
+        // sentence goes, the warning starts reading like a broken host.
+        // The metapackage override is NVIDIA's line: cuda-toolkit covers
+        // the set, where the per-header names carry version placeholders.
+        let root = PathBuf::from("/nonexistent/flodl-probe-test/cuda");
+        let w = gpu_toolkit_warning(
+            "precompiled/cu128", &root, "CUDA_HOME",
+            &[("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>")],
+            Some("cuda-toolkit libnccl-dev"), "cuda",
+        )
+        .unwrap();
+        assert!(w.contains("dev container is unaffected"), "{w}");
+        assert!(w.contains("--features cuda"), "{w}");
+        let hint = crate::util::requirements::install_hint(&[
+            "cuda-toolkit".to_string(),
+            "libnccl-dev".to_string(),
+        ]);
+        assert!(w.contains(&hint), "metapackage line not `{hint}`: {w}");
+        assert!(!w.contains("<M>-<m>"), "placeholders must not reach the user: {w}");
+    }
+
+    #[test]
+    fn toolkit_present_warns_nothing_and_partial_reports_only_the_gap() {
+        // A real include/ layout, because the requirements checker looks
+        // under <root>/include (and the system dirs) exactly as the
+        // compiler will.
+        let root = std::env::temp_dir()
+            .join(format!("fdl-probe-toolkit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("include/hip")).unwrap();
+        std::fs::write(root.join("include/hip/hip_runtime.h"), "//").unwrap();
+
+        assert!(
+            gpu_toolkit_warning(
+                "precompiled/rocm70", &root, "ROCM_PATH",
+                &[("hip/hip_runtime.h", "hip-dev")], None, "rocm",
+            )
+            .is_none(),
+            "a present header must not warn"
+        );
+        let w = gpu_toolkit_warning(
+            "precompiled/rocm70", &root, "ROCM_PATH",
+            &[("hip/hip_runtime.h", "hip-dev"), ("rccl/rccl.h", "rccl-dev")],
+            None, "rocm",
+        )
+        .expect("one missing header is still a warning");
+        assert!(w.contains("rccl/rccl.h"), "{w}");
+        assert!(!w.contains("hip_runtime"), "must not list the header it found: {w}");
+        assert!(!w.contains("hip-dev"), "nor the package it owns: {w}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cpu_variant_wants_no_toolkit() {
+        // `variant_vendor` returns None for a CPU build, which is the
+        // gate that keeps this whole check silent on CPU-only hosts.
+        assert!(detect::variant_vendor("precompiled/cpu").is_none());
+        assert!(detect::variant_vendor("precompiled/cpu-linux-aarch64").is_none());
+        // And the vendors that DO imply a toolkit still resolve.
+        assert_eq!(detect::variant_vendor("precompiled/rocm70"), Some(GpuVendor::Amd));
+        assert_eq!(detect::variant_vendor("precompiled/cu128"), Some(GpuVendor::Nvidia));
+    }
+
     #[test]
     fn data_path_check_skipped_when_flag_set() {
         let mut issues = Vec::new();
@@ -1239,15 +1610,21 @@ mod tests {
     fn data_path_check_reports_readable_tmp() {
         let mut issues = Vec::new();
         let mut warnings = Vec::new();
+        // `env::temp_dir()`, not a literal "/tmp": the assertion is that a
+        // path which exists is *reported* as existing, and hardcoding a
+        // POSIX path made this fail on Windows for a reason that had
+        // nothing to do with check_data_path (which was right to call a
+        // missing path missing).
         let status = check_data_path(
-            PathBuf::from("/tmp"),
+            std::env::temp_dir(),
             false,
             false,
             &mut issues,
             &mut warnings,
         );
-        // /tmp is virtually always readable on Linux; if not we'd see
-        // it in `issues` and the test would surface the surprise.
+        // The temp dir is readable on any host that can run this test; if
+        // not we'd see it in `issues` and the test would surface the
+        // surprise.
         assert!(status.exists);
         assert!(status.readable);
         assert!(issues.is_empty(), "issues = {:?}", issues);
@@ -1346,9 +1723,9 @@ mod tests {
             host: "h\tost".into(),
             gpus: vec![GpuInfo {
                 index: 0,
+                vendor: GpuVendor::Nvidia,
                 name: "Weird\tGPU \"X\"\r\n".into(),
-                sm_major: 8,
-                sm_minor: 6,
+                arch: GpuArch::Sm { major: 8, minor: 6 },
                 total_memory_mb: 1024,
             }],
             libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
@@ -1384,6 +1761,84 @@ mod tests {
         );
     }
 
+    /// Minimal worker fixture for the wire tests below.
+    fn wire_test_worker() -> ClusterWorker {
+        serde_yaml_ng::from_str(
+            "host: pascal\nlocal_devices: [0]\nnccl_socket_ifname: lo\npath: /opt/flodl",
+        )
+        .expect("minimal worker")
+    }
+
+    #[test]
+    fn gpu_wire_round_trips_both_vendors() {
+        // The probe JSON is a real wire: `fdl @cluster probe` SSHes and
+        // parses what the remote `fdl probe --json` emitted. Emit and
+        // parse must therefore agree for every vendor, or a remote AMD
+        // host reads back as something else.
+        let r = ProbeReport {
+            host: "h".into(),
+            gpus: vec![
+                GpuInfo {
+                    index: 0,
+                    vendor: GpuVendor::Nvidia,
+                    name: "NVIDIA GeForce RTX 5060 Ti".into(),
+                    arch: GpuArch::Sm { major: 12, minor: 0 },
+                    total_memory_mb: 16311,
+                },
+                GpuInfo {
+                    index: 1,
+                    vendor: GpuVendor::Amd,
+                    name: "AMD Radeon RX 6800".into(),
+                    arch: GpuArch::Gfx("gfx1030".into()),
+                    total_memory_mb: 16384,
+                },
+            ],
+            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
+            data_path: DataPathStatus {
+                path: PathBuf::from("/d"), exists: true, readable: true,
+                fs_type: None, skipped: false,
+            },
+            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            issues: vec![],
+            warnings: vec![],
+        };
+        let back = parse_remote_json(&report_to_json_object(&r), &wire_test_worker())
+            .expect("emitted JSON parses");
+        assert_eq!(back.gpus.len(), 2, "warnings: {:?}", back.warnings);
+        assert_eq!(back.gpus[0].arch, GpuArch::Sm { major: 12, minor: 0 });
+        assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);
+        assert_eq!(back.gpus[1].arch, GpuArch::Gfx("gfx1030".into()));
+        assert_eq!(back.gpus[1].vendor, GpuVendor::Amd);
+        assert_eq!(back.gpus[1].total_memory_mb, 16384);
+    }
+
+    #[test]
+    fn gpu_wire_reads_a_legacy_sm_only_remote() {
+        // An older `fdl` on the remote emits `sm` and no `vendor`/`arch`.
+        // It only ever ran on NVIDIA, so that is the right assumption.
+        let json = r#"{"host":"p","gpus":[{"index":0,"name":"A100","sm":"sm_80","vram_mb":81920}]}"#;
+        let back = parse_remote_json(json, &wire_test_worker()).expect("parses");
+        assert_eq!(back.gpus.len(), 1);
+        assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);
+        assert_eq!(back.gpus[0].arch, GpuArch::Sm { major: 8, minor: 0 });
+    }
+
+    #[test]
+    fn gpu_wire_warns_rather_than_inventing_an_arch() {
+        // An unrecognized arch must not fall through to a default: a
+        // bogus arch compares as incompatible with every libtorch
+        // variant, which reads as a hardware problem the user does not
+        // have.
+        let json = r#"{"host":"p","gpus":[{"index":0,"name":"X","vendor":"amd","arch":"wat","vram_mb":8}]}"#;
+        let back = parse_remote_json(json, &wire_test_worker()).expect("parses");
+        assert!(back.gpus.is_empty());
+        assert!(
+            back.warnings.iter().any(|w| w.contains("unrecognized")),
+            "warnings: {:?}",
+            back.warnings
+        );
+    }
+
     #[test]
     fn fs_type_detected_for_root() {
         let t = detect_fs_type(Path::new("/"));
@@ -1392,5 +1847,30 @@ mod tests {
         if std::path::Path::new("/proc/mounts").exists() {
             assert!(t.is_some(), "expected fs_type for /");
         }
+    }
+
+    #[test]
+    fn mounted_at_answers_only_for_a_real_mount_point() {
+        if !std::path::Path::new("/proc/mounts").exists() {
+            return;
+        }
+        // `/` is a mount point on every Linux box.
+        assert!(mounted_at(Path::new("/")).is_some());
+        // A path INSIDE a mount is not the mount point — this is the
+        // whole distinction from `detect_fs_type`, and the one that
+        // decides "mount it" from "already mounted".
+        let inside = std::env::temp_dir().join("fdl-not-a-mount-point");
+        assert!(mounted_at(&inside).is_none());
+        assert!(detect_fs_type(&inside).is_some(), "but it has an fs type");
+    }
+
+    #[test]
+    fn mount_fields_come_back_unescaped() {
+        assert_eq!(unescape_mount("exa:/flodl\\040data"), "exa:/flodl data");
+        assert_eq!(unescape_mount("plain:/flodl/data"), "plain:/flodl/data");
+        // A trailing backslash, or one that is not a full octal escape,
+        // is passed through rather than eating the rest of the field.
+        assert_eq!(unescape_mount("odd\\"), "odd\\");
+        assert_eq!(unescape_mount("odd\\9x"), "odd\\9x");
     }
 }

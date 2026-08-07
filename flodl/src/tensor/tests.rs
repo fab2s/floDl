@@ -213,7 +213,7 @@
         let t = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], Device::CPU).unwrap();
         assert!(!t.is_pinned(), "regular CPU tensor should not be pinned");
 
-        if cuda_available() {
+        if gpu_available() {
             let pinned = t.pin_memory().unwrap();
             assert!(pinned.is_pinned(), "pin_memory() result should be pinned");
             assert_eq!(pinned.device(), Device::CPU, "pinned tensor should stay on CPU");
@@ -654,7 +654,7 @@
     }
 
     #[test]
-    #[ignore = "GPU probe needs CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU probe needs CUDA; run with: fdl gpu-test-all"]
     fn test_probe_device_cuda() {
         if !test_device().is_cuda() { return; }
         // Device 0 should always work in a CUDA build
@@ -662,10 +662,10 @@
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_cuda_devices_has_compute_capability() {
         if !test_device().is_cuda() { return; }
-        let devices = cuda_devices();
+        let devices = gpu_devices();
         assert!(!devices.is_empty());
         for info in &devices {
             assert!(info.sm_major > 0, "compute capability should be detected");
@@ -676,17 +676,63 @@
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
+    fn test_gpu_arch_name_is_vendor_shaped() {
+        if !test_device().is_cuda() { return; }
+        for i in 0..gpu_device_count() {
+            let arch = gpu_arch_name(i).expect("arch name should resolve on a live device");
+            eprintln!("  device {i}: {arch}");
+            // Shape, not a hardcoded value: NVIDIA reports sm_<major><minor>,
+            // AMD reports a gfx target (optionally with `:feature` suffixes).
+            // Anything else means the FFI picked the wrong branch.
+            assert!(
+                arch.starts_with("sm_") || arch.starts_with("gfx"),
+                "unexpected arch shape {arch:?}"
+            );
+            // The step digit is why this exists rather than a numeric pair,
+            // so a bare family prefix is not enough.
+            assert!(
+                arch.len() > 3,
+                "arch {arch:?} carries no architecture digits"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
+    fn test_discrete_gpu_reports_not_integrated_and_budgets_unchanged() {
+        if !test_device().is_cuda() { return; }
+        for i in 0..gpu_device_count() {
+            let integrated = gpu_is_integrated(i)
+                .expect("integrated flag should resolve on a live device");
+            eprintln!("  device {i}: integrated={integrated}");
+            // Every card this suite runs on is discrete. The unified
+            // budget path must therefore be a strict no-op here: it is
+            // new machinery on the hot path for every existing user, and
+            // a regression would silently shrink their host RAM budget.
+            assert!(!integrated, "expected a discrete GPU in CI/dev");
+        }
+        let available = crate::sys::mem_info().unwrap().available_bytes;
+        let adjusted = crate::data::budget::unified_adjusted_available(
+            available,
+            test_device(),
+            None,
+        );
+        assert_eq!(adjusted, available, "discrete must not lose host RAM");
+    }
+
+    #[test]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_usable_cuda_devices() {
         if !test_device().is_cuda() { return; }
-        let usable = usable_cuda_devices();
+        let usable = usable_gpu_devices();
         assert!(!usable.is_empty(), "at least one device should be usable");
         // Device 0 should always be usable in a CUDA build
         assert!(usable.contains(&Device::CUDA(0)));
     }
 
     #[test]
-    #[ignore = "GPU diagnostics need CUDA; run with: fdl cuda-test-all"]
+    #[ignore = "GPU diagnostics need CUDA; run with: fdl gpu-test-all"]
     fn test_cuda_primary_context_and_nvml_probes() {
         if !test_device().is_cuda() { return; }
         // Force a real CUDA touch on runtime device 0, then the
@@ -695,7 +741,7 @@
             dtype: DType::Float32,
             device: Device::CUDA(0),
         }).unwrap();
-        assert!(cuda_has_primary_context(0),
+        assert!(gpu_has_primary_context(0),
             "primary context must exist after tensor work on the device");
 
         // NVML memory info takes PHYSICAL indices; resolve them via
@@ -703,7 +749,7 @@
         let gpus = crate::sys::detect_gpus();
         assert!(!gpus.is_empty(), "detect_gpus should see the test GPU");
         for g in &gpus {
-            let (used, total) = cuda_nvml_memory_info_idx(g.index as i32)
+            let (used, total) = gpu_smi_memory_info_idx(g.index as i32)
                 .expect("NVML memory info should be available on a CUDA rig");
             assert!(total > 0, "device-wide VRAM total should be non-zero");
             assert!(used <= total, "used VRAM cannot exceed total");
@@ -718,5 +764,5 @@
         // (CPU builds / CPU-only rigs); on CUDA rigs the parallel
         // harness makes context presence nondeterministic.
         if test_device().is_cuda() { return; }
-        assert!(!cuda_has_primary_context(0));
+        assert!(!gpu_has_primary_context(0));
     }

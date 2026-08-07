@@ -84,7 +84,7 @@ fn parse_env_cluster(raw: &str) -> FullCluster {
 }
 
 fn autodetect_local_gpus() -> Option<usize> {
-    let count = crate::tensor::cuda_device_count();
+    let count = crate::tensor::gpu_device_count();
     if count > 0 {
         Some(count as usize)
     } else {
@@ -121,12 +121,15 @@ fn synthesize_local_cluster(n_gpus: usize) -> FullCluster {
             nccl_socket_ifname: "lo".to_string(),
             path: String::new(),
             arch: None,
+            data_path: None,
+            gpu_ram_share: None,
             ssh: None,
             tunnel: false,
             env: std::collections::BTreeMap::new(),
         }],
         salt: [0u8; SESSION_SALT_BYTES],
         env: std::collections::BTreeMap::new(),
+        gpu_ram_share: None,
     }
 }
 

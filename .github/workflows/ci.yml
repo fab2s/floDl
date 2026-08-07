@@ -42,6 +42,15 @@ jobs:
       - name: Skill assets in sync with ai/
         run: sh ci/release/09-skill-assets.sh
 
+      # Also toolchain-free, and here rather than only in the release
+      # suite because of what it catches: the second pass parses every
+      # script under bash 3.2 (what macOS ships), and a local `bash -n`
+      # on a modern box cannot see those failures. The macOS leg in
+      # os.yml does see them -- after downloading libtorch, minutes in,
+      # for a syntax error. This says it in seconds.
+      - name: Shell scripts parse (incl. bash 3.2, what macOS ships)
+        run: sh ci/release/04-shell.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -101,6 +110,50 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
           LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
         run: cargo test leakcheck -- --test-threads=1 --nocapture
+
+      # The model-sig probe is a wire contract consumed by `fdl join`: it
+      # re-runs the training binary under FLODL_INTERNAL_MODEL_SIG_PROBE
+      # and scans stdout for one `flodl-model-sig: <hex>` line. Nothing
+      # else in CI pins that line's shape, so this runs a real example
+      # twice and asserts the contract: the line appears, the process
+      # exits 0 without training, and the hex is identical across runs
+      # (the signature is a pure function of the constructed model).
+      - name: Model-sig probe contract
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: |
+          cargo build -p flodl --example auto_promote
+          bin=target/debug/examples/auto_promote
+          out1=$(FLODL_INTERNAL_MODEL_SIG_PROBE=1 "$bin")
+          out2=$(FLODL_INTERNAL_MODEL_SIG_PROBE=1 "$bin")
+          sig1=$(printf '%s\n' "$out1" | sed -n 's/^flodl-model-sig: //p')
+          sig2=$(printf '%s\n' "$out2" | sed -n 's/^flodl-model-sig: //p')
+          echo "run 1: $sig1"
+          echo "run 2: $sig2"
+          printf '%s' "$sig1" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::no 64-hex flodl-model-sig line in probe stdout"; exit 1; }
+          [ "$sig1" = "$sig2" ] \
+            || { echo "::error::model-sig probe is not deterministic across runs"; exit 1; }
+
+      # join-config's --cloud-init artifact is consumed by cloud-init's
+      # own YAML parser, and it embeds a private key and a worker yml
+      # INSIDE yaml -- quoting that only a real parser validates. The
+      # credentials minted here are throwaway and never leave the runner;
+      # --json reports secrets as file paths, never payloads, so printing
+      # the report is safe.
+      - name: cloud-init artifact parses as YAML
+        run: |
+          python3 -c "import yaml" 2>/dev/null \
+            || python3 -m pip install --break-system-packages --quiet pyyaml
+          smoke=$(mktemp -d)
+          report=$(cd "$smoke" && "$GITHUB_WORKSPACE/target/debug/fdl" join-config ci-smoke \
+            --controller ci@localhost --no-install-key --yes --cloud-init --json)
+          printf '%s\n' "$report"
+          ci_path=$(printf '%s' "$report" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["cloud_init_path"])')
+          python3 -c "import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); assert isinstance(d,dict) and 'write_files' in d, sorted(d); print('cloud-init parses; top-level keys:', sorted(d))" "$ci_path"
 
       - name: Clippy
         env:
@@ -179,14 +232,43 @@ jobs:
           mv libtorch libtorch-ci
           rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip"
 
-      - name: Build with CUDA feature
+      # `--tests` is what makes this a LINK, not just a compile. The
+      # workspace's only `[[bin]]` is `fdl`, which is zero-dep on flodl by
+      # policy, so a plain `cargo build` produces exactly one executable
+      # and it references no libtorch at all; clippy below runs in check
+      # mode and never invokes the linker either. Test targets are the
+      # only thing here that reaches ld -- and reaching it is the point:
+      # the libtorch_cuda force-load and gpu_compat.h's symbol mapping
+      # fail at link or at first kernel, neither of which a metadata-only
+      # pass can see. This job already unzips the full cu128 archive, so
+      # the flag costs a download of nothing.
+      - name: Build with CUDA feature (links test binaries)
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
             flodl-cuda-ci \
-            cargo build --features cuda
+            cargo build --features cuda --tests
+          df -h /
+
+      # The step above linked every test binary; this RUNS the flodl lib
+      # suite on a runner with no GPU driver. Not a degenerate case: it is
+      # exactly what a `--features cuda` binary sees on a CPU-only box or
+      # a driverless container, and one class of bug lives only here -- a
+      # device query that treats "no driver" as a fatal C++ exception
+      # instead of an empty answer (the deprecated-alias sweep did, and
+      # 2000+ tests on driver-present boxes never saw it). Serial, because
+      # an abort kills the whole binary and only a serial run names the
+      # culprit test.
+      - name: Run the flodl suite without a GPU
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-cuda-ci \
+            cargo test -p flodl --features cuda --lib -- --test-threads=1 --skip leakcheck
 
       - name: Clippy with CUDA feature
         run: |
@@ -196,3 +278,161 @@ jobs:
             -w /workspace \
             flodl-cuda-ci \
             cargo clippy --features cuda --all-targets -- -W clippy::all
+
+  rocm-build:
+    name: ROCm (build + clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ROCm is the disk-hungry job: the base image is ~25 GB and a full
+      # libtorch-rocm expands to ~12 GB, so free everything possible
+      # before pulling anything.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift
+          sudo apt-get clean
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache-rocm
+          key: buildx-rocm-${{ hashFiles('Dockerfile.rocm') }}
+          restore-keys: buildx-rocm-
+
+      - name: Build ROCm Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.rocm
+          load: true
+          tags: flodl-rocm-ci
+          cache-from: type=local,src=/tmp/.buildx-cache-rocm
+          cache-to: type=local,dest=/tmp/.buildx-cache-rocm-new,mode=max
+
+      - name: Rotate buildx cache
+        run: |
+          rm -rf /tmp/.buildx-cache-rocm
+          mv /tmp/.buildx-cache-rocm-new /tmp/.buildx-cache-rocm
+
+      # The `-so` token encodes the extract SHAPE, not just the libtorch
+      # version. actions/cache restores by key alone: without it, an entry
+      # saved by the older headers-and-one-.so extract restores under the
+      # same key, the download step is skipped, and the tree that comes
+      # back cannot link. Any future change to the unzip list below must
+      # bump this token too -- the step after the download asserts it.
+      - name: Cache libtorch download (ROCm)
+        id: cache-libtorch-rocm
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libtorch-ci
+          key: libtorch-rocm70-so-${{ env.LIBTORCH_VERSION }}
+
+      # Headers plus every shared object -- enough to LINK, which the
+      # predecessor's headers-and-one-.so subset could not do at any
+      # price. `libtorch_hip.so` alone is not a link set: it pulls
+      # libMIOpen, libmagma, librocsolver and ~30 others through
+      # DT_NEEDED, and ld resolves those recursively.
+      #
+      # Measured on the 2.10.0+rocm7.0 tree: lib/*.so* is 5.0 GB against
+      # 11 GB for all of lib/. The 6 GB left behind is Tensile and kernel
+      # data (hipblaslt 3.8 GB, aotriton.images 889 MB, rocblas 650 MB) --
+      # needed to RUN a kernel, not to link one, and this runner has no
+      # AMD GPU to run on.
+      - name: Download libtorch (ROCm)
+        if: steps.cache-libtorch-rocm.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://download.pytorch.org/libtorch/rocm7.0/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.0.zip"
+          unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip" \
+            'libtorch/include/*' 'libtorch/lib/*.so*'
+          mv libtorch libtorch-ci
+          rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip"
+          du -sh libtorch-ci
+          df -h /
+
+      # Runs on BOTH paths -- fresh extract and cache restore -- because a
+      # stale entry never self-corrects: a hit skips the post-job save, so
+      # the wrong tree would persist and re-break every future run.
+      #
+      # It has to sit AHEAD of the build steps. With the old sparse tree
+      # they both pass (build.rs gates only on a header and
+      # lib/libtorch_hip.so, and clippy never links), so the failure would
+      # land on the link step and read as "the link step is broken"
+      # instead of "the cache is stale". The library list is the ROCm arm
+      # of flodl-sys/build.rs's `rustc-link-lib` block.
+      - name: Verify the tree can satisfy a link
+        run: |
+          missing=
+          for lib in torch torch_cpu c10 torch_hip c10_hip amdhip64 rccl; do
+            [ -e "libtorch-ci/lib/lib$lib.so" ] || missing="$missing lib$lib.so"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::libtorch-ci cannot satisfy a link, missing:$missing"
+            echo "The extract list and the cache key have drifted apart."
+            echo "Bump the -so token in the 'Cache libtorch download (ROCm)'"
+            echo "key so the restore misses and the download runs again."
+            exit 1
+          fi
+          echo "link set present"
+
+      # Scoped to the two crates that actually carry the vendor mapping.
+      - name: Build with ROCm feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo build -p flodl-sys -p flodl --features rocm
+
+      # ONE separate integration-test binary, linked but never run (no AMD
+      # GPU on this runner). A SEPARATE binary is the only place a wrong
+      # `FLODL_TORCH_GPU_LIB` force-load target or a bad gpu_compat.h
+      # mapping surfaces at link time -- the lib test binary the next step
+      # runs keeps passing through that hole by construction.
+      #
+      # It must be an INTEGRATION test, not flodl's lib test: `flodl` has
+      # no tests/ dir, so its whole suite is one lib-test binary -- exactly
+      # the case the force-load invariant says keeps passing while a
+      # separate test binary fails. And one, not `--tests`: unlike the CUDA
+      # job this leg carries a ~25 GB base image plus 5 GB of libtorch, and
+      # 60-odd linked debug binaries (~8 GB) would not fit beside them.
+      - name: Link a GPU test binary (ROCm)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo build --features rocm -p flodl-hf --test bert_cuda_smoke
+          df -h /
+
+      # The CUDA job's driverless-run rationale, ROCm edition -- and here
+      # it also covers the libtorch_hip force-load dlopen'ing against the
+      # sparse .so-only tree with no /dev/kfd. Costs one more linked
+      # binary (flodl's lib test), which is why it is the ONLY suite this
+      # job runs; the disk ceiling that keeps `--tests` out still stands.
+      - name: Run the flodl suite without a GPU (ROCm)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo test -p flodl --features rocm --lib -- --test-threads=1 --skip leakcheck
+          df -h /
+
+      - name: Clippy with ROCm feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo clippy -p flodl-sys -p flodl --features rocm --all-targets -- -W clippy::all

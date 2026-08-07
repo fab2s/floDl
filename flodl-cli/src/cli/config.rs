@@ -176,7 +176,7 @@ pub(crate) fn dispatch_config(
             (None, None) => {
                 // No YAML cluster, no --gpus, but the command opted into
                 // cluster mode. Print a one-line hint if N>=2 GPUs visible.
-                if let Ok(n) = gpus::count_visible_gpus_via_nvidia_smi() {
+                if let Ok(n) = gpus::local_gpu_count() {
                     if n >= 2 {
                         eprintln!(
                             "flodl: {n} GPUs visible but cluster mode is off; \
@@ -192,6 +192,17 @@ pub(crate) fn dispatch_config(
         // Non-cluster path (test/clippy/etc., or recursive child).
         // `--gpus`, if present, restricts CUDA_VISIBLE_DEVICES for the single
         // child process. No cluster dispatch.
+        //
+        // A farm overlay whose join window nothing opens is the one case
+        // here that is almost certainly a mistake, and it is otherwise
+        // silent: the command trains locally and never mentions the
+        // window it did not open. Recursive children are excluded --
+        // there the local run IS the point.
+        if !cluster::is_recursive_invocation() {
+            if let Some(hint) = cluster::unused_join_window_hint(&project, cmd) {
+                eprintln!("fdl: warning: {hint}");
+            }
+        }
         if let Some(spec) = gpus_spec {
             let devs = match spec.resolve() {
                 Ok(d) => d,

@@ -1886,7 +1886,7 @@
             let mut batches = Vec::new();
             while let Ok(b) = rx.recv() {
                 let b = b.unwrap();
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(e) = &b.ready_event {
                     e.synchronize().unwrap();
                 }

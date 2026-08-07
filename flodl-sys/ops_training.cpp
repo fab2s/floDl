@@ -639,17 +639,17 @@ extern "C" void flodl_manual_seed(uint64_t seed) {
     }
 }
 
-extern "C" void flodl_cuda_manual_seed_all(uint64_t seed) {
+extern "C" void flodl_gpu_manual_seed_all(uint64_t seed) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     torch::cuda::manual_seed_all(static_cast<int64_t>(seed));
 #else
     (void)seed;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_manual_seed_all", e.what());
+        flodl_fatal("flodl_gpu_manual_seed_all", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_manual_seed_all", nullptr);
+        flodl_fatal("flodl_gpu_manual_seed_all", nullptr);
     }
 }
 

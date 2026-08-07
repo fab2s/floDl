@@ -134,11 +134,11 @@ commands:
     run: cargo test
     append: -- --nocapture
     docker: dev
-  cuda-test:
-    description: Run CUDA tests (parallel)
-    run: cargo test --features cuda
+  gpu-test:
+    description: Run GPU tests (parallel)
+    run: cargo test --features "$FDL_GPU_FEATURE"
     append: -- --nocapture
-    docker: cuda
+    docker: gpu
   shell:
     run: bash
     docker: dev
@@ -147,7 +147,7 @@ commands:
 
 ```bash
 fdl test                              # runs "test" in the "dev" docker service
-fdl cuda-test                         # runs in the "cuda" service
+fdl gpu-test                          # runs in the vendor's GPU service
 fdl test -- -p flodl-hf --test foo    # forwards `-p flodl-hf --test foo` to cargo
 fdl shell                             # opens an interactive shell
 fdl ddp-bench --list                  # dispatches into the ddp-bench sub-command
@@ -155,8 +155,23 @@ fdl ddp-bench --list                  # dispatches into the ddp-bench sub-comman
 
 When a `run:` command declares `docker: <service>`, `fdl` wraps it in
 `docker compose run --rm <service> bash -c "…"`. Without `docker:`, it
-runs on the host. `docker:` is only valid on `run:` commands -
-declaring it on a `path:` or preset entry is rejected at load time.
+runs on the host (with the same libtorch env applied). `docker:` is only
+valid on `run:` commands - declaring it on a `path:` or preset entry is
+rejected at load time.
+
+Two pieces of GPU indirection keep a manifest vendor-neutral:
+
+- **`docker: gpu`** is a logical service name: fdl resolves it to the
+  `cuda` or `rocm` compose service from the ACTIVE libtorch variant.
+  `docker: cuda` / `docker: rocm` remain explicit pins, passed through
+  verbatim; when no `rocm` service exists the resolution falls back to
+  `cuda` with a message.
+- **`$FDL_GPU_FEATURE`** is exported by fdl from the active variant
+  (`cuda`, `rocm`, or empty for a CPU variant), so a `run:` line says
+  `--features "$FDL_GPU_FEATURE"` — quoted, so the empty CPU value
+  stays a valid cargo invocation — instead of hardcoding a vendor.
+  Compose passes it into containers via the scaffolded `environment:`
+  blocks; native runs receive it directly.
 
 #### Forwarding extra args with `--` and `append:`
 
@@ -339,8 +354,42 @@ Typical overlay files:
 - `fdl.dev.yml` - fast iteration (shorter epochs, smaller batches).
 - `fdl.ci.yml` - CPU-only, minimal epochs, strict validation.
 - `fdl.prod.yml` - full runs, checkpoint to cloud storage.
+- `fdl.<farm>.yml` - a walk-in cluster farm (scaffolded by
+  [`fdl join-config`](03-cluster-commands.md#fdl-join-config)).
 
 Use `fdl config show <env>` to preview the resolved merged config.
+
+### `inherit-from`
+
+Any config file (the base or an overlay) can name a parent to merge
+under with a top-level `inherit-from: <path>`:
+
+```yaml
+# fdl.b300-run.yml — a mostly-empty specialization
+inherit-from: ~/.flodl/farms/b300.yml
+cluster:
+  controller:
+    join:
+      min_rank_start: 4        # this run wants a bigger quorum
+```
+
+The cascade stays CSS-like: the more specific file wins, and the cwd
+`fdl.yml` (when present) is the root the whole chain merges onto. The
+effective layer order is `fdl.yml` → deepest ancestor → … → the file
+itself, and `fdl config show` annotates every line with the layer it
+came from.
+
+Rules: paths resolve relative to the *declaring file* (`~/` names the
+invoking user's home, the natural spot for a base shared between
+projects); chains may nest and a cycle is a loud error listing the full
+loop; the `inherit-from` key itself never reaches the merged config. A
+`://`-shaped value is refused by name: a remote parent is config that
+could change under a standing fleet between two invocations, so it
+stays reserved until pinning is designed.
+
+This is what lets a controller in an ephemeral working directory carry
+a two-line farm file while the shared definition lives wherever you
+keep it: a home directory, a NAS mount, a dotfiles checkout.
 
 ## Preset sub-commands
 

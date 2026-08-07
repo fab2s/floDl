@@ -104,11 +104,13 @@ fn test_worker_config_clone() {
         transform: None,
         vram_max_usage: 0.90,
         ram_max_usage: 0.50,
+        gpu_ram_share: None,
         sample_cache: true,
         disk_stage_gb: 0,
         disk_stage_dir: None,
         batch_size: 32,
         seed: 42,
+        epoch_splits: 1,
         max_grad_norm: None,
         vram_pool: false,
         easgd_alpha: None,
@@ -117,6 +119,7 @@ fn test_worker_config_clone() {
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        model_sig: [0u8; 32],
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -207,11 +210,13 @@ pub(super) fn make_test_worker_customized(
         transform: None,
         vram_max_usage: 0.90,
         ram_max_usage: 0.50,
+        gpu_ram_share: None,
         sample_cache: true,
         disk_stage_gb: 0,
         disk_stage_dir: None,
         batch_size: 4,
         seed: 42,
+        epoch_splits: 1,
         max_grad_norm: None,
         vram_pool: false,
         easgd_alpha: None,
@@ -220,6 +225,7 @@ pub(super) fn make_test_worker_customized(
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: None,
+        model_sig: [0u8; 32],
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -266,4 +272,61 @@ fn test_zero_param_model_is_rejected_loudly() {
     assert!(msg.contains("zero trainable parameters"), "unexpected: {msg}");
     assert!(msg.contains("Module::parameters()"), "unexpected: {msg}");
     super::ensure_trainable_params(1, "ddp: single device").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Partition generation under epoch splits
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_split_partitions_the_whole_pass() {
+    // The default must resolve exactly the pass permutation, so runs
+    // predating the splits knob reproduce bit for bit.
+    assert_eq!(
+        super::make_partition(0, 100, 100, 3, 1, 42),
+        crate::rng::epoch_permutation(42, 3, 100),
+    );
+}
+
+#[test]
+fn partitions_tile_each_split_and_the_pass() {
+    // Two ranks over four events of one pass. Coordinator-style
+    // consecutive offsets, but relative to the EVENT's slice rather
+    // than the pass — the property that lets ChunkPool keep working in
+    // [0, epoch_len) while the pass mapping happens in make_partition.
+    let (total, splits, seed) = (100usize, 4usize, 42u64);
+    let mut pass: Vec<usize> = Vec::new();
+    for event in 0..splits {
+        let (_, len) = crate::rng::epoch_split_span(event, splits, total);
+        let first = len / 2;
+        let mut ev = super::make_partition(0, first, total, event, splits, seed);
+        ev.extend(super::make_partition(first, len - first, total, event, splits, seed));
+        assert_eq!(ev.len(), len, "event {event} partitions must tile its slice");
+        pass.extend(ev);
+    }
+    // Disjointness, coverage and ordering, through the partition layer.
+    assert_eq!(pass, crate::rng::epoch_permutation(seed, 0, total));
+}
+
+#[test]
+fn an_oversized_request_clamps_to_the_epoch_not_the_pass() {
+    // Four splits of 100 picks: event 0 holds 25. A request for the
+    // whole pass must stop at the event boundary rather than spill into
+    // the next split's picks, which another event will train on.
+    let got = super::make_partition(0, 100, 100, 0, 4, 42);
+    assert_eq!(got.len(), 25);
+    assert_eq!(got, crate::rng::epoch_split_permutation(42, 0, 4, 100));
+}
+
+#[test]
+fn later_events_of_a_pass_reuse_nothing() {
+    let (total, splits, seed) = (60usize, 3usize, 7u64);
+    let mut seen = std::collections::HashSet::new();
+    for event in 0..splits {
+        let (_, len) = crate::rng::epoch_split_span(event, splits, total);
+        for pick in super::make_partition(0, len, total, event, splits, seed) {
+            assert!(seen.insert(pick), "pick {pick} served twice within one pass");
+        }
+    }
+    assert_eq!(seen.len(), total, "one pass must still cover the corpus");
 }

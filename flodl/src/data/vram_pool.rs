@@ -99,7 +99,7 @@ pub(crate) fn flow_reserve_bytes(in_flight_depth: u64, batch_bytes: u64) -> u64 
 
 /// One allocation unit of the pool: per data position, a device tensor
 /// of `[rows, ...sample_dims]`; `used` rows are filled so far.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 struct Slab {
     tensors: Vec<Tensor>,
     used: usize,
@@ -197,7 +197,7 @@ impl VramSamplePool {
 
         // The probe returns (used, total) — used first, not free.
         let Ok((used, total)) =
-            crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+            crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
         else {
             return; // no probe, no budget: stay dormant
         };
@@ -225,7 +225,7 @@ impl VramSamplePool {
 
     /// Split batch positions into pool hits and misses, in caller
     /// order. Positions index into `indices`.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn partition(&mut self, indices: &[usize]) -> (Vec<usize>, Vec<usize>) {
         if !self.active() || self.slots.is_empty() {
             return (Vec::new(), (0..indices.len()).collect());
@@ -247,7 +247,7 @@ impl VramSamplePool {
     /// Gather pooled rows for `indices[pos]` (every `pos` must be a
     /// hit), stacked in `positions` order. Device ops: the caller runs
     /// this on the transfer stream so batch delivery events cover it.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn gather(&self, indices: &[usize], positions: &[usize]) -> Result<Vec<Tensor>> {
         // Group requested rows by slab, remembering each row's rank in
         // the caller's order.
@@ -295,7 +295,7 @@ impl VramSamplePool {
     /// allows: `tensors[p]` row `r` holds sample `sample_indices[r]`.
     /// Rows already pooled are skipped. Device-to-device on the
     /// caller's stream.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn capture(
         &mut self,
         sample_indices: &[usize],
@@ -410,7 +410,7 @@ impl VramSamplePool {
             self.budget >> 20,
         );
         drop(slab);
-        crate::tensor::cuda_empty_cache();
+        crate::tensor::gpu_empty_cache();
         true
     }
 

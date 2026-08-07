@@ -19,11 +19,31 @@
 # self-register into the same window.)
 #
 # The worker side is `fdl join` -- see fdl.yml.example's top-level `join:`
-# block and docs/ddp.md "Walking in". Two roads in, both shown below:
+# block and docs/ddp/02-cluster-guide.md "Walking in". Two roads in:
 #   - same box / private network:  fdl join <controller>:1337 --token <hex> \
 #                                    --bin <training-binary> -- <its args>
 #   - through a guardrailed sshd:  fdl join --ssh <user>@<sshd-host>:<port> \
 #                                    --token <hex> --bin <binary> -- <args>
+#
+# `--bin` hands the box a prebuilt binary -- which a borrowed or cloud box
+# usually does not have. The fleet shape is publish-then-join: the
+# controller publishes the run ONCE (gate-builds it, writes the run
+# manifest that carries cwd/build/bin/args):
+#
+#   fdl publish file:///home/op/my-train --bin target/release/my-train \
+#               -- <the run's own args>
+#
+# and every worker builds it against its OWN libtorch (ABI by
+# construction; `libtorch: auto` serves NVIDIA and AMD from one image):
+#
+#   fdl join --ssh <user>@<sshd-host>:<port> --token <hex> \
+#            --libtorch auto --source rsync://<user>@<host>:/home/op/.flodl/run/tree
+#   # behind the guardrailed rrsync key the source spec is
+#   # rsync://<user>@<host>:/tree  (rrsync re-roots the path)
+#
+# Chaining runs on a standing fleet is then `fdl publish` again --
+# nothing to edit on any worker, every box picks the new run up on its
+# next dial (--persist).
 #
 # Per-key docs for everything under `join:` live in fdl.cluster.yml.example
 # (the `controller.join:` reference block). Only the choices that make this
@@ -72,6 +92,13 @@ cluster:
       token: 0123456789abcdef0123456789abcdef
 
   workers: []                          # deliberately empty -- walk-ins fill it
+
+  # Fleet default for an identical-APU farm: the fraction of host RAM
+  # each box's integrated GPU claims. It reaches every walk-in through
+  # its envelope (no roster needed); a box that knows better declares
+  # `join.gpu_ram_share:` in its own yml and wins. Discrete-GPU boxes
+  # ignore it. Leave commented on a discrete-GPU fleet.
+  # gpu_ram_share: 0.5
 
 commands:
   # The controller still enters the launcher path to OPEN the window, so the

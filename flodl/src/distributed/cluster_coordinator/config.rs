@@ -46,7 +46,20 @@ pub struct ClusterCoordinatorConfig {
     /// Total samples in the dataset; basis for partition sizing in
     /// [`super::ClusterCoordinator::dispatch_epoch`]. Default 0 (caller must
     /// set via [`Self::total_samples`] before dispatching epochs).
+    ///
+    /// Always the whole pick space, independent of [`Self::epoch_splits`]:
+    /// what a split changes is how much of it one epoch covers, not how
+    /// big the space is.
     pub total_samples: usize,
+    /// Slices per data pass. `1` (default) keeps an epoch a full pass.
+    ///
+    /// Above `1`, an epoch covers `total_samples / epoch_splits` picks and
+    /// the epoch index counts events. Must match the value every rank was
+    /// built with (see
+    /// [`crate::distributed::ddp_run::WorkerConfig::epoch_splits`]) —
+    /// a divergent value puts the coordinator's ledger and the rank's
+    /// expansion on different slices of the permutation.
+    pub epoch_splits: usize,
     /// Batch size; consumed by the progressive chunk-pool dispatch
     /// path to size per-chunk batches.
     pub batch_size: usize,
@@ -363,6 +376,7 @@ impl ClusterCoordinatorConfig {
             overshoot_ceiling: 15,
             overshoot_auto: true,
             total_samples: 0,
+            epoch_splits: 1,
             batch_size: 1,
             num_epochs: 0,
             partition_ratios: None,
@@ -578,6 +592,11 @@ impl ClusterCoordinatorConfig {
 
     pub fn total_samples(mut self, n: usize) -> Self {
         self.total_samples = n;
+        self
+    }
+
+    pub fn epoch_splits(mut self, n: usize) -> Self {
+        self.epoch_splits = n.max(1);
         self
     }
 

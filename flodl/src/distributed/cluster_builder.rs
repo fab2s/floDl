@@ -60,6 +60,10 @@ pub struct ClusterBuilder {
     /// host. Mirrors the YAML cluster-scope `env:` block. Per-host
     /// [`HostBuilder::env`] overrides matching keys.
     env: std::collections::BTreeMap<String, String>,
+    /// Cluster-scope default for the integrated-GPU host-RAM share.
+    /// Mirrors the YAML cluster-scope `gpu_ram_share:` field; per-host
+    /// [`HostBuilder::gpu_ram_share`] overrides it.
+    gpu_ram_share: Option<f64>,
     /// Host-finalization errors deferred from [`HostBuilder::done`] so the
     /// fluent chain stays infallible; surfaced as `Err` by
     /// [`ClusterBuilder::build`]. Required-field mistakes are user-input
@@ -90,8 +94,22 @@ impl ClusterBuilder {
             },
             workers: Vec::new(),
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
             deferred_errors: Vec::new(),
         }
+    }
+
+    /// Cluster-scope default for the integrated-GPU host-RAM share: the
+    /// fraction of `MemTotal` an APU host's GPU aperture claims (same
+    /// knob as `DataLoaderBuilder::gpu_ram_share`). Discrete-GPU hosts
+    /// ignore it, which is what makes a fleet-wide default legal on a
+    /// mixed fleet. Per-host [`HostBuilder::gpu_ram_share`] overrides
+    /// it, and a walk-in's own `join.gpu_ram_share:` overrides both.
+    /// Non-negative (above 1.0 is legal where `MemTotal` under-states
+    /// the aperture) — validated at [`Self::build`].
+    pub fn gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share);
+        self
     }
 
     /// Start configuring the controller. `host` is the rendezvous bind
@@ -205,6 +223,25 @@ impl ClusterBuilder {
                 }
             }
         }
+        // Fraction-of-RAM checks, one rule with the yml parser's:
+        // non-negative and finite, loud otherwise. Above 1.0 stays
+        // legal on purpose — the knob exists partly for platforms whose
+        // MemTotal under-states what the APU can address.
+        let share_ok = |s: Option<f64>| s.is_none_or(|f| f.is_finite() && f >= 0.0);
+        if !share_ok(self.gpu_ram_share) {
+            return Err(TensorError::new(&format!(
+                "ClusterBuilder: gpu_ram_share must be a non-negative \
+                 fraction of host RAM (e.g. 0.5), got {:?}",
+                self.gpu_ram_share,
+            )));
+        }
+        if let Some(w) = self.workers.iter().find(|w| !share_ok(w.gpu_ram_share)) {
+            return Err(TensorError::new(&format!(
+                "ClusterBuilder: host {:?}: gpu_ram_share must be a \
+                 non-negative fraction of host RAM (e.g. 0.5), got {:?}",
+                w.host, w.gpu_ram_share,
+            )));
+        }
         // Cross-worker rank check: union must be exactly 0..world_size.
         let mut all: Vec<usize> = self
             .workers
@@ -225,6 +262,7 @@ impl ClusterBuilder {
             workers: self.workers,
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
             env: self.env,
+            gpu_ram_share: self.gpu_ram_share,
         })
     }
 
@@ -249,9 +287,11 @@ impl ClusterBuilder {
         let gpus = crate::sys::detect_gpus();
         if gpus.is_empty() {
             return Err(TensorError::new(
-                "ClusterBuilder::all_local_gpus: no CUDA GPUs visible \
-                 (nvidia-smi reported none, or CUDA_VISIBLE_DEVICES \
-                 narrowed to empty). Use the single-device path instead.",
+                "ClusterBuilder::all_local_gpus: no usable GPU visible for this \
+                 build's vendor (none detected, or a visibility mask \
+                 narrowed the list to empty -- CUDA_VISIBLE_DEVICES, and \
+                 HIP/ROCR_VISIBLE_DEVICES on ROCm). Use the single-device \
+                 path instead.",
             ));
         }
         let hostname = crate::distributed::cluster::resolve_hostname()?;
@@ -284,12 +324,15 @@ impl ClusterBuilder {
                 nccl_socket_ifname: "lo".to_string(),
                 path: cwd,
                 arch: None,
+                data_path: None,
+                gpu_ram_share: None,
                 ssh: None,
                 tunnel: false,
                 env: std::collections::BTreeMap::new(),
             }],
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         })
     }
 }
@@ -486,6 +529,8 @@ pub struct HostBuilder {
     nccl_socket_ifname: Option<String>,
     path: Option<String>,
     arch: Option<String>,
+    data_path: Option<String>,
+    gpu_ram_share: Option<f64>,
     ssh: Option<crate::distributed::launcher::SshConfig>,
     tunnel: bool,
     env: std::collections::BTreeMap<String, String>,
@@ -501,6 +546,8 @@ impl HostBuilder {
             nccl_socket_ifname: None,
             path: None,
             arch: None,
+            data_path: None,
+            gpu_ram_share: None,
             ssh: None,
             tunnel: false,
             env: std::collections::BTreeMap::new(),
@@ -560,6 +607,18 @@ impl HostBuilder {
         self
     }
 
+    /// Dataset source root on this host: where its ranks READ training
+    /// data from. A shared mount or a node-local directory, whichever
+    /// the deployment provides. Mirrors the YAML field
+    /// `workers[].data_path`.
+    ///
+    /// Left unset, nothing travels to the rank and the training binary
+    /// keeps its own default.
+    pub fn data_path(mut self, p: impl Into<String>) -> Self {
+        self.data_path = Some(p.into());
+        self
+    }
+
     /// SSH target (e.g. `"user@host"` or a short alias from
     /// `~/.ssh/config`). Default: the host's `name`. Set to a
     /// different value when the SSH connect string differs from the
@@ -604,6 +663,17 @@ impl HostBuilder {
     /// validated loudly at launch. Mirrors the YAML field `tunnel:`.
     pub fn tunnel(mut self, tunnel: bool) -> Self {
         self.tunnel = tunnel;
+        self
+    }
+
+    /// Integrated-GPU host-RAM share for THIS host (fraction of
+    /// `MemTotal`; same knob as `DataLoaderBuilder::gpu_ram_share`).
+    /// Overrides the cluster-scope [`ClusterBuilder::gpu_ram_share`]
+    /// default. Mirrors the YAML per-worker `gpu_ram_share:` field.
+    /// Non-negative (above 1.0 is legal where `MemTotal` under-states
+    /// the aperture) — validated at [`ClusterBuilder::build`].
+    pub fn gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share);
         self
     }
 
@@ -655,6 +725,8 @@ impl HostBuilder {
             nccl_socket_ifname: self.nccl_socket_ifname.expect("checked above"),
             path: self.path.expect("checked above"),
             arch: self.arch,
+            data_path: self.data_path,
+            gpu_ram_share: self.gpu_ram_share,
             ssh: self.ssh,
             tunnel: self.tunnel,
             env: self.env,

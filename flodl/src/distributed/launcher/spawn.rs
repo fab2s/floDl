@@ -446,6 +446,17 @@ pub(super) fn build_local_spawn_command(
         // makes index → physical card stable.
         cmd.env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
         cmd.env("CUDA_VISIBLE_DEVICES", phys.to_string());
+        // HIP prefers its own variables over CUDA_VISIBLE_DEVICES (the
+        // first one SET wins), so on ROCm the pin above loses to any
+        // inherited HIP/ROCR mask — every rank then sees the full
+        // device list and trains on device 0, silently. Pin the HIP
+        // variable too, and drop the lower-level masks: HIP indexes
+        // within the ROCR-visible set, so an inherited ROCR mask would
+        // re-map the physical index this pin was derived from. On an
+        // NVIDIA box the extra variable is inert.
+        cmd.env("HIP_VISIBLE_DEVICES", phys.to_string());
+        cmd.env_remove("ROCR_VISIBLE_DEVICES");
+        cmd.env_remove("GPU_DEVICE_ORDINAL");
     }
     cmd
 }
@@ -877,6 +888,20 @@ pub(super) fn build_slim_envelope_for(
     host_obj.insert("path".into(), Value::String(worker.path.clone()));
     if let Some(a) = &worker.arch {
         host_obj.insert("arch".into(), Value::String(a.clone()));
+    }
+    // Dataset source root, emitted only when the host declared one.
+    // Absent means "the training binary keeps its own default", which
+    // is what every cluster that never mentions data paths expects.
+    if let Some(d) = &worker.data_path {
+        host_obj.insert("data_path".into(), Value::String(d.clone()));
+    }
+    // Integrated-GPU host-RAM share: the per-host declaration wins over
+    // the cluster-scope default. This is the ONE resolution point — a
+    // walk-in's synthesized entry carries None, so the default flows to
+    // it too, and its own `join.gpu_ram_share:` (host truth) overwrites
+    // the value at envelope localization on its box.
+    if let Some(g) = worker.gpu_ram_share.or(full.gpu_ram_share) {
+        host_obj.insert("gpu_ram_share".into(), Value::from(g));
     }
 
     let mut controller_obj = serde_json::Map::new();

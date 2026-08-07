@@ -1,4 +1,32 @@
 services:
+  # RHEL-family reproduction box. Not part of any routine flow: it
+  # exists so a RHEL question can be answered on a RHEL userland instead
+  # of by reasoning about one — the dnf package names, rrsync shipping
+  # as documentation, and which libtorch baselines EL9 can actually
+  # load. Deliberately NOT what CI uses: the rocky legs run a stock
+  # image and install prerequisites the way the docs tell a user to,
+  # which is the step a pre-baked image would skip.
+  #
+  #   docker compose build rhel
+  #   docker compose run --rm rhel bash
+  rhel:
+    build:
+      context: .
+      dockerfile: Dockerfile.rhel
+    image: flodl-rhel
+    volumes:
+      - .:/workspace
+      # Its own cargo cache: a tree built against this glibc has no
+      # business landing in the Debian images' registry cache.
+      - ./.cargo-cache-rhel:/root/.cargo/registry
+      - ${LIBTORCH_CPU_PATH:-./libtorch/precompiled/cpu}:/usr/local/libtorch:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - FLODL_VERBOSITY
+      - FDL_GPU_FEATURE
+
   dev:
     build:
       context: .
@@ -15,12 +43,18 @@ services:
     stdin_open: true
     tty: true
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     environment:
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path. Lets a `run:` line say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects
@@ -74,9 +108,11 @@ services:
     # generous headroom for ResNet-class workspaces.
     shm_size: 2gb
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     # Share the host's network namespace so the cluster controller +
     # coord (bound on exa-side ports) are reachable from remote rank
     # VMs. Docker's default bridge isolates the container from the
@@ -88,6 +124,10 @@ services:
     environment:
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path. Lets a `run:` line say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects
@@ -153,6 +193,76 @@ services:
   #   #       identity_file: /home/me/project/.ssh-cuda-rank/cuda_rank_key
   #   #     arch: precompiled/cu128
   #   # (drop `docker: cuda` -- launcher dispatches via SSH, not via docker)
+  # ROCm counterpart of `cuda`. Same shape: no libtorch baked in, the
+  # matching variant bind-mounted from libtorch/.
+  #
+  # `fdl` resolves `docker: gpu` to this service when the active libtorch
+  # variant is an AMD build, so fdl.yml never names a vendor.
+  #
+  # Device passthrough differs from NVIDIA in kind, not degree: there is
+  # no runtime shim, the kernel interfaces are handed in directly.
+  # /dev/kfd is the compute device, /dev/dri the render nodes, and the
+  # video/render groups gate access to both.
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${ROCM_VERSION:-7.0}
+    image: flodl-rocm:${ROCM_TAG:-7.0}
+    user: "${UID:-1000}:${GID:-1000}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
+      # LIBTORCH_HOST_PATH, same as the cuda services: fdl exports it
+      # from the ACTIVE variant, so a `builds/gfx…` install (or a
+      # per-host `arch:` in prebuild docker mode) mounts what fdl
+      # resolved instead of a hardcoded default it silently ignores.
+      - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/rocm70}:/usr/local/libtorch:ro
+      - ${SSH_AUTH_SOCK:-/dev/null}:/ssh-agent
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: 2gb
+    # Container hostname inherits the host's hostname so the cluster
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
+    network_mode: host
+    environment:
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path. Lets a `run:` line say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      - FDL_GPU_FEATURE
+      - FLODL_INTERNAL_FULL_CLUSTER_JSON
+      - FLODL_INTERNAL_FDL_CMD
+      - FDL_ENV
+      - FLODL_INTERNAL_PREBUILD_PER_HOST
+      # Same two the cuda service carries, for the same reasons: the
+      # launcher inside this container SSHes to remote hosts (fan-out),
+      # so it needs the host-side user name and the agent socket the
+      # volumes block already mounts — without these a ROCm controller
+      # fails every remote dial with a bare `Permission denied`.
+      - FLODL_INTERNAL_HOST_USER
+      - SSH_AUTH_SOCK=/ssh-agent
+
   cuda-rank:
     image: flodl-cuda:${CUDA_TAG:-12.8}
     build:
@@ -256,9 +366,11 @@ services:
     # exhausts the 64 MB Docker default /dev/shm.
     shm_size: 2gb
     # Container hostname inherits the host's hostname so the cluster
-    # launcher matches `cluster.hosts[i].name == hostname()` (otherwise
-    # the container ID is used and the host is "not in cluster.hosts").
-    hostname: ${HOSTNAME}
+    # launcher matches `cluster.workers[].host == hostname()` (otherwise
+    # the container ID is used and the host reads as unknown).
+    # `fdl` exports HOSTNAME itself; the `:-` default only keeps a bare
+    # `docker compose` (make, ci, IDE) from warning about it being unset.
+    hostname: ${HOSTNAME:-}
     # Share the host's network namespace so the cluster controller +
     # coord (bound on exa-side ports) are reachable from remote rank
     # VMs. Docker's default bridge isolates the container from the
@@ -270,6 +382,10 @@ services:
     environment:
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path. Lets a `run:` line say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      - FDL_GPU_FEATURE
       # Cluster envelope: when fdl-cli activates a `cluster: true`
       # command, these are set on the controller process so the
       # spawned user binary's `flodl::launcher::dispatch` detects

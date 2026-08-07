@@ -9,11 +9,11 @@
 //! that structural CPU unit tests can miss (kernel selection,
 //! stream/event wiring, tied-weight grad accumulation, etc.).
 //!
-//! The whole module is gated behind `#[cfg(feature = "cuda")]` so
+//! The whole module is gated behind `#[cfg(feature = "gpu")]` so
 //! non-CUDA builds (including GitHub CI's CPU test leg) compile and
 //! run unaffected.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 #![allow(dead_code)] // not every smoke test file uses every helper
 
 use flodl::{Device, Tensor, Variable};

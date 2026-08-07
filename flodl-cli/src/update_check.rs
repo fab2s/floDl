@@ -317,7 +317,12 @@ struct CrateInfo {
     max_version: String,
 }
 
-fn probe_crates_io(crate_name: &str) -> Option<String> {
+/// Latest published version of `crate_name`, straight from the
+/// crates.io API. Also `fdl init`'s source for the scaffold's flodl
+/// pin. The `-A` header is load-bearing: crates.io's data-access
+/// policy rejects unidentified clients, so a bare curl gets an error
+/// body, not JSON.
+pub(crate) fn probe_crates_io(crate_name: &str) -> Option<String> {
     let url = format!("https://crates.io/api/v1/crates/{crate_name}");
     let output = Command::new("curl")
         .arg("--silent")

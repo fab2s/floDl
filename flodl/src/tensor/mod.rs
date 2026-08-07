@@ -17,8 +17,23 @@ mod shape;
 mod nn_ops;
 
 pub use cuda::*;
-pub use cuda_event::{CudaEvent, CudaEventFlags};
-pub use cuda_stream::{CudaStream, StreamGuard};
+pub use cuda_event::{GpuEvent, GpuEventFlags};
+pub use cuda_stream::{GpuStream, StreamGuard};
+
+// Deprecated `cuda_*` / `Cuda*` spellings, re-exported here because
+// `pub use cuda::*` above used to carry them at this path. See
+// `crate::compat`.
+#[allow(deprecated)]
+pub use crate::compat::{
+    cuda_active_bytes, cuda_active_bytes_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx,
+    cuda_available, cuda_device_count, cuda_device_name, cuda_device_name_idx, cuda_devices,
+    cuda_empty_cache, cuda_has_primary_context, cuda_manual_seed_all, cuda_memory_info,
+    cuda_memory_info_idx, cuda_nvml_memory_info_idx, cuda_peak_active_bytes,
+    cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx,
+    cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_synchronize, cuda_utilization,
+    cuda_utilization_idx, current_cuda_device, set_current_cuda_device, usable_cuda_devices,
+    CudaEvent, CudaEventFlags, CudaStream,
+};
 
 pub use nn_ops::RnnParams;
 
@@ -819,7 +834,7 @@ impl Tensor {
     /// let pinned = cpu_tensor.pin_memory()?;
     /// let gpu = pinned.to_device_async(Device::CUDA(0))?;
     /// // ... do CPU work while transfer runs ...
-    /// cuda_synchronize(0); // ensure transfer is done before using gpu tensor
+    /// gpu_synchronize(0); // ensure transfer is done before using gpu tensor
     /// ```
     pub fn to_device_async(&self, device: Device) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
@@ -836,7 +851,7 @@ impl Tensor {
     /// kernels are still in flight — without it the allocator only
     /// guards the block against the ALLOCATION stream and can hand the
     /// freed block to a new allocation that overwrites it mid-read.
-    pub fn record_stream(&self, stream: &crate::tensor::cuda_stream::CudaStream) -> Result<()> {
+    pub fn record_stream(&self, stream: &crate::tensor::cuda_stream::GpuStream) -> Result<()> {
         let err = unsafe {
             ffi::flodl_tensor_record_stream(self.handle, stream.as_ptr())
         };
@@ -1371,7 +1386,7 @@ impl fmt::Debug for Tensor {
 pub fn test_device() -> Device {
     use std::sync::Once;
     static PRINT: Once = Once::new();
-    let dev = if cfg!(feature = "cuda") && cuda_available() { Device::CUDA(0) } else { Device::CPU };
+    let dev = if cfg!(feature = "gpu") && gpu_available() { Device::CUDA(0) } else { Device::CPU };
     PRINT.call_once(|| eprintln!("\n*** flodl test device: {} ***\n", dev));
     dev
 }

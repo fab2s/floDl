@@ -78,10 +78,13 @@ fn detect_arch_list() -> Result<String, String> {
         );
     }
 
-    // Collect unique compute capabilities, sorted numerically
+    // Collect unique compute capabilities, sorted numerically. This
+    // list feeds nvcc's TORCH_CUDA_ARCH_LIST, so it is NVIDIA-only by
+    // construction: a non-NVIDIA device contributes no capability and
+    // is skipped rather than defaulted to one.
     let mut caps: Vec<(u32, u32)> = gpus
         .iter()
-        .map(|g| (g.sm_major, g.sm_minor))
+        .filter_map(|g| Some((g.sm_major()?, g.sm_minor()?)))
         .collect();
     caps.sort();
     caps.dedup();
@@ -89,10 +92,7 @@ fn detect_arch_list() -> Result<String, String> {
 
     println!("  GPUs detected:");
     for g in &gpus {
-        println!(
-            "    [{}] {} (sm_{}.{})",
-            g.index, g.short_name(), g.sm_major, g.sm_minor
-        );
+        println!("    [{}] {} ({})", g.index, g.short_name(), g.arch_label());
     }
 
     Ok(caps.join(";"))
@@ -287,14 +287,17 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
     println!("  ================================================");
     println!();
     if ctx.is_project {
-        println!("  Run 'fdl cuda-test' to verify.");
+        println!("  Run 'fdl gpu-test' to verify.");
     } else {
         println!("  To use, add to your shell profile:");
         println!("    export LIBTORCH=\"{}\"", install_path.display());
-        println!(
-            "    export LD_LIBRARY_PATH=\"{}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"",
-            install_path.display()
-        );
+        // Shared recipe. A source build can be AMD too -- `arch_dir_name`
+        // maps a `gfx…` arch list to a `gfx…` variant directory, which
+        // `variant_vendor` then reads as AMD.
+        let lib = format!("{}/lib", install_path.display());
+        for line in detect::ld_library_path_lines(detect::variant_vendor(&variant_id), &lib) {
+            println!("    {line}");
+        }
     }
 
     Ok(())

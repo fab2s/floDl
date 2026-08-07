@@ -55,7 +55,12 @@ See [CHANGELOG.md](CHANGELOG.md) for the full per-version detail.
 
 ## In progress
 
-*(empty)*
+- **AMD (ROCm) hardware validation.** The vendor axis is shipped
+  (detection, variant install, `--features rocm`, the walk-in
+  join/publish path, vendor-coherent admission); what remains is a
+  training run on real AMD silicon — the walk-in rehearsal doubles as
+  the cloud-leg dress rehearsal. Until then the README's honest line
+  stands: builds, links and detects; not yet validated on hardware.
 
 (Length-1 by design. The next item pulls from Possibilities when work
 on it begins.)

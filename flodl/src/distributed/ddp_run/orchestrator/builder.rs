@@ -473,6 +473,12 @@ where
         self
     }
 
+    /// Slices per data pass (see [`DdpRunConfig::epoch_splits`]).
+    pub fn epoch_splits(mut self, n: usize) -> Self {
+        self.config = self.config.with_epoch_splits(n);
+        self
+    }
+
     /// Delivery transform, keyed per pick (see
     /// [`DdpRunConfig::transform`]).
     pub fn transform(
@@ -928,7 +934,14 @@ where
         }
         let dataset = self.dataset.take().expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
-        let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required");
+        // `num_epochs` is the user's count of DATA PASSES; everything below
+        // this line counts EPOCHS, and under `epoch_splits` an epoch is a
+        // slice of a pass. This multiplication is the whole boundary
+        // between the two vocabularies — without it a split run executes
+        // `num_epochs` slices and silently trains `1/epoch_splits` of the
+        // data it was asked to.
+        let num_epochs = self.num_epochs.expect("DdpBuilder: num_epochs is required")
+            * self.config.epoch_splits.max(1);
 
         // (Async, Nccl) has no mode: NcclAsync was dropped (within-noise
         // vs NcclCadence; the in-place writeback raced autograd on

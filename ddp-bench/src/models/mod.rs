@@ -47,6 +47,14 @@ pub struct DatasetConfig {
     pub virtual_len: usize,
     pub pool_size: usize,
     pub data_source: DataSource,
+    /// Requested training tokens (`--train-tokens`), token models only.
+    /// `None` = the model's default corpus.
+    pub train_tokens: Option<u64>,
+    /// Slices per data pass, and the batch size. Together they set the
+    /// multiple a staged corpus is snapped to, so that one pass divides
+    /// into whole batched events with nothing left over.
+    pub epoch_splits: usize,
+    pub batch_size: usize,
 }
 
 /// A benchmark model definition.

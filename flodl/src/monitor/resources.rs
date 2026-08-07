@@ -5,7 +5,7 @@
 //! [`crate::sys::detect_gpus`] (nvidia-smi) and live metrics from NVML;
 //! neither initializes the CUDA runtime. The only CUDA-context-dependent
 //! read, caching-allocator reserved bytes, is gated on
-//! [`crate::tensor::cuda_has_primary_context`] so that constructing or
+//! [`crate::tensor::gpu_has_primary_context`] so that constructing or
 //! polling a sampler never creates a CUDA context as a side effect.
 //! `Monitor::new` runs in every process, including the pre-fan-out
 //! launcher, where touching CUDA would break the
@@ -188,15 +188,15 @@ struct GpuStatic {
 /// ascending index list; a reordering list like `1,0` would mislabel
 /// allocator stats, which nothing in flodl's launch paths produces).
 fn detect_gpu_statics() -> Vec<GpuStatic> {
-    if !cfg!(feature = "cuda") {
+    if !cfg!(feature = "gpu") {
         return Vec::new();
     }
     crate::sys::detect_gpus()
         .into_iter()
         .map(|g| GpuStatic {
             physical_index: g.index,
+            total_bytes: Some(g.vram_bytes()),
             name: g.name,
-            total_bytes: Some(g.total_memory_mb * 1024 * 1024),
         })
         .collect()
 }
@@ -260,7 +260,7 @@ impl ResourceSampler {
                     }
                     if let Ok(mut acc) = accum2.lock() {
                         for (i, &phys) in physical.iter().enumerate() {
-                            if let Some(util) = crate::tensor::cuda_utilization_idx(phys as i32) {
+                            if let Some(util) = crate::tensor::gpu_utilization_idx(phys as i32) {
                                 let buf = &mut acc.samples[i];
                                 if buf.len() == GPU_UTIL_WINDOW {
                                     buf.pop_front();
@@ -348,15 +348,15 @@ impl ResourceSampler {
             // the CUDA runtime index (= position in the visible list).
             // Querying them from a process without a context would
             // CREATE one (pinning VRAM); gate on context presence.
-            if crate::tensor::cuda_has_primary_context(i as i32) {
-                if let Ok(alloc) = crate::tensor::cuda_allocated_bytes_idx(i as i32) {
+            if crate::tensor::gpu_has_primary_context(i as i32) {
+                if let Ok(alloc) = crate::tensor::gpu_allocated_bytes_idx(i as i32) {
                     gpu.vram_allocated_bytes = Some(alloc);
                 }
             }
             // Background average if available, else instant NVML sample
             gpu.util_percent = util_averages.get(i).copied().flatten()
                 .or_else(|| {
-                    crate::tensor::cuda_utilization_idx(g.physical_index as i32)
+                    crate::tensor::gpu_utilization_idx(g.physical_index as i32)
                         .map(|u| u as f32)
                 });
             s.gpus.push(gpu);
@@ -447,7 +447,7 @@ mod tests {
     /// (`--exact`) for the meaningful negative check.
     #[test]
     fn test_resource_sampler_never_initializes_cuda() {
-        if crate::tensor::cuda_has_primary_context(0) {
+        if crate::tensor::gpu_has_primary_context(0) {
             eprintln!("skipped: CUDA context already present in this process");
             return;
         }
@@ -457,7 +457,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(550));
         let _ = sampler.sample();
         assert!(
-            !crate::tensor::cuda_has_primary_context(0),
+            !crate::tensor::gpu_has_primary_context(0),
             "ResourceSampler must not create a CUDA context"
         );
         // Identity still works without a context: totals come from

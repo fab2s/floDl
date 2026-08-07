@@ -13,7 +13,14 @@ readme = "README.md"
 
 [features]
 default = []
-cuda = []
+# `gpu` is what every GPU-gated code path in the workspace actually
+# means: libtorch addresses AMD devices through the same `kCUDA` device
+# type and `c10::cuda` namespaces, so nearly all of that code is
+# vendor-neutral. Do NOT enable it directly -- pick a vendor, which
+# implies it. build.rs rejects `gpu` without one.
+gpu = []
+cuda = ["gpu"]
+rocm = ["gpu"]
 
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs"]

@@ -20,7 +20,7 @@ them:
    sub-commands, value-aware completions.
 3. **[In the flodl source checkout](06-source-checkout.md)** -
    the cloned repo's `fdl.yml` ships the concrete command set used to
-   develop flodl itself (`fdl test`, `fdl cuda-test`, `fdl ddp-bench …`,
+   develop flodl itself (`fdl test`, `fdl gpu-test`, `fdl ddp-bench …`,
    `fdl self-build`, etc.).
 
 Standalone, libtorch is managed under `~/.flodl/` (override with
@@ -103,7 +103,7 @@ default when no verbosity flag is passed.
 
 ```bash
 fdl -v ddp-bench quick    # verbose: DDP sync, cadence changes, prefetch detail
-fdl -vv cuda-test         # debug: per-batch timing, internal loops
+fdl -vv gpu-test          # debug: per-batch timing, internal loops
 fdl -vvv shell            # trace: extreme granularity
 fdl --quiet test          # errors only
 fdl --no-ansi config show # plain output for pipes and CI

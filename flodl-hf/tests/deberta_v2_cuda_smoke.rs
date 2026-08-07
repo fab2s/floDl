@@ -11,7 +11,7 @@
 //! tests can miss (disentangled-attention gather kernels, rel_embeddings
 //! LayerNorm on GPU, log-bucket integer arithmetic on the int64 path).
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 

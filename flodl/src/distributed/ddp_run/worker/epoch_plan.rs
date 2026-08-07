@@ -9,7 +9,7 @@ use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 
 use super::super::{
-    ControlMsg, EpochPlan, make_partition,
+    ControlMsg, EpochPlan, make_partition, pick_space,
 };
 use super::GpuWorker;
 
@@ -195,11 +195,10 @@ impl<M: Module> GpuWorker<M> {
     /// historical `num_batches == 0` early return).
     pub(crate) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
         self.current_epoch = plan.epoch;
-        // Pick space: the coordinator's offsets/sizes and this
-        // expansion must agree on `dataset.len() * augment` total.
         self.partition = make_partition(
             plan.partition_offset, plan.partition_size,
-            self.dataset.len() * self.augment.max(1), plan.epoch, self.base_seed,
+            pick_space(self.dataset.len(), self.augment), plan.epoch,
+            self.epoch_splits, self.base_seed,
         );
 
         let num_batches = self.partition.len() / self.batch_size;
@@ -209,7 +208,7 @@ impl<M: Module> GpuWorker<M> {
 
         // ALL CUDA work must avoid the default stream and device-wide sync.
         // The CUDA default stream implicitly synchronizes with every other
-        // stream, and cuda_synchronize waits for ALL streams on the device.
+        // stream, and gpu_synchronize waits for ALL streams on the device.
         // If a SyncNow triggered AllReduce on comm_stream (via the other rank)
         // while this rank touches the default stream or calls device sync,
         // it blocks waiting for comm_stream which waits for this rank -> deadlock.
@@ -220,29 +219,29 @@ impl<M: Module> GpuWorker<M> {
         // current-stream is compute_stream during every op, as before.
         let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
 
-        // NOTE: cuda_empty_cache() was here to defragment VRAM between chunks,
+        // NOTE: gpu_empty_cache() was here to defragment VRAM between chunks,
         // but it internally does a device-wide sync that deadlocks with pending
         // NCCL AllReduce on comm_stream. Removed: the caching allocator handles
         // fragmentation adequately without explicit cache flushes.
 
         // Update activation peak from the previous chunk's high-water mark.
         // Uses max() so the budget never grows beyond the worst observed peak.
-        // Sync compute_stream only (NOT device-wide cuda_synchronize which
+        // Sync compute_stream only (NOT device-wide gpu_synchronize which
         // would block on comm_stream's pending AllReduce -> deadlock).
         if self.device.is_cuda() && self.activation_peak_bytes > 0 {
             let idx = self.device.index() as i32;
             if let Some(ref stream) = self.compute_stream {
                 let _ = stream.synchronize();
             }
-            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
-                if let Ok(baseline) = crate::tensor::cuda_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
+                if let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(baseline as usize);
                     let batch_bytes = self.per_sample_bytes * self.batch_size;
                     let activation = overhead.saturating_sub(batch_bytes);
                     self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
                 }
             }
-            crate::tensor::cuda_reset_peak_stats_idx(idx);
+            crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
         // Sync-path activation-peak calibration marker: captured after the
@@ -267,7 +266,18 @@ impl<M: Module> GpuWorker<M> {
                 self.per_sample_bytes,
                 self.batch_size,
                 self.ram_max_usage,
-                crate::sys::mem_info().map(|m| m.available_bytes),
+                // Corrected for a unified-memory (APU) target: the VRAM
+                // pool is carved out of this same DRAM, so the raw probe
+                // would let the ring claim memory the device already
+                // owns. Same correction the stager applies to its own
+                // share.
+                crate::sys::mem_info().map(|m| {
+                    crate::data::budget::unified_adjusted_available(
+                        m.available_bytes,
+                        self.device,
+                        self.gpu_ram_share,
+                    )
+                }),
                 num_batches,
             )
             .min(crate::data::budget::RING_SLOTS_WITH_CACHE)
@@ -324,7 +334,7 @@ impl<M: Module> GpuWorker<M> {
                 // sizing call above already spent one `cudaMemGetInfo`, and a
                 // diagnostic must not add a second to every chunk boundary.
                 let (used, total) = if crate::log::enabled(crate::log::Verbosity::Debug) {
-                    crate::tensor::cuda_memory_info_idx(self.device.index() as i32)
+                    crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
                         .unwrap_or((0, 0))
                 } else {
                     (0, 0)
@@ -507,7 +517,7 @@ impl<M: Module> GpuWorker<M> {
             st.data_starve_ms_total += (st.last_data_ms - control_ms).max(0.0);
 
             // Ensure compute stream waits for async H2D copy to finish
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Some(ref event) = prefetched.ready_event {
                 if let Some(ref stream) = self.compute_stream {
                     stream.wait_event(event)?;
@@ -524,7 +534,7 @@ impl<M: Module> GpuWorker<M> {
             // upload can reuse and overwrite them mid-read (observed as
             // whole-slab garbage labels → device-side nll_loss assert
             // on fast small-model ranks in free-running CPU modes).
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if let Some(ref stream) = self.compute_stream {
                 for t in &prefetched.tensors {
                     t.record_stream(stream)?;
@@ -533,7 +543,7 @@ impl<M: Module> GpuWorker<M> {
 
             // Delivery transform: after the copy dependency is
             // installed, keyed by the batch's picks.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             let transformed = self.transform.is_some();
             let tensors = if let Some(ref f) = self.transform {
                 crate::data::apply_transform(
@@ -550,7 +560,7 @@ impl<M: Module> GpuWorker<M> {
             // Transform outputs are fresh allocations on this thread's
             // current stream — pin them to the compute stream for the
             // same freed-block-reuse reason as the uploaded batch.
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             if transformed {
                 if let Some(ref stream) = self.compute_stream {
                     for t in &tensors {
@@ -639,8 +649,8 @@ impl<M: Module> GpuWorker<M> {
                 let _ = stream.synchronize();
             }
             let idx = self.device.index() as i32;
-            if let Ok(peak) = crate::tensor::cuda_peak_active_bytes_idx(idx) {
-                if let Ok(current) = crate::tensor::cuda_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
+                if let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(current as usize);
                     // Floor a completed measurement to 1 byte so a degenerate
                     // reading cannot collide with the sentinel and re-arm
@@ -649,7 +659,7 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
             // Reset for ongoing monitoring in subsequent chunks.
-            crate::tensor::cuda_reset_peak_stats_idx(idx);
+            crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
         let norm = if self.steps_since_avg % 10 == 0 {

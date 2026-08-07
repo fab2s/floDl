@@ -59,7 +59,7 @@ const SUPERVISE_POLL: Duration = Duration::from_millis(50);
 /// dial-in worker: the controller address, an optional credential, and
 /// host-local scoping. Built by fan-out for managed hosts; a
 /// self-deployed worker carries the same shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSpec {
     /// Logical worker host name (member identity in the join window).
     pub host: String,
@@ -86,6 +86,42 @@ pub struct AgentSpec {
     /// the rendezvous path.
     #[serde(default)]
     pub dataset_sig_hex: Option<String>,
+    /// Identity of the published run this box prepared (`fdl join` puts
+    /// the `.fdl-run.yml` nonce here). Rides the hello so admission can
+    /// refuse a cohort straddling a publish boundary. `None` (a `--bin`
+    /// box, or a tree published before the field existed) gates nothing.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Dataset source root on THIS host, resolved on the box itself
+    /// (`fdl join`'s prepare phase mounts it when needed, then puts the
+    /// resulting path here). Written into the host block of the
+    /// controller-authored envelope so this host's ranks read it through
+    /// the same `LocalCluster::data_path()` a fan-out rank uses.
+    ///
+    /// Set only for a walk-in: the controller never configured that
+    /// host, so its roster entry carries no source root and has nothing
+    /// to be overridden. `None` on the fan-out path, where the roster IS
+    /// the authority.
+    #[serde(default)]
+    pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share declared on THIS box
+    /// (`join.gpu_ram_share:`). Same class of fact as `data_path`
+    /// (host-hardware truth) and it rides the same rewrite: written
+    /// into the envelope's host block at localization, where it
+    /// overrides the cluster-scope default the controller stamped.
+    /// `None` leaves the envelope's value alone.
+    #[serde(default)]
+    pub gpu_ram_share: Option<f64>,
+    /// Model signature (64-char hex) probed from the training binary by
+    /// `fdl join` before the dial (see
+    /// [`super::ENV_MODEL_SIG_PROBE`]). Rides the hello so admission
+    /// can refuse a box building a different model while the refusal
+    /// still condemns only that box's own attempt. `None` (probe
+    /// skipped, failed, or a fan-out host — the controller dispatched
+    /// its binary) gates nothing; the formation-time handshake check is
+    /// the backstop.
+    #[serde(default)]
+    pub model_sig_hex: Option<String>,
 }
 
 impl AgentSpec {
@@ -135,6 +171,8 @@ pub(crate) fn join_world(
     controller_port: u16,
     pre_shared: Option<SessionSalt>,
     hello: JoinMsgWire,
+    data_path: Option<&str>,
+    gpu_ram_share: Option<f64>,
 ) -> Result<JoinOutcome> {
     use std::net::ToSocketAddrs;
     let addr = (controller_host, controller_port)
@@ -236,10 +274,17 @@ pub(crate) fn join_world(
             // join-verified address; fan-out agents rewrite to the
             // values already in place (their tunnels bind the
             // controller port itself), so this is a no-op there.
-            let envelope_hex = rewrite_envelope_controller(
+            //
+            // A walk-in's dataset source root and integrated-GPU RAM
+            // share are the same shape of fact — host-local truth the
+            // controller never configured — so they ride the same
+            // rewrite.
+            let envelope_hex = localize_envelope(
                 &envelope_hex,
                 controller_host,
                 controller_port,
+                data_path,
+                gpu_ram_share,
             )?;
             let relay_spec_hex = relay_spec_hex
                 .map(|hex| {
@@ -263,14 +308,24 @@ pub(crate) fn join_world(
     }
 }
 
-/// Rewrite the slim envelope's `controller.host` / `controller.port`
-/// with the join-verified address (see the call site in [`join_world`]).
+/// Replace the parts of the slim envelope only this box can author: the
+/// `controller.host` / `controller.port` the join just proved reachable,
+/// and — for a walk-in — the `worker.data_path` its prepare phase
+/// resolved plus the `worker.gpu_ram_share` its join config declared
+/// (see the call site in [`join_world`]).
+///
+/// `data_path` / `gpu_ram_share` of `None` leave the envelope's own
+/// values alone, which is what the fan-out path needs: there the roster
+/// IS the authority (and the cluster-scope share default survives).
+///
 /// Loud on malformed artifacts — a truncated envelope must fail here,
 /// named, not in a rank child's parser.
-fn rewrite_envelope_controller(
+fn localize_envelope(
     envelope_hex: &str,
     host: &str,
     port: u16,
+    data_path: Option<&str>,
+    gpu_ram_share: Option<f64>,
 ) -> Result<String> {
     let bytes = crate::distributed::cluster::hex_decode(envelope_hex)
         .map_err(|e| TensorError::new(&format!("cluster agent: envelope hex: {e}")))?;
@@ -286,6 +341,23 @@ fn rewrite_envelope_controller(
     };
     controller.insert("host".into(), serde_json::Value::String(host.to_string()));
     controller.insert("port".into(), serde_json::Value::from(port));
+    if data_path.is_some() || gpu_ram_share.is_some() {
+        let Some(worker) = envelope.get_mut("worker").and_then(|w| w.as_object_mut())
+        else {
+            return Err(TensorError::new(
+                "cluster agent: envelope carries no worker object",
+            ));
+        };
+        if let Some(data_path) = data_path {
+            worker.insert(
+                "data_path".into(),
+                serde_json::Value::String(data_path.to_string()),
+            );
+        }
+        if let Some(share) = gpu_ram_share {
+            worker.insert("gpu_ram_share".into(), serde_json::Value::from(share));
+        }
+    }
     let json = serde_json::to_string(&envelope).map_err(|e| {
         TensorError::new(&format!("cluster agent: envelope re-encode: {e}"))
     })?;
@@ -312,7 +384,8 @@ fn rewrite_relay_controller(
 }
 
 /// Resolve the physical devices this worker offers: an explicit list
-/// from the spec/config, or every GPU nvidia-smi sees. Returns the
+/// from the spec/config, or every GPU detection sees for this build's
+/// vendor (masks applied). Returns the
 /// device ids plus one inventory label per device. Resolution happens
 /// HERE (on the worker) so `"all"` shorthands never cross the wire.
 pub(crate) fn resolve_devices(requested: Option<&Vec<u8>>) -> (Vec<u8>, Vec<String>) {
@@ -332,7 +405,7 @@ pub(crate) fn resolve_devices(requested: Option<&Vec<u8>>) -> (Vec<u8>, Vec<Stri
                         "{} ({}GB, {})",
                         g.name,
                         g.total_memory_mb / 1024,
-                        g.sm_version(),
+                        g.arch_label(),
                     )
                 })
                 .unwrap_or_else(|| format!("cuda:{d}"))
@@ -355,12 +428,29 @@ fn build_hello(spec: &AgentSpec, devices: &[u8], gpus: Vec<String>) -> Result<Jo
             })?
         }
     };
+    let model_sig: Option<[u8; 32]> = match &spec.model_sig_hex {
+        None => None,
+        Some(hex) => {
+            let bytes = crate::distributed::cluster::hex_decode(hex.trim()).map_err(|e| {
+                TensorError::new(&format!("cluster agent: model_sig hex-decode: {e}"))
+            })?;
+            Some(bytes.try_into().map_err(|_| {
+                TensorError::new("cluster agent: model_sig must be 32 bytes (64 hex chars)")
+            })?)
+        }
+    };
     Ok(JoinMsgWire::Hello {
         host: spec.host.clone(),
         local_devices: devices.to_vec(),
         gpus,
         libtorch: spec.libtorch.clone(),
         dataset_sig,
+        run_id: spec.run_id.clone(),
+        // Read from the library this binary actually loads, HERE on the
+        // worker: the whole point is that no other process can answer
+        // for this box. Costs no CUDA context.
+        nccl_version: crate::distributed::nccl::runtime_version(),
+        model_sig,
     })
 }
 
@@ -401,6 +491,8 @@ pub fn run_agent() -> Result<()> {
         spec.controller_port,
         pre_shared,
         hello,
+        spec.data_path.as_deref(),
+        spec.gpu_ram_share,
     )?;
     // Children inherit this process's environment (the fan-out ssh
     // command already applied cluster/host env blocks to it); no extra
@@ -444,6 +536,8 @@ pub(crate) fn join_and_spawn_local(
         spec.controller_port,
         pre_shared,
         hello,
+        spec.data_path.as_deref(),
+        spec.gpu_ram_share,
     )?;
     spawn_host_children(&spec.host, &devices, &outcome, extra_env)
 }
@@ -791,16 +885,21 @@ mod tests {
             gpus: vec!["T".to_string(), "T".to_string()],
             libtorch: "builds/test".to_string(),
             dataset_sig: [0u8; 32],
+            run_id: None,
+            nccl_version: None,
+            model_sig: None,
         }
     }
 
     /// Minimal controller-authored envelope, hex-encoded — the
     /// controller's (possibly wrong-for-this-host) dial address baked
-    /// in, as `build_slim_envelope_for` does.
+    /// in, as `build_slim_envelope_for` does. The `worker` object is
+    /// always present there, so it is present here.
     fn test_envelope_hex(host: &str, port: u16) -> String {
         let envelope = serde_json::json!({
             "controller": { "host": host, "port": port },
             "world_size": 2,
+            "worker": { "host": "worker-x", "ranks": [3, 4] },
         });
         crate::distributed::cluster::hex_encode(envelope.to_string().as_bytes())
     }
@@ -861,8 +960,12 @@ mod tests {
             controller_port: 1337,
             salt_hex: Some(salt_to_hex(&test_salt())),
             local_devices: Some(vec![0, 1]),
+            run_id: Some("cafe0123".to_string()),
             libtorch: "builds/sm61-sm120".to_string(),
             dataset_sig_hex: None,
+            data_path: Some("/flodl/data".to_string()),
+            gpu_ram_share: Some(0.5),
+            model_sig_hex: Some("ab".repeat(32)),
         };
         let hex = spec.to_env_hex().unwrap();
         let bytes = crate::distributed::cluster::hex_decode(&hex).unwrap();
@@ -878,6 +981,14 @@ mod tests {
         assert_eq!(minimal.salt_hex, None);
         assert_eq!(minimal.local_devices, None);
         assert_eq!(minimal.dataset_sig_hex, None);
+        // No source root declared on that box: the envelope's own value
+        // stands, so the training binary keeps its default. Same for
+        // the integrated-GPU share.
+        assert_eq!(minimal.data_path, None);
+        assert_eq!(minimal.gpu_ram_share, None);
+        // No probe ran on that box: the hello gates nothing and the
+        // formation-time handshake check stays the backstop.
+        assert_eq!(minimal.model_sig_hex, None);
     }
 
     #[test]
@@ -903,7 +1014,15 @@ mod tests {
                 },
             ],
         );
-        let outcome = join_world("127.0.0.1", port, None, test_hello()).unwrap();
+        let outcome = join_world(
+            "127.0.0.1",
+            port,
+            None,
+            test_hello(),
+            Some("/srv/corpus"),
+            Some(0.4),
+        )
+        .unwrap();
         assert_eq!(outcome.salt, salt);
         assert_eq!(outcome.ranks, vec![3, 4]);
         // Join-verified address rewrite: the artifacts now dial where
@@ -915,6 +1034,11 @@ mod tests {
         assert_eq!(envelope["controller"]["host"], "127.0.0.1");
         assert_eq!(envelope["controller"]["port"], port);
         assert_eq!(envelope["world_size"], 2, "other fields untouched");
+        // A walk-in's source root and RAM share: resolved on this box,
+        // so this box writes them into the envelope its ranks read.
+        assert_eq!(envelope["worker"]["data_path"], "/srv/corpus");
+        assert_eq!(envelope["worker"]["gpu_ram_share"], 0.4);
+        assert_eq!(envelope["worker"]["host"], "worker-x", "other fields untouched");
         let relay: super::super::RelaySpec = serde_json::from_slice(
             &crate::distributed::cluster::hex_decode(
                 outcome.relay_spec_hex.as_deref().unwrap(),
@@ -927,6 +1051,63 @@ mod tests {
         assert_eq!(relay.ranks, vec![3, 4], "other fields untouched");
         // The controller saw the hello it was sent.
         assert_eq!(controller.join().unwrap(), test_hello());
+    }
+
+    /// The fan-out half of the same rewrite: a managed host's roster
+    /// entry IS the authority on its source root, so an agent with
+    /// nothing of its own must leave the controller's value in place.
+    /// Getting this backwards would silently repoint every fan-out rank.
+    #[test]
+    fn localize_leaves_the_rosters_data_path_alone_when_the_box_has_none() {
+        let envelope = serde_json::json!({
+            "controller": { "host": "10.0.0.1", "port": 1337 },
+            // 0.25 stands in for the cluster-scope default the
+            // controller resolved into this envelope.
+            "worker": { "host": "exa", "data_path": "/flodl/data", "gpu_ram_share": 0.25 },
+        });
+        let hex = crate::distributed::cluster::hex_encode(
+            envelope.to_string().as_bytes(),
+        );
+        let out = localize_envelope(&hex, "127.0.0.1", 40123, None, None).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(&out).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["worker"]["data_path"], "/flodl/data");
+        assert_eq!(got["worker"]["gpu_ram_share"], 0.25);
+        assert_eq!(got["controller"]["host"], "127.0.0.1");
+
+        // ... and a walk-in's values win over whatever the envelope
+        // carried, because the controller cannot have known better.
+        let out =
+            localize_envelope(&hex, "127.0.0.1", 40123, Some("/srv/c"), Some(0.5)).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(
+            &crate::distributed::cluster::hex_decode(&out).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got["worker"]["data_path"], "/srv/c");
+        assert_eq!(got["worker"]["gpu_ram_share"], 0.5);
+    }
+
+    #[test]
+    fn localize_is_loud_on_a_malformed_envelope() {
+        let hex = crate::distributed::cluster::hex_encode(
+            serde_json::json!({ "controller": { "host": "h", "port": 1 } })
+                .to_string()
+                .as_bytes(),
+        );
+        // No worker object: only reachable on a truncated envelope, and
+        // it must name itself rather than surface in a rank's parser.
+        let err = localize_envelope(&hex, "h", 1, Some("/srv/c"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no worker object"), "got: {err}");
+        let err = localize_envelope(&hex, "h", 1, None, Some(0.5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no worker object"), "got: {err}");
+        // Same envelope with nothing to localize stays fine.
+        assert!(localize_envelope(&hex, "h", 1, None, None).is_ok());
     }
 
     #[test]
@@ -947,7 +1128,8 @@ mod tests {
                 },
             ],
         );
-        let outcome = join_world("127.0.0.1", port, Some(salt), test_hello()).unwrap();
+        let outcome =
+            join_world("127.0.0.1", port, Some(salt), test_hello(), None, None).unwrap();
         assert_eq!(outcome.salt, salt);
         assert!(outcome.relay_spec_hex.is_none());
         controller.join().unwrap();
@@ -962,7 +1144,7 @@ mod tests {
             salt,
             vec![JoinMsgWire::Reject { reason: "dataset signature mismatch".to_string() }],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("REJECTED"), "got: {err}");
@@ -981,7 +1163,7 @@ mod tests {
                 JoinMsgWire::Abort { reason: "quorum not met".to_string() },
             ],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("aborted"), "got: {err}");
@@ -1002,7 +1184,7 @@ mod tests {
                 formation_wait_secs: 60,
             }],
         );
-        let err = join_world("127.0.0.1", port, None, test_hello())
+        let err = join_world("127.0.0.1", port, None, test_hello(), None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("trust mode"), "got: {err}");

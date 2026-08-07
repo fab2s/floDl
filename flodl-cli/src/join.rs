@@ -8,12 +8,16 @@
 //! its whole job is orchestration —
 //!
 //!   1. resolve settings (flags over the fdl.yml `join:` block),
-//!   2. optionally bring up an ssh `-L` forward of the controller port
+//!   2. prepare this box ([`crate::prepare`]): the GPU gate, the dataset
+//!      source root, the node-local directories the data plane writes —
+//!      all of it BEFORE the dial, because admission starts a window
+//!      deadline,
+//!   3. optionally bring up an ssh `-L` forward of the controller port
 //!      (the guardrailed-sshd trust path: reachability = authentication),
-//!   3. synthesize the agent bootstrap spec into the binary's
+//!   4. synthesize the agent bootstrap spec into the binary's
 //!      environment (`FLODL_INTERNAL_AGENT_JSON`, hex-encoded JSON — the
 //!      same envelope cluster fan-out ships),
-//!   4. run + supervise the binary, and in `--persist` mode re-dial
+//!   5. run + supervise the binary, and in `--persist` mode re-dial
 //!      with backoff when it exits (the systemd / golden-image loop).
 //!
 //! The spec (which may carry the pre-shared session token) rides the
@@ -27,14 +31,31 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::builtins::JoinArgs;
-use crate::config::{self, SshConfig, WorkerJoin, DEFAULT_CONTROLLER_PORT};
+use crate::config::{self, SshConfig, WorkerJoin, WorkerSource, DEFAULT_CONTROLLER_PORT};
 use crate::context::Context;
+use crate::prepare::{self, DataSpec, Fail, Prepared, PrepareSpec, SourceSpec};
 use crate::style;
 
 /// Agent bootstrap env var — must match flodl's
 /// `distributed::launcher::ENV_AGENT_JSON` (the field names in the hex
 /// JSON must match `AgentSpec`; locked by `agent_spec_shape_is_the_wire_contract`).
 const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
+
+/// Exit code for a failure retrying cannot fix: no usable GPU, a spec
+/// that does not parse, a directory that cannot be created, a missing
+/// binary. Distinct from 1 (a transient failure, one-shot) so a
+/// fleet can act on the difference without parsing stderr:
+///
+/// ```ini
+/// # /etc/systemd/system/flodl-join.service
+/// Restart=always
+/// RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+/// FailureAction=poweroff       # ... and self-deprovision it
+/// ```
+///
+/// fdl deliberately does not power a box off itself: the decision belongs
+/// to whatever owns the instance's lifecycle, and 2 is how it hears about it.
+pub const EXIT_PERMANENT: i32 = 2;
 
 /// How long the ssh forward gets to come up (auth + local bind).
 const TUNNEL_READY_BUDGET: Duration = Duration::from_secs(20);
@@ -52,15 +73,16 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(120);
 /// no `--` was given (the config block's `args:` applies); a present
 /// but empty tail is an explicit "no arguments".
 ///
-/// Exit code: the agent's own exit code (one-shot); 1 on any
-/// orchestration failure. `--persist` only returns on setup errors —
-/// agent exits re-dial forever.
+/// Exit code: the agent's own exit code (one-shot); [`EXIT_PERMANENT`]
+/// for a failure retrying cannot fix; 1 for a transient one. `--persist`
+/// re-dials through transient failures and agent exits, and returns only
+/// on a permanent one.
 pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     let (block, project_root) = match load_join_block() {
         Ok(pair) => pair,
         Err(e) => {
             crate::cli_error!("{e}");
-            return 1;
+            return EXIT_PERMANENT;
         }
     };
     let eff = match resolve_effective(
@@ -72,7 +94,7 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         Ok(eff) => eff,
         Err(e) => {
             crate::cli_error!("{e}");
-            return 1;
+            return EXIT_PERMANENT;
         }
     };
     if eff.controller_defaulted {
@@ -86,16 +108,19 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         );
     }
 
-    // The binary must exist NOW — a persist loop retrying a missing
-    // path forever helps nobody.
-    let bin = Path::new(&eff.bin);
-    if !bin.is_file() {
-        crate::cli_error!(
-            "training binary not found: {} — build it first, then point \
-             `--bin` (or fdl.yml `join.bin`) at it",
-            eff.bin,
-        );
-        return 1;
+    // A binary named as a path must exist NOW — a persist loop retrying
+    // a missing path forever helps nobody. A binary built from source
+    // cannot be checked here: it does not exist until the attempt has
+    // fetched and compiled the tree.
+    if let BinSource::Given(path) = &eff.bin {
+        if !Path::new(path).is_file() {
+            crate::cli_error!(
+                "training binary not found: {path} — build it first and \
+                 point `--bin` (or fdl.yml `join.bin`) at it, or hand this \
+                 box a `--source` to build",
+            );
+            return EXIT_PERMANENT;
+        }
     }
 
     // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
@@ -106,19 +131,51 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     // environment already provides the libs.
     let libtorch = resolve_local_libtorch(project_root.as_deref());
 
+    // Model-sig probe cache, living exactly as long as the persist loop:
+    // one slot, keyed by a digest of the probe recipe (binary identity +
+    // args). An idle fleet re-dials every BACKOFF_MAX forever, and
+    // without this every re-dial would rebuild the model on CPU — or,
+    // for a binary that predates the probe, pay the full probe timeout
+    // — for an unchanged binary.
+    let mut sig_cache: Option<(u64, Option<String>)> = None;
+
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
-        let code = attempt(&eff, libtorch.as_ref());
-        if !eff.persist {
-            return code;
-        }
+        // What happened, phrased for the re-dial line. Every branch that
+        // is not re-dialable returns from here.
+        let outcome = match attempt(&eff, libtorch.as_ref(), &mut sig_cache) {
+            Ok(code) => {
+                if !eff.persist {
+                    return code;
+                }
+                format!("agent exited with code {code}")
+            }
+            Err(fail) => {
+                crate::cli_error!("{}", fail.message());
+                if fail.is_permanent() {
+                    // The whole point of the class: a box that cannot be
+                    // fixed by waiting must stop, not hot-loop.
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "fdl join: not re-dialing — retrying cannot \
+                             fix this (exit {EXIT_PERMANENT})"
+                        )),
+                    );
+                    return EXIT_PERMANENT;
+                }
+                if !eff.persist {
+                    return 1;
+                }
+                "attempt failed".to_string()
+            }
+        };
         if started.elapsed() > BACKOFF_RESET_AFTER {
             backoff = BACKOFF_MIN;
         }
         eprintln!(
-            "fdl join: agent exited with code {code} after {}s; re-dialing \
-             in {}s (--persist)",
+            "fdl join: {outcome} after {}s; re-dialing in {}s (--persist)",
             started.elapsed().as_secs(),
             backoff.as_secs(),
         );
@@ -146,8 +203,11 @@ struct Effective {
     ssh: Option<SshConfig>,
     /// Pre-shared session credential (hex). `None` = open admission.
     token: Option<String>,
-    /// Training binary path, as given (resolved against cwd at spawn).
-    bin: String,
+    /// How this box gets its training binary: a path to run as given, or
+    /// a source to build. Exactly one, checked at resolution.
+    bin: BinSource,
+    /// libtorch variant to acquire; `None` keeps this box's active one.
+    libtorch_spec: Option<String>,
     /// Logical host name in the join hello.
     host: String,
     /// Explicit CUDA device ids; `None` = all GPUs on this host.
@@ -155,6 +215,62 @@ struct Effective {
     persist: bool,
     /// The binary's own arguments.
     bin_args: Vec<String>,
+    /// Dataset source root on this box (the mountpoint when
+    /// `data_source` is set); `None` ships nothing to the ranks.
+    data_path: Option<String>,
+    /// Transport that establishes the source root, `<scheme>://<target>`.
+    data_source: Option<String>,
+    /// Integrated-GPU host-RAM share of this box; `None` ships nothing
+    /// (the envelope's cluster-scope default, if any, then stands).
+    gpu_ram_share: Option<f64>,
+    /// Probe the binary for its model signature before each dial
+    /// (default true; `--no-sig-probe` / `join.sig_probe: false`).
+    sig_probe: bool,
+}
+
+/// Where this box's training binary comes from. `source:` and `bin:` are
+/// mutually exclusive because they answer the same question, and keeping
+/// the given-binary case a separate variant rather than a third kind of
+/// source spec is what keeps an artifact-versus-source distinction out of
+/// the source grammar.
+#[derive(Debug, PartialEq, Eq)]
+enum BinSource {
+    /// A path on this box, run as given.
+    Given(String),
+    /// Fetched and built here.
+    Build(WorkerSource),
+}
+
+impl Effective {
+    /// Everything [`crate::prepare`] has to settle. The tunnel block
+    /// rides along to both artifact specs: the data host and the source
+    /// host are the controller box in the shape this exists for, so its
+    /// key and options apply to them too.
+    fn prepare_spec<'a>(
+        &'a self,
+        active_libtorch: Option<&'a (PathBuf, String)>,
+    ) -> PrepareSpec<'a> {
+        PrepareSpec {
+            data: DataSpec {
+                path: self.data_path.as_deref(),
+                source: self.data_source.as_deref(),
+                ssh: self.ssh.as_ref(),
+            },
+            libtorch: self.libtorch_spec.as_deref(),
+            active_libtorch,
+            devices: self.devices.as_deref(),
+            source: match &self.bin {
+                BinSource::Given(_) => None,
+                BinSource::Build(s) => Some(SourceSpec {
+                    from: &s.from,
+                    cwd: s.cwd.as_deref(),
+                    build: s.build.as_deref(),
+                    bin: s.bin.as_deref(),
+                    ssh: self.ssh.as_ref(),
+                }),
+            },
+        }
+    }
 }
 
 /// Merge flags over the config block. Pure — all I/O (hostname, config
@@ -215,16 +331,77 @@ fn resolve_effective(
         None => ("127.0.0.1".to_string(), DEFAULT_CONTROLLER_PORT),
     };
 
-    let bin = cli
-        .bin
-        .clone()
-        .or(block.bin)
-        .ok_or_else(|| {
-            "no training binary configured — pass `--bin <path>` or set \
-             `join.bin` in fdl.yml (the binary is the protocol: it dials, \
-             joins, and runs this host's ranks)"
-                .to_string()
-        })?;
+    // The binary: a path to run, or a source to build. Flags win over
+    // the block on each side, and naming both ways is an authoring error
+    // rather than a precedence puzzle — a box that builds its own binary
+    // and is also handed one has no defensible answer.
+    let bin_path = cli.bin.clone().or(block.bin);
+    let source = match (cli.source.clone(), block.source) {
+        (Some(from), b) => Some(WorkerSource {
+            from,
+            // The compact `--source` flag carries only the transport, so
+            // the rest keeps coming from the block unless its own flag
+            // overrides it (same shape as `--ssh`).
+            cwd: cli.source_cwd.clone().or_else(|| b.as_ref().and_then(|b| b.cwd.clone())),
+            build: cli.source_build.clone().or_else(|| b.as_ref().and_then(|b| b.build.clone())),
+            // No artifact anywhere is legal: a published tree carries a
+            // run manifest that names it, and that manifest is the
+            // authority when it is there.
+            bin: cli.source_bin.clone().or_else(|| b.as_ref().and_then(|b| b.bin.clone())),
+        }),
+        (None, Some(mut b)) => {
+            if let Some(cwd) = cli.source_cwd.clone() {
+                b.cwd = Some(cwd);
+            }
+            if let Some(build) = cli.source_build.clone() {
+                b.build = Some(build);
+            }
+            if let Some(bin) = cli.source_bin.clone() {
+                b.bin = Some(bin);
+            }
+            Some(b)
+        }
+        (None, None) => None,
+    };
+    // A source flag with no source to attach to is an authoring error,
+    // not something to drop on the floor: the operator meant it to change
+    // the run.
+    if source.is_none() {
+        for (flag, set) in [
+            ("--source-cwd", cli.source_cwd.is_some()),
+            ("--source-build", cli.source_build.is_some()),
+            ("--source-bin", cli.source_bin.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "{flag} has no source to apply to — pass `--source \
+                     <spec>` too, or set `join.source` in fdl.yml"
+                ));
+            }
+        }
+    }
+
+    let bin = match (bin_path, source) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "`bin:` and `source:` both name this box's training binary \
+                 — keep the one you mean. `bin:` runs a binary as given; \
+                 `source:` fetches and builds one here"
+                    .to_string(),
+            );
+        }
+        (Some(path), None) => BinSource::Given(path),
+        (None, Some(source)) => BinSource::Build(source),
+        (None, None) => {
+            return Err(
+                "no training binary configured — pass `--bin <path>` (run \
+                 it as given) or `--source <spec>` (build it here), or set \
+                 `join.bin` / `join.source` in fdl.yml. The binary is the \
+                 protocol: it dials, joins, and runs this host's ranks"
+                    .to_string(),
+            );
+        }
+    };
 
     let devices = match &cli.devices {
         Some(spec) => parse_devices(spec)?,
@@ -253,6 +430,13 @@ fn resolve_effective(
         devices,
         persist: cli.persist || block.persist,
         bin_args,
+        libtorch_spec: cli.libtorch.clone().or(block.libtorch),
+        data_path: cli.data_path.clone().or(block.data_path),
+        data_source: cli.data_source.clone().or(block.data_source),
+        gpu_ram_share: cli.gpu_ram_share.or(block.gpu_ram_share),
+        // The flag only disables; `sig_probe: false` in yml is the
+        // standing form of the same choice. Default on.
+        sig_probe: !cli.no_sig_probe && block.sig_probe.unwrap_or(true),
     })
 }
 
@@ -354,7 +538,20 @@ fn parse_devices(spec: &str) -> Result<Option<Vec<u8>>, String> {
 /// Build the hex-encoded JSON payload for [`ENV_AGENT_JSON`]. Field
 /// names ARE the wire contract with flodl's `AgentSpec` deserializer;
 /// optional fields are omitted (serde defaults fill them).
-fn agent_spec_hex(eff: &Effective, dial: (&str, u16), libtorch_label: &str) -> String {
+///
+/// The prepared data path travels this way rather than in the join hello
+/// because the controller has nothing to say about it: it never
+/// configured this host, and only this box knows where its source root
+/// actually ended up. flodl's agent inserts it into the envelope its
+/// rank children read, beside the same-shaped rewrite it already does
+/// for the controller address.
+fn agent_spec_hex(
+    eff: &Effective,
+    dial: (&str, u16),
+    libtorch_label: &str,
+    prepared: &Prepared,
+    model_sig_hex: Option<&str>,
+) -> String {
     let mut spec = serde_json::json!({
         "host": eff.host,
         "controller_host": dial.0,
@@ -366,6 +563,25 @@ fn agent_spec_hex(eff: &Effective, dial: (&str, u16), libtorch_label: &str) -> S
     }
     if let Some(devices) = &eff.devices {
         spec["local_devices"] = serde_json::json!(devices);
+    }
+    if let Some(data) = &prepared.data_path {
+        spec["data_path"] = serde_json::json!(data.display().to_string());
+    }
+    if let Some(run) = &prepared.run_id {
+        spec["run_id"] = serde_json::json!(run);
+    }
+    // Host-hardware truth, same as data_path: the agent writes it into
+    // the envelope's host block, overriding any cluster-scope default
+    // the controller stamped. Omitted when undeclared, so that default
+    // stands.
+    if let Some(share) = eff.gpu_ram_share {
+        spec["gpu_ram_share"] = serde_json::json!(share);
+    }
+    // Probed from the binary itself, so admission can refuse a box
+    // building a different model while it still costs only this box's
+    // own attempt. Omitted when the probe was skipped or failed.
+    if let Some(sig) = model_sig_hex {
+        spec["model_sig_hex"] = serde_json::json!(sig);
     }
     hex_encode(spec.to_string().as_bytes())
 }
@@ -379,40 +595,152 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Active libtorch of this box: `(lib dir to prepend on
-/// LD_LIBRARY_PATH, variant label for the hello)`. Anchored on the
-/// project root when the config walk found one (a command-dir cwd's
-/// `Context::resolve` would stop a level too low); the plain context
-/// fallback covers project-less setups (`~/.flodl`).
+/// Active libtorch of this box, anchored on the project root when the
+/// config walk found one (a command-dir cwd's `Context::resolve` would
+/// stop a level too low); the plain context fallback covers project-less
+/// setups (`~/.flodl`).
 fn resolve_local_libtorch(project_root: Option<&Path>) -> Option<(PathBuf, String)> {
     let root = match project_root {
         Some(r) => r.to_path_buf(),
         None => Context::resolve().root,
     };
-    let info = crate::libtorch::detect::read_active(&root)?;
-    let lib = root.join("libtorch").join(&info.path).join("lib");
-    lib.is_dir().then_some((lib, info.path))
+    crate::libtorch::detect::active_variant(&root)
+}
+
+/// `LD_LIBRARY_PATH` for the training binary, with this box's inherited
+/// value appended.
+///
+/// The ordering inside is not ours to choose: on ROCm the system runtime
+/// must precede libtorch's own lib dir, because libtorch-rocm bundles the
+/// whole userspace ROCm stack and a bundle that disagrees with the host's
+/// amdkfd driver segfaults the rank at its first GPU op. Prepending
+/// unconditionally, which is what this did before, is the segfault
+/// configuration on an AMD box.
+fn child_ld_library_path(libtorch_dir: &Path, variant: &str) -> String {
+    let lib = libtorch_dir.join("lib").display().to_string();
+    let vendor = crate::libtorch::detect::variant_vendor(variant);
+    let value = crate::libtorch::detect::ld_library_path_value(
+        vendor,
+        &lib,
+        &crate::libtorch::detect::local_rocm_lib_dir(),
+    );
+    match std::env::var("LD_LIBRARY_PATH") {
+        Ok(cur) if !cur.is_empty() => format!("{value}:{cur}"),
+        _ => value,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // One attempt: tunnel up (optional), agent run, teardown
 // ---------------------------------------------------------------------------
 
-/// One full join attempt. Returns the agent's exit code (or 1 on
-/// orchestration failure). The tunnel — when one is configured — lives
-/// exactly as long as the attempt: rebuilt fresh each re-dial, so a
-/// half-dead forward can never outlive the run it served.
-fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
+/// One full join attempt: prepare, tunnel, dial, supervise. Returns the
+/// agent's exit code, or the classed reason preparation/orchestration
+/// stopped.
+///
+/// Preparation comes first and every attempt re-runs it: admission
+/// starts a window deadline, so a mount established after the dial burns
+/// it, and re-running is how `--persist` becomes a provisioning loop.
+///
+/// The tunnel — when one is configured — lives exactly as long as the
+/// attempt: rebuilt fresh each re-dial, so a half-dead forward can never
+/// outlive the run it served.
+fn attempt(
+    eff: &Effective,
+    active_libtorch: Option<&(PathBuf, String)>,
+    sig_cache: &mut Option<(u64, Option<String>)>,
+) -> Result<i32, Fail> {
+    let mut notes = Vec::new();
+    let prepared = prepare::prepare(&eff.prepare_spec(active_libtorch), &mut notes);
+    prepare::print_notes("join", &notes);
+    let prepared = prepared?;
+
+    // A built binary runs in the project directory inside the fetched
+    // tree, which is where its own relative paths resolve; a given one
+    // keeps fdl's cwd, exactly as before.
+    let (bin, bin_cwd) = match (&eff.bin, &prepared.bin) {
+        (BinSource::Build(_), Some(built)) => (built.bin.clone(), Some(built.cwd.clone())),
+        (BinSource::Given(path), None) => (PathBuf::from(path), None),
+        // Neither combination is reachable — preparation returns a binary
+        // exactly when it was given a source — so say so rather than
+        // quietly preferring one and hiding a wiring inversion.
+        (kind, built) => {
+            return Err(Fail::Permanent(format!(
+                "internal: preparation and the resolved binary disagree \
+                 ({}, built={})",
+                match kind {
+                    BinSource::Given(_) => "a path was given",
+                    BinSource::Build(_) => "a source was given",
+                },
+                built.is_some(),
+            )));
+        }
+    };
+
+    // The run's arguments belong to the run. A published manifest replaces
+    // whatever this box carried, because rank children re-enter the binary
+    // with them: a standing fleet holding its own copy would train the new
+    // run with the previous one's hyperparameters. Saying so out loud is
+    // the difference between authority and a silent substitution.
+    let args: &[String] = match &prepared.args {
+        Some(published) => {
+            if !eff.bin_args.is_empty() && published != &eff.bin_args {
+                eprintln!(
+                    "{}",
+                    style::dim(&format!(
+                        "fdl join: the published run's arguments replace \
+                         this box's ({} -> {})",
+                        eff.bin_args.join(" "),
+                        published.join(" "),
+                    )),
+                );
+            }
+            published
+        }
+        None => &eff.bin_args,
+    };
+
+    // Model-signature probe, before the tunnel like everything else in
+    // preparation: admission starts a window deadline, and the probe
+    // runs the binary's whole main up to `Trainer::run`. Cached by
+    // recipe digest across re-dials — the OUTCOME is cached, a failed
+    // probe included, so an unchanged binary pays the probe (or its
+    // timeout) once, not once per backoff tick. A rebuild changes the
+    // mtime and a re-publish changes the args, so staleness invalidates
+    // itself; the libtorch variant is deliberately not in the recipe
+    // (the manifest — names, shapes, dtypes — is device-independent).
+    let model_sig_hex = if eff.sig_probe {
+        match probe_recipe_digest(&bin, args) {
+            Some(digest) => match sig_cache {
+                Some((key, cached)) if *key == digest => cached.clone(),
+                _ => {
+                    let sig = model_sig_probe(
+                        &bin,
+                        bin_cwd.as_deref(),
+                        args,
+                        prepared.libtorch.as_ref(),
+                    );
+                    *sig_cache = Some((digest, sig.clone()));
+                    sig
+                }
+            },
+            // The binary un-stat-able between resolution and here is a
+            // race with a rebuild: probe uncached, next attempt keys.
+            None => model_sig_probe(
+                &bin,
+                bin_cwd.as_deref(),
+                args,
+                prepared.libtorch.as_ref(),
+            ),
+        }
+    } else {
+        None
+    };
+
     let mut tunnel: Option<Child> = None;
     let dial: (String, u16) = match &eff.ssh {
         Some(ssh) => {
-            let local_port = match pick_local_port() {
-                Ok(p) => p,
-                Err(e) => {
-                    crate::cli_error!("{e}");
-                    return 1;
-                }
-            };
+            let local_port = pick_local_port().map_err(Fail::Transient)?;
             let argv = build_tunnel_argv(
                 ssh,
                 local_port,
@@ -425,22 +753,23 @@ fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
                 eff.controller_host,
                 eff.controller_port,
             );
-            let mut child = match Command::new(&argv[0])
+            let mut child = Command::new(&argv[0])
                 .args(&argv[1..])
                 .stdin(Stdio::null())
                 .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    crate::cli_error!("spawn ssh tunnel: {e}");
-                    return 1;
-                }
-            };
+                .map_err(|e| {
+                    // No ssh on the box is a provisioning fact, not a
+                    // passing condition.
+                    Fail::Permanent(format!("spawn ssh tunnel: {e}"))
+                })?;
+            // Auth failure and an unreachable host are both possible
+            // here and ssh does not let us tell them apart, so this
+            // stays re-dialable: a wrong key hits the backoff cap and
+            // keeps saying so, once a minute, loudly.
             if let Err(e) = wait_tunnel_ready(&mut child, local_port) {
-                crate::cli_error!("{e}");
                 let _ = child.kill();
                 let _ = child.wait();
-                return 1;
+                return Err(Fail::Transient(e));
             }
             tunnel = Some(child);
             ("127.0.0.1".to_string(), local_port)
@@ -448,36 +777,220 @@ fn attempt(eff: &Effective, libtorch: Option<&(PathBuf, String)>) -> i32 {
         None => (eff.controller_host.clone(), eff.controller_port),
     };
 
-    let libtorch_label = libtorch.map(|(_, l)| l.as_str()).unwrap_or("");
-    let spec_hex = agent_spec_hex(eff, (&dial.0, dial.1), libtorch_label);
+    // Preparation is the authority on libtorch: it either acquired a
+    // variant or carried the active one through, and the label it settles
+    // on is what the join hello announces.
+    let libtorch_label = prepared.libtorch.as_ref().map(|(_, l)| l.as_str()).unwrap_or("");
+    let spec_hex = agent_spec_hex(
+        eff,
+        (&dial.0, dial.1),
+        libtorch_label,
+        &prepared,
+        model_sig_hex.as_deref(),
+    );
 
-    let mut cmd = Command::new(&eff.bin);
-    cmd.args(&eff.bin_args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args)
         .env(ENV_AGENT_JSON, &spec_hex)
         // Children report under the logical roster name even when it
         // differs from `hostname` — same override fan-out applies.
         .env(crate::cluster::ENV_HOST_OVERRIDE, &eff.host)
         .stdin(Stdio::null());
-    if let Some((lib, _)) = libtorch {
-        let merged = match std::env::var("LD_LIBRARY_PATH") {
-            Ok(cur) if !cur.is_empty() => format!("{}:{cur}", lib.display()),
-            _ => lib.display().to_string(),
-        };
-        cmd.env("LD_LIBRARY_PATH", merged);
+    if let Some(cwd) = &bin_cwd {
+        cmd.current_dir(cwd);
+    }
+    if let Some((dir, variant)) = &prepared.libtorch {
+        cmd.env("LD_LIBRARY_PATH", child_ld_library_path(dir, variant));
     }
 
-    let code = match cmd.status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            crate::cli_error!("run {}: {e}", eff.bin);
-            1
-        }
-    };
+    // A given path was checked before the loop and a built one was just
+    // written, so a spawn failure here is the file itself: not
+    // executable, wrong architecture, bad interpreter.
+    let status = cmd.status().map_err(|e| {
+        Fail::Permanent(format!("run {}: {e}", bin.display()))
+    });
     if let Some(mut t) = tunnel.take() {
         let _ = t.kill();
         let _ = t.wait();
     }
-    code
+    Ok(status?.code().unwrap_or(1))
+}
+
+/// Digest of the probe recipe — everything the probe's answer depends
+/// on: the binary's identity (path, mtime, size) and the arguments the
+/// run enters it with. One u64 via std's SipHash rather than a
+/// cryptographic hash: flodl-cli is zero-dep, the key lives one process
+/// and guards a cache on a box that is trusted (not proven), and a
+/// collision's worst case — a stale signature in the hello — lands on
+/// the formation-time backstop. `None` when the binary cannot be
+/// stat'ed (a race with a rebuild): probe uncached, key next attempt.
+fn probe_recipe_digest(bin: &Path, args: &[String]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let meta = std::fs::metadata(bin).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bin.hash(&mut h);
+    meta.len().hash(&mut h);
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .hash(&mut h);
+    args.hash(&mut h);
+    Some(h.finish())
+}
+
+/// How many trailing stdout lines the probe keeps as evidence when no
+/// signature appears.
+const PROBE_TAIL_LINES: usize = 8;
+
+/// Probe-run marker env (flodl's launcher contract: with it set,
+/// `Trainer::run` builds the model on CPU, prints the signature line
+/// and exits — before auto-promote, before any cluster role).
+const ENV_MODEL_SIG_PROBE: &str = "FLODL_INTERNAL_MODEL_SIG_PROBE";
+
+/// Stdout line the probe scans for (main-body prints above it are
+/// harmless — the prefix is the protocol, not the whole stream).
+const MODEL_SIG_LINE: &str = "flodl-model-sig: ";
+
+/// Ceiling on the probe re-run. A current flodl answers in the time its
+/// main takes to reach `Trainer::run`; a binary built against a flodl
+/// that predates the probe ignores the env and runs its whole main,
+/// which is exactly what this bounds.
+const MODEL_SIG_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Re-run the training binary as a model-signature probe and return the
+/// 64-hex signature it prints.
+///
+/// Best-effort BY DESIGN: every failure degrades to `None` — the hello
+/// then gates nothing and the formation-time handshake check stays the
+/// backstop — but each failure mode says so, because one of them
+/// (a non-zero exit) predicts the rank children failing the same way
+/// after formation, with the same binary and the same arguments.
+fn model_sig_probe(
+    bin: &Path,
+    cwd: Option<&Path>,
+    args: &[String],
+    libtorch: Option<&(PathBuf, String)>,
+) -> Option<String> {
+    eprintln!(
+        "{}",
+        style::dim("fdl join: probing the binary for its model signature \
+                    (--no-sig-probe skips this)"),
+    );
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .env(ENV_MODEL_SIG_PROBE, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    if let Some((dir, variant)) = libtorch {
+        cmd.env("LD_LIBRARY_PATH", child_ld_library_path(dir, variant));
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "fdl join: model-sig probe could not run {}: {e}; joining \
+                 without a signature",
+                bin.display(),
+            );
+            return None;
+        }
+    };
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let mut sig = None;
+        // Last few lines kept as evidence: when no signature turns up,
+        // what the binary actually said beats anything we could infer
+        // about why. Bounded so a chatty binary cannot grow this.
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(rest) = line.strip_prefix(MODEL_SIG_LINE) {
+                sig = Some(rest.trim().to_string());
+            }
+            if tail.len() == PROBE_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        (sig, tail)
+    });
+    let deadline = Instant::now() + MODEL_SIG_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let (sig, tail) = reader.join().unwrap_or_default();
+    let sig = sig.filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    match (&status, &sig) {
+        (Some(st), Some(_)) if st.success() => sig,
+        (None, _) => {
+            eprintln!(
+                "fdl join: model-sig probe killed after {}s — a binary built \
+                 against a flodl that predates the probe runs its whole main \
+                 here; joining without a signature (`--no-sig-probe` or \
+                 `join.sig_probe: false` silences this)",
+                MODEL_SIG_PROBE_TIMEOUT.as_secs(),
+            );
+            None
+        }
+        (Some(st), _) if !st.success() => {
+            // The loud one: rank children re-enter this binary with these
+            // arguments, so this failure is what the cohort would see
+            // AFTER formation.
+            eprintln!(
+                "fdl join: WARNING: the training binary exited with {} under \
+                 the model-sig probe — rank children re-enter it with the \
+                 same arguments after admission, so if this failure is real \
+                 it takes the cohort's formation with it. Check: {} {}",
+                st.code().map_or("a signal".to_string(), |c| c.to_string()),
+                bin.display(),
+                args.join(" "),
+            );
+            None
+        }
+        _ => {
+            // Exit 0 and no signature has two very different causes: a
+            // binary older than the probe contract, or one that failed
+            // before reaching `Trainer::run` while still exiting 0.
+            // Guessing the first was wrong often enough to matter (a
+            // read-only project dir defeats a binary that creates an
+            // output directory in main, which is the walk-in's normal
+            // condition), so quote what it said and let the reader
+            // judge.
+            eprintln!(
+                "fdl join: model-sig probe exited 0 without printing a \
+                 signature; joining without one — the formation-time check \
+                 still applies. Either the binary predates the probe, or it \
+                 failed before reaching the trainer (check its output above, \
+                 and that this box can write wherever it writes).",
+            );
+            if !tail.is_empty() {
+                eprintln!("fdl join: last lines of the probe's output:");
+                for line in &tail {
+                    eprintln!("    {line}");
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Reserve a loopback port for the tunnel's local end: bind :0, read
@@ -587,9 +1100,18 @@ mod tests {
             identity: None,
             token: None,
             bin: None,
+            source: None,
+            source_cwd: None,
+            source_build: None,
+            source_bin: None,
+            libtorch: None,
             host: None,
             devices: None,
             persist: false,
+            data_path: None,
+            data_source: None,
+            gpu_ram_share: None,
+            no_sig_probe: false,
         }
     }
 
@@ -605,10 +1127,30 @@ mod tests {
             }),
             token: Some("aa".repeat(16)),
             bin: Some("target/release/train".into()),
+            source: None,
+            libtorch: Some("auto".into()),
             host: Some("worker-7".into()),
             devices: Some(vec![0, 1]),
             persist: true,
             args: vec!["--model".into(), "lenet".into()],
+            data_path: Some("/flodl/data".into()),
+            data_source: Some("sshfs://flodl@ctrl:/srv/data".into()),
+            gpu_ram_share: Some(0.5),
+            sig_probe: None,
+        }
+    }
+
+    /// A block that builds its binary instead of naming one.
+    fn source_block() -> WorkerJoin {
+        WorkerJoin {
+            source: Some(WorkerSource {
+                from: "rsync://exa:/home/op/rdl".into(),
+                cwd: Some("ddp-bench".into()),
+                build: Some("cargo build --release --bin ddp-bench".into()),
+                bin: Some("target/release/ddp-bench".into()),
+            }),
+            bin: None,
+            ..full_block()
         }
     }
 
@@ -620,9 +1162,13 @@ mod tests {
             identity: Some("/tmp/id".into()),
             token: Some("bb".repeat(16)),
             bin: Some("other/bin".into()),
+            libtorch: Some("cu128".into()),
             host: Some("pascal".into()),
             devices: Some("2".into()),
             persist: false,
+            data_path: Some("/mnt/corpus".into()),
+            data_source: Some("sshfs://exa/mnt/corpus".into()),
+            ..no_flags()
         };
         let tail: Vec<String> = vec!["--epochs".into(), "3".into()];
         let eff = resolve_effective(
@@ -643,13 +1189,16 @@ mod tests {
         assert_eq!(ssh.identity_file.as_deref(), Some("/tmp/id"));
         assert_eq!(ssh.options, vec!["StrictHostKeyChecking=accept-new".to_string()]);
         assert_eq!(eff.token.as_deref(), Some("bb".repeat(16).as_str()));
-        assert_eq!(eff.bin, "other/bin");
+        assert_eq!(eff.bin, BinSource::Given("other/bin".into()));
+        assert_eq!(eff.libtorch_spec.as_deref(), Some("cu128"));
         assert_eq!(eff.host, "pascal");
         assert_eq!(eff.devices, Some(vec![2]));
         // persist: block `true` sticks (the flag can only turn it on).
         assert!(eff.persist);
         // A `--` tail replaces the block's args.
         assert_eq!(eff.bin_args, vec!["--epochs".to_string(), "3".into()]);
+        assert_eq!(eff.data_path.as_deref(), Some("/mnt/corpus"));
+        assert_eq!(eff.data_source.as_deref(), Some("sshfs://exa/mnt/corpus"));
     }
 
     #[test]
@@ -661,11 +1210,99 @@ mod tests {
         let ssh = eff.ssh.as_ref().unwrap();
         assert_eq!(ssh.target.as_deref(), Some("bastion"));
         assert_eq!(ssh.identity_file.as_deref(), Some("/etc/flodl/join_key"));
-        assert_eq!(eff.bin, "target/release/train");
+        assert_eq!(eff.bin, BinSource::Given("target/release/train".into()));
+        assert_eq!(eff.libtorch_spec.as_deref(), Some("auto"));
         assert_eq!(eff.host, "worker-7");
         assert_eq!(eff.devices, Some(vec![0, 1]));
         assert!(eff.persist);
         assert_eq!(eff.bin_args, vec!["--model".to_string(), "lenet".into()]);
+        assert_eq!(eff.data_path.as_deref(), Some("/flodl/data"));
+        assert_eq!(
+            eff.data_source.as_deref(),
+            Some("sshfs://flodl@ctrl:/srv/data"),
+        );
+        // The tunnel block's key and options carry to the data mount:
+        // same box, same key (which that key must permit — see
+        // `prepare::DataSpec::ssh`).
+        let spec = eff.prepare_spec(None);
+        assert_eq!(
+            spec.data.ssh.and_then(|s| s.identity_file.as_deref()),
+            Some("/etc/flodl/join_key"),
+        );
+    }
+
+    #[test]
+    fn a_source_block_becomes_a_source_spec_carrying_the_same_key() {
+        let eff = resolve_effective(&no_flags(), None, Some(source_block()), "localbox").unwrap();
+        let spec = eff.prepare_spec(None);
+        let source = spec.source.expect("a source block yields a source spec");
+        assert_eq!(source.from, "rsync://exa:/home/op/rdl");
+        assert_eq!(source.cwd, Some("ddp-bench"));
+        assert_eq!(source.bin, Some("target/release/ddp-bench"));
+        // The pull runs over the same hop the tunnel uses.
+        assert_eq!(
+            source.ssh.and_then(|s| s.identity_file.as_deref()),
+            Some("/etc/flodl/join_key"),
+        );
+    }
+
+    #[test]
+    fn naming_both_a_binary_and_a_source_is_a_loud_error() {
+        // Not a precedence puzzle: a box handed both has no defensible
+        // answer, so it must be told rather than guessed at.
+        let block = WorkerJoin { bin: Some("target/release/train".into()), ..source_block() };
+        let err = resolve_effective(&no_flags(), None, Some(block), "x").unwrap_err();
+        assert!(err.contains("both name"), "got: {err}");
+    }
+
+    #[test]
+    fn a_source_flag_keeps_the_blocks_other_source_fields() {
+        // Same shape as the compact `--ssh`: the flag carries the
+        // transport, the block still answers for the rest.
+        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let eff = resolve_effective(&cli, None, Some(source_block()), "x").unwrap();
+        assert_eq!(
+            eff.bin,
+            BinSource::Build(WorkerSource {
+                from: "file:///mnt/rdl".into(),
+                cwd: Some("ddp-bench".into()),
+                build: Some("cargo build --release --bin ddp-bench".into()),
+                bin: Some("target/release/ddp-bench".into()),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_source_with_no_artifact_is_legal_because_a_manifest_may_name_it() {
+        // The controller's published tree carries a run manifest, and that
+        // manifest is the authority. Refusing here would make every worker
+        // config repeat what the publish already said.
+        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let eff = resolve_effective(&cli, None, None, "x").unwrap();
+        assert_eq!(
+            eff.bin,
+            BinSource::Build(WorkerSource {
+                from: "file:///mnt/rdl".into(),
+                cwd: None,
+                build: None,
+                bin: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn a_source_detail_flag_with_no_source_is_a_loud_error() {
+        // Silently dropping it would leave the operator with a run that
+        // ignored what they typed, which is the failure `--`-forwarded
+        // options already taught this CLI once.
+        let cli = JoinArgs {
+            bin: Some("t/bin".into()),
+            source_cwd: Some("ddp-bench".into()),
+            ..no_flags()
+        };
+        let err = resolve_effective(&cli, None, None, "x").unwrap_err();
+        assert!(err.contains("--source-cwd"), "got: {err}");
+        assert!(err.contains("no source"), "got: {err}");
     }
 
     #[test]
@@ -681,6 +1318,10 @@ mod tests {
         assert_eq!(eff.devices, None);
         assert!(!eff.persist);
         assert!(eff.bin_args.is_empty());
+        // No data fields: prepare checks nothing and ships nothing, so
+        // the training binary keeps its own default.
+        assert!(eff.data_path.is_none());
+        assert!(eff.data_source.is_none());
     }
 
     #[test]
@@ -769,6 +1410,71 @@ mod tests {
 
     /// The JSON field names are flodl's `AgentSpec` wire contract —
     /// this test IS the cross-crate compatibility lock (flodl-cli is
+    /// The cache key binds exactly what the probe's answer depends on:
+    /// same binary + same args is a hit; touched binary, different
+    /// args, or a missing file is not.
+    #[test]
+    fn probe_recipe_digest_binds_binary_identity_and_args() {
+        let dir = std::env::temp_dir()
+            .join(format!("fdl-sig-digest-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("train");
+        std::fs::write(&bin, b"v1").unwrap();
+        let args = vec!["--model".to_string(), "lenet".to_string()];
+        let base = probe_recipe_digest(&bin, &args).unwrap();
+        assert_eq!(probe_recipe_digest(&bin, &args).unwrap(), base);
+        assert_ne!(
+            probe_recipe_digest(&bin, &["--model".to_string(), "resnet".to_string()])
+                .unwrap(),
+            base,
+            "args are part of the recipe (a re-publish must re-probe)"
+        );
+        // A rebuild: same path, new content — size or mtime moves.
+        std::fs::write(&bin, b"v2 longer").unwrap();
+        assert_ne!(
+            probe_recipe_digest(&bin, &args).unwrap(),
+            base,
+            "a rebuilt binary must re-probe"
+        );
+        assert_eq!(probe_recipe_digest(&dir.join("absent"), &args), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe's child-process contract, driven with shell-script
+    /// stand-ins for the training binary: the prefixed line is found
+    /// among main-body noise, and every failure mode (no line, bad
+    /// line, non-zero exit) degrades to `None` rather than erroring —
+    /// the hello then gates nothing and formation stays the backstop.
+    /// (The timeout path is deliberately not exercised: it is a 120s
+    /// wait by construction.)
+    #[cfg(unix)]
+    #[test]
+    fn model_sig_probe_parses_the_line_and_absorbs_failures() {
+        // Each case is `/bin/sh -c <body>`, not a script this test writes
+        // and then execs. Writing an executable and running it from a
+        // multithreaded process is a race: a `Command` spawned anywhere
+        // else in the binary during the window where the write fd is open
+        // inherits that fd across the fork, and the exec then fails with
+        // ETXTBSY. Reproduced at about 1 run in 60 -- the probe returned
+        // None and the message said "Text file busy", which reads like a
+        // parsing bug and is not one. /bin/sh is never opened for writing.
+        let sh = PathBuf::from("/bin/sh");
+        let run = |body: String| {
+            model_sig_probe(&sh, None, &["-c".to_string(), body], None)
+        };
+        let sig = "ab".repeat(32);
+        assert_eq!(
+            run(format!("echo main noise; echo '{MODEL_SIG_LINE}{sig}'")),
+            Some(sig),
+        );
+        assert_eq!(run("exit 0".to_string()), None);
+        assert_eq!(run("exit 3".to_string()), None);
+        assert_eq!(
+            run(format!("echo '{MODEL_SIG_LINE}not-hex-at-all'")),
+            None,
+        );
+    }
+
     /// zero-dep on flodl by design, so the shape is asserted literally;
     /// flodl's `agent_spec_round_trips_through_hex` holds the other end).
     #[test]
@@ -778,10 +1484,23 @@ mod tests {
             bin: Some("t/bin".into()),
             host: Some("pascal".into()),
             devices: Some("0,1".into()),
+            gpu_ram_share: Some(0.5),
             ..no_flags()
         };
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
-        let hex = agent_spec_hex(&eff, ("127.0.0.1", 40123), "builds/sm61-sm120");
+        let prepared = Prepared {
+            data_path: Some(PathBuf::from("/flodl/data")),
+            run_id: Some("a1b2c3d4e5f60718".to_string()),
+            ..Prepared::default()
+        };
+        let hex =
+            agent_spec_hex(
+                &eff,
+                ("127.0.0.1", 40123),
+                "builds/sm61-sm120",
+                &prepared,
+                Some(&"cd".repeat(32)),
+            );
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -793,12 +1512,16 @@ mod tests {
         assert_eq!(spec["salt_hex"], "ab".repeat(16));
         assert_eq!(spec["local_devices"], serde_json::json!([0, 1]));
         assert_eq!(spec["libtorch"], "builds/sm61-sm120");
+        assert_eq!(spec["data_path"], "/flodl/data");
+        assert_eq!(spec["run_id"], "a1b2c3d4e5f60718");
+        assert_eq!(spec["gpu_ram_share"], 0.5);
+        assert_eq!(spec["model_sig_hex"], "cd".repeat(32));
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
             let cli = JoinArgs { bin: Some("t/bin".into()), ..no_flags() };
             let eff = resolve_effective(&cli, None, None, "cloud-1").unwrap();
-            agent_spec_hex(&eff, ("10.0.0.1", 1337), "")
+            agent_spec_hex(&eff, ("10.0.0.1", 1337), "", &Prepared::default(), None)
         };
         let bytes: Vec<u8> = (0..open.len())
             .step_by(2)
@@ -808,6 +1531,15 @@ mod tests {
         assert!(spec.get("salt_hex").is_none());
         assert!(spec.get("local_devices").is_none());
         assert!(spec.get("dataset_sig_hex").is_none());
+        // A box that declares no source root must ship no key at all:
+        // an empty string here would point every rank at the process cwd.
+        assert!(spec.get("data_path").is_none());
+        // Same rule for the run id: a `--bin` box carries none, and an
+        // absent key is what gates nothing at admission.
+        assert!(spec.get("run_id").is_none());
+        // And for the RAM share: an absent key is what lets the
+        // envelope's cluster-scope default stand.
+        assert!(spec.get("gpu_ram_share").is_none());
     }
 
     #[test]

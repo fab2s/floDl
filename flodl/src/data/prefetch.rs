@@ -173,8 +173,8 @@ pub(crate) struct PrefetchedBatch {
     /// and pooled by the decoded sample ids.
     pub picks: Vec<usize>,
     /// Event recorded after async H2D copy. Consumer waits on this.
-    #[cfg(feature = "cuda")]
-    pub ready_event: Option<crate::tensor::cuda_event::CudaEvent>,
+    #[cfg(feature = "gpu")]
+    pub ready_event: Option<crate::tensor::cuda_event::GpuEvent>,
 }
 
 /// Commands sent to the persistent worker thread.
@@ -376,9 +376,9 @@ fn worker_loop(
     stop: &AtomicBool,
 ) {
     // Create a dedicated CUDA stream for H2D transfers (lives across epochs).
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     let copy_stream = if device.is_cuda() {
-        crate::tensor::cuda_stream::CudaStream::new(device, false).ok()
+        crate::tensor::cuda_stream::GpuStream::new(device, false).ok()
     } else {
         None
     };
@@ -462,7 +462,7 @@ fn worker_loop(
                         &mut pool,
                         augment,
                         stop,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         copy_stream.as_ref(),
                     );
                 } else {
@@ -477,7 +477,7 @@ fn worker_loop(
                         &mut pool,
                         augment,
                         stop,
-                        #[cfg(feature = "cuda")]
+                        #[cfg(feature = "gpu")]
                         copy_stream.as_ref(),
                     );
                 }
@@ -577,7 +577,7 @@ fn worker_loop(
                                                 &tensors,
                                                 device,
                                                 pool,
-                                                #[cfg(feature = "cuda")]
+                                                #[cfg(feature = "gpu")]
                                                 copy_stream.as_ref(),
                                             )
                                         },
@@ -590,7 +590,7 @@ fn worker_loop(
                                         &tensors,
                                         device,
                                         &mut pool,
-                                        #[cfg(feature = "cuda")]
+                                        #[cfg(feature = "gpu")]
                                         copy_stream.as_ref(),
                                     )
                                 }
@@ -632,7 +632,7 @@ fn worker_loop(
                                     augment,
                                     device,
                                     pool,
-                                    #[cfg(feature = "cuda")]
+                                    #[cfg(feature = "gpu")]
                                     copy_stream.as_ref(),
                                 )
                             },
@@ -645,7 +645,7 @@ fn worker_loop(
                             augment,
                             device,
                             &mut pool,
-                            #[cfg(feature = "cuda")]
+                            #[cfg(feature = "gpu")]
                             copy_stream.as_ref(),
                         )
                     };
@@ -721,7 +721,7 @@ fn run_single_stage_epoch(
     pool: &mut VramSamplePool,
     augment: usize,
     stop: &AtomicBool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) {
     let n = indices.len();
     let mut start = 0;
@@ -753,7 +753,7 @@ fn run_single_stage_epoch(
                 device,
                 governor,
                 pool,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 copy_stream,
             )
         });
@@ -785,7 +785,7 @@ fn run_two_stage_epoch(
     pool: &mut VramSamplePool,
     augment: usize,
     stop: &AtomicBool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) {
     let (ring_tx, ring_rx) =
         mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
@@ -817,7 +817,7 @@ fn run_two_stage_epoch(
                     device,
                     governor,
                     pool,
-                    #[cfg(feature = "cuda")]
+                    #[cfg(feature = "gpu")]
                     copy_stream,
                 )
             }
@@ -946,7 +946,7 @@ impl DistRing {
 /// and the pool's slab eviction is the only remaining relief valve
 /// (last resort: only once half the retry budget is spent).
 fn dist_oom_relief(pool: &mut VramSamplePool, attempt: usize) {
-    crate::tensor::cuda_empty_cache();
+    crate::tensor::gpu_empty_cache();
     thread::sleep(OOM_RETRY_SLEEP);
     if attempt >= OOM_RETRY_ATTEMPTS / 2 {
         pool.evict_one_slab();
@@ -959,7 +959,7 @@ fn dist_oom_relief(pool: &mut VramSamplePool, attempt: usize) {
 fn oom_backoff(governor: &GovernorCtl) {
     let t = governor.target.load(Ordering::Relaxed);
     governor.target.store((t / 2).max(1), Ordering::Relaxed);
-    crate::tensor::cuda_empty_cache();
+    crate::tensor::gpu_empty_cache();
     thread::sleep(OOM_RETRY_SLEEP);
 }
 
@@ -974,7 +974,7 @@ fn pooled_transfer_with_retry(
     device: Device,
     governor: &GovernorCtl,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return transfer_batch(
@@ -983,7 +983,7 @@ fn pooled_transfer_with_retry(
             tensors,
             device,
             pool,
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             copy_stream,
         );
     }
@@ -998,7 +998,7 @@ fn pooled_transfer_with_retry(
                 tensors,
                 device,
                 pool,
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 copy_stream,
             )
         },
@@ -1047,7 +1047,7 @@ fn fetch_and_transfer(
     augment: usize,
     device: Device,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) -> Result<PrefetchedBatch> {
     let samples = crate::data::picks_to_samples(picks, augment);
     let tensors = guarded_get_batch(dataset, &samples)?;
@@ -1057,7 +1057,7 @@ fn fetch_and_transfer(
         &tensors,
         device,
         pool,
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         copy_stream,
     )
 }
@@ -1076,20 +1076,20 @@ fn transfer_batch(
     tensors: &[Tensor],
     device: Device,
     pool: &mut VramSamplePool,
-    #[cfg(feature = "cuda")] copy_stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) -> Result<PrefetchedBatch> {
     if !device.is_cuda() {
         return Ok(PrefetchedBatch {
             tensors: tensors.to_vec(),
             picks: picks.to_vec(),
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "gpu")]
             ready_event: None,
         });
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
-        use crate::tensor::cuda_event::{CudaEvent, CudaEventFlags};
+        use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
         use crate::tensor::cuda_stream::StreamGuard;
 
         if let Some(stream) = copy_stream {
@@ -1098,7 +1098,7 @@ fn transfer_batch(
                 assemble_on_device(samples, tensors, device, pool, /* async_copy */ true)?;
 
             // Record completion event on the copy stream
-            let event = CudaEvent::new(CudaEventFlags::DisableTiming)?;
+            let event = GpuEvent::new(GpuEventFlags::DisableTiming)?;
             event.record_on(stream)?;
 
             return Ok(PrefetchedBatch {
@@ -1118,7 +1118,7 @@ fn transfer_batch(
         })
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = samples;
         let _ = pool;
@@ -1134,7 +1134,7 @@ fn transfer_batch(
 /// rows, upload only the misses, stitch back to caller row order, and
 /// capture the fresh rows. With the pool dormant this is exactly the
 /// plain upload. Caller owns the stream context.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "gpu")]
 fn assemble_on_device(
     indices: &[usize],
     tensors: &[Tensor],

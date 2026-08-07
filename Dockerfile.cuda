@@ -23,6 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     graphviz \
     openssh-client \
     openssh-server \
+    # rsync: this image runs sshd, so it can BE a join door, and door `b`
+    # serves its source pull through rrsync (shipped in the rsync
+    # package) as the key's forced command. Without it the door
+    # authenticates and then fails with sshd's least helpful error.
+    rsync \
+    # python3: Ubuntu's rrsync is a python3 script, so the interpreter is
+    # part of the door working, not an extra.
+    python3-minimal \
     && rm -rf /var/lib/apt/lists/*
 
 # --- sshd setup for the `cuda-rank` compose service ---

@@ -1,0 +1,210 @@
+name: OS Matrix
+
+# Per-OS coverage for the parts of floDl that are OS-specific.
+#
+# Everything this workflow actually does lives in `ci/os-matrix.sh`, and
+# that is the point: the script runs end to end on a developer box, so
+# its logic can be fixed before a runner ever sees it. The YAML that used
+# to hold that logic could only be verified by pushing, and twice shipped
+# bugs a local run would have caught in seconds -- `libtorch: yes` parsed
+# as a boolean so every gated step silently skipped GREEN, and a
+# job-level `needs:` that skipped the macOS leg because Windows was red.
+#
+# So this file carries only what genuinely cannot be a shell script:
+# the checkout, the Rust toolchain, and the cargo cache. The matrix is a
+# list of runner images -- the script identifies its own host from
+# `uname`, the way a user's machine does. The RHEL-family legs sit in
+# their own job and drive the same script through `docker run` rather
+# than a `container:` -- steps inside a container cannot run the host
+# free-disk sweep, and a vendor rotation needs it (a 12 GB libtorch tree
+# plus the Tensile-heavy devel packages).
+#
+# The script is native throughout: no Docker, no container toolchain. A
+# vendor install adds HEADERS (libtorch already ships every library the
+# link needs, libamdhip64 included), and installing those the way a
+# Debian cloud host would is both cheaper than a 25 GB image and the
+# path an AMD rental will actually take.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Force the Linux variant (rotate = alternate by run number; rocky runs the opposite phase)'
+        type: choice
+        default: rotate
+        options: [rotate, cuda, rocm, cpu]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Git Bash ships on the Windows runners, so one shell covers all hosts.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  os:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every host reports. A red leg on one OS must not hide the others,
+      # which is the whole point of having a matrix.
+      fail-fast: false
+      matrix:
+        os:
+          # 24.04 is the base the release artifacts are built against, so
+          # it is the floor this project promises; 26.04 is where new
+          # toolchain and glibc behaviour shows up first. Both, because
+          # testing only the new one stops telling us whether the floor
+          # still works, and that is the one users have.
+          - ubuntu-24.04       # x86_64: installs a vendor libtorch, builds the feature
+          - ubuntu-26.04       # x86_64: the newest LTS, same sequence
+          - ubuntu-24.04-arm   # aarch64: no upstream archive; asserts fdl refuses
+          - macos-latest       # arm64: CPU only, upstream publishes nothing else
+          - windows-latest     # x86_64: installs, does not compile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: os-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: os-${{ matrix.os }}-
+
+      # The Linux x86_64 leg installs a vendor toolkit and a multi-GB
+      # libtorch, so give it room. Harmless where it does not apply --
+      # the paths simply are not there.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: ci/os-matrix.sh
+        env:
+          FDL_CI_VARIANT: ${{ github.event.inputs.variant || 'rotate' }}
+        run: bash ci/os-matrix.sh
+
+  # The RHEL-family legs. A dnf system is what an AMD cloud rental is
+  # likelier to hand out than Ubuntu, and it is where apt-flavoured
+  # assumptions surface. Each EL release is given only variants it can
+  # actually run: what a distro cannot run is not a test, it is a
+  # scheduled failure that never heals (see the matrix below).
+  #
+  # These two do not rotate, and that is not a loss of coverage. The two
+  # releases happen to be capable of opposite vendors -- EL9 can install
+  # CUDA and not ROCm, EL10 the reverse -- so pinning each to the one it
+  # can serve covers BOTH vendors on EVERY run, where the rotation only
+  # covered both across two. The ubuntu hosts still rotate, because they
+  # are the ones that can genuinely take either.
+  rocky:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # EL9 ships glibc 2.34, so the cu128 archive (needs 2.29) runs
+          # and the rocm7.0 one (needs 2.35) cannot — glibc is pinned to
+          # the release, so no package fixes it. NVIDIA's rhel9 repo
+          # installs cleanly here.
+          - name: rockylinux-9
+            image: rockylinux:9
+            variant: cuda
+          # EL10 clears every archive's glibc floor (2.39), but it is the
+          # NVIDIA repo that cannot follow: the rhel10 repo starts at CUDA
+          # 13 (which fdl does not offer a variant for), and the rhel9 one
+          # dies in the GPG import because EL10's rpm-sequoia policy
+          # rejects that key. AMD publishes el10 from 7.0.2 on, verified
+          # installing here. Note the image moved off Docker Hub.
+          - name: rockylinux-10
+            image: quay.io/rockylinux/rockylinux:10
+            variant: rocm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same sweep as the matrix legs, same reason: a vendor rotation
+      # means a multi-GB libtorch plus its toolkit packages.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean || true
+          df -h /
+
+      # Rust lives inside the container (mounted from cached host dirs),
+      # not on the runner: the toolchain must be the one a rocky user
+      # would run, glibc and all.
+      - name: Cache cargo + rustup + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rocky/cargo
+            ~/.rocky/rustup
+            target
+          key: os-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: os-${{ matrix.name }}-
+
+      # The dnf list is deliberately minimal: what checkout, rustup and
+      # the shim's C++ compile need, plus the two tools the script
+      # itself calls (find, awk). Anything fdl is supposed to detect and
+      # advise about stays out, so the probe assertions run against an
+      # honest baseline. GITHUB_RUN_NUMBER rides in for the rotation,
+      # GITHUB_ACTIONS for the ::group:: folds.
+      - name: ci/os-matrix.sh in a ${{ matrix.image }} container
+        env:
+          FDL_CI_VARIANT: ${{ (github.event.inputs.variant == '' || github.event.inputs.variant == 'rotate') && matrix.variant || github.event.inputs.variant }}
+        run: |
+          mkdir -p ~/.rocky/cargo ~/.rocky/rustup
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.rocky/cargo:/root/.cargo" \
+            -v "$HOME/.rocky/rustup:/root/.rustup" \
+            -w /workspace \
+            -e FDL_CI_VARIANT -e GITHUB_ACTIONS -e GITHUB_RUN_NUMBER \
+            ${{ matrix.image }} bash -c '
+              set -e
+              dnf install -y -q git gcc gcc-c++ unzip tar gzip findutils gawk
+              if [ ! -x /root/.cargo/bin/cargo ]; then
+                curl -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component clippy
+              fi
+              . /root/.cargo/env
+              git config --global --add safe.directory /workspace
+              bash ci/os-matrix.sh'

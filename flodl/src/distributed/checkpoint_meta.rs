@@ -41,7 +41,13 @@ use crate::tensor::{Result, TensorError};
 /// - 4: adds optional `coverage` ([`CoverageBlock`]) for coverage-granular
 ///   async resume (per in-progress epoch: the uncovered offset ranges + the
 ///   shuffle seed). v3 files still parse — the field defaults to `None`.
-pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 4;
+/// - 5: adds `CoverageBlock.epoch_splits`. v4 files still parse — the field
+///   defaults to `1`, which is what an epoch meant before splitting existed.
+///   The bump is load-bearing in the other direction: a v4 binary reading a
+///   v5 file would ignore the unknown field and resume a split run as
+///   unsplit, mapping the recorded offsets onto different samples. Rejecting
+///   the file outright (the `schema_version >` guard below) is the point.
+pub const CHECKPOINT_META_SCHEMA_VERSION: u32 = 5;
 
 /// Uncovered data coverage for one in-progress epoch pool, captured at a
 /// checkpoint reduce.
@@ -69,6 +75,12 @@ pub struct EpochCoverage {
     pub uncovered_ranges: Vec<(usize, usize)>,
 }
 
+/// Serde default for [`CoverageBlock::epoch_splits`]: a checkpoint written
+/// before the field existed described a run whose epoch was a whole pass.
+fn unsplit_epochs() -> usize {
+    1
+}
+
 /// Data-coverage snapshot across all in-progress epoch pools at a checkpoint
 /// reduce — the resume contract's coverage half (the consensus model is the
 /// other half, written at the forge).
@@ -81,8 +93,24 @@ pub struct EpochCoverage {
 /// recorded uncovered ranges over the SAME index space.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoverageBlock {
-    /// Shuffle base seed; the epoch `e` permutation is `Rng::seed(seed + e)`.
+    /// Shuffle base seed; the permutation for data pass `p` is
+    /// `Rng::seed(seed + p)`, and pass `p` is epoch `e` itself unless the
+    /// run splits epochs, in which case `p = e / epoch_splits` and the
+    /// epoch takes a slice of that permutation.
     pub seed: u64,
+    /// Slices per data pass at save time.
+    ///
+    /// Recorded for the same reason as [`Self::seed`], and checked the same
+    /// way: the pool totals restore from [`EpochCoverage::total_samples`]
+    /// exactly as recorded, but ranks map those offsets back to picks
+    /// through the *live* value, so resuming with a different one silently
+    /// trains a different slice of the permutation. Resume refuses on
+    /// mismatch rather than reshuffling quietly.
+    ///
+    /// Defaults to `1` when absent, which is what every checkpoint written
+    /// before epoch splitting existed meant.
+    #[serde(default = "unsplit_epochs")]
+    pub epoch_splits: usize,
     /// Batch size at save time (sanity-check on resume; the pool total is
     /// already batch-aligned in [`EpochCoverage::total_samples`]).
     pub batch_size: usize,
@@ -936,6 +964,7 @@ mod tests {
 
         let coverage = CoverageBlock {
             seed: 42,
+            epoch_splits: 4,
             batch_size: 32,
             per_epoch: vec![
                 EpochCoverage {
@@ -999,5 +1028,19 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Checkpoints written before `epoch_splits` existed must still load,
+    // and they described runs whose epoch was a whole data pass. Without
+    // the serde default this reads as 0 and every legacy resume trips the
+    // mismatch guard it was never meant to see.
+    #[test]
+    fn coverage_without_epoch_splits_reads_as_unsplit() {
+        let legacy = r#"{"seed":42,"batch_size":32,"per_epoch":[]}"#;
+        let cov: CoverageBlock =
+            serde_json::from_str(legacy).expect("a pre-splits coverage block still loads");
+        assert_eq!(cov.epoch_splits, 1, "absent means the epoch was a whole pass");
+        assert_eq!(cov.seed, 42);
+        assert_eq!(cov.batch_size, 32);
     }
 }

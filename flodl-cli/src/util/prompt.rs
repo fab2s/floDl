@@ -31,6 +31,27 @@ fn read_line(tty: &mut dyn BufRead) -> String {
     buf.trim().to_string()
 }
 
+/// Detect a usable controlling terminal, mirroring `open_tty`'s
+/// platform paths — so callers can error loudly BEFORE a prompt would
+/// silently fall back to its default.
+pub fn has_tty() -> bool {
+    #[cfg(unix)]
+    {
+        std::fs::File::open("/dev/tty").is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("CONIN$")
+            .is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
 /// Ask a yes/no question. Returns `default` on empty input.
 ///
 /// Prompt should NOT include the `[Y/n]` suffix -- it is appended automatically.

@@ -1,0 +1,86 @@
+# floDl on the RHEL family — a reference, not a build target.
+#
+# Nothing in this repo uses this image: the CI leg runs stock
+# `rockylinux:9` with an inline bootstrap, because the point there is to
+# exercise `fdl` the way a user's own box would. This file exists to
+# answer "what does a RHEL box actually need", in a form that can be
+# built and checked rather than prose that drifts.
+#
+# ── The one hard limit, measured 2026-08-07 ──────────────────────────
+#
+# Upstream libtorch archives do not share a C library baseline, and RHEL
+# 9 can satisfy only some of them:
+#
+#   variant   needs                          RHEL 9 (glibc 2.34, GLIBCXX 3.4.29)
+#   cpu       GLIBC_2.29 / GLIBCXX_3.4.26    runs
+#   cu128     GLIBC_2.29 / GLIBCXX_3.4.26    runs
+#   rocm7.0   GLIBC_2.35 / GLIBCXX_3.4.30    CANNOT RUN
+#
+# The ROCm archive is built against a newer glibc than RHEL 9 ships, and
+# glibc is not a package you upgrade past your release: it binds the
+# whole userland. So a ROCm libtorch on RHEL 9 compiles, links, and then
+# dies in the loader complaining about symbol versions. `fdl probe` now
+# says so directly instead of leaving that error to be decoded.
+#
+# The fix is a newer base (RHEL 10 ships glibc 2.39), not a package.
+# `gcc-toolset` would supply the newer GLIBCXX but cannot touch GLIBC.
+#
+# ── The mirror-image limit on RHEL 10, measured the same day ─────────
+#
+# Moving to EL10 to get ROCm costs you CUDA, and for a reason that has
+# nothing to do with glibc:
+#
+#   * NVIDIA's rhel10 repo starts at CUDA 13 -- its oldest cublas is
+#     `libcublas-devel-13-0` -- and fdl publishes no 13.x variant.
+#   * Pointing an EL10 box at the rhel9 repo instead fails in the GPG
+#     import, not the install: EL10's rpm uses rpm-sequoia, whose policy
+#     rejects NVIDIA's rhel9 key ("No binding signature at time ..."),
+#     where EL9's legacy parser accepts the same key.
+#
+# So the RHEL family covers both vendors only across two releases, which
+# is why ci/os-matrix.sh pins EL9 to cuda and EL10 to rocm rather than
+# rotating either. ROCm on EL10 needs the `el10` repo path, which AMD
+# publishes from 7.0.2 on (there is no el10/7.0).
+FROM rockylinux:9
+
+# What a native build needs. `fdl` reports each of these by name when it
+# is missing, so this list is the answer to its own advice rather than a
+# separate opinion:
+#   gcc-c++      the shim's C++ compile (`g++` on Debian)
+#   unzip        libtorch archives
+#   python3      Ubuntu-and-RHEL rrsync is a python script; also the
+#                cloud-init and YAML checks
+#   rsync        source transport; on RHEL its rrsync ships as
+#                documentation, hence the install line below
+#
+# curl is deliberately ABSENT from this list. The base image ships
+# `curl-minimal`, which CONFLICTS with the full `curl` package, so asking
+# for it fails the whole transaction ("conflicts with curl provided
+# by..."). curl-minimal already provides /usr/bin/curl, which is all fdl
+# wants — and fdl only ever suggests installing curl when the binary is
+# absent, so its advice does not walk into this either.
+RUN dnf install -y \
+        gcc gcc-c++ \
+        git \
+        unzip tar gzip \
+        findutils gawk \
+        python3 \
+        rsync \
+    && dnf clean all
+
+# RHEL packages rrsync as DOCUMENTATION: /usr/share/doc/.../rrsync, mode
+# 0644, not on PATH. A join door composed with a bare `rrsync` forced
+# command fails there until it is placed and made executable. Debian
+# needs none of this — its rsync package installs /usr/bin/rrsync.
+RUN install -m 755 /usr/share/doc/rsync/support/rrsync /usr/local/bin/rrsync
+
+# Rust, as the user would get it.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+# From here the documented path works:
+#   fdl libtorch download --cpu     # or --cuda 12.8; NOT --rocm on EL9
+#   fdl build
+#   fdl run

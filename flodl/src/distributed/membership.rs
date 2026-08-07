@@ -127,6 +127,15 @@ pub struct JoinConfig {
     pub open_admission: bool,
     /// Who closes the window once quorum is met (default [`StartMode::Auto`]).
     pub start_mode: StartMode,
+    /// Whether the run's collective data plane is NCCL/RCCL. When true,
+    /// admission refuses a cohort mixing GPU vendors: NCCL and RCCL
+    /// export the same symbols and 128-byte unique-id format, so a mixed
+    /// cohort passes every structural check and then hangs (or dies
+    /// opaquely) inside `ncclCommInitRank` at formation — after the
+    /// window deadline was spent. CPU averaging modes genuinely work
+    /// cross-vendor, so `false` disables the gate rather than the
+    /// mixing. Default true, matching the launcher's backend default.
+    pub nccl_backend: bool,
 }
 
 impl Default for JoinConfig {
@@ -138,6 +147,7 @@ impl Default for JoinConfig {
             max_join_timeout_secs: 600,
             open_admission: false,
             start_mode: StartMode::Auto,
+            nccl_backend: true,
         }
     }
 }
@@ -319,6 +329,26 @@ pub(crate) enum WindowVerdict {
     Failed(String),
 }
 
+/// One hello's admission-relevant facts, as decoded off the wire.
+///
+/// A struct rather than a parameter list because the fact set GROWS:
+/// each cross-host coherence check the window learns (vendor, run
+/// identity, NCCL version, model signature) is another field, and
+/// admission is the only place a walk-in fleet can be checked for
+/// cross-host consistency (there is no roster to probe, and the
+/// controller cannot reach back through a NAT'd tunnel).
+#[derive(Debug)]
+pub(crate) struct JoinOffer {
+    pub host: String,
+    pub local_devices: Vec<u8>,
+    pub gpus: Vec<String>,
+    pub libtorch: String,
+    pub dataset_sig: [u8; 32],
+    pub run_id: Option<String>,
+    pub nccl_version: Option<(u32, u32, u32)>,
+    pub model_sig: Option<[u8; 32]>,
+}
+
 /// Pure membership state machine: admission, rank assignment, window
 /// verdicts, snapshots. Owns no I/O — [`run_join_window`] drives it
 /// against real connections, tests drive it directly.
@@ -330,6 +360,34 @@ pub(crate) struct MembershipLedger {
     /// behavior); the launcher passes its own signature when it has
     /// one.
     expected_dataset_sig: Option<[u8; 32]>,
+    /// GPU vendor every member must match under an NCCL data plane.
+    /// Seeded by the first member whose libtorch label classifies to a
+    /// vendor (same first-member pattern as the dataset signature): the
+    /// gate is a CONSISTENCY check among joiners, not an authority — a
+    /// coordinator-only controller may legitimately be a CUDA build in
+    /// front of an all-AMD RCCL cohort, so its own build vendor must not
+    /// seed this. An enumerated fan-out rig mixed with walk-ins stays
+    /// prebuild's problem: those hosts never pass through admission.
+    expected_vendor: Option<flodl_hw::GpuVendor>,
+    /// Identity of the published run the cohort prepared (the
+    /// `.fdl-run.yml` nonce). First-member seeded; a mismatch means a
+    /// publish landed between two boxes' fetches, and a cohort
+    /// straddling that boundary would train two different runs as one
+    /// world. Boxes carrying no id (`--bin`, pre-field trees) gate
+    /// nothing.
+    expected_run_id: Option<String>,
+    /// major.minor of the NCCL/RCCL library the cohort loads. Skew
+    /// refuses the NCCL handshake at formation, so the window refuses
+    /// it first. Only enforced under an NCCL data plane; unknown
+    /// versions gate nothing.
+    expected_nccl: Option<(u32, u32)>,
+    /// Model signature (see `distributed::model_sig`) the cohort must
+    /// agree on. Controller-seeded when the launcher could build the
+    /// model on CPU (its model IS the run's truth — unlike the vendor,
+    /// where a coordinator-only controller legitimately differs);
+    /// first-member seeded otherwise. `None` in a hello gates nothing:
+    /// the formation-time handshake check is the backstop.
+    expected_model_sig: Option<[u8; 32]>,
     members: Vec<JoinedMember>,
     next_rank: usize,
 }
@@ -339,11 +397,16 @@ impl MembershipLedger {
     pub fn new(
         config: JoinConfig,
         expected_dataset_sig: Option<[u8; 32]>,
+        expected_model_sig: Option<[u8; 32]>,
     ) -> Result<Self> {
         config.validate()?;
         Ok(MembershipLedger {
             config,
             expected_dataset_sig,
+            expected_vendor: None,
+            expected_run_id: None,
+            expected_nccl: None,
+            expected_model_sig,
             members: Vec::new(),
             next_rank: 0,
         })
@@ -360,13 +423,20 @@ impl MembershipLedger {
     /// its own attempt, never the run).
     pub fn admit(
         &mut self,
-        host: &str,
-        local_devices: Vec<u8>,
-        gpus: Vec<String>,
-        libtorch: String,
-        dataset_sig: [u8; 32],
+        offer: JoinOffer,
         elapsed: Duration,
     ) -> std::result::Result<Vec<usize>, String> {
+        let JoinOffer {
+            host,
+            local_devices,
+            gpus,
+            libtorch,
+            dataset_sig,
+            run_id,
+            nccl_version,
+            model_sig,
+        } = offer;
+        let host = host.as_str();
         if host.trim().is_empty() {
             return Err("host name must be non-empty".to_string());
         }
@@ -412,6 +482,112 @@ impl MembershipLedger {
                 ));
             }
             Some(_) => {}
+        }
+        // Vendor coherence, only where the data plane demands it. NCCL
+        // and RCCL cannot form one communicator, and nothing structural
+        // rejects the attempt (same symbols, same 128-byte id), so a
+        // mixed cohort admitted here hangs at formation AFTER the window
+        // was spent. A label that classifies to no vendor (cpu, unknown,
+        // empty — fan-out agents may send none) gates nothing: refusing
+        // what cannot be classified would turn a naming convention into
+        // an admission requirement.
+        if self.config.nccl_backend {
+            if let flodl_hw::VariantClass::Vendor(vendor) =
+                flodl_hw::classify_variant_label(&libtorch)
+            {
+                match self.expected_vendor {
+                    None => self.expected_vendor = Some(vendor),
+                    Some(expected) if expected != vendor => {
+                        return Err(format!(
+                            "GPU vendor mismatch: this run's cohort is {expected} \
+                             (libtorch {:?}) and {host:?} offers {vendor} \
+                             ({libtorch:?}) — NCCL and RCCL cannot form one \
+                             communicator, so a mixed cohort hangs at formation. \
+                             Use a CPU ElChe mode (cpu_sync / cpu_cadence / \
+                             cpu_async), or a one-vendor fleet",
+                            self.members
+                                .iter()
+                                .map(|m| m.libtorch.as_str())
+                                .find(|l| {
+                                    matches!(
+                                        flodl_hw::classify_variant_label(l),
+                                        flodl_hw::VariantClass::Vendor(v) if v == expected
+                                    )
+                                })
+                                .unwrap_or(""),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Run identity, whatever the data plane: a cohort straddling a
+        // publish boundary holds two different runs — different args at
+        // minimum, and rank children re-enter the binary with them.
+        // First-member seeded like the rest: consistency among joiners,
+        // not an authority the controller asserts.
+        if let Some(run) = &run_id {
+            match &self.expected_run_id {
+                None => self.expected_run_id = Some(run.clone()),
+                Some(expected) if expected != run => {
+                    return Err(format!(
+                        "run identity mismatch: this cohort prepared run \
+                         {}… and {host:?} prepared {}… — a publish landed \
+                         between their fetches, so they hold two different \
+                         runs. The stale side picks the new run up on its \
+                         next dial",
+                        id_prefix(expected),
+                        id_prefix(run),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // NCCL/RCCL version, where that plane will actually form: skew
+        // in major.minor refuses the handshake at formation, after the
+        // window was spent, and a walk-in fleet has no roster for a
+        // probe to sweep — this window is the only place the check can
+        // live.
+        if self.config.nccl_backend {
+            if let Some((maj, min, _)) = nccl_version {
+                match self.expected_nccl {
+                    None => self.expected_nccl = Some((maj, min)),
+                    Some((emaj, emin)) if (emaj, emin) != (maj, min) => {
+                        return Err(format!(
+                            "NCCL version skew: this cohort loads \
+                             {emaj}.{emin}.x and {host:?} loads {maj}.{min}.x \
+                             — NCCL refuses its handshake across major.minor \
+                             skew, at formation. Align the libtorch variants, \
+                             or bridge with `fdl nccl build`",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Model signature, whatever the data plane: mismatched parameter
+        // manifests corrupt CPU averaging exactly as they hang NCCL.
+        // Refusing here (instead of at the formation handshake, which
+        // stays the backstop) means the box condemns only its own dial
+        // and `--persist` re-dials once it is fixed. `None` gates
+        // nothing: not every road can probe a model before the hello.
+        if let Some(sig) = &model_sig {
+            match &self.expected_model_sig {
+                None => self.expected_model_sig = Some(*sig),
+                Some(expected) if expected != sig => {
+                    return Err(format!(
+                        "model mismatch: the model this box builds ({}…) \
+                         differs from the cohort's ({}…) — parameter names, \
+                         shapes or dtypes disagree, so the boxes would \
+                         corrupt each other at the first averaging step. A \
+                         stale source tree or a wrong `bin:` is the usual \
+                         cause",
+                        hex_prefix(sig),
+                        hex_prefix(expected),
+                    ));
+                }
+                Some(_) => {}
+            }
         }
         let ranks: Vec<usize> = (self.next_rank..self.next_rank + rank_count).collect();
         self.next_rank += rank_count;
@@ -576,7 +752,13 @@ impl MembershipLedger {
 
 /// Leading 4 bytes of a signature as hex, for reject messages that
 /// should identify without dumping 64 chars.
-fn hex_prefix(sig: &[u8; 32]) -> String {
+/// First 8 chars of a run id, for refusal messages (the full nonce is
+/// noise at the width a log line has).
+fn id_prefix(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+pub(crate) fn hex_prefix(sig: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(8);
     for b in &sig[..4] {
@@ -624,16 +806,19 @@ pub(crate) struct FormedWorld {
 /// publishes the refreshed snapshot to `status` (the `state.json`
 /// source — see [`crate::distributed::status`]); `abort` stops the
 /// window promptly (launcher failure path).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_join_window(
     source: &StreamSource,
     config: &JoinConfig,
     salt: &SessionSalt,
     pre_shared_salt: bool,
     expected_dataset_sig: Option<[u8; 32]>,
+    expected_model_sig: Option<[u8; 32]>,
     abort: &AtomicBool,
     status: &crate::distributed::status::StatusBoard,
 ) -> Result<FormedWorld> {
-    let mut ledger = MembershipLedger::new(config.clone(), expected_dataset_sig)?;
+    let mut ledger =
+        MembershipLedger::new(config.clone(), expected_dataset_sig, expected_model_sig)?;
     let join_key = join_frame_key(!pre_shared_salt, salt);
     let window = Duration::from_secs(scaled_deadline_secs(config.join_timeout_secs));
     let cap = Duration::from_secs(scaled_deadline_secs(config.max_join_timeout_secs));
@@ -818,20 +1003,32 @@ fn handle_join_dial(
             return Err(why);
         }
     };
-    let JoinMsgWire::Hello { host, local_devices, gpus, libtorch, dataset_sig } = msg
+    let JoinMsgWire::Hello {
+        host,
+        local_devices,
+        gpus,
+        libtorch,
+        dataset_sig,
+        run_id,
+        nccl_version,
+        model_sig,
+    } = msg
     else {
         let why = "first join-channel message must be Hello".to_string();
         reject(stream, join_key, &why);
         return Err(why);
     };
-    let ranks = match ledger.admit(
-        &host,
+    let offer = JoinOffer {
+        host: host.clone(),
         local_devices,
         gpus,
         libtorch,
         dataset_sig,
-        started.elapsed(),
-    ) {
+        run_id,
+        nccl_version,
+        model_sig,
+    };
+    let ranks = match ledger.admit(offer, started.elapsed()) {
         Ok(r) => r,
         Err(why) => {
             reject(stream, join_key, &why);

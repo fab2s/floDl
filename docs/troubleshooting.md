@@ -14,7 +14,7 @@ libtorch directory.
 **Fix (Docker - recommended):** All builds should run in the Docker container.
 ```bash
 fdl build        # CPU
-fdl cuda-build   # CUDA
+fdl gpu-build   # CUDA
 ```
 
 **Fix (host):** Use the download script to install libtorch and set up paths:
@@ -53,7 +53,7 @@ drops CUDA libs with `--as-needed`.
 **Fix:** Make sure your `main.rs` calls the CUDA link anchor:
 ```rust
 fn main() -> flodl::Result<()> {
-    flodl_sys::flodl_force_cuda_link();
+    flodl_sys::flodl_force_gpu_link();
     // ... rest of your code
 }
 ```
@@ -72,6 +72,9 @@ host:
 ```bash
 # Ubuntu/Debian
 sudo apt-get install gcc g++ pkg-config
+
+# RHEL / Rocky / Alma / Fedora
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config
 
 # macOS
 xcode-select --install
@@ -117,8 +120,8 @@ GPU not available to Docker. For CPU-only development:
 
 **Fix:** Use CPU targets instead:
 ```bash
-fdl build    # not cuda-build
-fdl test     # not cuda-test
+fdl build    # not gpu-build
+fdl test     # not gpu-test
 ```
 
 ---
@@ -306,9 +309,9 @@ or inference runs without disabling gradients.
 
 **Diagnose first** - check how much VRAM you actually have and how it's used:
 ```rust
-if let Ok((used, total)) = cuda_memory_info() {
-    let active = cuda_active_bytes().unwrap_or(0);
-    let reserved = cuda_allocated_bytes().unwrap_or(0);
+if let Ok((used, total)) = gpu_memory_info() {
+    let active = gpu_active_bytes().unwrap_or(0);
+    let reserved = gpu_allocated_bytes().unwrap_or(0);
     println!("VRAM: {:.0}/{:.0} MB (active: {:.0} MB, reserved: {:.0} MB)",
         used as f64 / 1e6, total as f64 / 1e6,
         active as f64 / 1e6, reserved as f64 / 1e6);
@@ -316,7 +319,7 @@ if let Ok((used, total)) = cuda_memory_info() {
 ```
 
 If `reserved` is much larger than `active`, the allocator is holding freed
-blocks. Call `cuda_empty_cache()` to release them before checking again.
+blocks. Call `gpu_empty_cache()` to release them before checking again.
 
 **Fix:**
 - **Reduce batch size** - the single biggest lever for VRAM usage

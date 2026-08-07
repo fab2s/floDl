@@ -338,7 +338,7 @@ fn main() -> Result<()> {
 
     // ---- Build ----
     let model = DnaAutoencoder::new(seq_len, latent_dim)?;
-    if flodl::cuda_available() {
+    if flodl::gpu_available() {
         model.encoder.move_to_device(Device::CUDA(0));
         model.decoder.move_to_device(Device::CUDA(0));
     }

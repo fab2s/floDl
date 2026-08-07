@@ -10,7 +10,7 @@
 //! — the load-bearing structural invariant that distinguishes ALBERT
 //! from every other family in this crate.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 

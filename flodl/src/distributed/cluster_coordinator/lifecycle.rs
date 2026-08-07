@@ -110,6 +110,11 @@ impl ClusterCoordinator {
         let mut rank_to_conn: Vec<Option<usize>> = (0..world_size).map(|_| None).collect();
         let mut conn_reads: Vec<TcpStream> = Vec::new();
         let mut covered = 0usize;
+        // First model signature seen, with its (host, rank) provenance:
+        // every later signature must match it. Cross-host is the check's
+        // reason to exist (a stale tree or a wrong `bin:` on one box);
+        // within-host it also catches a nondeterministic model factory.
+        let mut expected_sig: Option<([u8; 32], String, u32)> = None;
         // Poll accept instead of blocking: on a pre-rendezvous failure the
         // relays never dial in, and the launcher must be able to stop this
         // loop (via `ClusterCoordinatorConfig::abort`), join the coord
@@ -163,10 +168,47 @@ impl ClusterCoordinator {
                 "cluster_coordinator",
             )?;
             let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
-                Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
+                Some(MuxRecord::Control(RelayControlMsg::Hello {
+                    host,
+                    ranks,
+                    model_sigs,
+                })) => {
                     crate::verbose!(
                         "  cluster_coordinator: relay '{host}' carries ranks {ranks:?}"
                     );
+                    // Refuse a mixed-model formation by name, before the
+                    // ack: without this the first collective hangs on
+                    // mismatched shapes and nothing says which box is
+                    // wrong. Signatures are compared pairwise against the
+                    // first one seen; an empty list gates nothing (test
+                    // drivers may send none).
+                    for (rank, sig) in ranks.iter().zip(model_sigs.iter()) {
+                        match &expected_sig {
+                            None => {
+                                expected_sig = Some((*sig, host.clone(), *rank));
+                            }
+                            Some((expected, seed_host, seed_rank))
+                                if expected != sig =>
+                            {
+                                return Err(TensorError::new(&format!(
+                                    "cluster_coordinator: model mismatch at \
+                                     formation: rank {rank} on host {host:?} \
+                                     trains a different model than rank \
+                                     {seed_rank} on host {seed_host:?} \
+                                     (parameter names/shapes/dtypes differ: \
+                                     {}… vs {}…). Every rank must run the \
+                                     same model code — a stale source tree \
+                                     or a wrong `bin:` on one box is the \
+                                     usual cause",
+                                    crate::distributed::membership::hex_prefix(sig),
+                                    crate::distributed::membership::hex_prefix(
+                                        expected,
+                                    ),
+                                )));
+                            }
+                            Some(_) => {}
+                        }
+                    }
                     ranks
                 }
                 Some(other) => {
@@ -298,8 +340,12 @@ impl ClusterCoordinator {
         // epoch, dropping to ~1 sync/epoch and serializing the cohort).
         // No-op for NCCL (cheap sync → window stays well under) and for
         // any run where the epoch size isn't known yet.
-        if config.batch_size > 0 && config.total_samples >= config.batch_size {
-            el_che.set_max_total_batches(config.total_samples / config.batch_size);
+        if let Some(cap) = crate::distributed::ddp_run::window_cap_batches(
+            config.total_samples,
+            config.epoch_splits,
+            config.batch_size,
+        ) {
+            el_che.set_max_total_batches(cap);
         }
         // `calibrated` mirrors the post-restore ElChe state: true when
         // any rank has a positive smoothed reading. Matches the
@@ -392,6 +438,7 @@ impl ClusterCoordinator {
             run_phase: RunPhase::Training,
             epoch_plan_cache: std::collections::HashMap::new(),
             total_samples: config.total_samples,
+            epoch_splits: config.epoch_splits.max(1),
             batch_size: config.batch_size.max(1),
             num_epochs: config.num_epochs,
             partition_ratios: config.partition_ratios,

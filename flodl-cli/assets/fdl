@@ -63,10 +63,28 @@ if [ ! -f "$CLI" ] || [ "${FDL_REBUILD:-}" = "1" ]; then
     fi
 
     # --- Fall back to building from source ---
+    #
+    # Two shapes, and only one of them has source lying around. Inside a
+    # checkout, build the tree you actually have. Anywhere else -- the
+    # curl-and-run shape, a scaffolded project, a cloud instance that
+    # fetched this script and nothing else -- there is no Cargo.toml to
+    # build, and the old code failed here with "could not find
+    # Cargo.toml". The registry has the crate, so cargo alone is enough.
+    #
+    # This is also what makes a too-new release binary a non-event: the
+    # download is verified by RUNNING it above, and a binary that cannot
+    # run on this libc is removed and replaced by one compiled here.
     if ! $DOWNLOADED; then
         if command -v cargo >/dev/null 2>&1; then
-            echo "Building fdl from source..."
-            (cd "$DIR" && cargo build --release -p flodl-cli)
+            if [ -f "$DIR/Cargo.toml" ] && grep -q 'flodl-cli' "$DIR/Cargo.toml" 2>/dev/null; then
+                echo "Building fdl from source..."
+                (cd "$DIR" && cargo build --release -p flodl-cli)
+            else
+                echo "Installing fdl from crates.io..."
+                mkdir -p "$DIR/target/release"
+                cargo install flodl-cli --root "$DIR/.fdl-cargo" --force \
+                    && cp "$DIR/.fdl-cargo/bin/fdl" "$CLI"
+            fi
         elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
             echo "Building fdl via Docker..."
             (cd "$DIR" && docker compose run --rm dev cargo build --release -p flodl-cli)

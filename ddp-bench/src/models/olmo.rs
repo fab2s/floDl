@@ -53,10 +53,9 @@ pub fn def() -> ModelDef {
         description: "OLMo-150M (configs/tiny) LM pretraining on an olmo-mix books slice",
         build: build_model,
         dataset: make_dataset,
-        // Windows over the staged slice: tokens = bytes / 2 (u16), a
-        // window needs seq_len + 1 tokens. Pure arithmetic, so cluster
-        // launchers size partitions without touching the data.
-        dataset_size_hint: |_| Ok(((OLMO_TRAIN_BYTES / 2 - 1) / SEQ_LEN as u64) as usize),
+        // Pure arithmetic, so cluster launchers size partitions without
+        // touching the data — and the same derivation the ranks use.
+        dataset_size_hint: |cfg| Ok(resolve_train_corpus(cfg).windows),
         train_fn: train_step,
         eval_fn: Some(eval_loss),
         test_dataset: Some(make_eval_dataset),
@@ -95,8 +94,88 @@ fn build_model(device: Device) -> Result<Box<dyn Module>> {
     Ok(Box::new(Olmo::new(device)?))
 }
 
+/// The staged training corpus, resolved once and shared by the launcher's
+/// `dataset_size_hint` and the ranks' `make_dataset`.
+///
+/// Both must agree exactly — the launcher sizes the coordinator's ledger
+/// from the hint while the ranks index the real shard, and a disagreement
+/// is a silent partition mismatch. One derivation, for the same reason
+/// `pick_space` is one derivation in flodl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TrainCorpus {
+    /// Bytes to stage from the shard head.
+    pub bytes: u64,
+    /// Windows those bytes yield, i.e. `dataset.len()`.
+    pub windows: usize,
+    /// Tokens asked for, before snapping.
+    pub requested_tokens: u64,
+    /// Tokens actually staged.
+    pub staged_tokens: u64,
+}
+
+impl TrainCorpus {
+    pub fn was_snapped(&self) -> bool {
+        self.requested_tokens != self.staged_tokens
+    }
+
+    /// Say what was staged, at most once per process.
+    ///
+    /// Both `dataset_size_hint` and `make_dataset` resolve the corpus, and
+    /// on a cluster every rank resolves it too. Once per process means the
+    /// launcher and each rank each state their geometry, which is also the
+    /// cheapest way to see that they agree.
+    fn announce_once(&self) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        if !self.was_snapped() {
+            return;
+        }
+        SAID.call_once(|| {
+            eprintln!(
+                "  olmo corpus: {} tokens requested -> {} staged ({} windows at seq {}), \
+                 so a pass divides into equal epochs of whole batches",
+                self.requested_tokens, self.staged_tokens, self.windows, SEQ_LEN,
+            );
+        });
+    }
+}
+
+/// Size the staged corpus so one data pass divides exactly into whole
+/// batched events.
+///
+/// A window needs `SEQ_LEN + 1` tokens, so `windows = (tokens - 1) /
+/// SEQ_LEN`. Snapping rounds that window count to the nearest multiple of
+/// `epoch_splits * batch_size` and derives the byte count back from it, so
+/// the pass splits into equal events of whole batches with no remainder
+/// dropped anywhere.
+///
+/// Snapping to a multiple of `batch_size` does make the staged corpus
+/// depend on the batch size, so two runs at different batch sizes stage
+/// corpora differing by under one event. Nothing is excluded (the staged
+/// corpus IS the dataset) but the shuffle differs, which is why the run
+/// reports the geometry it settled on rather than assuming it.
+pub(super) fn resolve_train_corpus(cfg: &DatasetConfig) -> TrainCorpus {
+    let requested_tokens = cfg.train_tokens.unwrap_or(OLMO_TRAIN_BYTES / 2);
+    let multiple = (cfg.epoch_splits.max(1) * cfg.batch_size.max(1)) as u64;
+    let seq = SEQ_LEN as u64;
+
+    let want = requested_tokens.saturating_sub(1) / seq;
+    // Nearest multiple, but never zero: a corpus has to hold one event.
+    let windows = (((want + multiple / 2) / multiple) * multiple).max(multiple);
+    let staged_tokens = windows * seq + 1;
+
+    let corpus = TrainCorpus {
+        bytes: staged_tokens * 2,
+        windows: windows as usize,
+        requested_tokens,
+        staged_tokens,
+    };
+    corpus.announce_once();
+    corpus
+}
+
 pub(super) fn make_dataset(cfg: &DatasetConfig) -> Result<Arc<dyn BatchDataSet>> {
-    let shard = ensure_olmo_train(&cfg.data_dir)?;
+    let corpus = resolve_train_corpus(cfg);
+    let shard = ensure_olmo_train(&cfg.data_dir, corpus.bytes)?;
     Ok(Arc::new(TokenShards::open_raw(&[shard], TokenDtype::U16, SEQ_LEN)?))
 }
 
@@ -247,5 +326,95 @@ impl Module for Olmo {
 
     fn set_training(&self, _mode: bool) {
         // All OLMo-150M dropout rates are 0.0; nothing is mode-dependent.
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+    use crate::models::DataSource;
+
+    fn cfg(train_tokens: Option<u64>, epoch_splits: usize, batch_size: usize) -> DatasetConfig {
+        DatasetConfig {
+            seed: 42,
+            data_dir: std::path::PathBuf::from("data"),
+            virtual_len: 0,
+            pool_size: 0,
+            data_source: DataSource::Ram,
+            train_tokens,
+            epoch_splits,
+            batch_size,
+        }
+    }
+
+    /// The staged byte count must yield exactly the promised window count.
+    /// The launcher sizes the coordinator's ledger from `windows` while the
+    /// ranks open the real shard; a round-trip that loses a window is a
+    /// silent partition mismatch.
+    #[test]
+    fn bytes_round_trip_to_the_promised_window_count() {
+        for (tokens, splits, bs) in
+            [(20_000_000u64, 20usize, 4usize), (2_097_152, 1, 4), (500_000, 7, 8), (1_000, 1, 1)]
+        {
+            let c = resolve_train_corpus(&cfg(Some(tokens), splits, bs));
+            let from_bytes = ((c.bytes / 2 - 1) / SEQ_LEN as u64) as usize;
+            assert_eq!(
+                from_bytes, c.windows,
+                "tokens={tokens} splits={splits} bs={bs}: bytes imply {from_bytes} windows, \
+                 corpus promised {}",
+                c.windows,
+            );
+        }
+    }
+
+    #[test]
+    fn a_pass_divides_into_whole_batched_events() {
+        for (tokens, splits, bs) in
+            [(20_000_000u64, 20usize, 4usize), (2_097_152, 1, 4), (500_000, 7, 8), (77, 3, 5)]
+        {
+            let c = resolve_train_corpus(&cfg(Some(tokens), splits, bs));
+            assert_eq!(
+                c.windows % (splits * bs),
+                0,
+                "tokens={tokens} splits={splits} bs={bs} left {} windows over",
+                c.windows % (splits * bs),
+            );
+        }
+    }
+
+    #[test]
+    fn snapping_lands_on_the_nearest_corpus() {
+        // 20M tokens at seq 256 wants 78,124 windows; the multiple is 80,
+        // and 78,124 / 80 = 976.55, so the nearest is 977 * 80 = 78,160.
+        let c = resolve_train_corpus(&cfg(Some(20_000_000), 20, 4));
+        assert_eq!(c.windows, 78_160);
+        assert_eq!(c.staged_tokens, 78_160 * 256 + 1);
+        assert!(c.was_snapped());
+    }
+
+    #[test]
+    fn a_corpus_that_already_divides_is_left_alone() {
+        let exact = resolve_train_corpus(&cfg(Some(20_000_000), 20, 4));
+        let again = resolve_train_corpus(&cfg(Some(exact.staged_tokens), 20, 4));
+        assert_eq!(again.windows, exact.windows);
+        assert!(!again.was_snapped(), "a snapped corpus must be a fixed point");
+    }
+
+    #[test]
+    fn a_tiny_request_still_yields_one_whole_event() {
+        // Never round down to an empty corpus.
+        let c = resolve_train_corpus(&cfg(Some(1), 20, 4));
+        assert_eq!(c.windows, 80);
+        assert!(c.windows >= 20 * 4);
+    }
+
+    #[test]
+    fn the_default_corpus_is_the_shipped_slice_snapped() {
+        let c = resolve_train_corpus(&cfg(None, 1, 4));
+        assert_eq!(c.requested_tokens, OLMO_TRAIN_BYTES / 2);
+        assert_eq!(c.windows % 4, 0);
+        // 4 MiB is 2,097,152 tokens = 8191 windows + 1 spare token; the
+        // snap to a multiple of 4 lands on 8192.
+        assert_eq!(c.windows, 8192);
     }
 }

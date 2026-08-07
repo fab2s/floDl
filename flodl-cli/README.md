@@ -121,7 +121,7 @@ for the full command surface.
 ### In the flodl source checkout specifically
 
 The flodl repo ships its own `fdl.yml` with commands like `fdl test`,
-`fdl cuda-test`, `fdl clippy`, `fdl shell`, and the `fdl ddp-bench`
+`fdl gpu-test`, `fdl clippy`, `fdl shell`, and the `fdl ddp-bench`
 sub-project for DDP validation runs. These are concrete examples of the
 manifest format, not built into the CLI. Your scaffolded project starts
 with a minimal `fdl.yml` and grows its own command set as needed.

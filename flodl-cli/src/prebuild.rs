@@ -615,7 +615,7 @@ fn prebuild_one_worker(
     // `arch:` basename → cargo --features (`cuda` for GPU variants, none
     // for `cpu`). The compose SERVICE is `controller.docker` (above),
     // not arch-derived — the controller's toolchain builds every host.
-    let (features_arg, _) = features_and_service_from_arch(arch);
+    let features_arg = features_from_arch(arch);
     let cuda_version_for_image = cuda_version_from_arch(arch);
     // Key the target dir by host AND arch. Host alone is not enough: the
     // `arch:` field selects the libtorch variant, but in docker mode that
@@ -751,13 +751,7 @@ fn prebuild_one_worker(
             feat = if features_arg.is_empty() { "(none)" } else { features_arg },
         ));
     }
-    // Runtime LD_LIBRARY_PATH uses the REMOTE-side view: the rank
-    // exec's the binary on the remote, where libtorch is at
-    // `<worker.path>/libtorch/<arch>/lib` per the convention.
-    let runtime_lib = format!(
-        "{path}/libtorch/{arch}/lib",
-        path = worker.path.trim_end_matches('/'),
-    );
+    let runtime_lib = runtime_ld_library_path(&worker.path, arch);
     let _ = host_path; // controller-side path used only for the build above
     // cwd_subpath: the cmd's filesystem cwd relative to project_root.
     // For `fdl ddp-bench` invoked from the repo, cmd_cwd is
@@ -774,23 +768,58 @@ fn prebuild_one_worker(
     })
 }
 
-/// Pick cargo features + docker compose service from the host's
-/// libtorch `.arch` metadata. `cuda=12.x` → (`cuda`, `cuda`); anything
-/// else → (`""`, `dev`).
-/// Derive `(cargo --features arg, docker-compose service name)` from
-/// the YAML `arch:` path basename. The yml `arch:` IS the single
-/// source of truth (no `.arch` metadata file required) — `cpu` is the
-/// only non-CUDA convention; everything else is a GPU variant.
-fn features_and_service_from_arch(arch: &str) -> (&'static str, &'static str) {
-    let basename = std::path::Path::new(arch)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if basename == "cpu" {
-        ("", "dev")
-    } else {
-        ("cuda", "cuda")
-    }
+/// The cargo `--features` argument for a host, from its YAML `arch:`
+/// path. `""` for a CPU-only variant, otherwise the vendor's feature.
+///
+/// Delegates to [`crate::libtorch::detect::variant_feature`] so the
+/// naming convention has one home. The predecessor returned `("cuda",
+/// "cuda")` for **every** non-`cpu` basename, which silently derived a
+/// CUDA build for an AMD host the moment a `builds/gfx1030` variant
+/// existed.
+///
+/// It also returned a docker-compose service name that no caller ever
+/// used: the service is `controller.docker` (the controller owns one
+/// build toolchain and compiles every host's binary in it), so the
+/// arch-derived half was dead. Dropped rather than extended.
+fn features_from_arch(arch: &str) -> &'static str {
+    crate::libtorch::detect::variant_feature(arch)
+}
+
+/// Runtime `LD_LIBRARY_PATH` for a remote rank, in the REMOTE-side view:
+/// the rank execs the binary on the remote, where libtorch lives at
+/// `<worker.path>/libtorch/<arch>/lib` per the convention.
+///
+/// **D1a: on ROCm the SYSTEM runtime must come FIRST**, ahead of
+/// libtorch's own lib dir. libtorch-rocm bundles the ENTIRE userspace
+/// ROCm stack (libamdhip64, libhsa-runtime64, libamd_comgr, librocm-core,
+/// and the kernel-interface-coupled libdrm / libdrm_amdgpu / libnuma), so
+/// with libtorch first that bundle wins over the host's — and when it
+/// disagrees with the host's amdkfd driver the rank segfaults at its
+/// FIRST GPU OP, a failure that looks nothing like a library-path
+/// problem. Same ordering as `Dockerfile.rocm`, whose comment carries the
+/// full derivation.
+///
+/// A path that does not exist is skipped by the loader, so prefixing is
+/// harmless on a host without ROCm there. `/opt/rocm` is the convention;
+/// a host installing elsewhere overrides via
+/// `worker.env: { LD_LIBRARY_PATH: ... }`.
+///
+/// Split out from the build path so the ordering is testable without a
+/// cluster — it is exactly the kind of load-bearing detail that rots
+/// silently when only an integration path exercises it.
+fn runtime_ld_library_path(worker_path: &str, arch: &str) -> String {
+    let libtorch_lib = format!(
+        "{path}/libtorch/{arch}/lib",
+        path = worker_path.trim_end_matches('/'),
+    );
+    // `/opt/rocm/lib` as a literal, not this box's resolved directory:
+    // the path is composed for the REMOTE host, whose ROCm root (and
+    // lib-vs-lib64 layout) our environment knows nothing about.
+    crate::libtorch::detect::ld_library_path_value(
+        crate::libtorch::detect::variant_vendor(arch),
+        &libtorch_lib,
+        "/opt/rocm/lib",
+    )
 }
 
 /// Extract a CUDA major.minor string from a `precompiled/cuNN` arch
@@ -798,6 +827,12 @@ fn features_and_service_from_arch(arch: &str) -> (&'static str, &'static str) {
 /// builds (`builds/sm…`) where the arch alone does not encode a CUDA
 /// version — the caller falls back to the `CUDA_VERSION` env var (or
 /// docker-compose's own default) for the toolkit image tag.
+///
+/// Deliberately CUDA-only: it feeds the NVIDIA toolkit image tag. A
+/// `rocm70` or `gfx…` basename returns `None` for free (neither starts
+/// with `cu`). ROCm needs no sibling: its compose service pins the
+/// runtime version in the image itself (`ROCM_VERSION` build arg),
+/// rather than deriving a toolkit tag from the libtorch variant.
 fn cuda_version_from_arch(arch: &str) -> Option<String> {
     let basename = std::path::Path::new(arch)
         .file_name()
@@ -895,33 +930,59 @@ mod tests {
     }
 
     #[test]
-    fn features_and_service_precompiled_cuda_picks_cuda() {
+    fn features_from_arch_picks_the_variant_vendor() {
+        assert_eq!(features_from_arch("precompiled/cu128"), "cuda");
+        assert_eq!(features_from_arch("builds/sm61-sm120"), "cuda");
+        assert_eq!(features_from_arch("builds/sm80"), "cuda");
+        assert_eq!(features_from_arch("precompiled/cpu"), "");
+    }
+
+    #[test]
+    fn runtime_ld_path_is_libtorch_only_on_nvidia_and_cpu() {
         assert_eq!(
-            features_and_service_from_arch("precompiled/cu128"),
-            ("cuda", "cuda")
+            runtime_ld_library_path("/home/me/rdl", "precompiled/cu128"),
+            "/home/me/rdl/libtorch/precompiled/cu128/lib"
+        );
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl", "builds/sm61-sm120"),
+            "/home/me/rdl/libtorch/builds/sm61-sm120/lib"
+        );
+        assert_eq!(
+            runtime_ld_library_path("/home/me/rdl", "precompiled/cpu"),
+            "/home/me/rdl/libtorch/precompiled/cpu/lib"
         );
     }
 
     #[test]
-    fn features_and_service_precompiled_cpu_picks_dev() {
+    fn runtime_ld_path_puts_system_rocm_first_on_amd() {
+        // D1a. The ORDER is the whole point: libtorch-rocm ships its own
+        // copy of the userspace ROCm stack, and letting it win over the
+        // host's segfaults at the first GPU op.
+        for arch in ["precompiled/rocm70", "builds/gfx1030-gfx1100"] {
+            let p = runtime_ld_library_path("/home/me/rdl", arch);
+            assert!(
+                p.starts_with("/opt/rocm/lib:"),
+                "system ROCm must come first, got {p}"
+            );
+            assert!(p.ends_with(&format!("/libtorch/{arch}/lib")), "got {p}");
+        }
+    }
+
+    #[test]
+    fn runtime_ld_path_normalizes_a_trailing_slash_in_worker_path() {
         assert_eq!(
-            features_and_service_from_arch("precompiled/cpu"),
-            ("", "dev")
+            runtime_ld_library_path("/home/me/rdl/", "precompiled/cu128"),
+            "/home/me/rdl/libtorch/precompiled/cu128/lib"
         );
     }
 
     #[test]
-    fn features_and_service_source_build_picks_cuda() {
-        // Source builds under `builds/<gpu-arch>` are CUDA by
-        // convention; only `cpu` basename is non-CUDA.
-        assert_eq!(
-            features_and_service_from_arch("builds/sm61-sm120"),
-            ("cuda", "cuda")
-        );
-        assert_eq!(
-            features_and_service_from_arch("builds/sm80"),
-            ("cuda", "cuda")
-        );
+    fn features_from_arch_no_longer_calls_an_amd_variant_cuda() {
+        // The regression this replaced: the predecessor returned "cuda"
+        // for EVERY non-`cpu` basename, so the first `builds/gfx1030`
+        // host would have been silently cross-built for NVIDIA.
+        assert_eq!(features_from_arch("builds/gfx1030-gfx1100"), "rocm");
+        assert_eq!(features_from_arch("precompiled/rocm63"), "rocm");
     }
 
     #[test]

@@ -397,7 +397,7 @@ flowchart TB
         N3 -->|"no: whole cohort idle"| N4["return after ONE collective<br/>consensus already holds"]
         N3 -->|yes| N5["PARAM collective<br/>all_reduce_premul_sum<br/>factor = n^γ / Σn^γ"]
         N5 --> N6["BUFFER collective<br/>only if f32 buffers exist<br/>factor = mover / Σmover"]
-        N6 --> N7["Worker: record CudaEvent<br/>SyncAck { divergence, pre/post_norm }"]
+        N6 --> N7["Worker: record GpuEvent<br/>SyncAck { divergence, pre/post_norm }"]
         N7 --> N8["finish_averaging_nccl<br/>INLINE at trigger"]
     end
 
@@ -688,4 +688,4 @@ detector's job, not the stall ceiling's.
 
 ---
 
-Previous: [Working in the Source Checkout](../cli/06-source-checkout.md) | Next: [Mac / Apple Silicon](../mac-apple-silicon.md)
+Previous: [Working in the Source Checkout](../cli/06-source-checkout.md) | Next: [Windows / WSL2](../windows-wsl.md)

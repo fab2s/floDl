@@ -258,6 +258,7 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
 ///                      = <host.path>/libtorch/<host.arch>     (overlay)
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
+///   FDL_GPU_FEATURE   = the cargo feature the active variant needs
 fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
@@ -268,7 +269,92 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     ));
 
     if let Some((info, host_path)) = resolve_libtorch(project_root)? {
-        env.push(("LIBTORCH_HOST_PATH".into(), host_path));
+        env.push(("LIBTORCH_HOST_PATH".into(), host_path.clone()));
+
+        // Native commands: fill what the docker services get from their
+        // compose env, so the scaffold's printed next steps
+        // (`./fdl libtorch download --cpu` then `./fdl build` then
+        // `./fdl run`) are true without hand exports. `LIBTORCH_PATH`
+        // is what flodl-sys's build.rs consumes (fill-when-absent: the
+        // inherited value is build.rs's documented manual override and
+        // keeps the last word); `LD_LIBRARY_PATH` is what lets the
+        // linked binary load at runtime, vendor-ordered — on ROCm the
+        // system runtime must precede libtorch's bundled copy.
+        let abs_path = if Path::new(&host_path).is_relative() {
+            project_root.join(&host_path).display().to_string()
+        } else {
+            host_path
+        };
+        if std::env::var_os("LIBTORCH_PATH").is_none() {
+            env.push(("LIBTORCH_PATH".into(), abs_path.clone()));
+        }
+        let lib = format!("{abs_path}/lib");
+        let inherited = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        if !inherited.split(':').any(|p| p == lib) {
+            let value = crate::libtorch::detect::ld_library_path_value(
+                crate::libtorch::detect::variant_vendor(&info.path),
+                &lib,
+                &crate::libtorch::detect::local_rocm_lib_dir(),
+            );
+            let composed = if inherited.is_empty() {
+                value
+            } else {
+                format!("{value}:{inherited}")
+            };
+            env.push(("LD_LIBRARY_PATH".into(), composed));
+        }
+
+        // macOS: bake the runtime search path into the BINARY, because
+        // neither of the two obvious fixes works here.
+        //
+        // Its loader ignores `LD_LIBRARY_PATH` entirely, so everything
+        // above is inert there and a scaffolded project builds and then
+        // dies with `dyld: Library not loaded: @rpath/libtorch.dylib`.
+        // The apparent fix, exporting `DYLD_LIBRARY_PATH` beside it, does
+        // not survive: run lines execute through `sh -c`, /bin/sh is SIP
+        // restricted, and dyld purges every `DYLD_*` from a restricted
+        // process before the shell ever execs the binary. The other
+        // apparent fix, an rpath from `flodl-sys`'s build script, does not
+        // reach here either -- `cargo:rustc-link-arg` does not propagate
+        // to dependents (the same property that forces the libtorch_cuda
+        // dlopen).
+        //
+        // RUSTFLAGS is neither: SIP has no opinion on it, and it applies
+        // to the final link of whatever cargo is building. The binary
+        // then locates libtorch on its own, which also means it still
+        // runs when launched directly rather than through `fdl run`.
+        //
+        // Fill-when-absent, like LIBTORCH_PATH above: a caller's own
+        // RUSTFLAGS is theirs, and appending to it would silently change
+        // a build they had configured. Linux is deliberately untouched --
+        // LD_LIBRARY_PATH already works there, and setting RUSTFLAGS
+        // would invalidate every existing cargo cache for no gain.
+        if cfg!(target_os = "macos") && std::env::var_os("RUSTFLAGS").is_none() {
+            env.push((
+                "RUSTFLAGS".into(),
+                format!("-C link-arg=-Wl,-rpath,{lib}"),
+            ));
+        }
+
+        // The cargo feature this variant needs, so a `run:` line can say
+        // `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+        // Run lines execute under `bash -c` / `sh -c`, so the expansion
+        // is the shell's; this just has to be in the child's env.
+        //
+        // Defaults to `cuda` when no variant resolves, which reproduces
+        // exactly what the hardcoded `--features cuda` did before: a GPU
+        // command with no GPU libtorch fails the same way it always has,
+        // rather than failing differently in a way nobody recognises.
+        // `source::build_env` (join/publish recipes) deliberately answers
+        // "" for the same case instead — there a CPU variant is the
+        // publish gate's advertised cheap mode, not a misconfiguration.
+        env.push((
+            "FDL_GPU_FEATURE".into(),
+            match crate::libtorch::detect::variant_vendor(&info.path) {
+                Some(v) => v.cargo_feature().to_string(),
+                None => "cuda".to_string(),
+            },
+        ));
 
         // CUDA version from .arch metadata.
         if let Some(cuda) = &info.cuda_version {
@@ -590,10 +676,102 @@ pub(crate) fn compose_run_command(
 /// here as a literal because flodl-cli is decoupled from the flodl
 /// library crate by policy (it must build without libtorch).
 fn testing_cluster_env_arg() -> String {
-    match std::env::var("FLODL_TESTING_CLUSTER_JSON") {
-        Ok(_) => " -e FLODL_TESTING_CLUSTER_JSON".to_string(),
-        Err(_) => String::new(),
+    let mut out = String::new();
+    for name in TESTING_ENV_VARS {
+        if std::env::var(name).is_ok() {
+            out.push_str(" -e ");
+            out.push_str(name);
+        }
     }
+    out
+}
+
+/// Testing env vars forwarded into a docker-compose run when present.
+///
+/// `FLODL_TESTING_CLUSTER_JSON` injects a cluster topology;
+/// `FLODL_TESTING_GPU_JSON` injects a spoofed GPU survey (source of
+/// truth: `flodl_hw::ENV_TESTING_GPU_JSON`). Both die at the docker
+/// boundary without an explicit `-e`, and both fail *silently* when
+/// they do -- the container falls back to real detection and the test
+/// quietly measures the host's actual hardware instead of the described
+/// one. Names are literals here because flodl-cli is decoupled from the
+/// flodl library crate by policy; `flodl-hw` is a dependency, so the GPU
+/// one is asserted against its constant in the tests below.
+const TESTING_ENV_VARS: &[&str] =
+    &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
+
+/// The logical `docker:` value meaning "whichever GPU container matches
+/// the active libtorch variant".
+pub const LOGICAL_GPU_SERVICE: &str = "gpu";
+
+/// Resolve a `docker:` value to a concrete docker-compose service.
+///
+/// Only `gpu` is logical; every other value passes through untouched, so
+/// `docker: cuda` and `docker: rocm` remain explicit escapes for anyone
+/// who wants to pin a container regardless of the active variant.
+///
+/// Why the container cannot simply BE vendor-neutral the way the cargo
+/// feature is: both vendors build from one source tree, so a feature is
+/// derivable, but a CUDA image (nvidia/cuda base, nvidia runtime,
+/// `/dev/nvidia*`) and a ROCm image (rocm/dev-ubuntu, `/dev/kfd` +
+/// `/dev/dri`, render group) are genuinely different artifacts. A
+/// service that declared both device sets would fail to start on a host
+/// missing either. So the service must be *selected*, and this is where.
+///
+/// The AMD arm falls back to the CUDA container **with a message** when
+/// no `rocm` service is defined. This repo and `fdl init`'s scaffolds
+/// both define one now, so the fallback is for a project whose
+/// `docker-compose.yml` predates it (or was hand-trimmed). It stays a
+/// message rather than an error because landing in the CUDA container
+/// produces the *better* diagnostic: flodl-sys then reports exactly
+/// which part of its ROCm path is missing, where compose's bare "no such
+/// service: rocm" would say less.
+pub fn resolve_docker_service(name: &str, project_root: &Path) -> String {
+    if name != LOGICAL_GPU_SERVICE {
+        return name.to_string();
+    }
+    let vendor = resolve_libtorch(project_root)
+        .ok()
+        .flatten()
+        .and_then(|(info, _)| crate::libtorch::detect::variant_vendor(&info.path));
+
+    // CONVENTION: the compose service name IS the cargo feature name
+    // (`cuda`, `rocm`). One table instead of two, and `GpuVendor` is
+    // `#[non_exhaustive]`, so a vendor added upstream resolves to a
+    // sensibly-named service here without touching this function.
+    let Some(vendor) = vendor else {
+        // No GPU variant resolved: nothing to select on. `cuda` is the
+        // historical default and its own failure is the informative one.
+        return "cuda".to_string();
+    };
+    let service = vendor.cargo_feature();
+    if service == "cuda" || compose_has_service(service, project_root) {
+        return service.to_string();
+    }
+    eprintln!(
+        "fdl: the active libtorch variant targets {vendor}, but no `{service}` \
+         docker-compose service is defined; falling back to the `cuda` container. \
+         Define a `{service}` service, or set `docker:` explicitly on the command \
+         to silence this."
+    );
+    "cuda".to_string()
+}
+
+/// Whether the merged compose config defines `service`.
+///
+/// One subprocess, and only on the AMD path -- an NVIDIA host never pays
+/// for it.
+fn compose_has_service(service: &str, project_root: &Path) -> bool {
+    std::process::Command::new("docker")
+        .args(["compose", "config", "--services"])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.trim() == service)
+        })
 }
 
 pub fn exec_script(
@@ -612,6 +790,7 @@ pub fn exec_script(
             // don't escape the inner shell.
             let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
             let testing_env_arg = testing_cluster_env_arg();
+            let service = resolve_docker_service(service, cwd);
             let docker_cmd = format!(
                 "docker compose{overlay} run --rm{testing_env_arg} {service} bash -c {}",
                 posix_quote(&inner_cmd)
@@ -625,8 +804,25 @@ pub fn exec_script(
                 ("sh", "-c")
             };
 
-            match std::process::Command::new(shell)
-                .args([flag, inner_cmd.as_str()])
+            // The same libtorch env the docker path gets (via the
+            // compose `environment:` passthrough): a native `run:` line
+            // saying `--features "$FDL_GPU_FEATURE"` was silently
+            // getting an empty variable, which broke the scaffolded
+            // gpu-* commands in `fdl init --native` projects — for both
+            // vendors.
+            let env_vars = match libtorch_env(cwd) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("fdl: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut cmd = std::process::Command::new(shell);
+            cmd.args([flag, inner_cmd.as_str()]);
+            for (key, val) in &env_vars {
+                cmd.env(key, val);
+            }
+            match cmd
                 .current_dir(cwd)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -718,7 +914,10 @@ pub fn exec_command(
     let use_docker = cmd_config.docker.is_some() && !inside_docker();
 
     if use_docker {
-        let service = cmd_config.docker.as_deref().unwrap();
+        let service = resolve_docker_service(
+            cmd_config.docker.as_deref().unwrap(),
+            project_root,
+        );
         let workdir = cmd_dir
             .strip_prefix(project_root)
             .unwrap_or(cmd_dir)
@@ -732,7 +931,7 @@ pub fn exec_command(
         // regardless of the service's own `working_dir:`. Falls back
         // to `/workspace` (the fdl init convention) when the compose
         // file is missing or silent on this service.
-        let container_root = container_project_root(project_root, service);
+        let container_root = container_project_root(project_root, &service);
         let args_str = shell_join(&args);
         let inner = if workdir.is_empty() || workdir == "." {
             format!("{entry} {args_str}")
@@ -785,9 +984,22 @@ pub fn exec_command(
             eprintln!("fdl: {entry} {}", preview.join(" "));
         }
 
-        match std::process::Command::new(program)
-            .args(entry_args)
-            .args(&args)
+        // Same libtorch env as the docker path — see exec_script's
+        // native arm for why (a native entry saying
+        // `--features "$FDL_GPU_FEATURE"` got nothing before).
+        let env_vars = match libtorch_env(project_root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("fdl: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(entry_args).args(&args);
+        for (key, val) in &env_vars {
+            cmd.env(key, val);
+        }
+        match cmd
             .current_dir(cmd_dir)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2089,5 +2301,43 @@ mod tests {
         std::fs::create_dir_all(&bogus).unwrap();
         assert!(resolve_libtorch_at(&bogus).is_none(),
             "dir without lib/, .active, or pointer-shape filename → None");
+    }
+
+    #[test]
+    fn resolve_docker_service_passes_explicit_names_through() {
+        // Only `gpu` is logical. An explicit pin must survive untouched,
+        // including one naming a service that does not exist yet --
+        // resolving it would defeat the point of pinning.
+        let root = Path::new("/nonexistent");
+        for name in ["cuda", "rocm", "dev", "bench", "something-custom"] {
+            assert_eq!(resolve_docker_service(name, root), name, "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_docker_service_falls_back_when_no_variant_resolves() {
+        // No libtorch under this root, so nothing to select on: `cuda`
+        // is the historical default and its own failure is the
+        // informative one.
+        assert_eq!(
+            resolve_docker_service(LOGICAL_GPU_SERVICE, Path::new("/nonexistent")),
+            "cuda",
+        );
+    }
+
+    #[test]
+    fn testing_env_var_names_match_their_source_of_truth() {
+        // The names are literals here (flodl-cli is decoupled from the
+        // flodl library by policy). flodl-hw IS a dependency, so at
+        // least that one can be pinned to its constant rather than
+        // trusted. A rename there would otherwise silently stop the
+        // forward, and the container would fall back to real hardware
+        // while the test still passed.
+        assert!(
+            TESTING_ENV_VARS.contains(&flodl_hw::ENV_TESTING_GPU_JSON),
+            "flodl_hw::ENV_TESTING_GPU_JSON = {:?} is not forwarded into docker; \
+             TESTING_ENV_VARS = {TESTING_ENV_VARS:?}",
+            flodl_hw::ENV_TESTING_GPU_JSON,
+        );
     }
 }

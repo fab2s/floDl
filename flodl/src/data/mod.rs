@@ -42,14 +42,16 @@
 pub mod sampler;
 pub mod loader;
 pub mod datasets;
+pub mod host_cache;
 pub mod records;
 pub(crate) mod budget;
 pub(crate) mod prefetch;
 pub(crate) mod sample_cache;
 pub(crate) mod vram_pool;
 
-pub use sampler::{Sampler, RandomSampler, SequentialSampler};
+pub use sampler::{Sampler, RandomSampler, SequentialSampler, SplitSampler};
 pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
+pub use host_cache::{data_cache_dir, publish_atomically, resolve_cached, write_error};
 pub use records::FixedStrideRecords;
 pub(crate) use budget::prefetch_depth_from_vram;
 

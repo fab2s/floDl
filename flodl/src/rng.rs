@@ -106,6 +106,74 @@ pub(crate) fn epoch_permutation(seed: u64, epoch: usize, picks: usize) -> Vec<us
     all
 }
 
+/// Where one split lives inside its data pass: `(start, len)` into the
+/// pass permutation.
+///
+/// `event` counts training events over the whole run, so `event /
+/// splits` names the data pass and `event % splits` the slice within
+/// it. Only the slice matters here — the pass index is what
+/// [`epoch_permutation`] consumes.
+///
+/// Sizes are balanced: the first `picks % splits` splits carry one
+/// extra pick. The alternative (last split absorbs the whole
+/// remainder, as `ChunkPool` does for per-rank spans) is equivalent
+/// when splits are few, but a split length IS the reduce-window bound
+/// and the eval interval, and at fine splitting last-absorbs makes the
+/// final one several times every other — `picks = 2047, splits = 100`
+/// gives a 67-pick tail against 20-pick siblings. Balanced keeps every
+/// event the same size to within one pick.
+///
+/// # Panics
+/// Panics if `splits == 0`.
+pub(crate) fn epoch_split_span(event: usize, splits: usize, picks: usize) -> (usize, usize) {
+    assert!(splits > 0, "epoch splits must be >= 1, got 0");
+    let split = event % splits;
+    let base = picks / splits;
+    let extra = picks % splits;
+    // Splits before this one each took `base`, and the first `extra` of
+    // them took one more.
+    let start = split * base + split.min(extra);
+    (start, base + usize::from(split < extra))
+}
+
+/// One split of the epoch permutation: the `event`-th slice of a
+/// contiguous partition of [`epoch_permutation`].
+///
+/// `splits` separates the two meanings "epoch" used to fuse — a full
+/// pass over the data, and a periodic event during training. The pass
+/// permutation is unchanged and still covers every pick exactly once;
+/// splitting only decides how much of it one event consumes.
+/// Concatenating events `p * splits .. (p + 1) * splits` reproduces
+/// pass `p` exactly, so splits are disjoint and jointly complete by
+/// construction — a run gains interior boundaries without seeing any
+/// sample twice.
+///
+/// Every consumer that keys off the epoch boundary (the `window <=
+/// epoch` reduce cap, eval cadence, checkpointing, coverage resume)
+/// inherits the finer boundary with no further plumbing, which is what
+/// makes a single-pass run checkpointable and evaluable at all.
+///
+/// At `splits = 1` this is `epoch_permutation(seed, event, picks)` byte
+/// for byte, so defaults reproduce shipped runs exactly.
+///
+/// Cost is one full shuffle per event rather than per pass. Callers
+/// stepping many splits over a large corpus can hold the pass
+/// permutation across events of the same pass and slice it with
+/// [`epoch_split_span`] instead.
+///
+/// # Panics
+/// Panics if `splits == 0`.
+pub(crate) fn epoch_split_permutation(
+    seed: u64,
+    event: usize,
+    splits: usize,
+    picks: usize,
+) -> Vec<usize> {
+    let (start, len) = epoch_split_span(event, splits, picks);
+    let all = epoch_permutation(seed, event / splits, picks);
+    all[start..start + len].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +308,94 @@ mod tests {
         let mut expected: Vec<usize> = (0..n).collect();
         rng.shuffle(&mut expected);
         assert_eq!(epoch_permutation(seed, epoch, n), expected);
+    }
+
+    #[test]
+    fn one_split_is_the_unsplit_scheme() {
+        // The default must reproduce shipped runs, event for event.
+        for event in 0..6 {
+            assert_eq!(
+                epoch_split_permutation(42, event, 1, 100),
+                epoch_permutation(42, event, 100),
+                "event {event}"
+            );
+        }
+        assert_eq!(epoch_split_span(3, 1, 100), (0, 100));
+    }
+
+    #[test]
+    fn splits_of_a_pass_concatenate_to_the_pass() {
+        // Disjointness, coverage AND ordering in one assert: the splits
+        // of pass `p` are that pass's permutation, cut in place.
+        let (seed, picks, splits, pass) = (42u64, 100usize, 7usize, 2usize);
+        let mut cat = Vec::new();
+        for split in 0..splits {
+            cat.extend(epoch_split_permutation(seed, pass * splits + split, splits, picks));
+        }
+        assert_eq!(cat, epoch_permutation(seed, pass, picks));
+    }
+
+    #[test]
+    fn split_sizes_are_balanced_and_contiguous() {
+        let (picks, splits) = (100usize, 7usize);
+        // 100 / 7 = 14 r 2 → the first two splits carry the remainder.
+        let sizes: Vec<usize> =
+            (0..splits).map(|s| epoch_split_span(s, splits, picks).1).collect();
+        assert_eq!(sizes, vec![15, 15, 14, 14, 14, 14, 14]);
+
+        let mut at = 0;
+        for split in 0..splits {
+            let (start, len) = epoch_split_span(split, splits, picks);
+            assert_eq!(start, at, "split {split} must start where the previous ended");
+            at += len;
+        }
+        assert_eq!(at, picks, "splits must cover the pass exactly");
+    }
+
+    #[test]
+    fn split_sizes_stay_balanced_when_the_pass_divides_evenly() {
+        let sizes: Vec<usize> = (0..4).map(|s| epoch_split_span(s, 4, 100).1).collect();
+        assert_eq!(sizes, vec![25, 25, 25, 25]);
+    }
+
+    #[test]
+    fn splits_more_numerous_than_picks_degrade_gracefully() {
+        // Degenerate but not wrong: three picks, five events. The
+        // trailing events are empty rather than the last one hoarding.
+        let sizes: Vec<usize> = (0..5).map(|s| epoch_split_span(s, 5, 3).1).collect();
+        assert_eq!(sizes, vec![1, 1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn crossing_splits_starts_a_new_pass() {
+        let (seed, picks, splits) = (42u64, 100usize, 4usize);
+        // event 0 and event `splits` are both split 0, of pass 0 and 1.
+        assert_eq!(epoch_split_span(0, splits, picks), epoch_split_span(splits, splits, picks));
+        assert_ne!(
+            epoch_split_permutation(seed, 0, splits, picks),
+            epoch_split_permutation(seed, splits, splits, picks),
+        );
+    }
+
+    #[test]
+    fn split_permutation_is_deterministic() {
+        let a = epoch_split_permutation(7, 11, 5, 250);
+        let b = epoch_split_permutation(7, 11, 5, 250);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "epoch splits must be >= 1")]
+    fn zero_splits_panics() {
+        epoch_split_span(0, 0, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "epoch splits must be >= 1")]
+    fn zero_splits_panics_before_dividing_by_it() {
+        // The span check must run ahead of `event / splits`, or the
+        // caller gets a bare divide-by-zero instead of the reason.
+        epoch_split_permutation(42, 3, 0, 100);
     }
 
     #[test]

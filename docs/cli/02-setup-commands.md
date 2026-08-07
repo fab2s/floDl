@@ -18,8 +18,13 @@ The wizard handles tricky scenarios automatically:
 - **No GPU?** Downloads CPU libtorch.
 - **Volta+ GPUs (sm_70+)?** Downloads cu128.
 - **Pre-Volta GPUs (sm_50-sm_61)?** Downloads cu126.
-- **Mixed GPUs (old + new)?** Offers to build from source or pick the best
-  pre-built variant.
+- **Mixed NVIDIA GPUs (old + new)?** Offers to build from source or pick the
+  best pre-built variant.
+- **AMD GPUs?** Downloads the ROCm 7.0 build when the card is one it ships
+  kernels for, otherwise says which targets are covered and stays on CPU.
+- **Both NVIDIA and AMD?** One libtorch build serves one vendor, so the NVIDIA
+  cards are set up and the AMD ones are left to an explicit
+  `fdl libtorch download --rocm 7.0`.
 
 ## `fdl libtorch`
 
@@ -36,29 +41,76 @@ fdl libtorch download              # auto-detect GPU, pick best variant
 fdl libtorch download --cpu        # force CPU-only (~200MB)
 fdl libtorch download --cuda 12.8  # CUDA 12.8 / cu128 (~2GB)
 fdl libtorch download --cuda 12.6  # CUDA 12.6 / cu126 (~2GB)
+fdl libtorch download --rocm 7.0   # AMD ROCm 7.0 (~5GB, Linux only)
+fdl libtorch download --rocm 7.1   # AMD ROCm 7.1 (same GPUs, newer runtime)
 fdl libtorch download --path ~/lib # install to a custom directory
 fdl libtorch download --no-activate # install but do not switch `.active`
 fdl libtorch download --dry-run    # show what would happen
 ```
 
-`--cuda` only accepts `12.6` or `12.8` (the published pre-built
-versions). Auto-completion offers both.
+`--cuda` only accepts `12.6` or `12.8` and `--rocm` only `7.0` or `7.1`
+(the published pre-built versions). Auto-completion offers each.
 
 **Variant coverage:**
 
-| Variant | Architectures  | GPUs                              |
-|---------|----------------|-----------------------------------|
-| CPU     | -              | Any (no GPU acceleration)          |
-| cu126   | sm_50 to sm_90 | Maxwell through Ada Lovelace      |
-| cu128   | sm_70 to sm_120 | Volta through Blackwell          |
+| Variant | Architectures   | GPUs                                    |
+|---------|-----------------|-----------------------------------------|
+| CPU     | -               | Any (no GPU acceleration)               |
+| cu126   | sm_50 to sm_90  | Maxwell through Ada Lovelace            |
+| cu128   | sm_70 to sm_120 | Volta through Blackwell                 |
+| rocm70  | gfx908 to gfx1201 | CDNA 1-4 (MI100/MI200/MI300/MI350), RDNA 2-4 incl. Strix APUs |
+| rocm71  | same as rocm70  | same as rocm70, newer HIP runtime        |
 
-If your GPUs span both ranges (e.g. GTX 1060 + RTX 5060 Ti), no single
-pre-built variant covers both. Use `fdl libtorch build` instead.
+A libtorch build serves exactly one vendor, so there is no variant
+covering both an NVIDIA and an AMD card in one process. On a box holding
+both, auto-detect picks the NVIDIA cards and prints the `--rocm` line to
+use instead.
+
+**Which ROCm version.** The two ROCm variants reach exactly the same
+cards, so the choice is about the runtime. flodl puts the host's own
+ROCm ahead of the bundled one on `LD_LIBRARY_PATH` (a bundled HIP
+runtime that disagrees with the host's kernel driver segfaults at the
+first GPU op), and within a major version that ABI only grows: a bundle
+older than the host loads, a newer one can fail on a symbol the host
+does not have. So auto-detect picks **7.0**, which serves every ROCm 7.x
+host, and `--rocm 7.1` is there for a host that wants the exact match.
+
+The ROCm archive ships pre-built rocBLAS kernels for a fixed gfx list:
+
+```
+gfx908 gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1101 gfx1102 gfx1150
+gfx1151 gfx1200 gfx1201
+```
+
+`gfx900` and `gfx906` (Vega 10 / Vega 20, i.e. MI50 and Radeon VII) are
+**not** on it: the archive carries MIOpen tuning databases for them but
+no rocBLAS kernels, so they are treated as uncovered rather than
+installed and left to fail at the first matmul.
+
+A card outside it has no kernels, so auto-detect stays on CPU and names
+the covered targets rather than installing something that cannot run.
+ROCm libtorch is published for Linux only; `--rocm` on Windows or macOS
+is refused with that reason.
+
+When an AMD box behaves in a way `fdl probe` / `fdl diagnose` cannot
+explain, `rocm-capture.sh` at the repo root snapshots the whole stack in
+one pass (KFD topology, ROCm userspace, device permissions, both sides
+of the container boundary) — attach its output to a bug report.
+
+If your NVIDIA GPUs span both CUDA ranges (e.g. GTX 1060 + RTX 5060 Ti),
+no single pre-built variant covers both. Use `fdl libtorch build`.
 
 #### `fdl libtorch build`
 
 Compile libtorch from PyTorch source for your exact GPU combination.
-Takes 2-6 hours depending on CPU cores. Two build methods are available:
+Takes 2-6 hours depending on CPU cores.
+
+This is a **CUDA-only** path: `--archs` takes compute capabilities and the
+toolchain expects nvcc. AMD is served by the pre-built `--rocm 7.0`
+download, which already covers every gfx target upstream builds kernels
+for; there is no source-build equivalent.
+
+Two build methods are available:
 
 - **Docker** (default when available) - isolated, reproducible, resumes
   via layer caching. Requires Docker.
@@ -118,6 +170,18 @@ Archs:    6.1 12.0
 Source:   compiled
 ```
 
+The same fields describe an AMD variant, with `CUDA: none` (the field is
+the CUDA toolkit version, which a ROCm build has none of) and gfx targets
+in `Archs`:
+
+```
+Active:   precompiled/rocm70
+Version:  2.10.0
+CUDA:     none
+Archs:    gfx906 gfx908 gfx90a gfx942 gfx1030 gfx1100 gfx1101 gfx1102 gfx1200 gfx1201
+Source:   precompiled
+```
+
 #### Using `fdl` as a standalone libtorch manager (tch-rs / PyTorch C++)
 
 The libtorch-management and diagnostics commands are independent of
@@ -127,8 +191,13 @@ flodl and fill a gap PyTorch itself never filled: a proper installer.
 - **tch-rs projects** - download the right libtorch, point `LIBTORCH`
   at it, build. No more hand-fetching URLs from the PyTorch
   get-started page.
-- **PyTorch C++ development** - juggle CPU, CUDA 12.6, CUDA 12.8, and
-  source-built variants on the same host without symlink choreography.
+- **PyTorch C++ development** - juggle CPU, CUDA 12.6, CUDA 12.8, ROCm
+  7.0, and source-built variants on the same host without symlink
+  choreography.
+- **AMD hosts** - `fdl libtorch download --rocm 7.0` fetches the ROCm
+  build and records the gfx targets it covers, so a card with no bundled
+  kernels is caught before the build rather than at the first kernel
+  launch.
 - **Mixed-GPU systems** - when no single pre-built variant covers
   your architectures (e.g. GTX 1060 sm_61 + RTX 5060 Ti sm_120),
   `fdl libtorch build` compiles PyTorch from source with the exact
@@ -272,22 +341,27 @@ In all three modes the scaffold generates:
 - `src/main.rs` - complete training template.
 - `fdl.yml.example` - committed manifest; fdl copies it to a gitignored
   `fdl.yml` on first use. Declares `build` / `test` / `run` / `check` /
-  `clippy` (and `shell` / `cuda-shell` in Docker modes) plus the `cuda-*`
-  siblings.
+  `clippy` plus the `gpu-*` siblings (`gpu-build` / `gpu-test` /
+  `gpu-run`, all `docker: gpu` + `--features "$FDL_GPU_FEATURE"`, so one
+  manifest serves both vendors) and `shell` / `gpu-shell` in Docker
+  modes.
 - `./fdl` - self-contained bootstrap script (`./fdl install` promotes it
   to `~/.local/bin/fdl`).
-- `.gitignore`.
+- `.gitignore` and `.env.example`.
 
 Docker modes additionally generate:
 
-- `Dockerfile` / `Dockerfile.cuda` (mounted variant) or
-  `Dockerfile.cpu` / `Dockerfile.cuda` (baked variant).
-- `docker-compose.yml`.
+- `Dockerfile` / `Dockerfile.cuda` / `Dockerfile.rocm` (mounted variant)
+  or `Dockerfile.cpu` / `Dockerfile.cuda` / `Dockerfile.rocm` (baked
+  variant).
+- `docker-compose.yml`, with `dev` / `cuda` / `rocm` services; the
+  logical `docker: gpu` in fdl.yml resolves to the vendor's service
+  from the active libtorch variant.
 
 Native mode skips all the Docker files - commands run on the host. Point
 `$LIBTORCH` / `$LD_LIBRARY_PATH` at a libtorch install (use
-`./fdl libtorch download --cpu` or `--cuda 12.8`) and `./fdl build`
-dispatches straight to `cargo build`.
+`./fdl libtorch download --cpu`, `--cuda 12.8` or `--rocm 7.0`) and
+`./fdl build` dispatches straight to `cargo build`.
 
 > The scaffold is fdl-native: there is no Makefile. Every task lives in
 > `fdl.yml` and runs via `./fdl <cmd>`. Libtorch environment variables

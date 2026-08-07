@@ -101,6 +101,12 @@ pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
         || key == "CUDA_DEVICE_ORDER"
+        // The AMD masks outrank CUDA_VISIBLE_DEVICES for HIP (first one
+        // set wins), so an env-block value would silently defeat the
+        // launcher's per-rank pin — the same reservation, other vendor.
+        || key == "HIP_VISIBLE_DEVICES"
+        || key == "ROCR_VISIBLE_DEVICES"
+        || key == "GPU_DEVICE_ORDINAL"
         || key == ENV_HOST_OVERRIDE
         || key == ENV_FDL_ENV
 }
@@ -160,6 +166,31 @@ pub fn should_dispatch(project: &ProjectConfig, chain: &[Option<bool>]) -> bool 
 /// recursion guard everywhere cluster dispatch is evaluated.
 pub fn is_recursive_invocation() -> bool {
     std::env::var_os(ENV_CLUSTER_JSON).is_some()
+}
+
+/// A configured join window that this command will not open.
+///
+/// A farm overlay declares `controller.join.discovery`, but the window
+/// only opens for a command running in launcher mode, which is what
+/// `cluster: true` selects. Miss that and the command resolves against
+/// the base config and trains locally — and nothing about the run says
+/// so, because training on this box is a legitimate thing to do. Silence
+/// here reads as "my GPUs were not detected" rather than "my farm never
+/// engaged", so the mismatch is worth one line on stderr.
+///
+/// Pure: takes the merged config, returns the text. Returns `None` when
+/// there is no discovery window to miss.
+pub fn unused_join_window_hint(project: &ProjectConfig, command: &str) -> Option<String> {
+    let join = project.cluster.as_ref()?.controller.join.as_ref()?;
+    if join.discovery != Some(true) {
+        return None;
+    }
+    Some(format!(
+        "this env declares a join window (controller.join.discovery), but \
+         `{command}` is not a cluster command, so it runs HERE and no \
+         window opens. Add it to the env's `commands:` with `cluster: \
+         true` to put it in launcher mode."
+    ))
 }
 
 /// Prepare the env vars needed for the user binary's flodl launcher to
@@ -263,12 +294,12 @@ pub fn prepare_cluster_env(
 /// instead of SSHing back to ourselves.
 ///
 /// - `LocalDevices::Explicit(v)` → `v.len()`
-/// - `LocalDevices::All` → [`crate::gpus::count_visible_gpus_via_nvidia_smi`]
+/// - `LocalDevices::All` → [`crate::gpus::local_gpu_count`]
 ///   (result cached across workers since they all resolve to the same
 ///   local box in testing mode).
 ///
-/// Errors loudly on nvidia-smi failure or a 0 count (caller treats 0
-/// as misconfiguration — no GPUs visible to the test).
+/// Errors loudly when no GPU is detected, quoting the reason (caller
+/// treats 0 as misconfiguration — no GPUs visible to the test).
 fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, String> {
     let mut counts = Vec::with_capacity(cluster.workers.len());
     let mut cached_local: Option<usize> = None;
@@ -278,10 +309,10 @@ fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Stri
             config::LocalDevices::All => {
                 if cached_local.is_none() {
                     cached_local = Some(
-                        crate::gpus::count_visible_gpus_via_nvidia_smi().map_err(|e| {
+                        crate::gpus::local_gpu_count().map_err(|e| {
                             format!(
-                                "cluster.workers[{i}] ({:?}): local nvidia-smi \
-                                 probe failed: {e}",
+                                "cluster.workers[{i}] ({:?}): local GPU probe \
+                                 failed: {e}",
                                 w.host,
                             )
                         })?,
@@ -350,9 +381,10 @@ fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Str
         };
         if count == 0 {
             return Err(format!(
-                "cluster.workers[{i}] ({:?}): probed 0 CUDA devices \
+                "cluster.workers[{i}] ({:?}): probed 0 GPUs \
                  (local_devices: all). Either the host has no GPUs visible \
-                 (check nvidia-smi + CUDA_VISIBLE_DEVICES) or it's a \
+                 (NVIDIA: `nvidia-smi` and the visibility masks; AMD: \
+                 `/dev/kfd` and a loaded amdgpu driver) or it's a \
                  misconfiguration — provide an explicit `local_devices: [...]` \
                  list instead.",
                 w.host,
@@ -448,10 +480,19 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         "ConnectTimeout=5",
     ]);
     cmd.arg(target);
-    // Pipe to wc -l for a one-line numeric output; nvidia-smi's
-    // error stream is silenced so a missing driver produces "0" cleanly
-    // rather than a parse failure on stderr noise.
-    cmd.arg("nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l");
+    // Both vendors in one round trip, because "how many GPUs" is not an
+    // NVIDIA question: counting only nvidia-smi made an AMD worker probe
+    // 0 and abort the fan-out, with an error naming a tool that host
+    // does not have. Each count is piped to `wc -l` for a numeric line
+    // and each error stream is silenced, so an absent driver or an
+    // unmatched glob produces "0" rather than parse noise. The AMD side
+    // reads the KFD topology's `vendor_id 4098` (0x1002), which is
+    // flodl-hw's primary AMD gate and mask-proof by construction.
+    cmd.arg(
+        "n=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l); \
+         a=$(grep -l '^vendor_id 4098$' /sys/class/kfd/kfd/topology/nodes/*/properties \
+         2>/dev/null | wc -l); echo \"$n $a\"",
+    );
 
     let output = cmd
         .output()
@@ -464,13 +505,54 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let count_str = stdout.trim();
-    count_str.parse::<usize>().map_err(|e| {
-        format!(
-            "could not parse nvidia-smi output as device count: {e:?} \
-             (got {count_str:?})"
-        )
-    })
+    let counts = stdout.trim();
+    let (nvidia, amd) = parse_gpu_counts(counts)
+        .ok_or_else(|| format!("could not parse the remote GPU counts (got {counts:?})"))?;
+    pick_worker_count(nvidia, amd, worker.arch.as_deref(), target)
+}
+
+/// Split the two-number reply of the remote count probe.
+///
+/// Reads the LAST non-empty line: the probe echoes one, but a remote
+/// profile script that prints anything would otherwise shift the fields
+/// and turn a working host into a parse error.
+fn parse_gpu_counts(text: &str) -> Option<(usize, usize)> {
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let mut it = line.split_whitespace();
+    let nvidia = it.next()?.parse().ok()?;
+    let amd = it.next()?.parse().ok()?;
+    Some((nvidia, amd))
+}
+
+/// Reduce the per-vendor counts to the number of ranks this worker owns.
+///
+/// A libtorch build serves one vendor, so a host's rank count is the
+/// count for the vendor it will actually run, which its declared
+/// `arch:` names. Without that declaration a single-vendor host is still
+/// unambiguous, and a host reporting both is genuinely undecidable here:
+/// the controller cannot know which build that box will load, and
+/// guessing assigns ranks to devices nobody will address.
+fn pick_worker_count(
+    nvidia: usize,
+    amd: usize,
+    arch: Option<&str>,
+    target: &str,
+) -> Result<usize, String> {
+    match arch.and_then(crate::libtorch::detect::variant_vendor) {
+        Some(crate::util::system::GpuVendor::Nvidia) => return Ok(nvidia),
+        Some(crate::util::system::GpuVendor::Amd) => return Ok(amd),
+        _ => {}
+    }
+    match (nvidia, amd) {
+        (0, a) => Ok(a),
+        (n, 0) => Ok(n),
+        (n, a) => Err(format!(
+            "{target:?} reports {n} NVIDIA and {a} AMD GPU(s), and one \
+             libtorch build serves one vendor, so which of them this host \
+             trains on cannot be inferred. Declare the host's `arch:` (the \
+             libtorch variant it uses) or pin `local_devices: [...]`."
+        )),
+    }
 }
 
 /// Resolve each cluster worker's `host` to an IP via the controller's
@@ -739,6 +821,46 @@ mod tests {
     use crate::util::test_env::env_lock;
 
     #[test]
+    fn remote_gpu_counts_parse_as_a_vendor_pair() {
+        assert_eq!(parse_gpu_counts("2 0"), Some((2, 0)));
+        assert_eq!(parse_gpu_counts(" 0   8 "), Some((0, 8)));
+        // A host answering with anything else must be a loud parse
+        // failure, never a silent zero that reads as "no GPUs".
+        assert_eq!(parse_gpu_counts("2"), None);
+        assert_eq!(parse_gpu_counts(""), None);
+        assert_eq!(parse_gpu_counts("bash: nvidia-smi: not found"), None);
+        // A remote profile script that prints must not shift the fields:
+        // the counts are the last line, not the first two tokens.
+        assert_eq!(parse_gpu_counts("Welcome to node 7\n0 8"), Some((0, 8)));
+        assert_eq!(parse_gpu_counts("2 0\n"), Some((2, 0)));
+    }
+
+    #[test]
+    fn a_workers_rank_count_follows_the_vendor_it_declares() {
+        // The bug this guards: the probe counted nvidia-smi only, so an
+        // AMD worker with `local_devices: all` probed 0 and aborted the
+        // fan-out, quoting a tool that host does not have.
+        assert_eq!(pick_worker_count(0, 8, Some("precompiled/rocm70"), "h"), Ok(8));
+        assert_eq!(pick_worker_count(2, 0, Some("precompiled/cu128"), "h"), Ok(2));
+        // A declared arch outranks the other vendor's cards being present.
+        assert_eq!(pick_worker_count(2, 8, Some("precompiled/rocm71"), "h"), Ok(8));
+        assert_eq!(pick_worker_count(2, 8, Some("builds/sm61-sm120"), "h"), Ok(2));
+    }
+
+    #[test]
+    fn an_undeclared_single_vendor_host_still_resolves() {
+        assert_eq!(pick_worker_count(4, 0, None, "h"), Ok(4));
+        assert_eq!(pick_worker_count(0, 4, None, "h"), Ok(4));
+        assert_eq!(pick_worker_count(0, 0, None, "h"), Ok(0));
+        // Both vendors and nothing declared: undecidable HERE (the
+        // controller cannot know which build that box loads), so it must
+        // say so rather than assign ranks to devices nobody addresses.
+        let err = pick_worker_count(2, 8, None, "mixed-host").unwrap_err();
+        assert!(err.contains("2 NVIDIA and 8 AMD"), "got {err}");
+        assert!(err.contains("arch:"), "got {err}");
+    }
+
+    #[test]
     fn net_timeout_scale_validation_mirrors_library_rule() {
         // Pure core — no env mutation needed.
         assert!(validate_net_timeout_scale_value(None).is_ok());
@@ -972,6 +1094,7 @@ commands:
             },
             workers: Vec::new(),
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let err = prepare_cluster_env(&cluster, None, "train").unwrap_err();
         assert!(err.contains("controller.host"), "got: {err}");
@@ -1015,10 +1138,12 @@ commands:
                 tunnel: false,
                 arch: None,
                 data_path: None,
+                gpu_ram_share: None,
                 docker: None,
                 env: std::collections::BTreeMap::new(),
             }],
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
         assert!(
@@ -1053,15 +1178,52 @@ commands:
                 tunnel: false,
                 arch: None,
                 data_path: None,
+                gpu_ram_share: None,
                 docker: None,
                 env: std::collections::BTreeMap::new(),
             }],
             env: std::collections::BTreeMap::new(),
+            gpu_ram_share: None,
         };
         let (_hosts, warnings) = resolve_cluster_extra_hosts(&cluster);
         assert!(
             warnings.iter().any(|w| w.contains("did not resolve")),
             "missing ssh.target should keep the warning, got warnings: {warnings:?}"
         );
+    }
+
+    /// A farm overlay declares a join window; a command that is not a
+    /// cluster command will not open it and trains here instead. The run
+    /// looks entirely normal, which is why this needs saying out loud.
+    #[test]
+    fn a_declared_join_window_that_no_command_opens_is_called_out() {
+        let with_window = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /opt/flodl
+    join:
+      discovery: true
+      token: aaaabbbbccccddddaaaabbbbccccdddd
+  workers: []
+";
+        let project: ProjectConfig = serde_yaml_ng::from_str(with_window).unwrap();
+        let hint = unused_join_window_hint(&project, "train").expect("a window nobody opens");
+        assert!(hint.contains("train"), "names the command: {hint}");
+        assert!(hint.contains("cluster:"), "names the fix: {hint}");
+
+        // A roster-style cluster block without a discovery window has
+        // nothing to miss: fan-out is the command's own business.
+        let no_window = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /opt/flodl
+  workers: []
+";
+        let project: ProjectConfig = serde_yaml_ng::from_str(no_window).unwrap();
+        assert!(unused_join_window_hint(&project, "train").is_none());
     }
 }

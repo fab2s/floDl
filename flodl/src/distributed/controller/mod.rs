@@ -399,7 +399,14 @@ fn run_reduce_thread(
                     "cluster_controller",
                 )?;
                 let ranks = match MuxRecord::read_from(&mut stream, &salt)? {
-                    Some(MuxRecord::Control(RelayControlMsg::Hello { host, ranks })) => {
+                    // Model signatures ride the control channel's Hello
+                    // only; the data channel's bare handshake carries
+                    // none and the coordinator already compared them.
+                    Some(MuxRecord::Control(RelayControlMsg::Hello {
+                        host,
+                        ranks,
+                        model_sigs: _,
+                    })) => {
                         crate::verbose!(
                             "  cluster_controller: relay '{host}' carries ranks {ranks:?}"
                         );

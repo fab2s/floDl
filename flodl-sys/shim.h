@@ -499,60 +499,71 @@ char* flodl_to_device(FlodlTensor t, int device_type, int device_index,
 char* flodl_to_device_async(FlodlTensor t, int device_type, int device_index,
                            FlodlTensor* result);
 
-int flodl_cuda_is_available(void);
-int flodl_cuda_device_count(void);
-int flodl_force_cuda_link(void);
+int flodl_gpu_is_available(void);
+int flodl_gpu_device_count(void);
+int flodl_force_gpu_link(void);
 void flodl_set_cudnn_benchmark(int enable);
 void flodl_manual_seed(uint64_t seed);
-void flodl_cuda_manual_seed_all(uint64_t seed);
+void flodl_gpu_manual_seed_all(uint64_t seed);
 void flodl_set_current_device(int device_index);
 int flodl_get_current_device(void);
-void flodl_cuda_synchronize(int device_index);
+void flodl_gpu_synchronize(int device_index);
 
 // --- CUDA memory/utilization (monitor support) ---
 
 // Query CUDA memory: writes used and total bytes for a specific device.
 // Returns error string on failure (caller must free), NULL on success.
-char* flodl_cuda_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
+char* flodl_gpu_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
 // NVML-backed variant of the above (queries the driver directly rather than
 // libtorch's allocator view). Returns 0 on success, -1 if NVML is
 // unavailable or the query fails.
-int flodl_cuda_nvml_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
+int flodl_gpu_smi_mem_info(int device_index, uint64_t* used_bytes, uint64_t* total_bytes);
 
 // Query bytes currently handed out by libtorch's CUDA caching allocator.
 // This can exceed physical VRAM when unified memory spills to host RAM.
 // spill = max(0, allocated - vram_total).
-char* flodl_cuda_alloc_bytes(int device_index, uint64_t* allocated_bytes);
-char* flodl_cuda_active_bytes(int device_index, uint64_t* active_bytes);
+char* flodl_gpu_alloc_bytes(int device_index, uint64_t* allocated_bytes);
+char* flodl_gpu_active_bytes(int device_index, uint64_t* active_bytes);
 
 // Peak active allocator bytes (max since last reset).
 // Matches torch.cuda.max_memory_allocated() semantics.
-char* flodl_cuda_peak_active_bytes(int device_index, uint64_t* peak_bytes);
+char* flodl_gpu_peak_active_bytes(int device_index, uint64_t* peak_bytes);
 
 // Peak reserved allocator bytes (max since last reset).
 // Matches torch.cuda.max_memory_reserved() semantics.
-char* flodl_cuda_peak_reserved_bytes(int device_index, uint64_t* peak_bytes);
+char* flodl_gpu_peak_reserved_bytes(int device_index, uint64_t* peak_bytes);
 
 // Reset peak allocator statistics.
 // Equivalent to torch.cuda.reset_peak_memory_stats().
-void flodl_cuda_reset_peak_stats(int device_index);
+void flodl_gpu_reset_peak_stats(int device_index);
 
 // Release all unused cached memory from the CUDA caching allocator.
 // Equivalent to torch.cuda.empty_cache().
-void flodl_cuda_empty_cache(void);
+void flodl_gpu_empty_cache(void);
 
 // Query GPU utilization percentage (0-100) via NVML.
 // Returns -1 if NVML is not available or query fails.
-int flodl_cuda_utilization(int device_index);
+int flodl_gpu_utilization(int device_index);
 
 // Whether the given device has an active CUDA primary context (i.e. CUDA
 // has been initialized on it). Returns 1 if present, 0 if not, -1 on error.
-int flodl_cuda_has_primary_context(int device_index);
+int flodl_gpu_has_primary_context(int device_index);
 
 // Query GPU device name (e.g. "NVIDIA GeForce GTX 1060 6GB").
 // Writes into caller-provided buffer. Returns error string on failure.
-char* flodl_cuda_device_name(int device_index, char* buf, int buf_len);
+char* flodl_gpu_device_name(int device_index, char* buf, int buf_len);
+
+// Architecture as the vendor names it: "sm_120" on NVIDIA, "gfx1100" (or
+// "gfx90a:sramecc+:xnack-") on AMD. Read from the GPU runtime, so it
+// describes the device libtorch sees. See the note at the definition for
+// why compute capability could not simply be generalised.
+char* flodl_gpu_arch_name(int device_index, char* buf, int buf_len);
+
+// 1 when the device is an APU (memory carved out of system RAM), 0 when
+// discrete. Both vendors spell this property the same. Load-bearing for
+// memory budgeting: see the note at the definition.
+char* flodl_gpu_is_integrated(int device_index, int* out);
 
 // Query GPU compute capability (e.g. major=6, minor=1 for sm_61).
 // Returns error string on failure, NULL on success.
@@ -811,42 +822,42 @@ int flodl_is_channels_last(FlodlTensor t);
 // All CUDA Graph functions require CUDA builds. On CPU builds, they
 // return an error string.
 
-char* flodl_cuda_graph_new(void** graph_out);
-char* flodl_cuda_graph_capture_begin(void* graph, uint64_t pool_hi,
+char* flodl_gpu_graph_new(void** graph_out);
+char* flodl_gpu_graph_capture_begin(void* graph, uint64_t pool_hi,
                                       uint64_t pool_lo, int mode);
-char* flodl_cuda_graph_capture_end(void* graph);
-char* flodl_cuda_graph_replay(void* graph);
-char* flodl_cuda_graph_reset(void* graph);
-void  flodl_cuda_graph_delete(void* graph);
-void  flodl_cuda_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo);
-void  flodl_cuda_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo);
+char* flodl_gpu_graph_capture_end(void* graph);
+char* flodl_gpu_graph_replay(void* graph);
+char* flodl_gpu_graph_reset(void* graph);
+void  flodl_gpu_graph_delete(void* graph);
+void  flodl_gpu_graph_pool(void* graph, uint64_t* pool_hi, uint64_t* pool_lo);
+void  flodl_gpu_graph_pool_handle(uint64_t* pool_hi, uint64_t* pool_lo);
 
 // --- CUDA Events ---
 // All CUDA Event functions require CUDA builds. On CPU builds, they
 // return an error string.
 
 // flags: 0 = Default (timing enabled), 1 = DisableTiming (lower overhead)
-char* flodl_cuda_event_new(int flags, void** event_out);
-char* flodl_cuda_event_record(void* event);
-char* flodl_cuda_event_record_on_stream(void* event, void* stream);
-char* flodl_cuda_event_synchronize(void* event);
-char* flodl_cuda_event_elapsed_time(void* start, void* end, float* ms_out);
-int   flodl_cuda_event_query(void* event);
-void  flodl_cuda_event_delete(void* event);
+char* flodl_gpu_event_new(int flags, void** event_out);
+char* flodl_gpu_event_record(void* event);
+char* flodl_gpu_event_record_on_stream(void* event, void* stream);
+char* flodl_gpu_event_synchronize(void* event);
+char* flodl_gpu_event_elapsed_time(void* start, void* end, float* ms_out);
+int   flodl_gpu_event_query(void* event);
+void  flodl_gpu_event_delete(void* event);
 
 // --- CUDA Streams ---
 // All CUDA Stream functions require CUDA builds. On CPU builds, they
 // return an error string.
 
-char* flodl_cuda_stream_new(int device_index, int high_priority, void** stream_out);
-char* flodl_cuda_stream_synchronize(void* stream);
-char* flodl_cuda_stream_wait_event(void* stream, void* event);
+char* flodl_gpu_stream_new(int device_index, int high_priority, void** stream_out);
+char* flodl_gpu_stream_synchronize(void* stream);
+char* flodl_gpu_stream_wait_event(void* stream, void* event);
 char* flodl_tensor_record_stream(void* tensor, void* stream);
-int   flodl_cuda_stream_query(void* stream);
-void  flodl_cuda_stream_set_current(void* stream);
-void* flodl_cuda_stream_get_current(int device_index);
-void  flodl_cuda_stream_restore_default(int device_index);
-void  flodl_cuda_stream_delete(void* stream);
+int   flodl_gpu_stream_query(void* stream);
+void  flodl_gpu_stream_set_current(void* stream);
+void* flodl_gpu_stream_get_current(int device_index);
+void  flodl_gpu_stream_restore_default(int device_index);
+void  flodl_gpu_stream_delete(void* stream);
 
 // --- NCCL Collective Operations ---
 // All NCCL functions require CUDA builds with 2+ GPUs at runtime.
@@ -897,6 +908,10 @@ int flodl_nccl_size(void* handle);
 // Generate a unique ID for NCCL communicator initialization.
 // uid_out: pointer to at least FLODL_NCCL_UNIQUE_ID_BYTES bytes.
 // Called once on any thread; result shared with all ranks.
+// Version of the NCCL/RCCL library this process actually loads
+// (LD_PRELOAD-aware). Writes NCCL's integer code (e.g. 22705 = 2.27.5).
+// No CUDA context is created, so it is safe before any GPU op.
+char* flodl_nccl_runtime_version(int* version_out);
 char* flodl_nccl_get_unique_id(void* uid_out);
 
 // Initialize a single-rank NCCL communicator.

@@ -41,6 +41,7 @@ pub(crate) mod cluster_dashboard_emit;
 pub mod launcher;
 pub mod max_failure;
 pub(crate) mod membership;
+pub(crate) mod model_sig;
 pub mod nccl;
 pub mod outer_optimizer;
 pub(crate) mod port_mux;
@@ -67,7 +68,9 @@ pub use checkpoint_forge::load_consensus_checkpoint;
 /// Loader for the outer-optimizer momentum sidecar (`<stem>.outer.fdl`),
 /// used by the launcher on resume to re-seed the outer optimizer.
 pub use checkpoint_forge::load_outer_momentum;
-pub use cluster::{WorkerBlock, LocalCluster, is_reserved_cluster_env_key};
+pub use cluster::{
+    WorkerBlock, LocalCluster, cluster_data_path, is_reserved_cluster_env_key,
+};
 pub use launcher::{FullCluster, FullWorker, Role};
 /// Join-window start-switch mode (`controller.join.start:` — auto /
 /// manual / hybrid). Public because [`ClusterBuilder::controller`]'s
@@ -79,10 +82,10 @@ pub use outer_optimizer::{NesterovMomentum, OuterAvg, OuterOptimizer, SlowMoment
 // CUDA stream/event primitives live in `tensor` (they are device-runtime
 // tools, not DDP machinery — audit D5 moved them so `data/` no longer
 // reaches into `distributed/`). Re-exported here so existing
-// `flodl::distributed::cuda_stream::CudaStream`-style paths keep working.
+// `flodl::distributed::cuda_stream::GpuStream`-style paths keep working.
 pub use crate::tensor::cuda_event;
 pub use crate::tensor::cuda_stream;
-pub use crate::tensor::{CudaEvent, CudaEventFlags, CudaStream, StreamGuard};
+pub use crate::tensor::{GpuEvent, GpuEventFlags, GpuStream, StreamGuard};
 pub use dashboard_sink::{ClusterDashboardSink, DashboardSink};
 pub use nccl::{NCCL_UNIQUE_ID_BYTES, NcclAbortHandle, NcclComms, NcclRankComm, NcclUniqueId, ReduceOp};
 pub use testing::{discover_test_cluster, ENV_TESTING_CLUSTER_JSON};

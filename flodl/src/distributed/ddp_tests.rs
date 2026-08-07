@@ -1,10 +1,10 @@
     use super::*;
     use crate::tensor::{
-        cuda_device_count, cuda_synchronize, test_device, DType, TensorOptions,
+        gpu_device_count, gpu_synchronize, test_device, DType, TensorOptions,
     };
 
     fn require_multi_gpu() -> bool {
-        if !test_device().is_cuda() || cuda_device_count() < 2 {
+        if !test_device().is_cuda() || gpu_device_count() < 2 {
             return false;
         }
         for i in 0..2 {
@@ -100,8 +100,8 @@
             "w1 gradient should be non-zero, got {g1_sum}"
         );
 
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
     }
 
     #[test]
@@ -182,8 +182,8 @@
             );
         }
 
-        cuda_synchronize(0);
-        cuda_synchronize(1);
+        gpu_synchronize(0);
+        gpu_synchronize(1);
     }
 
     // -- Graph integration tests (CPU, single-GPU fallback) -----------------

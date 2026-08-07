@@ -83,7 +83,7 @@
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            write_handshake_rank(&mut stream, rank, ws, &TEST_SALT).unwrap();
+            write_handshake_rank(&mut stream, rank, ws, &[0u8; 32], &TEST_SALT).unwrap();
             read_handshake_ack(&mut stream, &TEST_SALT).unwrap();
             // Hold the stream open briefly so the coord can register
             // before we drop.
@@ -115,7 +115,7 @@
 
         let rank = thread::spawn(move || {
             let mut s = TcpStream::connect_timeout(&relay_addr, Duration::from_secs(5)).unwrap();
-            let _ = write_handshake_rank(&mut s, 0, world_size as u32, &bad_salt);
+            let _ = write_handshake_rank(&mut s, 0, world_size as u32, &[0u8; 32], &bad_salt);
             let _ = read_handshake_ack(&mut s, &bad_salt);
         });
         let err = match relay_rx.recv().unwrap() {
@@ -130,7 +130,7 @@
     }
 
     /// End-to-end Sync+Nccl smoke test. Requires CUDA + NCCL; runs
-    /// only under `fdl cuda-test-nccl`. Validates the full
+    /// only under `fdl gpu-test-nccl`. Validates the full
     /// connect → handshake → wait_for_epoch_plan → train_step → SyncNow
     /// → SyncAck → Shutdown round-trip with two real ranks doing real
     /// NCCL AllReduce(Avg) on their parameters.
@@ -139,9 +139,9 @@
     /// tensors are bit-identical (NCCL AllReduce-Avg makes them so).
     ///
     /// Marked `#[ignore]` so the CPU test suite skips it; lift the
-    /// `ignore` (or run via `fdl cuda-test-nccl`) on the Pascal rig.
+    /// `ignore` (or run via `fdl gpu-test-nccl`) on the Pascal rig.
     #[test]
-    #[ignore = "requires CUDA + NCCL — run via fdl cuda-test-nccl"]
+    #[ignore = "requires CUDA + NCCL — run via fdl gpu-test-nccl"]
     fn end_to_end_sync_nccl_smoke() {
         // The full body is left for the next slice's bring-up on the
         // Pascal rig. Once the rig is online we'll:
@@ -186,7 +186,7 @@
     /// and exits cleanly.
     ///
     /// Marked `#[ignore]` — requires 2+ visible GPUs + libnccl. Run
-    /// via `fdl @cluster-test cuda-test-nccl` (env overlay defines
+    /// via `fdl @cluster-test gpu-test-nccl` (env overlay defines
     /// the cluster topology) or with N visible GPUs locally
     /// (autodetect).
     ///
@@ -195,7 +195,7 @@
     /// validation lands as separate `#[ignore]` tests once this
     /// happy-path baseline is green on the rig.
     #[test]
-    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl @cluster-test cuda-test-nccl"]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl @cluster-test gpu-test-nccl"]
     fn end_to_end_sync_nccl_via_coord_smoke() {
         use crate::distributed::testing::discover_test_cluster;
         use crate::distributed::nccl::NcclComms;
@@ -309,11 +309,13 @@
                     transform: None,
                     vram_max_usage: 0.90,
                     ram_max_usage: 0.50,
+                    gpu_ram_share: None,
                     sample_cache: true,
                     disk_stage_gb: 0,
                     disk_stage_dir: None,
                     batch_size,
                     seed: 42,
+                    epoch_splits: 1,
                     max_grad_norm: None,
                     vram_pool: false,
                     easgd_alpha: None,
@@ -322,6 +324,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -390,7 +393,7 @@
     /// bit-identical across ranks via NCCL AllReduce-Avg invariant.
     ///
     /// Marked `#[ignore]` — requires CUDA + NCCL + 2+ GPUs. Run via
-    /// `fdl @cluster-test cuda-test-nccl` on the Pascal rig.
+    /// `fdl @cluster-test gpu-test-nccl` on the Pascal rig.
     ///
     /// [`ClusterCoordinator`]: crate::distributed::cluster_coordinator::ClusterCoordinator
     /// [`ClusterCoordinator::should_average`]:
@@ -398,7 +401,7 @@
     /// [`ClusterCoordinator::trigger_averaging`]:
     ///     crate::distributed::cluster_coordinator::ClusterCoordinator::trigger_averaging
     #[test]
-    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl @cluster-test cuda-test-nccl"]
+    #[ignore = "requires CUDA + NCCL + 2+ GPUs — run via fdl @cluster-test gpu-test-nccl"]
     fn end_to_end_cadence_nccl_via_coord_smoke() {
         use crate::distributed::testing::discover_test_cluster;
         use crate::distributed::nccl::NcclComms;
@@ -505,11 +508,13 @@
                     transform: None,
                     vram_max_usage: 0.90,
                     ram_max_usage: 0.50,
+                    gpu_ram_share: None,
                     sample_cache: true,
                     disk_stage_gb: 0,
                     disk_stage_dir: None,
                     batch_size,
                     seed: 42,
+                    epoch_splits: 1,
                     max_grad_norm: None,
                     vram_pool: false,
                     easgd_alpha: None,
@@ -522,6 +527,7 @@
                     // Production callers using auto_with auto-route here
                     // when save_path is set on DdpRunConfig.
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -717,11 +723,13 @@
                     transform: None,
                     vram_max_usage: 0.90,
                     ram_max_usage: 0.50,
+                    gpu_ram_share: None,
                     sample_cache: true,
                     disk_stage_gb: 0,
                     disk_stage_dir: None,
                     batch_size,
                     seed: 42,
+                    epoch_splits: 1,
                     max_grad_norm: None,
                     vram_pool: false,
                     easgd_alpha: None,
@@ -730,6 +738,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Cadence,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };
@@ -1047,11 +1056,13 @@
                     transform: None,
                     vram_max_usage: 0.90,
                     ram_max_usage: 0.50,
+                    gpu_ram_share: None,
                     sample_cache: true,
                     disk_stage_gb: 0,
                     disk_stage_dir: None,
                     batch_size,
                     seed: 42,
+                    epoch_splits: 1,
                     max_grad_norm: None,
                     vram_pool: false,
                     easgd_alpha: None,
@@ -1060,6 +1071,7 @@
                     timeline: None,
                     policy: ApplyPolicy::Sync,
                     save_path: None,
+                    model_sig: [0u8; 32],
                     coord_liveness_timeout_secs:
                         crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 };

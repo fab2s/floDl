@@ -313,9 +313,9 @@ any other section of code. These match the standard PyTorch memory diagnostics:
 
 | flodl | PyTorch equivalent |
 |---|---|
-| `cuda_peak_active_bytes()` | `torch.cuda.max_memory_allocated()` |
-| `cuda_peak_reserved_bytes()` | `torch.cuda.max_memory_reserved()` |
-| `cuda_reset_peak_stats()` | `torch.cuda.reset_peak_memory_stats()` |
+| `gpu_peak_active_bytes()` | `torch.cuda.max_memory_allocated()` |
+| `gpu_peak_reserved_bytes()` | `torch.cuda.max_memory_reserved()` |
+| `gpu_reset_peak_stats()` | `torch.cuda.reset_peak_memory_stats()` |
 
 "Active" bytes are memory currently holding tensor data. "Reserved" bytes
 include the CUDA caching allocator's free pool - memory that libtorch has
@@ -325,12 +325,12 @@ between the two tells you how much allocator headroom exists.
 A typical pattern for profiling a training step:
 
 ```rust
-use flodl::{cuda_reset_peak_stats, cuda_peak_active_bytes, cuda_peak_reserved_bytes,
-            cuda_empty_cache};
+use flodl::{gpu_reset_peak_stats, gpu_peak_active_bytes, gpu_peak_reserved_bytes,
+            gpu_empty_cache};
 
 // Flush the allocator cache so reserved starts from a clean baseline
-cuda_empty_cache();
-cuda_reset_peak_stats();
+gpu_empty_cache();
+gpu_reset_peak_stats();
 
 // --- run one training step ---
 let output = model.forward(&batch)?;
@@ -340,13 +340,13 @@ optimizer.step()?;
 optimizer.zero_grad()?;
 
 // Read peaks
-let active_mb = cuda_peak_active_bytes()? as f64 / 1048576.0;
-let reserved_mb = cuda_peak_reserved_bytes()? as f64 / 1048576.0;
+let active_mb = gpu_peak_active_bytes()? as f64 / 1048576.0;
+let reserved_mb = gpu_peak_reserved_bytes()? as f64 / 1048576.0;
 println!("peak active: {active_mb:.1} MB, peak reserved: {reserved_mb:.1} MB");
 ```
 
-The `_idx` variants (`cuda_peak_active_bytes_idx`, `cuda_peak_reserved_bytes_idx`,
-`cuda_reset_peak_stats_idx`) accept an explicit device index for multi-GPU setups.
+The `_idx` variants (`gpu_peak_active_bytes_idx`, `gpu_peak_reserved_bytes_idx`,
+`gpu_reset_peak_stats_idx`) accept an explicit device index for multi-GPU setups.
 
 ## Device Transfer
 
@@ -354,12 +354,12 @@ The `_idx` variants (`cuda_peak_active_bytes_idx`, `cuda_peak_reserved_bytes_idx
 let gpu = t.to_device(Device::CUDA(0))?;   // move to GPU
 let cpu = gpu.to_device(Device::CPU)?;  // move back to CPU
 
-if flodl::cuda_available() {
-    println!("CUDA devices: {}", flodl::cuda_device_count());
+if flodl::gpu_available() {
+    println!("CUDA devices: {}", flodl::gpu_device_count());
 }
 ```
 
-> **Note**: `cuda_device_count()` and `cuda_available()` initialize
+> **Note**: `gpu_device_count()` and `gpu_available()` initialize
 > libtorch's CUDA context as a side effect. That's safe in
 > single-process code or after `Trainer::run` has fanned out. If you
 > need a GPU count *before* `Trainer::run` (e.g. to log the topology
@@ -376,7 +376,7 @@ transfers, you can overlap the copy with CPU work by using pinned memory and an
 asynchronous transfer:
 
 ```rust
-use flodl::{Tensor, Device, TensorOptions, cuda_synchronize};
+use flodl::{Tensor, Device, TensorOptions, gpu_synchronize};
 
 let cpu_tensor = Tensor::randn(&[256, 512], TensorOptions::default())?;
 
@@ -389,7 +389,7 @@ let gpu = pinned.to_device_async(Device::CUDA(0))?;
 // ... do CPU work while the DMA transfer runs ...
 
 // Synchronize before using the GPU tensor
-cuda_synchronize(0);
+gpu_synchronize(0);
 ```
 
 `pin_memory()` allocates the tensor in page-locked (pinned) host memory, which

@@ -6,9 +6,18 @@
 # Quick start:
 #   fdl setup             # detect hardware, download libtorch, build Docker image
 #   fdl test              # run CPU tests
-#   fdl cuda-test-all     # full CUDA suite
+#   fdl gpu-test-all     # full CUDA suite
 
 COMPOSE = docker compose
+
+# docker-compose.yml sets each service's `hostname:` from HOSTNAME so the
+# cluster launcher's `cluster.hosts[i].name == hostname()` match works from
+# inside the container. bash keeps HOSTNAME as a shell variable but never
+# exports it, so make doesn't inherit it and every COMPOSE target below
+# would otherwise run with a blank one. `fdl` fills it the same way
+# (flodl-cli/src/main.rs). `?=` leaves an already-exported value alone.
+HOSTNAME ?= $(shell hostname)
+export HOSTNAME
 
 .PHONY: docs-rs site site-stop sync-skills test-init release-check clean
 
@@ -43,8 +52,8 @@ COMPOSE = docker compose
 #    `[package.metadata.docs.rs]`. This is what the published docs.rs
 #    page would generate. Catches docsrs-specific breakage.
 #
-# 3. **docs.rs hosting pass (per-crate)** — flodl-sys, flodl-cli,
-#    flodl-cli-macros, flodl-hf each documented with `--cfg docsrs`
+# 3. **docs.rs hosting pass (per-crate)** — flodl-hw, flodl-sys,
+#    flodl-cli, flodl-cli-macros, flodl-hf each documented with `--cfg docsrs`
 #    and their docs.rs feature set. Plus a flodl `--all-features` pass
 #    to catch any cuda-gated breakage CI's default-feature build
 #    wouldn't see (rustdoc parses without GPU; flodl-sys's libtorch
@@ -54,6 +63,8 @@ docs-rs:
 	$(COMPOSE) run --rm docs-rs bash -c "\
 		rustup install nightly 2>&1 | tail -1 && \
 		RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items && \
+		cargo +nightly rustdoc --lib -p flodl-hw \
+			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl-sys \
 			--config 'build.rustdocflags=[\"--cfg\", \"docsrs\", \"-D\", \"warnings\"]' && \
 		cargo +nightly rustdoc --lib -p flodl \

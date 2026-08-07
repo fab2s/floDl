@@ -85,6 +85,16 @@ fn describe_run(
         if config.augment > 1 {
             obj.insert("augment".into(), config.augment.into());
         }
+        // Without these two a split run's artifact is indistinguishable
+        // from an unsplit one: `epochs` counts data passes, so a 1-pass
+        // 20-split run and a plain 1-epoch run record the same number
+        // while training on different boundaries and a different corpus.
+        if config.epoch_splits > 1 {
+            obj.insert("epoch_splits".into(), config.epoch_splits.into());
+        }
+        if let Some(t) = config.train_tokens {
+            obj.insert("train_tokens".into(), t.into());
+        }
         if let Some(a) = config.max_anchor {
             obj.insert("max_anchor".into(), a.into());
         }
@@ -250,6 +260,9 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         virtual_len,
         pool_size,
         data_source: config.data_source,
+        train_tokens: config.train_tokens,
+        epoch_splits: config.epoch_splits,
+        batch_size: config.batch_size,
     };
     // Cluster-mode launcher: skip the real dataset load. The launcher
     // fans out to rank children and never reads training data; only
@@ -282,6 +295,20 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         config.batches_per_epoch
     };
 
+    // Epoch geometry (starved-epoch refusal, tail report) belongs to flodl,
+    // which validates it once at the tier entry point for every caller.
+    // Solo is the one case flodl cannot see: it hand-drives its own loop
+    // instead of going through the builder, so the knob would be accepted
+    // and ignored, and the run recorded as split while training unsplit.
+    if config.epoch_splits > 1 && matches!(mode, DdpMode::Solo(_)) {
+        return Err(flodl::tensor::TensorError::new(&format!(
+            "--epoch-splits {} is not honored in solo mode: the solo baseline runs \
+             its own loop rather than the trainer, so the run would train unsplit \
+             while recording {} epochs. Use a DDP mode, or drop the flag.",
+            config.epoch_splits, config.epoch_splits,
+        )));
+    }
+
     let preload_tag = if mode.requires_multi_gpu() { "cpu" } else { "gpu-preload" };
     let baseline_tag = if model_def.needs_baseline_eval { " [baseline-eval]" } else { "" };
     // Surface the augmentation arm in the banner: an A/B log where the
@@ -296,10 +323,23 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     } else {
         String::new()
     };
+    // "N epochs" means N passes over the data. Once an epoch is a slice of
+    // a pass those stop being the same number, and the banner is what ends
+    // up quoted in a run's provenance, so it says both.
+    let epochs_tag = if config.epoch_splits > 1 {
+        format!(
+            "{} passes x {} splits = {} epochs",
+            config.epochs,
+            config.epoch_splits,
+            config.epochs * config.epoch_splits,
+        )
+    } else {
+        format!("{} epochs", config.epochs)
+    };
     if real_data {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} samples, {} batches x {}{}{}){} ===",
-            model_def.name, mode_str, config.epochs, dataset.len(), actual_batches,
+            "\n=== {} / {} ({}, {} samples, {} batches x {}{}{}){} ===",
+            model_def.name, mode_str, epochs_tag, dataset.len(), actual_batches,
             config.batch_size, augment_tag, lr_note, baseline_tag,
         );
         let source_tag = match config.data_source {
@@ -312,8 +352,8 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         );
     } else {
         eprintln!(
-            "\n=== {} / {} ({} epochs, {} batches x {}{}{}){} ===",
-            model_def.name, mode_str, config.epochs, actual_batches, config.batch_size,
+            "\n=== {} / {} ({}, {} batches x {}{}{}){} ===",
+            model_def.name, mode_str, epochs_tag, actual_batches, config.batch_size,
             augment_tag, lr_note, baseline_tag,
         );
         eprintln!("  data: pool={pool_size}, virtual={virtual_len}, mode={preload_tag} ({load_ms}ms)");
@@ -327,7 +367,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // line: the harness owns a richer `done: loss=…, syncs=…,
     // idle=…` summary below, so emitting both is just duplication.
     // HTML archive + dashboard pushes are unaffected.
-    let mut monitor = Monitor::new(config.epochs);
+    // The monitor counts EPOCHS, and `config.epochs` counts data passes:
+    // under splits an epoch is a slice, so the progress denominator is
+    // passes x splits (otherwise it renders "epoch 4/1").
+    let mut monitor = Monitor::new(config.epochs * config.epoch_splits.max(1));
     monitor.silent_summary();
     if let Some(port) = config.monitor_port {
         monitor
@@ -410,10 +453,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // the cooperative tier; always in managed).
     if !suppress_artifacts {
         let log_path = format!("{run_dir}/training.log");
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let local_header = {
             let mut h = String::new();
-            for dev in flodl::tensor::cuda_devices() {
+            for dev in flodl::tensor::gpu_devices() {
                 h.push_str(&format!(
                     "# gpu{}: {} ({}GB, sm_{}{})\n",
                     dev.index, dev.name, dev.total_memory / (1024 * 1024 * 1024),
@@ -422,7 +465,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
             }
             h
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "gpu"))]
         let local_header = String::new();
         // Cluster runs: local probing only sees this host's GPUs, so the
         // header would misdescribe the cohort (the historical "Pascals
@@ -458,12 +501,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // Clean up CUDA state between runs. NCCL communicators and cached
     // allocator blocks from the previous run can fragment VRAM or leave
     // stale stream state that interferes with the next NCCL init.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     {
-        let gpu_count = flodl::tensor::cuda_device_count();
+        let gpu_count = flodl::tensor::gpu_device_count();
         for i in 0..gpu_count {
-            flodl::tensor::cuda_synchronize(i as u8);
-            flodl::tensor::cuda_empty_cache();
+            flodl::tensor::gpu_synchronize(i as u8);
+            flodl::tensor::gpu_empty_cache();
         }
     }
 
@@ -895,6 +938,12 @@ fn run_unified(
     // pick, same bytes, on every rank and every run.
     if config.augment > 1 {
         builder = builder.augment(config.augment);
+    }
+    // Slice each data pass into N events. `--epochs` still counts passes,
+    // so the LR schedule (batches x passes) is untouched — splitting
+    // changes where the boundaries fall, not how much work there is.
+    if config.epoch_splits > 1 {
+        builder = builder.epoch_splits(config.epoch_splits);
     }
     // Data-plane memory knobs (unified budget policy A/B levers).
     // Unset preserves the library defaults (0.90 / 0.50).

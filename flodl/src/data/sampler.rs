@@ -48,9 +48,26 @@ pub trait Sampler: Send {
 
     /// Generate the index ordering for a given epoch.
     ///
-    /// Must return exactly [`len()`](Sampler::len) indices, each in `[0, len())`.
-    /// Called once per epoch.
+    /// Must return indices in `[0, len())`, as many as
+    /// [`epoch_len()`](Sampler::epoch_len) reports. Called once per epoch.
     fn indices(&mut self, epoch: usize) -> Vec<usize>;
+
+    /// How many indices one epoch visits.
+    ///
+    /// Defaults to [`len()`](Sampler::len) — an epoch is a full pass over
+    /// the data, which is what every sampler did before epoch splitting
+    /// existed. [`SplitSampler`] overrides it, since there an epoch is a
+    /// slice of a pass; the count is nominal in that case, as balanced
+    /// slicing gives some epochs one extra index.
+    ///
+    /// Distinct from `len()` on purpose: `len()` describes the *dataset*
+    /// (what [`DataLoader::len`](super::DataLoader::len) reports) while
+    /// this describes an *epoch* (what
+    /// [`DataLoader::num_batches`](super::DataLoader::num_batches)
+    /// counts). They coincide unless the sampler splits.
+    fn epoch_len(&self) -> usize {
+        self.len()
+    }
 }
 
 /// Deterministic random sampler. Default for [`DataLoader`](super::DataLoader).
@@ -76,6 +93,63 @@ impl Sampler for RandomSampler {
 
     fn indices(&mut self, epoch: usize) -> Vec<usize> {
         crate::rng::epoch_permutation(self.seed, epoch, self.n)
+    }
+}
+
+/// Like [`RandomSampler`], but an epoch is a *slice* of a data pass.
+///
+/// `splits` says how finely to cut one pass. The pass permutation is
+/// unchanged and still covers every sample exactly once; splitting only
+/// decides how much of it one epoch consumes, so `splits` epochs make one
+/// pass and no sample is seen twice along the way.
+///
+/// This is what makes single-pass training (the normal regime for LLM
+/// pretraining) workable: everything that keys off the epoch boundary —
+/// eval, checkpointing, reporting — gets a boundary to key off, where a
+/// naive one-epoch run has none until teardown.
+///
+/// ```ignore
+/// use flodl::SplitSampler;
+///
+/// // One pass over 10k samples, delivered as 20 epochs of 500.
+/// let sampler = SplitSampler::new(10_000, 42, 20);
+/// ```
+///
+/// At `splits = 1` it behaves exactly like [`RandomSampler`].
+pub struct SplitSampler {
+    n: usize,
+    seed: u64,
+    splits: usize,
+}
+
+impl SplitSampler {
+    /// Create a split sampler for `n` samples with the given base seed.
+    ///
+    /// `splits` is clamped to at least 1.
+    pub fn new(n: usize, seed: u64, splits: usize) -> Self {
+        SplitSampler { n, seed, splits: splits.max(1) }
+    }
+
+    /// Slices per data pass.
+    pub fn splits(&self) -> usize {
+        self.splits
+    }
+}
+
+impl Sampler for SplitSampler {
+    fn len(&self) -> usize {
+        self.n
+    }
+
+    fn epoch_len(&self) -> usize {
+        // The base slice. Balanced splitting hands the first `n % splits`
+        // epochs one extra index, so this is the nominal size — callers
+        // that need the exact count read `indices(epoch).len()`.
+        self.n / self.splits
+    }
+
+    fn indices(&mut self, epoch: usize) -> Vec<usize> {
+        crate::rng::epoch_split_permutation(self.seed, epoch, self.splits, self.n)
     }
 }
 
@@ -161,6 +235,51 @@ mod tests {
         let a = sampler.indices(0);
         let b = sampler.indices(1);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn split_sampler_epochs_tile_one_pass() {
+        // Four epochs consume one pass between them, in pass order and
+        // with no sample served twice.
+        let mut split = SplitSampler::new(100, 42, 4);
+        let mut seen = Vec::new();
+        for epoch in 0..4 {
+            seen.extend(split.indices(epoch));
+        }
+        assert_eq!(seen, RandomSampler::new(100, 42).indices(0));
+    }
+
+    #[test]
+    fn split_sampler_at_one_split_matches_random_sampler() {
+        let mut split = SplitSampler::new(100, 42, 1);
+        let mut random = RandomSampler::new(100, 42);
+        for epoch in 0..3 {
+            assert_eq!(split.indices(epoch), random.indices(epoch), "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn split_sampler_reports_dataset_len_and_epoch_len_apart() {
+        let split = SplitSampler::new(100, 42, 4);
+        // The dataset is still 100 samples; an epoch is 25 of them.
+        assert_eq!(split.len(), 100);
+        assert_eq!(split.epoch_len(), 25);
+        assert_eq!(split.splits(), 4);
+    }
+
+    #[test]
+    fn unsplit_samplers_report_one_epoch_per_pass() {
+        // The defaulted trait method: sampler types that predate
+        // splitting must keep reporting the whole pass.
+        assert_eq!(RandomSampler::new(50, 0).epoch_len(), 50);
+        assert_eq!(SequentialSampler::new(30).epoch_len(), 30);
+    }
+
+    #[test]
+    fn split_sampler_clamps_zero_splits() {
+        let mut sampler = SplitSampler::new(10, 1, 0);
+        assert_eq!(sampler.splits(), 1);
+        assert_eq!(sampler.indices(0).len(), 10);
     }
 
     #[test]

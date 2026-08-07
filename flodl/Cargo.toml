@@ -19,11 +19,16 @@ include = [
 
 [features]
 default = ["rng"]
-cuda = ["flodl-sys/cuda"]
+# Vendor selectors. `cuda` keeps working exactly as before; `gpu` is the
+# vendor-neutral gate they both imply (see flodl-sys/Cargo.toml).
+gpu = ["flodl-sys/gpu"]
+cuda = ["gpu", "flodl-sys/cuda"]
+rocm = ["gpu", "flodl-sys/rocm"]
 rng = ["rand"]
 
 [dependencies]
 flodl-sys = { version = "0.7.0", path = "../flodl-sys" }
+flodl-hw = { version = "0.7.0", path = "../flodl-hw" }
 indexmap = "2"
 flate2 = "1"
 hmac-sha256 = "1"

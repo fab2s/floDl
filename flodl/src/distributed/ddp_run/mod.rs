@@ -78,7 +78,8 @@ pub mod convergence;
 pub use cooperative::{StepOutcome, Worker};
 pub use worker::*;
 pub(crate) use shared::{
-    aggregate_epoch_metrics, equal_sizes, ratio_to_sizes, throughput_sizes,
+    aggregate_epoch_metrics, check_epoch_geometry, epoch_label, equal_sizes, pick_space,
+    ratio_to_sizes, throughput_sizes, window_cap_batches,
 };
 pub use orchestrator::*;
 pub use convergence::{
@@ -501,6 +502,20 @@ pub struct DdpRunConfig {
     /// scheduling — data variation comes from `transform`, keyed per
     /// pick. Default: `1`.
     pub augment: usize,
+    /// How finely one data pass is sliced into epochs.
+    ///
+    /// At the default `1`, an epoch is a full pass over the data. Above
+    /// `1`, an epoch becomes a *slice* of a pass: `num_epochs *
+    /// epoch_splits` epochs run in total, and each sample is still seen
+    /// exactly `num_epochs` times. Everything that keys off the epoch boundary
+    /// follows — eval cadence, checkpointing, and the reduce window,
+    /// which the coordinator caps at one epoch.
+    ///
+    /// This is what makes a single-pass run (`epochs: 1`, the normal
+    /// regime for LLM pretraining) usable: without it such a run has no
+    /// interior boundary, so no checkpoint and no eval until teardown.
+    /// Default: `1`.
+    pub epoch_splits: usize,
     /// Deterministic delivery transform applied on each rank, keyed by
     /// [`crate::data::PickKey`] — the sanctioned augmentation seam.
     /// Runs at the worker's delivery point on freshly assembled rows;
@@ -518,6 +533,20 @@ pub struct DdpRunConfig {
     /// stage fetch). Default: `0.50` (the solo loader's
     /// `ram_max_usage` default).
     pub ram_max_usage: f64,
+    /// Fraction of **physical** host RAM (`MemTotal`) to hand the GPU on
+    /// an **integrated (APU) target**, where device memory is carved out
+    /// of system RAM rather than being a pool of its own — so the host
+    /// staging tiers and the VRAM pool otherwise price the same DRAM
+    /// twice and over-commit it.
+    ///
+    /// `None` (default) reserves whatever aperture the device reports.
+    /// Ignored on discrete GPUs, where the two pools are genuinely
+    /// separate. Values above `1.0` are allowed and meaningful: if a
+    /// platform under-reports `MemTotal` relative to what the APU can
+    /// address, a share above 1.0 is how you still express the true
+    /// reservation. Same knob as `DataLoaderBuilder::gpu_ram_share` on
+    /// the solo path.
+    pub gpu_ram_share: Option<f64>,
     /// Pinned RAM sample retention in each rank's staging tier (see
     /// [`crate::distributed::TrainerConfig::sample_cache`]). `false`
     /// pins the read-through cache's budget to zero; the flow window
@@ -685,9 +714,11 @@ impl DdpRunConfig {
             max_grad_norm: None,
             vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
             augment: 1,
+            epoch_splits: 1,
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            gpu_ram_share: None,
             sample_cache: true,
             disk_stage_gb: 0,
             disk_stage_dir: None,
@@ -937,6 +968,12 @@ impl DdpRunConfig {
         self
     }
 
+    /// Slices per data pass (see [`Self::epoch_splits`]).
+    pub fn with_epoch_splits(mut self, n: usize) -> Self {
+        self.epoch_splits = n.max(1);
+        self
+    }
+
     /// Delivery transform (see [`Self::transform`]).
     pub fn with_transform(
         mut self,
@@ -960,6 +997,15 @@ impl DdpRunConfig {
     /// [`Self::ram_max_usage`]).
     pub fn with_ram_max_usage(mut self, max_usage: f64) -> Self {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
+        self
+    }
+
+    /// Fraction of physical host RAM (`MemTotal`) reserved for the GPU on
+    /// an integrated (APU) target (see [`Self::gpu_ram_share`]). Ignored
+    /// on discrete GPUs. Same knob as `DataLoaderBuilder::gpu_ram_share`
+    /// on the solo path.
+    pub fn with_gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share.max(0.0));
         self
     }
 
@@ -1300,7 +1346,7 @@ pub(crate) enum ControlMsg {
     /// \[CPU path\] Deliver averaged parameters.
     Update(AveragedParams),
     /// \[NCCL path\] Trigger in-place AllReduce on this worker's own params.
-    /// Worker runs AllReduce on comm_stream and records CudaEvent.
+    /// Worker runs AllReduce on comm_stream and records GpuEvent.
     SyncNow,
     /// Begin processing a new epoch with the given partition assignment.
     ///
@@ -1513,10 +1559,25 @@ pub struct WorkerConfig {
     pub augment: usize,
     /// Delivery transform (see [`DdpRunConfig::transform`]).
     pub transform: Option<crate::data::TransformFn>,
-    /// RNG base seed for deterministic shuffling; the epoch `e` permutation is
-    /// `Rng::seed(seed + e)`. Defaults to [`SHUFFLE_BASE_SEED`] at every
-    /// construction site.
+    /// RNG base seed for deterministic shuffling; the permutation for
+    /// data pass `p` is `Rng::seed(seed + p)`. Defaults to
+    /// [`SHUFFLE_BASE_SEED`] at every construction site.
     pub seed: u64,
+    /// How finely one data pass is sliced into epochs.
+    ///
+    /// `1` (the default everywhere) means an epoch is a full pass, the
+    /// behaviour this framework shipped with. Above `1`, an epoch is a
+    /// *slice* of a pass: `epoch / epoch_splits` is the data pass and
+    /// `epoch % epoch_splits` the slice within it, so a single-pass run
+    /// still gets interior eval, checkpoint and reduce-window
+    /// boundaries without repeating a sample.
+    ///
+    /// Must match on every rank and on the coordinator. Like [`seed`],
+    /// a divergent value silently puts a rank on a different slice of
+    /// the permutation rather than raising anything.
+    ///
+    /// [`seed`]: Self::seed
+    pub epoch_splits: usize,
     /// Maximum gradient norm for clipping (None = no clipping).
     pub max_grad_norm: Option<f64>,
     /// Device-resident sample pool on this worker (see
@@ -1529,6 +1590,9 @@ pub struct WorkerConfig {
     /// Host-RAM share for this worker's staging tiers (see
     /// [`DdpRunConfig::ram_max_usage`]).
     pub ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target (see
+    /// [`DdpRunConfig::gpu_ram_share`]).
+    pub gpu_ram_share: Option<f64>,
     /// Pinned RAM sample retention in this worker's staging tier (see
     /// [`DdpRunConfig::sample_cache`]).
     pub sample_cache: bool,
@@ -1583,6 +1647,13 @@ pub struct WorkerConfig {
     /// [`crate::distributed::cluster_worker`]'s TCP inbound loop reads it.
     /// Defaults to [`DEFAULT_COORD_LIVENESS_TIMEOUT_SECS`].
     pub coord_liveness_timeout_secs: u64,
+    /// Model signature (see `distributed::model_sig`) of the model
+    /// this rank constructed, carried into the control-channel
+    /// handshake so the coordinator can refuse a mixed-model formation
+    /// by name. Only the cluster rank path computes it; the thread-based
+    /// single-process path leaves it zeroed (all ranks share one
+    /// process, so there is nothing to disagree about).
+    pub model_sig: [u8; 32],
 }
 
 /// Default coordinator-liveness deadline (seconds), matching the
@@ -1596,27 +1667,38 @@ pub const DEFAULT_COORD_LIVENESS_TIMEOUT_SECS: u64 = 30;
 
 /// Generate a deterministic partition of sample indices from a global permutation.
 ///
-/// All ranks sharing the same `(epoch, seed)` produce the same global permutation.
-/// The coordinator computes consecutive `(offset, size)` pairs for each rank so
-/// that slices are non-overlapping and cover the full dataset.
+/// All ranks sharing the same `(epoch, splits, seed)` produce the same global
+/// permutation. The coordinator computes consecutive `(offset, size)` pairs for
+/// each rank so that slices are non-overlapping and cover the epoch.
 ///
 /// **Non-overlapping guarantee:** the coordinator assigns consecutive offsets
-/// that sum to `total`, so all slices are disjoint by construction.
+/// that sum to the epoch's length, so all slices are disjoint by construction.
+///
+/// `total` is the full pick space ([`pick_space`]) and never varies with
+/// `splits` — every consumer keeps deriving it the same way. `offset` and
+/// `size` are relative to the *epoch's own slice* of that space, which is
+/// what lets `ChunkPool` keep partitioning `[0, epoch_len)` unchanged: the
+/// whole slice-to-pass mapping lives here.
 fn make_partition(
     offset: usize,
     size: usize,
     total: usize,
     epoch: usize,
+    splits: usize,
     seed: u64,
 ) -> Vec<usize> {
     // Deterministic global shuffle (same seed = same permutation for
-    // all ranks) — the one scheme shared with the solo RandomSampler.
+    // all ranks) — the one scheme shared with the solo samplers.
     // `total` counts PICKS (samples × augment); see epoch_permutation.
-    let all = crate::rng::epoch_permutation(seed, epoch, total);
+    // At `splits == 1` this is the whole pass, byte for byte as shipped.
+    let all = crate::rng::epoch_split_permutation(seed, epoch, splits, total);
 
-    // This rank's consecutive slice
-    let end = (offset + size).min(total);
-    all[offset..end].to_vec()
+    // This rank's consecutive slice. Clamped to what the epoch actually
+    // holds, generalising the previous `.min(total)` now that an epoch
+    // can be shorter than the pick space.
+    let start = offset.min(all.len());
+    let end = (offset + size).min(all.len());
+    all[start..end].to_vec()
 }
 
 #[cfg(test)]

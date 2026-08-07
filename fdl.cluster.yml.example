@@ -91,13 +91,33 @@
 #     instead of erroring on a missing libnccl.so on the host. Omit
 #     when the host runs flodl natively. Per-host, NOT global: mixed
 #     deployments (controller in Docker, worker bare-metal) are common.
-#   - `data_path:` (optional) shared-storage path visible to this host.
-#     flodl assumes a filesystem reachable at the same logical path on
-#     every node (NAS / SMB / virtiofs / S3-FUSE / SSHFS) holding
-#     training data, model checkpoints, and per-rank logs. Defaults to
-#     `/flodl/data` when omitted. `fdl probe` verifies it exists + is
-#     readable on each host before fan-out. Multi-host checkpoint /
-#     resume paths must live here (see `save_path` / `resume_from`).
+#   - `data_path:` (optional) dataset SOURCE ROOT on this host: where
+#     its ranks read training data from, plus model checkpoints and
+#     per-rank logs. Usually a filesystem reachable at the same logical
+#     path on every node (NAS / SMB / virtiofs / S3-FUSE / SSHFS), which
+#     is the recommended shape; a node-local directory is legal too, and
+#     then each host holds its own copy. `fdl probe` verifies it exists
+#     + is readable on each host before fan-out, and multi-host
+#     checkpoint / resume paths must live here (see `save_path` /
+#     `resume_from`).
+#
+#     DECLARING IT CHANGES A RUN. The path travels to every rank and
+#     supplies the training binary's data directory (ddp-bench's
+#     `--data-dir`, which still wins when passed explicitly). Omitted,
+#     nothing travels and the binary keeps its own default, so the
+#     `/flodl/data` convention below is what `fdl probe` checks against,
+#     never something a run is silently pointed at.
+#   - `gpu_ram_share:` (optional) integrated-GPU host-RAM share for
+#     this host: the fraction of its physical RAM the APU's GPU
+#     aperture claims, e.g. 0.5 (the library's `gpu_ram_share` knob;
+#     discrete-GPU hosts ignore it, and above 1.0 is legal where the
+#     platform under-states the aperture). Host-hardware truth like
+#     `data_path:` -- it rides the same envelope and fills the training
+#     binary's config when that left the knob unset (an explicit
+#     `with_gpu_ram_share` in code still wins). A cluster-scope
+#     `gpu_ram_share:` (sibling of `env:`, below) sets a fleet default
+#     for the identical-APU-farm case; the per-host value overrides it,
+#     and a walk-in's own `join.gpu_ram_share:` overrides both.
 #
 # `controller.port:` defaults to 1337 when omitted (replaces
 # PyTorch's MASTER_PORT default of 29500). This single port carries
@@ -171,7 +191,7 @@
 #
 # The worker side of this window is `fdl join` (its defaults live in a
 # top-level `join:` block of the WORKER's fdl.yml — see fdl.yml.example
-# and docs/ddp.md "Walking in").
+# and docs/ddp/02-cluster-guide.md "Walking in").
 
 cluster:
   controller:
@@ -180,7 +200,7 @@ cluster:
     path: /opt/flodl                  # controller's view of the shared project root
     # docker: cuda                    # optional pre-flight build context
     # arch: precompiled/cu128         # optional libtorch variant for pre-flight
-    # data_path: /flodl/data          # shared-storage root (default /flodl/data)
+    # data_path: /flodl/data          # dataset source root; declaring it feeds every rank
     # join:                           # membership-window overrides (see above)
     #   min_rank_start: 2
     #   join_timeout: 300
@@ -197,7 +217,8 @@ cluster:
                                       # host NCCL scan); does NOT wrap training -- the
                                       # rank binary runs directly over SSH. Omit when
                                       # this worker runs flodl natively.
-      # data_path: /flodl/data        # shared-storage root (default /flodl/data)
+      # data_path: /flodl/data        # dataset source root; declaring it feeds every rank
+      # gpu_ram_share: 0.5            # APU hosts only: fraction of host RAM the GPU claims
 
     - host: node-b
       ssh:                            # optional sub-block; omit entirely to use defaults
@@ -235,6 +256,13 @@ cluster:
   # Per-worker `env:` blocks override matching keys.
   # env:
   #   NCCL_DEBUG: INFO
+
+  # Cluster-scope APU default: the integrated-GPU host-RAM share every
+  # host gets unless its own entry (or a walk-in's `join.gpu_ram_share:`)
+  # overrides it. Discrete-GPU hosts ignore it, so it is legal on a
+  # mixed fleet; the case it exists for is a farm of identical APU
+  # boxes, where one line covers walk-ins never enumerated here.
+  # gpu_ram_share: 0.5
 
 # ---------------------------------------------------------------------------
 # commands: which commands fan out to the cluster.

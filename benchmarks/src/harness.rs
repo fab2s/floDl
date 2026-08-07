@@ -67,8 +67,8 @@ fn run_single_pass(
     }
 
     // Sync before measurement
-    #[cfg(feature = "cuda")]
-    flodl::cuda_synchronize(0);
+    #[cfg(feature = "gpu")]
+    flodl::gpu_synchronize(0);
 
     // Measured epochs
     let mut epoch_times = Vec::with_capacity(config.measured_epochs);
@@ -78,8 +78,8 @@ fn run_single_pass(
         let start = Instant::now();
         final_loss = run_epoch(i, false)?;
 
-        #[cfg(feature = "cuda")]
-        flodl::cuda_synchronize(0);
+        #[cfg(feature = "gpu")]
+        flodl::gpu_synchronize(0);
 
         epoch_times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
@@ -114,8 +114,8 @@ pub fn run_benchmark(
     param_count: usize,
     mut run_epoch: impl FnMut(usize, bool) -> flodl::Result<f64>,
 ) -> flodl::Result<BenchResult> {
-    let device_name = if flodl::cuda_available() {
-        format!("CUDA ({})", flodl::cuda_device_name().unwrap_or_default())
+    let device_name = if flodl::gpu_available() {
+        format!("CUDA ({})", flodl::gpu_device_name().unwrap_or_default())
     } else {
         "CPU".to_string()
     };
@@ -129,9 +129,9 @@ pub fn run_benchmark(
     // Reset VRAM peak tracking AFTER warmup so steady-state is measured,
     // not cuDNN autotuning / JIT workspace spikes.
     // Matches Python's torch.cuda.empty_cache() + reset_peak_memory_stats().
-    if flodl::cuda_available() {
-        flodl::cuda_empty_cache();
-        flodl::cuda_reset_peak_stats();
+    if flodl::gpu_available() {
+        flodl::gpu_empty_cache();
+        flodl::gpu_reset_peak_stats();
     }
 
     // Measured runs
@@ -156,12 +156,12 @@ pub fn run_benchmark(
     let epoch_times = best_times.unwrap();
 
     // VRAM — peak active tensors (matches torch.cuda.max_memory_allocated)
-    let vram_mb = flodl::cuda_peak_active_bytes()
+    let vram_mb = flodl::gpu_peak_active_bytes()
         .ok()
         .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
 
     // VRAM — peak allocator reservation (matches torch.cuda.max_memory_reserved)
-    let vram_reserved_mb = flodl::cuda_peak_reserved_bytes()
+    let vram_reserved_mb = flodl::gpu_peak_reserved_bytes()
         .ok()
         .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
 

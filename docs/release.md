@@ -7,11 +7,12 @@ is `make release-check`.
 ## Pre-flight
 
 1. Bump the workspace version in `Cargo.toml` (`version = "X.Y.Z"`) —
-   **plus the four hardcoded dep-version companions** (the `=` pins make a
+   **plus the six hardcoded dep-version companions** (the `=` pins make a
    miss fail loudly at resolve, but they are part of the bump, not a
-   surprise): `flodl-sys = { version = ... }` in `flodl/Cargo.toml`,
-   `flodl-cli-macros "=..."` in `flodl-cli/Cargo.toml`, and `flodl "=..."` +
-   `flodl-cli "=..."` in `flodl-hf/Cargo.toml`.
+   surprise): `flodl-sys = { version = ... }` + `flodl-hw = { version = ... }`
+   in `flodl/Cargo.toml`, `flodl-cli-macros "=..."` + `flodl-hw "=..."` in
+   `flodl-cli/Cargo.toml`, and `flodl "=..."` + `flodl-cli "=..."` in
+   `flodl-hf/Cargo.toml`.
 2. Rename the `[Unreleased]` CHANGELOG heading to `[X.Y.Z] - YYYY-MM-DD`
    and add a fresh empty `[Unreleased]` above.
 3. Commit both edits on `main`.
@@ -39,6 +40,7 @@ Scripts, in order:
 | 07 | `07-docs-rs.sh`     | `make docs-rs`: nightly rustdoc build simulating docs.rs. |
 | 08 | `08-publish-dry.sh` | `cargo publish --dry-run` per workspace crate in dep order. |
 | 09 | `09-skill-assets.sh`| `flodl-cli/assets/skills/` matches its `ai/` sources, so a released `fdl` does not ship a stale `/port` skill. |
+| 10 | `10-crate-coverage.sh`| Every publishable workspace member is listed in this doc's publish block AND the `Makefile` `docs-rs` target (and neither names a crate that is no longer a member). |
 
 To iterate on a single check without running the whole suite:
 
@@ -72,6 +74,11 @@ sh ci/release/03-lint-docs.sh
   `fdl init` scaffold).
 - **`08-publish-dry` missing `version =`** - a `path = "../foo"` dep
   without a `version = "X.Y.Z"` companion - crates.io requires both.
+- **`10-crate-coverage` fails after adding a crate** - add it to the
+  publish block above and to the `Makefile` `docs-rs` target. The failure
+  names the crate and the list it is missing from. If it fires the other
+  way (a list names a non-member), the crate was renamed, removed, or
+  marked `publish = false`; drop the stale entry.
 
 ## Tagging and publishing
 
@@ -91,15 +98,30 @@ uploads them to the GitHub release. `init.sh` and the scaffolded
 Then publish to crates.io in dependency order:
 
 ```bash
+cargo publish -p flodl-hw
 cargo publish -p flodl-sys
 cargo publish -p flodl-cli-macros
 cargo publish -p flodl
 cargo publish -p flodl-cli
+cargo publish -p flodl-hf
 ```
 
 Wait for each to index on crates.io (typically a few seconds) before
-running the next - `flodl` depends on `flodl-sys`, so the latter must
-be indexed first.
+running the next - `flodl` depends on `flodl-sys` and `flodl-hw`, so
+those must be indexed first, and `flodl-hf` depends on both `flodl` and
+`flodl-cli`.
+
+The order is leaves-first. Membership is gated: `10-crate-coverage.sh`
+checks this block and the `Makefile` `docs-rs` target against the
+workspace `members` list in the root `Cargo.toml`, in both directions, so
+a new crate cannot reach a release absent from either. The gate exists
+because `08-publish-dry.sh` uses `--workspace` and therefore picks a new
+crate up *automatically* -- the check that covers every crate is exactly
+the one that can never notice a hand-maintained list going stale.
+
+The **order** within this block is not gated, deliberately: getting it
+wrong fails loudly at the registry on the first `cargo publish` and costs
+a re-run, whereas a missing crate is silent.
 
 ## After the release
 

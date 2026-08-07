@@ -6,7 +6,7 @@
 //! `position_ids` — positions are derived pad-aware inside the
 //! embedding module).
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 

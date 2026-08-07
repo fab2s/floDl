@@ -67,8 +67,9 @@ Each `log` call prints a one-liner to stderr:
 
 The ETA adapts its format automatically: `3h 12m`, `4m 32s`, `12s`, `420ms`.
 
-GPU metrics (VRAM usage and utilization) appear automatically when CUDA is
-available. On CPU-only builds they are silently omitted.
+GPU metrics appear automatically when a GPU is available, and are silently
+omitted on CPU-only builds. VRAM works on either vendor; utilization is
+NVIDIA-only today (see [Resource Tracking](#resource-tracking)).
 
 ## Multiple Metrics
 
@@ -348,26 +349,36 @@ The monitor samples system resources on every `log` call:
 | CPU % | `/proc/stat` (delta) | Linux |
 | RAM used/total | `/proc/meminfo` | Linux |
 | GPU utilization % | NVML (dynamic load) | NVIDIA GPU + driver |
-| VRAM allocated / spill | CUDA caching allocator (`reserved_bytes`) | CUDA feature enabled |
+| VRAM allocated / spill | libtorch caching allocator (`reserved_bytes`) | GPU feature enabled |
 
 Resources that aren't available are silently omitted from both the terminal
 output and the dashboard.
 
+**On ROCm, utilization is the one gap.** The allocator-backed VRAM figures
+come from libtorch and work on either vendor, but the utilization probe
+loads NVML, which is NVIDIA-only: on an AMD box it fails to load and the
+metric is omitted rather than reported wrong. Everything else in the
+dashboard — throughput, VRAM, batch share, timings — is unaffected. Use
+`rocm-smi` alongside the run for utilization until an AMD SMI probe lands.
+
 ### VRAM metrics
 
-flodl exposes two levels of CUDA memory measurement:
+flodl exposes two levels of GPU memory measurement. Both read libtorch's
+caching allocator, so both work on either vendor (the `gpu_` names are
+vendor-neutral for that reason; ROCm keeps the CUDA device type all the
+way down):
 
 | Function | What it measures | PyTorch equivalent |
 |----------|-----------------|-------------------|
-| `cuda_active_bytes()` | Bytes backing live tensors | `torch.cuda.memory_allocated()` |
-| `cuda_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
+| `gpu_active_bytes()` | Bytes backing live tensors | `torch.cuda.memory_allocated()` |
+| `gpu_allocated_bytes()` | Total allocator reservation (includes cached free blocks) | `torch.cuda.memory_reserved()` |
 
-The monitor tracks `cuda_allocated_bytes` (reserved) because it detects
+The monitor tracks `gpu_allocated_bytes` (reserved) because it detects
 unified-memory spill - when reserved bytes exceed physical VRAM, the
 allocator has spilled to host RAM.
 
 For debugging, compare both: if `active` is small but `reserved` is large,
-the allocator is holding freed blocks. Call `cuda_empty_cache()` to release them.
+the allocator is holding freed blocks. Call `gpu_empty_cache()` to release them.
 
 ### Accessing resource data
 

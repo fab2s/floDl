@@ -100,6 +100,19 @@ pub struct ClusterConfig {
     /// keys.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Cluster-scope default for the integrated-GPU host-RAM share: the
+    /// fraction of `MemTotal` an APU host's GPU aperture claims (the
+    /// library's `gpu_ram_share` knob). Discrete-GPU hosts ignore it,
+    /// which is what makes a fleet-wide default legal on a mixed fleet;
+    /// the case it exists for is a farm of identical APU boxes, where
+    /// one line here covers walk-ins the controller never enumerates.
+    /// Per-worker [`ClusterWorker::gpu_ram_share`] overrides it, and a
+    /// walk-in's own `join.gpu_ram_share:` overrides both (host truth
+    /// wins). Non-negative fraction of `MemTotal` (above 1.0 is legal
+    /// where the platform under-states the aperture); unset ships
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ram_share: Option<f64>,
 }
 
 /// Controller-side cluster config. Holds the rendezvous bind point and
@@ -141,11 +154,14 @@ pub struct ClusterController {
     /// controller's project-root `.active` file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// Shared-storage path visible to the controller. flodl assumes a
-    /// shared filesystem reachable at the same logical path on every
-    /// node — training data, model checkpoints, and per-rank logs all
-    /// live here. When absent, the convention default
-    /// [`DEFAULT_DATA_PATH`] applies.
+    /// Dataset source root visible to the controller: training data,
+    /// model checkpoints and per-rank logs. Usually a filesystem
+    /// reachable at the same logical path on every node, which is the
+    /// recommended shape; a node-local directory is legal, and then
+    /// each host holds its own copy. When absent, the convention
+    /// default [`DEFAULT_DATA_PATH`] applies to the checks (`fdl probe`,
+    /// pre-flight) but is NOT shipped to a run — see
+    /// [`ClusterWorker::data_path`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
     /// Join-window quorum knobs (dial-in membership). fdl-cli carries
@@ -239,17 +255,39 @@ pub struct WorkerJoin {
     /// controller hands the salt out in the accept reply).
     #[serde(default)]
     pub token: Option<String>,
-    /// Training binary to run in agent role. The one field `fdl join`
-    /// cannot default: the binary IS the protocol (it dials, joins,
-    /// and spawns this host's relay + rank children itself).
+    /// Training binary to run in agent role, as a path on this box: use
+    /// it as given. Mutually exclusive with `source:`, and one of the
+    /// two is required — the binary IS the protocol (it dials, joins,
+    /// and spawns this host's relay + rank children itself), so `fdl
+    /// join` cannot default it.
+    ///
+    /// This is also the escape hatch for a box whose owner wants the
+    /// last word on what it compiles and runs: a declared binary wins
+    /// over any source a controller would hand it.
     #[serde(default)]
     pub bin: Option<String>,
+    /// Build the training binary here instead of naming one. The box
+    /// fetches the tree to local disk and compiles it against its OWN
+    /// libtorch, which is what makes the ABI match by construction
+    /// rather than by manifest discipline.
+    #[serde(default)]
+    pub source: Option<WorkerSource>,
+    /// libtorch variant to acquire before building or running:
+    /// `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`. It lands under
+    /// `~/.flodl/libtorch/` (never the project tree, which on a walk-in
+    /// is often a read-only mount) and becomes this box's active
+    /// variant. Unset leaves the box on whatever it already has.
+    ///
+    /// `auto` is the fleet value: it routes on the devices THIS box has,
+    /// so one golden image serves NVIDIA and AMD instances.
+    #[serde(default)]
+    pub libtorch: Option<String>,
     /// Logical host name presented in the join hello (default: this
     /// machine's hostname).
     #[serde(default)]
     pub host: Option<String>,
-    /// CUDA device indices to offer, one rank each (default: every
-    /// GPU nvidia-smi sees).
+    /// GPU device indices to offer, one rank each (default: every
+    /// device detection sees for the training build's vendor).
     #[serde(default)]
     pub devices: Option<Vec<u8>>,
     /// Keep dialing across runs: when the agent exits (run finished,
@@ -257,8 +295,153 @@ pub struct WorkerJoin {
     /// re-dials instead of exiting. The systemd / golden-image mode.
     #[serde(default)]
     pub persist: bool,
+    /// Dataset source root on THIS box — a local path, the same role
+    /// `cluster.workers[].data_path` plays for a fan-out host. `fdl
+    /// join` verifies it before dialing and ships it to this host's
+    /// ranks, so the training binary needs no data flag. Unset ships
+    /// nothing: the binary keeps its own default.
+    ///
+    /// With `data_source:` set this is the MOUNTPOINT, defaulting to
+    /// [`DEFAULT_DATA_PATH`].
+    #[serde(default)]
+    pub data_path: Option<String>,
+    /// Transport that establishes `data_path:` when it is not already
+    /// there, `<scheme>://<target>`. One scheme ships today:
+    ///
+    /// ```text
+    /// sshfs://[user@]host[:port]/abs/path
+    /// sshfs://[user@]host:/abs/path        # the scp spelling, same thing
+    /// ```
+    ///
+    /// A source already mounted by provisioning needs nothing here —
+    /// name its path in `data_path:` and leave this unset. The mount
+    /// goes up READ-ONLY: a rank reads the source root and never
+    /// writes it, so the kernel, not a convention, enforces that.
+    #[serde(default)]
+    pub data_source: Option<String>,
+    /// Integrated-GPU host-RAM share for THIS box: the fraction of
+    /// `MemTotal` its GPU aperture claims (the library's
+    /// `gpu_ram_share` knob; discrete GPUs ignore it). Same role as a
+    /// fan-out host's `cluster.workers[].gpu_ram_share`, riding the
+    /// same envelope road: the agent writes it into this host's block
+    /// at join time, where it overrides any cluster-scope default the
+    /// controller stamped. Non-negative fraction of `MemTotal` (above
+    /// 1.0 is legal where the platform under-states the aperture);
+    /// unset ships nothing.
+    #[serde(default)]
+    pub gpu_ram_share: Option<f64>,
+    /// Probe the training binary for its model signature before each
+    /// dial (default: on). The probe re-runs the binary with
+    /// `FLODL_INTERNAL_MODEL_SIG_PROBE` set; it builds its model on
+    /// CPU, prints the signature and exits, and admission can then
+    /// refuse a box building a different model without costing the
+    /// run. `false` skips it — the formation-time check remains — for
+    /// a binary whose startup is too heavy to run twice per dial, or
+    /// one built against a flodl that predates the probe (which would
+    /// otherwise run its whole `main` until the probe timeout kills
+    /// it).
+    #[serde(default)]
+    pub sig_probe: Option<bool>,
     /// Arguments for the training binary (the binary's own training
     /// flags). A `--` tail on the command line replaces this list.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// `join.source:` — build the training binary on this box.
+///
+/// A tree always lands on LOCAL disk before it is built, whatever the
+/// transport: cargo fingerprints by stat'ing every source file on every
+/// invocation, so compiling over a network mount pays that latency
+/// thousands of times, and the attribute caching that would hide the
+/// latency makes cargo serve a stale binary. The fetch preserves mtimes,
+/// which is what keeps the loop incremental rather than a cold rebuild
+/// wearing an incremental costume.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSource {
+    /// Transport plus location. Three ship:
+    ///
+    /// ```text
+    /// file:///abs/path                      a directory on this box (a mount, a disk)
+    /// rsync://[user@]host[:port]:/abs/path  a working tree over ssh
+    /// git+https://host/owner/repo#<ref>     a pinned checkout (also git+ssh://)
+    /// ```
+    ///
+    /// rsync is the one that carries UNCOMMITTED work, which is what a
+    /// training crate living in no repo at all needs. `git+` wants a ref
+    /// (`#<tag|branch|sha>`) because a default branch floats, and a
+    /// floating ref is not a pin.
+    pub from: String,
+    /// Project directory inside the fetched tree (default: its root).
+    /// Governs the build and the run both, so it answers "where is the
+    /// project in this tree" exactly once. A path dep pointing outside
+    /// this directory still resolves, which is why the fetched tree has
+    /// to be the dep root and not just the crate.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Build recipe, run as a shell line in `cwd`. Default: `cargo build
+    /// --release`, which is right whenever the crate carries its own
+    /// `Cargo.toml`, lockfile and `rust-toolchain.toml` — the usual case
+    /// for a crate that builds on the operator's own box.
+    ///
+    /// It can be a script committed beside the code (`./ci/node-build.sh`),
+    /// so the recipe travels with the source while its invocation stays
+    /// here. fdl exports what it resolved: `LIBTORCH_PATH`,
+    /// `FDL_GPU_FEATURE` (say `--features "$FDL_GPU_FEATURE"` rather than
+    /// naming a vendor) and `LD_LIBRARY_PATH`.
+    ///
+    /// It re-runs on every dial, so it must be cheap when nothing
+    /// changed. cargo is; a recipe that rebuilds unconditionally is not.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Built artifact, relative to `cwd` (e.g. `target/release/train`).
+    /// Not guessed: `cargo build` in a workspace member writes to the
+    /// WORKSPACE `target/`, not the member's, so any rule fdl invented
+    /// would be wrong for someone.
+    ///
+    /// Optional because a published tree carries a run manifest that
+    /// names it, and that manifest is the authority when present. Declare
+    /// it here for a box the operator drives by hand.
+    #[serde(default)]
+    pub bin: Option<String>,
+}
+
+/// Top-level `publish:` block — the controller's standing answers for
+/// `fdl publish`, so re-publishing a run is one bare command. Every
+/// field mirrors a flag 1:1 and the FLAG WINS when both are given; a
+/// `--` tail replaces `args:` outright (even an empty tail, because
+/// "explicitly none" must be sayable — the args belong to the RUN).
+///
+/// `--no-build` has no field here ON PURPOSE: a standing config that
+/// silently skips the gate would ship every future typo to the fleet.
+/// The escape hatch stays a per-invocation decision.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishBlock {
+    /// Source to publish, same grammar as `join.source.from:`
+    /// (`file://`, `rsync://`, `git+https://…#<ref>`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Built artifact, relative to the project directory — what workers
+    /// run (`--bin`).
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// Project directory inside the tree (`--cwd`; default: its root).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Build recipe for the gate, a shell line (`--build`; default
+    /// `cargo build --release`).
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Served directory (`--to`; default `~/.flodl/run`).
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Identity file for a source pulled over ssh (`--identity`).
+    #[serde(default)]
+    pub identity: Option<String>,
+    /// The run's own arguments — what rank children re-enter the binary
+    /// with. A command-line `--` tail replaces this list.
     #[serde(default)]
     pub args: Vec<String>,
 }
@@ -267,7 +450,7 @@ pub struct WorkerJoin {
 /// the `"all"` shorthand (auto-detect at startup on that host).
 ///
 /// `local_devices: all` defers device-index resolution to startup on
-/// whichever host the value lives on. The host uses `cuda_device_count()`
+/// whichever host the value lives on. The host uses `gpu_device_count()`
 /// and binds devices `0..ranks.len()` (sequential from index 0). The
 /// detected count must be at least as large as `ranks.len()`, otherwise
 /// rendezvous errors loudly.
@@ -468,15 +651,38 @@ pub struct ClusterWorker {
     /// where the basename names the CUDA version, not GPU archs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
-    /// Shared-storage path visible to this host. flodl assumes a
-    /// shared filesystem (NAS / SMB / virtiofs / S3-FUSE / SSHFS)
-    /// reachable at the same logical path on every node — training
-    /// data, model checkpoints, and per-rank logs all live here. When
-    /// absent, the convention default [`DEFAULT_DATA_PATH`] applies.
-    /// `fdl probe` verifies the path exists + is readable on each
-    /// host before training can fan out.
+    /// Dataset source root on this host: where its ranks READ training
+    /// data from, alongside model checkpoints and per-rank logs.
+    ///
+    /// Usually a shared filesystem (NAS / SMB / virtiofs / S3-FUSE /
+    /// SSHFS) reachable at the same logical path on every node, which
+    /// is the recommended shape and the one multi-host checkpointing
+    /// requires. A node-local directory is legal too, and then each
+    /// host holds its own copy. `fdl probe` verifies the path exists +
+    /// is readable on each host before training can fan out.
+    ///
+    /// **Declaring it changes a run.** The value travels to every rank
+    /// through the launcher envelope and supplies the training binary's
+    /// data directory (`LocalCluster::data_path` on the flodl side; an
+    /// explicit `--data-dir` still wins). When absent, nothing travels
+    /// and the binary keeps its own default: the convention default
+    /// [`DEFAULT_DATA_PATH`] governs the CHECKS only, because shipping
+    /// it would point every cluster that never mentioned data at a
+    /// directory most hosts do not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share for THIS host: the fraction of
+    /// `MemTotal` its GPU aperture claims (the library's
+    /// `gpu_ram_share` knob; discrete GPUs ignore it). Host-hardware
+    /// truth like `data_path`: it travels to this host's ranks through
+    /// the launcher envelope and fills the training binary's config
+    /// when that left the knob unset (an explicit `with_gpu_ram_share`
+    /// in code still wins). Overrides the cluster-scope
+    /// [`ClusterConfig::gpu_ram_share`] default. Non-negative fraction
+    /// of `MemTotal` (above 1.0 is legal where the platform
+    /// under-states the aperture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_ram_share: Option<f64>,
     /// Names the docker compose service that provides this host's
     /// runtime environment (e.g. `cuda`, `dev`). It does NOT wrap the
     /// training exec: cluster fan-out runs each rank's binary directly
@@ -741,14 +947,20 @@ impl ClusterConfig {
         // doesn't need them — the rank-side library has nothing to do
         // with SSH. They're already on the FULL envelope via serde on
         // `ClusterConfig` so the launcher picks them up there.
-        // Shared-data path: always serialize the effective value
-        // (declared or convention default) so the rank-side envelope
-        // surfaces a non-ambiguous path. Library validates existence
-        // via `fdl probe` before training; ship the path verbatim.
-        worker_obj.insert(
-            "data_path".into(),
-            Value::String(worker.effective_data_path().into()),
-        );
+        //
+        // Dataset source root: DECLARED values only, never
+        // `effective_data_path()`. The convention default names a path
+        // that most hosts do not actually have, and the rank consumes
+        // this one (it reaches `--data-dir` through
+        // `LocalCluster::data_path`), so shipping the default would
+        // point every run that never mentioned data at a directory that
+        // is not there. Absent = the training binary keeps its own
+        // default. Same split `check_remote_data_path` already makes:
+        // a declared path that is missing is an error, a convention
+        // default that is missing is a warning.
+        if let Some(dp) = &worker.data_path {
+            worker_obj.insert("data_path".into(), Value::String(dp.clone()));
+        }
 
         let mut controller_obj = serde_json::Map::new();
         controller_obj.insert("host".into(), Value::String(self.controller.host.clone()));

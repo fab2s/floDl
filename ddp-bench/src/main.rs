@@ -31,9 +31,32 @@ struct Cli {
     epochs: Option<usize>,
 
     /// Unsupported (loud error): epoch length is the dataset; use
-    /// --epochs / --batch-size to scale a run.
+    /// --epochs / --batch-size to scale a run, or --train-tokens to size
+    /// the staged corpus on token models.
     #[option]
     batches: Option<usize>,
+
+    /// Slice each data pass into N epochs. `--epochs` keeps counting data
+    /// PASSES, so `--epochs 1 --epoch-splits 20` delivers one pass as 20
+    /// epochs and sees no sample twice, while `--epochs 2 --epoch-splits
+    /// 20` is 40 epochs over two passes.
+    /// Eval, checkpointing and the reduce-window cap all follow the
+    /// finer boundary. The reason to use it is single-pass training (the
+    /// normal regime for LLM pretraining): without it such a run has no
+    /// interior boundary, so no checkpoint and no eval until the end.
+    /// [default: 1]
+    #[option]
+    epoch_splits: Option<usize>,
+
+    /// Tokens of the training shard to stage (token models only: olmo,
+    /// olmo-graph). Accepts K/M/G suffixes, e.g. `20M`. In real-data mode
+    /// the staged corpus IS one data pass, so this is the knob that sizes
+    /// a pass. Expressed in tokens rather than bytes so it does not shift
+    /// when sequence length changes. Snapped up or down to the nearest
+    /// corpus that divides exactly into `--epoch-splits` epochs of whole
+    /// batches — the run reports what it staged. [default: 2M (4 MiB)]
+    #[option]
+    train_tokens: Option<String>,
 
     /// Override batch size.
     #[option]
@@ -47,9 +70,11 @@ struct Cli {
     #[option(default = "runs")]
     output: String,
 
-    /// Dataset cache directory.
-    #[option(default = "data")]
-    data_dir: std::path::PathBuf,
+    /// Dataset source directory. Absent: the cluster host's declared
+    /// `data_path:` when there is one, else `data` next to the binary's
+    /// working directory.
+    #[option]
+    data_dir: Option<std::path::PathBuf>,
 
     /// Training data source: "ram" parses the dataset into memory up
     /// front; "disk" reads per sample from the raw files through
@@ -623,9 +648,14 @@ fn apply_gpu_selection(spec: &str) -> flodl::tensor::Result<()> {
     let canonical = parts.join(",");
     eprintln!("ddp-bench: --gpus {spec} -> CUDA_VISIBLE_DEVICES={canonical}");
     // SAFETY: we are still in `main`, no threads spawned, no libtorch
-    // touched yet. Setting CUDA_VISIBLE_DEVICES from a single-threaded
-    // context before any FFI call into libtorch is safe.
-    unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", &canonical); }
+    // touched yet. Setting the masks from a single-threaded context
+    // before any FFI call into libtorch is safe. HIP prefers its own
+    // variable over CUDA_VISIBLE_DEVICES (first one set wins), so the
+    // AMD spelling rides along; it is inert on an NVIDIA box.
+    unsafe {
+        std::env::set_var("CUDA_VISIBLE_DEVICES", &canonical);
+        std::env::set_var("HIP_VISIBLE_DEVICES", &canonical);
+    }
     Ok(())
 }
 
@@ -633,7 +663,7 @@ fn run() -> flodl::tensor::Result<()> {
     let cli: Cli = parse_or_schema();
 
     // GPU selection MUST be applied before any libtorch / CUDA init
-    // (cuda_device_count() at line ~260 is the first such call). Once
+    // (gpu_device_count() at line ~260 is the first such call). Once
     // libtorch latches onto a device list, CUDA_VISIBLE_DEVICES is ignored.
     if let Some(spec) = cli.gpus.as_deref() {
         apply_gpu_selection(spec)?;
@@ -713,9 +743,47 @@ fn run() -> flodl::tensor::Result<()> {
              batches. Scale runs with --epochs / --batch-size instead.",
         )));
     }
+    // Nonsense input, caught here. Splitting a pass into more epochs than
+    // it has batches is the other bad case, and flodl refuses that one
+    // centrally (it needs the dataset length, which is not known yet).
+    let epoch_splits = cli.epoch_splits;
+    if epoch_splits == Some(0) {
+        return Err(flodl::tensor::TensorError::new(
+            "--epoch-splits 0 is meaningless: a data pass is sliced into at \
+             least one epoch. Omit the flag for the default of 1.",
+        ));
+    }
+    // Token models only, matching the --batches precedent: silently
+    // ignoring a corpus size would train a different amount of data than
+    // the invocation records.
+    let train_tokens = match cli.train_tokens.as_deref() {
+        None => None,
+        Some(raw) => {
+            let requested = crate::config::parse_token_count(raw)
+                .map_err(|e| flodl::tensor::TensorError::new(&format!("--train-tokens: {e}")))?;
+            let target = cli.model.as_deref().unwrap_or("all");
+            if !matches!(target, "olmo" | "olmo-graph") {
+                return Err(flodl::tensor::TensorError::new(&format!(
+                    "--train-tokens sizes a staged TOKEN corpus and only the token \
+                     models honor it (olmo, olmo-graph); --model {target} would stage \
+                     its own fixed dataset and train a different amount of data than \
+                     this invocation records. Pass --model olmo or --model olmo-graph.",
+                )));
+            }
+            Some(requested)
+        }
+    };
     let batch_size = cli.batch_size;
     let output = cli.output.clone();
-    let data_dir = cli.data_dir.clone();
+    // Dataset source root, in precedence order: an explicit --data-dir,
+    // then the source root this cluster host declared, then the
+    // historical cwd-relative default. A solo run resolves to `data`
+    // exactly as before, since there is no envelope to read.
+    let data_dir = match cli.data_dir.clone() {
+        Some(p) => p,
+        None => flodl::distributed::cluster_data_path()?
+            .unwrap_or_else(|| std::path::PathBuf::from("data")),
+    };
     let monitor_port = cli.monitor;
     let validate = cli.validate;
     let save_baseline = cli.save_baseline;
@@ -944,11 +1012,17 @@ fn run() -> flodl::tensor::Result<()> {
             g.index,
             g.short_name(),
             g.vram_bytes() / (1024 * 1024 * 1024),
-            g.sm_version(),
+            g.arch_label(),
         );
     }
 
     let mut all_results: Vec<Vec<harness::RunResult>> = Vec::new();
+    // A cell that failed must reach the exit code. Reporting it only on
+    // stderr made `ddp-bench` exit 0 after training nothing, which reads
+    // as success to everything upstream — `fdl join`'s model-sig probe
+    // concluded the binary was too old to carry the contract when it had
+    // in fact failed on a read-only output directory.
+    let mut failed_cells = 0usize;
 
     for model_def in &model_defs {
         let defaults = &model_def.defaults;
@@ -1023,6 +1097,8 @@ fn run() -> flodl::tensor::Result<()> {
                 bf16_wire: cli.bf16_wire,
                 augment: cli.augment.unwrap_or(1).max(1),
                 augment_noise: cli.augment_noise.unwrap_or(0.0),
+                epoch_splits: epoch_splits.unwrap_or(1).max(1),
+                train_tokens,
                 vram_max_usage: cli.vram_max_usage,
                 ram_max_usage: cli.ram_max_usage,
                 sample_cache: cli.sample_cache,
@@ -1038,6 +1114,7 @@ fn run() -> flodl::tensor::Result<()> {
                 Ok(result) => model_results.push(result),
                 Err(e) => {
                     eprintln!("  FAILED: {} / {}: {}", model_def.name, mode, e);
+                    failed_cells += 1;
                 }
             }
         }
@@ -1085,6 +1162,13 @@ fn run() -> flodl::tensor::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    if failed_cells > 0 {
+        eprintln!(
+            "\nddp-bench: {failed_cells} cell(s) failed (see FAILED above)"
+        );
+        std::process::exit(1);
     }
 
     Ok(())

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::autograd::{NoGradGuard, Variable};
 use crate::data::BatchDataSet;
-use crate::tensor::cuda_event::{CudaEvent, CudaEventFlags};
-use crate::tensor::cuda_stream::{CudaStream, StreamGuard};
+use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
+use crate::tensor::cuda_stream::{GpuStream, StreamGuard};
 use crate::distributed::nccl::NcclRankComm;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
@@ -72,6 +72,16 @@ impl<M: Module> GpuWorker<M> {
         // in-process logger never sees. Setting the same prefix in-process
         // would double it on flodl-log-macro lines, so skip it there,
         // detected by the launcher's per-rank env marker.
+        // Whether this rank's device can be budgeted at all. Static for
+        // the process, so it is answered once here rather than per epoch
+        // inside the arithmetic, which has no way to report it. Before
+        // any stream, model or dataset work: a refusal is a
+        // configuration verdict and costs nothing to reach.
+        crate::data::budget::check_apu_sizing(config.device, config.gpu_ram_share)
+            .map_err(|e| {
+                TensorError::new(&format!("GpuWorker rank {}: {e}", config.rank))
+            })?;
+
         let local_dev = match config.device {
             Device::CUDA(d) => d,
             _ => 0,
@@ -87,9 +97,9 @@ impl<M: Module> GpuWorker<M> {
         // triggering libtorch's "stream does not match" warning and breaking
         // CUDA graph capture.
         let (compute_stream, comm_stream, copy_done) = if config.device.is_cuda() {
-            let cs = CudaStream::new(config.device, false)?;
-            let ms = CudaStream::new(config.device, false)?;
-            let ev = CudaEvent::new(CudaEventFlags::DisableTiming)?;
+            let cs = GpuStream::new(config.device, false)?;
+            let ms = GpuStream::new(config.device, false)?;
+            let ev = GpuEvent::new(GpuEventFlags::DisableTiming)?;
             // Record initial event so first wait_event is a no-op
             ev.record_on(&ms)?;
             (Some(cs), Some(ms), Some(ev))
@@ -235,10 +245,12 @@ impl<M: Module> GpuWorker<M> {
                 stage_cache,
                 stream_pool,
                 config.seed,
+                config.epoch_splits.max(1),
                 config.rank,
                 config.world_size,
                 config.augment,
                 config.ram_max_usage,
+                config.gpu_ram_share,
                 config.sample_cache,
             );
             (dataset, Some(stager))
@@ -262,10 +274,10 @@ impl<M: Module> GpuWorker<M> {
             crate::debug!(
                 "  ddp-worker: rank {} constructor prefetch sizing: psb={} depth={} (used, total)={:?}",
                 config.rank, psb, depth,
-                crate::tensor::cuda_memory_info_idx(config.device.index() as i32)
+                crate::tensor::gpu_memory_info_idx(config.device.index() as i32)
             );
             // Reset peak stats so first run_epoch_plan gets a clean baseline.
-            crate::tensor::cuda_reset_peak_stats_idx(config.device.index() as i32);
+            crate::tensor::gpu_reset_peak_stats_idx(config.device.index() as i32);
             if depth > 0 {
                 // Device sample pool: coordinator-paced epochs have no
                 // governor, so the worker signals the pool's budget
@@ -386,6 +398,7 @@ impl<M: Module> GpuWorker<M> {
             partition: Vec::new(), // filled by first StartEpoch from coordinator
             batch_size: config.batch_size,
             base_seed: config.seed,
+            epoch_splits: config.epoch_splits.max(1),
             augment: config.augment.max(1),
             transform: config.transform.clone(),
             local_step: 0,
@@ -412,6 +425,7 @@ impl<M: Module> GpuWorker<M> {
             per_sample_bytes,
             vram_max_usage: config.vram_max_usage,
             ram_max_usage: config.ram_max_usage,
+            gpu_ram_share: config.gpu_ram_share,
             activation_peak_bytes: 0,
             // Nothing to signal when the pool is off: pre-latch so the
             // install boundary (and its flow-reserve depth collapse)

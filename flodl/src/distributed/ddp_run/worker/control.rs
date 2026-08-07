@@ -5,7 +5,7 @@ use crate::nn::Module;
 use crate::tensor::{Result, TensorError};
 
 use super::super::{
-    ControlMsg, TimingMsg, make_partition,
+    ControlMsg, TimingMsg, make_partition, pick_space,
 };
 use super::GpuWorker;
 
@@ -201,10 +201,9 @@ impl<M: Module> GpuWorker<M> {
                 let extra = make_partition(
                     partition_offset,
                     partition_size,
-                    // Pick space: must agree with the coordinator's
-                    // ledger and run_epoch_plan's own expansion.
-                    self.dataset.len() * self.augment.max(1),
+                    pick_space(self.dataset.len(), self.augment),
                     self.current_epoch,
+                    self.epoch_splits,
                     self.base_seed,
                 );
                 let old_batches = self.partition.len() / self.batch_size;

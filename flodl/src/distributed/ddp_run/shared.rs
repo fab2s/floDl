@@ -9,6 +9,111 @@
 
 use super::{EpochMetrics, MetricsMsg};
 
+/// The pick space: `dataset.len() * augment`, the schedule space every
+/// partition offset and size lives in. A pick decodes as
+/// `(pick / augment, pick % augment)` = (sample, repeat).
+///
+/// One derivation, because agreement here is a correctness property
+/// rather than a convention. The coordinator's ledger, each rank's
+/// epoch expansion, the resume coverage map and the stager's read-ahead
+/// all index the same permutation of this range: a consumer that sizes
+/// it differently silently trains on a different shuffle, with no error
+/// anywhere to catch it.
+pub(crate) fn pick_space(dataset_len: usize, augment: usize) -> usize {
+    dataset_len * augment.max(1)
+}
+
+/// The `window <= epoch` ceiling, in batches, or `None` when an epoch is
+/// too small to bound (the caller then leaves the window uncapped).
+///
+/// A reduce window must never span more than one epoch: left unbounded, an
+/// ElChe schedule grows the window past the epoch and syncs collapse to
+/// under one per pass, serializing the cohort. Under epoch splits the
+/// ceiling follows the slice, and the floor keeps it valid for every event
+/// including the longer ones carrying the balanced remainder.
+pub(crate) fn window_cap_batches(
+    total_samples: usize,
+    epoch_splits: usize,
+    batch_size: usize,
+) -> Option<usize> {
+    if batch_size == 0 {
+        return None;
+    }
+    let epoch_samples = total_samples / epoch_splits.max(1);
+    (epoch_samples >= batch_size).then(|| epoch_samples / batch_size)
+}
+
+/// Validate and describe the epoch geometry before a run starts.
+///
+/// One home for both, called from every tier's entry point, because both
+/// answers depend on the same three numbers and neither is specific to a
+/// dispatch path. Refusing here beats refusing at dispatch: the failure it
+/// prevents is silent at runtime, not loud.
+///
+/// `total_samples` is the pick space, `epoch_splits` the slices per data
+/// pass, `num_epochs` the number of passes.
+pub(crate) fn check_epoch_geometry(
+    total_samples: usize,
+    batch_size: usize,
+    epoch_splits: usize,
+    num_epochs: usize,
+) -> crate::tensor::Result<()> {
+    let splits = epoch_splits.max(1);
+    if splits == 1 || batch_size == 0 || total_samples == 0 {
+        return Ok(());
+    }
+    let epoch_samples = total_samples / splits;
+    if epoch_samples < batch_size {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "epoch_splits {splits} slices {total_samples} picks into epochs of \
+             {epoch_samples} picks, short of one {batch_size}-pick batch: those \
+             epochs would train nothing, and the `window <= epoch` reduce cap has \
+             no epoch large enough to bound the window. Use at most {} splits, or \
+             a larger dataset.",
+            (total_samples / batch_size).max(1),
+        )));
+    }
+
+    let multiple = splits * batch_size;
+    let divides = total_samples % multiple == 0;
+    eprintln!(
+        "  ddp: pass = {splits} epochs x {} batches x {batch_size} of {total_samples} picks ({})",
+        epoch_samples / batch_size,
+        if divides {
+            "exact".to_string()
+        } else {
+            format!("up to {} picks/pass outside the last batch", splits * (batch_size - 1))
+        },
+    );
+    // A tail is re-drawn every pass, so multi-pass runs average it away
+    // (200 passes miss a given sample ~0.3 times). One pass averages with
+    // nothing, so say so rather than let it pass as rounding.
+    if !divides && num_epochs <= 1 {
+        eprintln!(
+            "  ddp: WARNING single-pass run, so that tail is never re-drawn. Size the \
+             dataset to a multiple of {multiple} to use all of it."
+        );
+    }
+    Ok(())
+}
+
+/// Render an epoch index for a human reader.
+///
+/// Bare when unsplit, so existing logs are untouched; `3 (pass 0, split
+/// 4/20)` when an epoch is a slice, because the bare index alone stops
+/// answering "how far through the data am I". Internals keep counting
+/// epochs — only what a person reads gains the extra vocabulary.
+pub(crate) fn epoch_label(epoch: usize, epoch_splits: usize) -> String {
+    if epoch_splits <= 1 {
+        return epoch.to_string();
+    }
+    format!(
+        "{epoch} (pass {}, split {}/{epoch_splits})",
+        epoch / epoch_splits,
+        epoch % epoch_splits + 1,
+    )
+}
+
 /// Equal partition sizes with remainder distributed to the first ranks.
 pub(crate) fn equal_sizes(world_size: usize, total: usize) -> Vec<usize> {
     let base = total / world_size;
@@ -250,7 +355,7 @@ pub(crate) fn aggregate_epoch_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::aggregate_epoch_metrics;
+    use super::{aggregate_epoch_metrics, pick_space, window_cap_batches};
     use super::super::MetricsMsg;
     use std::collections::HashMap;
 
@@ -384,5 +489,84 @@ mod tests {
 
         // Weighted average: (0.9*60 + 1.5*40)/100 = (54+60)/100 = 1.14
         assert!((m.scalars["loss"] - 1.14).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pick_space_treats_zero_augment_as_one() {
+        assert_eq!(pick_space(50, 1), 50);
+        assert_eq!(pick_space(50, 3), 150);
+        assert_eq!(pick_space(50, 0), 50);
+    }
+
+    #[test]
+    fn epoch_label_stays_bare_when_unsplit() {
+        // Existing logs must not gain noise for runs that never split.
+        assert_eq!(super::epoch_label(7, 1), "7");
+        assert_eq!(super::epoch_label(7, 0), "7");
+    }
+
+    #[test]
+    fn epoch_label_locates_a_split_epoch_in_its_pass() {
+        // Epoch 0..3 are pass 0, epoch 4 starts pass 1. Splits read
+        // 1-based because "split 1/4" is the first one to a human.
+        assert_eq!(super::epoch_label(0, 4), "0 (pass 0, split 1/4)");
+        assert_eq!(super::epoch_label(3, 4), "3 (pass 0, split 4/4)");
+        assert_eq!(super::epoch_label(4, 4), "4 (pass 1, split 1/4)");
+    }
+
+    #[test]
+    fn window_cap_follows_the_split() {
+        // Unsplit: the bound is the whole pass, as it always was.
+        assert_eq!(window_cap_batches(2048, 1, 4), Some(512));
+        // Split four ways: a window cannot outgrow one event's slice.
+        assert_eq!(window_cap_batches(2048, 4, 4), Some(128));
+        // A 0 reads as unsplit rather than dividing by zero.
+        assert_eq!(window_cap_batches(2048, 0, 4), Some(512));
+    }
+
+    #[test]
+    fn window_cap_floors_so_it_holds_for_the_longer_events() {
+        // 100 over 7 events: the balanced remainder makes two events 15
+        // picks and five 14. The cap must be sized on 14, not 15.
+        assert_eq!(window_cap_batches(100, 7, 2), Some(7));
+    }
+
+    #[test]
+    fn a_starved_epoch_is_refused_before_the_run_starts() {
+        // 100 picks, batch 4, 50 splits => 2 picks per epoch. Those epochs
+        // train nothing, and window_cap_batches declines so the reduce
+        // window grows unbounded. Both are silent at runtime.
+        let err = super::check_epoch_geometry(100, 4, 50, 1)
+            .expect_err("a starved epoch must be refused, not scheduled");
+        let msg = err.to_string();
+        assert!(msg.contains("epoch_splits 50"), "unexpected: {msg}");
+        assert!(msg.contains("train nothing"), "unexpected: {msg}");
+        assert!(msg.contains("at most 25"), "must name a usable bound: {msg}");
+    }
+
+    #[test]
+    fn geometry_that_fits_is_accepted() {
+        // Exactly one batch per epoch is the boundary case, and it fits.
+        super::check_epoch_geometry(100, 4, 25, 1).expect("25 splits of 100 at batch 4 fits");
+        super::check_epoch_geometry(78_160, 4, 20, 1).expect("the snapped olmo corpus fits");
+    }
+
+    #[test]
+    fn unsplit_runs_are_never_refused_or_narrated() {
+        // splits == 1 is the historical shape: no new failure mode, and
+        // no new line in anyone's logs.
+        super::check_epoch_geometry(3, 4, 1, 1).expect("unsplit tiny dataset stays accepted");
+        super::check_epoch_geometry(0, 4, 1, 1).expect("unsized dataset stays accepted");
+        super::check_epoch_geometry(100, 0, 8, 1).expect("unknown batch size cannot be judged");
+    }
+
+    #[test]
+    fn window_cap_declines_when_an_epoch_cannot_fill_a_batch() {
+        assert_eq!(window_cap_batches(3, 1, 4), None);
+        // Splitting too finely starves an epoch below one batch even
+        // though the pass is ample — the cap declines rather than
+        // pinning the window to zero.
+        assert_eq!(window_cap_batches(100, 50, 4), None);
+        assert_eq!(window_cap_batches(100, 1, 0), None);
     }
 }

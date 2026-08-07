@@ -88,7 +88,17 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 /// Wire version of the control-channel protocol. Independent of the
 /// data-channel `PROTOCOL_VERSION` in `controller.rs`. Bump on any
 /// breaking change to [`ControlFrame`] or to the wire-message types.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+// v3: Hello gained `run_id` + `nccl_version` (bincode is not
+// self-describing, so new fields ARE a new protocol; the bump moves a
+// mixed-version cohort's failure to the handshake, named, instead of a
+// decode error mid-join).
+// v4: the rank handshake carries the 32-byte model signature and
+// `RelayControlMsg::Hello` forwards the per-rank signatures, so the
+// coordinator can refuse a mixed-model formation by name instead of
+// letting the first collective hang on mismatched shapes. The join
+// hello gained the same signature as an `Option` (probed by `fdl join`
+// before the dial), moving the refusal to admission for walk-ins.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Channel-select magics (single-port mux)
@@ -605,13 +615,17 @@ fn frame_mac(salt: &SessionSalt, kind: MsgKind, payload: &[u8]) -> u64 {
 /// u32 version     = CONTROL_PROTOCOL_VERSION
 /// u32 rank_id     (0..world_size)
 /// u32 world_size  (rank's view; coordinator validates)
-/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..16])
+/// [u8; 32]        model signature (see `distributed::model_sig`)
+/// u64 auth_tag    = first 8 bytes of HMAC-SHA256(salt, hdr[0..48])
 /// ```
 ///
-/// Total: 24 bytes. The HMAC proves the rank shares the launcher's
+/// Total: 56 bytes. The HMAC proves the rank shares the launcher's
 /// session salt; mismatched salts surface here before any control
-/// frame round-trip.
-const HS_RANK_BYTES: usize = 24;
+/// frame round-trip. The model signature rides the handshake (rather
+/// than a later frame) because it is the relay that terminates this
+/// exchange, and the relay must have every local rank's signature in
+/// hand when it sends its upstream `Hello`.
+const HS_RANK_BYTES: usize = 56;
 
 /// Handshake-ack layout (coordinator → rank):
 ///
@@ -636,6 +650,7 @@ pub(crate) fn write_handshake_rank(
     stream: &mut TcpStream,
     rank_id: u32,
     world_size: u32,
+    model_sig: &[u8; 32],
     salt: &SessionSalt,
 ) -> Result<()> {
     let mut buf = [0u8; HS_RANK_BYTES];
@@ -643,23 +658,24 @@ pub(crate) fn write_handshake_rank(
     buf[4..8].copy_from_slice(&CONTROL_PROTOCOL_VERSION.to_le_bytes());
     buf[8..12].copy_from_slice(&rank_id.to_le_bytes());
     buf[12..16].copy_from_slice(&world_size.to_le_bytes());
-    let tag = hmac_first8(salt, &buf[0..16]);
-    buf[16..24].copy_from_slice(&tag);
+    buf[16..48].copy_from_slice(model_sig);
+    let tag = hmac_first8(salt, &buf[0..48]);
+    buf[48..56].copy_from_slice(&tag);
     stream.write_all(&buf).map_err(|e| {
         TensorError::new(&format!("wire: handshake write: {e}"))
     })
 }
 
 /// Read and validate the rank-side control-channel handshake (salt-
-/// authenticated), returning the announced `rank_id`. Used by the
-/// coordinator's accept loop and by the per-host relay
-/// ([`crate::distributed::relay`]), which terminates the handshake
-/// toward its local ranks as the coordinator does.
+/// authenticated), returning the announced `rank_id` and the rank's
+/// model signature. Used by the coordinator's accept loop and by the
+/// per-host relay ([`crate::distributed::relay`]), which terminates the
+/// handshake toward its local ranks as the coordinator does.
 pub(crate) fn read_handshake_rank(
     stream: &mut TcpStream,
     expected_world_size: u32,
     salt: &SessionSalt,
-) -> Result<u32> {
+) -> Result<(u32, [u8; 32])> {
     let mut buf = [0u8; HS_RANK_BYTES];
     stream.read_exact(&mut buf).map_err(|e| {
         TensorError::new(&format!("wire: handshake read: {e}"))
@@ -683,8 +699,9 @@ pub(crate) fn read_handshake_rank(
             "wire: handshake world_size {world_size} != expected {expected_world_size}"
         )));
     }
-    let expected_tag = hmac_first8(salt, &buf[0..16]);
-    let got_tag: [u8; 8] = buf[16..24].try_into().unwrap();
+    let model_sig: [u8; 32] = buf[16..48].try_into().unwrap();
+    let expected_tag = hmac_first8(salt, &buf[0..48]);
+    let got_tag: [u8; 8] = buf[48..56].try_into().unwrap();
     if expected_tag != got_tag {
         return Err(TensorError::new(
             "wire: handshake HMAC verification failed; \
@@ -692,7 +709,7 @@ pub(crate) fn read_handshake_rank(
              or wrong key configured)",
         ));
     }
-    Ok(rank_id)
+    Ok((rank_id, model_sig))
 }
 
 /// Coordinator/relay-side handshake ack write (salt-authenticated).
@@ -1697,12 +1714,34 @@ pub enum JoinMsgWire {
         /// GPU inventory, one label per device (informational: logged
         /// and surfaced in the membership state, not validated).
         gpus: Vec<String>,
-        /// libtorch variant label (informational, same as `gpus`).
+        /// libtorch variant label. Its VENDOR is validated (a mixed
+        /// NCCL+RCCL cohort hangs at formation); the rest is
+        /// informational, same as `gpus`.
         libtorch: String,
         /// 32-byte dataset signature; must match the controller's own.
         /// A stale worker from a previous run is rejected at the door,
         /// not discovered mid-epoch.
         dataset_sig: [u8; 32],
+        /// Identity of the published run this box prepared (the
+        /// `.fdl-run.yml` nonce `fdl publish` stamps). `None` gates
+        /// nothing: a `--bin` box carries no manifest, and that escape
+        /// hatch stays one. Two boxes holding DIFFERENT ids fetched
+        /// across a publish boundary, and a cohort straddling that
+        /// boundary would train two different runs as one world.
+        run_id: Option<String>,
+        /// `(major, minor, patch)` of the NCCL/RCCL library this box's
+        /// binary actually loads. Skew in major.minor refuses the NCCL
+        /// handshake at formation — after the window was spent — so the
+        /// window checks it instead. `None` (CPU build, read failed)
+        /// gates nothing.
+        nccl_version: Option<(u32, u32, u32)>,
+        /// Model signature of the model this box's binary constructs
+        /// (see `distributed::model_sig`), probed by `fdl join` before
+        /// the dial. Admission refuses a mismatch so the box condemns
+        /// only its own attempt; the formation-time handshake check
+        /// remains the backstop for boxes that carry `None` (probe
+        /// skipped or failed — gates nothing).
+        model_sig: Option<[u8; 32]>,
     },
     /// Controller → worker agent: admitted. Carries the assigned global
     /// rank ids (admission order — contiguous by construction).

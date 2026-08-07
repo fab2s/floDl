@@ -123,7 +123,7 @@ trampoline; pick whichever shape your call site prefers.
 
 > **Invariant - "no CUDA before `Trainer::run`"**: user binaries must
 > not touch libtorch's CUDA context before reaching `Trainer::run`. That
-> means no `flodl::tensor::cuda_device_count()`, no
+> means no `flodl::tensor::gpu_device_count()`, no
 > `Module::on_device(CUDA(_))`, no CUDA-Tensor construction in `main()`.
 > Cluster fan-out exits the launcher process without running training;
 > touching CUDA there corrupts spawned children's context on
@@ -415,6 +415,68 @@ Controls which rank executes per-epoch callbacks (`checkpoint_fn`,
 
 ---
 
+## Slicing a pass into epochs - `epoch_splits`
+
+"Epoch" normally fuses two things: a full pass over the data, and a
+periodic event during training. They coincide until you train **one pass**,
+which is the normal regime for LLM pretraining — and then the run has no
+interior boundary at all, so no eval, no checkpoint and no reduce-window
+bound until it ends. On rented hardware that can vanish, a lost box is a
+lost run.
+
+`epoch_splits` separates the two. `num_epochs` keeps counting **data
+passes**; `epoch_splits` says how finely to slice one:
+
+```rust
+Trainer::builder(model_factory, optim_factory, train_step)
+    .dataset(dataset)
+    .num_epochs(1)         // one pass over the corpus
+    .epoch_splits(20)      // delivered as 20 epochs, no sample seen twice
+    .run()?;
+```
+
+| invocation | data passes | epochs | repeats |
+|---|---|---|---|
+| `num_epochs(10)` | 10 | 10 | yes — the default, unchanged |
+| `num_epochs(1).epoch_splits(20)` | 1 | 20 | **no** |
+| `num_epochs(2).epoch_splits(20)` | 2 | 40 | yes, twice |
+
+Repetition is never implicit: it is `num_epochs` passes, visible in the
+call.
+
+- **Everything that keys off the epoch boundary follows**, with no extra
+  configuration: eval cadence, `checkpoint_every`, `reports_per_epoch`, and
+  the load-bearing `window <= epoch` cap — the coordinator bounds a reduce
+  window by one epoch, so slicing the epoch tightens the window too. That
+  shared boundary is why one knob is enough.
+- **The permutation is unchanged.** A pass is still one shuffle covering
+  every sample exactly once; splitting only decides how much of it an epoch
+  consumes. Concatenating the epochs of a pass reproduces that pass exactly,
+  so slices are disjoint and jointly complete by construction.
+- **The LR schedule is untouched.** Total steps stay `batches x passes`, so
+  a split run and an unsplit one follow the same curve.
+- **At `epoch_splits(1)` (the default) nothing changes** — same scheduling,
+  same logs, byte-identical shuffle to runs that predate the knob.
+- **Refused rather than silently degraded:** splitting a pass into more
+  epochs than it has batches would leave epochs with no work *and* leave the
+  reduce window unbounded, so it errors at construction naming a usable
+  bound.
+- **The tail.** An epoch trains whole batches, so `epoch_samples %
+  batch_size` picks per epoch fall outside the last one. They are dropped
+  *before* allocation (never dispatched, so nothing waits on them), and the
+  run prints the geometry it settled on. The tail is re-drawn every pass, so
+  multi-pass runs average it away — across 200 passes a given sample is
+  missed ~0.3 times. A **single-pass** run averages with nothing, so it warns
+  and asks you to size the dataset to a multiple of
+  `epoch_splits * batch_size`. In `ddp-bench` the token models do exactly
+  that: `--train-tokens` snaps the staged corpus so the pass divides exactly.
+- **Scope.** `TrainerConfig::with_epoch_splits`, `builder.epoch_splits(n)`,
+  and the solo `SplitSampler` for non-distributed loaders. In `ddp-bench`:
+  `--epoch-splits N` (DDP modes; the solo baseline drives its own loop and
+  refuses the flag rather than ignoring it).
+
+---
+
 ## Sub-epoch reports - `reports_per_epoch`
 
 `metrics_fn` and the dashboard are driven by the **per-epoch** feed, which
@@ -626,18 +688,24 @@ than the whole cluster, so cost does not grow with rank count. See
 
 ## CUDA-free GPU detection - `flodl::sys::detect_gpus`
 
-`detect_gpus() -> Vec<GpuInfo>` shells out to `nvidia-smi` and returns
-per-device `(index, name, sm_version, vram_bytes)` without loading
-libtorch. Honors `CUDA_VISIBLE_DEVICES`, so the result matches the view
-the auto-promote path and child processes will see.
+`detect_gpus() -> Vec<GpuInfo>` enumerates GPUs without loading
+libtorch, returning per-device `index`, `vendor`, `name`, `arch` and
+`total_memory_mb`. Honors `CUDA_VISIBLE_DEVICES`, so the result matches
+the view the auto-promote path and child processes will see. Its sibling
+`detect_gpus_physical()` ignores visibility masks, which is what
+provisioning questions ("does this box's libtorch cover its cards") want.
+
+`arch` is vendor-shaped (`GpuArch::Sm { major, minor }` on NVIDIA), so
+`arch_label()` is the display form and `sm_major()` / `sm_minor()` return
+`Option` for the NVIDIA-specific consumers.
 
 ```rust
 use flodl::sys::detect_gpus;
 
 let gpus = detect_gpus();
 for g in &gpus {
-    eprintln!("GPU {}: {} (sm_{}, {} MB)",
-        g.index, g.name, g.sm_version, g.vram_bytes / 1_000_000);
+    eprintln!("GPU {}: {} ({}, {} MB)",
+        g.index, g.name, g.arch_label(), g.total_memory_mb);
 }
 
 // Use the count for partition planning, but do NOT instantiate
@@ -646,7 +714,7 @@ let world_size = gpus.len();
 ```
 
 This is the canonical pre-`Trainer::run` GPU query. The previous habit
-of calling `flodl::tensor::cuda_device_count()` from `main()`
+of calling `flodl::tensor::gpu_device_count()` from `main()`
 initializes libtorch's CUDA context in the launcher process; that
 context then poisons spawned children on heterogeneous-GPU rigs.
 `detect_gpus` does not touch CUDA.

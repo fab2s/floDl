@@ -232,7 +232,7 @@ On CUDA builds, `manual_seed` seeds both CPU and GPU. To re-seed CUDA
 independently:
 
 ```rust
-flodl::cuda_manual_seed_all(42);
+flodl::gpu_manual_seed_all(42);
 ```
 
 ### CPU-side RNG
@@ -487,7 +487,7 @@ Three ways to set the level, in priority order:
 ```bash
 # 1. CLI (sets FLODL_VERBOSITY for child processes too, including Docker)
 fdl -v   ddp-bench quick      # Verbose
-fdl -vv  cuda-test            # Debug
+fdl -vv  gpu-test             # Debug
 fdl -vvv shell                # Trace
 fdl --quiet test              # Errors only
 ```
@@ -536,13 +536,13 @@ actual allocation peaks. Reset counters before the region of interest,
 then read the high-water marks:
 
 ```rust
-cuda_empty_cache();
-cuda_reset_peak_stats();
+gpu_empty_cache();
+gpu_reset_peak_stats();
 
 // ... training step or inference ...
 
-let peak_alloc = cuda_peak_active_bytes()?;  // bytes used by tensors
-let peak_reserved = cuda_peak_reserved_bytes()?;  // bytes held by allocator
+let peak_alloc = gpu_peak_active_bytes()?;  // bytes used by tensors
+let peak_reserved = gpu_peak_reserved_bytes()?;  // bytes held by allocator
 println!("Peak alloc: {:.0} MB", peak_alloc as f64 / 1048576.0);
 println!("Peak reserved: {:.0} MB", peak_reserved as f64 / 1048576.0);
 ```
@@ -559,14 +559,14 @@ entire forward/backward/step sequence as a single GPU operation,
 eliminating per-kernel launch overhead.
 
 ```rust
-use flodl::{CudaGraph, cuda_graph_capture, CaptureMode};
+use flodl::{GpuGraph, gpu_graph_capture, CaptureMode};
 
 // Static tensors (reused across replays via copy_)
 let static_input = Tensor::zeros(&[batch, dim], cuda_opts)?;
 let static_target = Tensor::zeros(&[batch, dim], cuda_opts)?;
 
 // Capture training step
-let graph = cuda_graph_capture(3, None, || {
+let graph = gpu_graph_capture(3, None, || {
     let inp = Variable::new(static_input.clone(), false);
     let tgt = Variable::new(static_target.clone(), false);
     let pred = model.forward(&inp)?;
@@ -587,7 +587,7 @@ for (x, y) in &batches {
 Expect 2-5x speedup for models with many small kernels (RNNs, GRUs).
 All tensors involved in the captured region must have fixed shapes -
 dynamic shapes require a new capture. Tests that use CUDA graphs must
-run single-threaded (`fdl cuda-test-serial`).
+run single-threaded (`fdl gpu-test-serial`).
 
 ## Putting it together
 

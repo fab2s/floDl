@@ -4,7 +4,10 @@
 
 use crate::context::Context;
 use crate::libtorch::{build, detect, download};
-use crate::util::{docker, prompt, system};
+use crate::util::{docker, prompt, requirements, system};
+
+/// The CPU variant's pointer value, as `download` installs it.
+const CPU_VARIANT: &str = "precompiled/cpu";
 
 #[derive(Default)]
 pub struct SetupOpts {
@@ -12,6 +15,38 @@ pub struct SetupOpts {
     pub non_interactive: bool,
     /// Re-download/rebuild even if libtorch exists.
     pub force: bool,
+}
+
+/// Which libtorch a macOS host in a Docker-mounted project should get.
+///
+/// The libtorch is bind-mounted into a Linux container, so the host's
+/// Mach-O build cannot load there. What to fetch instead depends on the
+/// host arch, and only one of the two cases has an answer upstream.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum MacDockerPlan {
+    /// Not macOS, or not a Docker-mounted project: fetch for the host.
+    HostBuild,
+    /// Intel Mac. The container is linux/amd64 and upstream publishes
+    /// Linux x86_64 libtorch, so the container's build can be fetched.
+    ForceLinuxX86,
+    /// Apple Silicon. The container is linux/arm64 and upstream
+    /// publishes no Linux aarch64 libtorch in any variant, so no forced
+    /// download is correct. Fetch the host build (what the guide's
+    /// symlink step expects at `precompiled/cpu`) and name the gap.
+    HostBuildThenManualArm64,
+}
+
+/// Pure so both macOS arms are checkable from any host: the branch is
+/// unreachable on the machine most of this is developed on, and picking
+/// the wrong one installs a libtorch that cannot load in the container.
+fn macos_docker_plan(os: &str, arch: &str, docker_project: bool) -> MacDockerPlan {
+    if os != "macos" || !docker_project {
+        return MacDockerPlan::HostBuild;
+    }
+    match arch {
+        "aarch64" => MacDockerPlan::HostBuildThenManualArm64,
+        _ => MacDockerPlan::ForceLinuxX86,
+    }
 }
 
 pub fn run(opts: SetupOpts) -> Result<(), String> {
@@ -54,23 +89,31 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  Rust:   not found");
     }
 
-    let gpus = system::detect_gpus();
+    let survey = flodl_hw::survey();
+    let gpus = &survey.devices;
     if !gpus.is_empty() {
         println!();
         println!("  GPUs:");
-        for g in &gpus {
+        for g in gpus {
             println!(
-                "    [{}] {} -- sm_{}.{}, {}GB VRAM",
+                "    [{}] {} -- {}, {}GB VRAM",
                 g.index,
                 g.name,
-                g.sm_major,
-                g.sm_minor,
+                g.arch_label(),
                 g.total_memory_mb / 1024
             );
         }
     } else {
         println!();
         println!("  GPU:    not detected (CPU-only mode)");
+        // The sweep's findings, not just its device list: an AMD card
+        // with no ROCm runtime is a common first-contact state, and
+        // "CPU-only" with the explanation discarded sends the operator
+        // away thinking the box has nothing — setup is the entry point,
+        // so it says what probe would say.
+        for note in survey.notes.iter().filter(|n| n.kind.explains_absence()) {
+            println!("          {}", note.message);
+        }
     }
 
     if !has_docker && !has_cargo {
@@ -82,6 +125,24 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!();
         println!("  Install one or both and run 'fdl setup' again.");
         return Err("no Rust or Docker found".into());
+    }
+
+    // Native prerequisites apply only to a native build: the Docker
+    // path carries its own toolchain in the image. Cargo without Docker
+    // is unambiguously native; with both available the path is not yet
+    // chosen, so it is phrased as a note rather than a blocker.
+    let tools = requirements::missing_host_tools();
+    if !tools.is_empty() && has_cargo {
+        let owned: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();
+        println!();
+        if has_docker {
+            println!("  Note: building natively would also need: {}", tools.join(", "));
+            println!("        {}", requirements::install_hint(&owned));
+            println!("        (not needed if you build in the dev container)");
+        } else {
+            println!("  Native builds need these first: {}", tools.join(", "));
+            println!("    {}", requirements::install_hint(&owned));
+        }
     }
 
     // ---- Step 2: libtorch ----
@@ -108,34 +169,40 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     if !opts.force {
         if let Some(ref info) = existing {
-            let is_cuda = info.cuda_version.as_deref() != Some("none");
-            if is_cuda {
-                println!("  Found existing CUDA libtorch: {}", info.path);
-                if opts.non_interactive {
-                    println!("  Keeping existing installation.");
-                    skip_download = true;
-                } else if !prompt::ask_yn("  Download fresh?", false) {
-                    skip_download = true;
+            // The variant PATH carries the vendor, not `.arch`'s `cuda=`
+            // field: a ROCm build has no CUDA toolkit version and writes
+            // `cuda=none` there, exactly like a CPU build. Reading that
+            // field as "is this a GPU install" labelled every existing
+            // ROCm install CPU-only and re-downloaded over it.
+            match detect::variant_vendor(&info.path) {
+                Some(vendor) => {
+                    println!("  Found existing {vendor} libtorch: {}", info.path);
+                    if opts.non_interactive {
+                        println!("  Keeping existing installation.");
+                        skip_download = true;
+                    } else if !prompt::ask_yn("  Download fresh?", false) {
+                        skip_download = true;
+                    }
+                    println!();
                 }
-                println!();
-            } else {
-                println!("  Found existing CPU libtorch.");
+                None => println!("  Found existing CPU libtorch."),
             }
         }
     }
 
     if !skip_download {
         // Always download CPU variant (useful as fallback).
-        //
-        // Special case: on macOS in a Docker-Mounted project the libtorch
-        // ends up bind-mounted into a Linux container, so the host's
-        // macOS arm64 (Mach-O) build is useless. Force Linux x86_64 in
-        // that combination so the mount works as expected.
         let mounted_docker_project =
             ctx.is_project && ctx.root.join("Dockerfile").exists();
-        let force_linux = cfg!(target_os = "macos") && mounted_docker_project;
+        let plan = macos_docker_plan(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            mounted_docker_project,
+        );
+        let force_linux = plan == MacDockerPlan::ForceLinuxX86;
+        let apple_silicon_docker = plan == MacDockerPlan::HostBuildThenManualArm64;
         if force_linux {
-            println!("  macOS + Docker-Mounted project: fetching Linux libtorch");
+            println!("  macOS + Docker-mounted project: fetching Linux libtorch");
             println!("  for the container (host arch would not load inside Linux).");
         }
         println!("  Downloading CPU libtorch...");
@@ -147,10 +214,59 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         };
         download::run_with_context(cpu_opts, &ctx)?;
 
+        if apple_silicon_docker {
+            println!();
+            println!("  That is the macOS build, for the host. The dev container is");
+            println!("  linux/arm64 and needs Linux aarch64 libtorch, which PyTorch");
+            println!("  does not publish; it has to be extracted from the PyPI wheel.");
+            println!("  Steps 1 and 2 of the Apple Silicon guide do this:");
+            println!("    https://flodl.dev/guide/mac-apple-silicon");
+            println!("  Until then `fdl build` / `fdl test` will not link.");
+        }
+
+        // The variant table below is CUDA-only, so the capability span
+        // is taken over NVIDIA devices; a non-NVIDIA card contributes
+        // none and leaves this branch inert rather than skewing it.
+        let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
+
+        // AMD libtorch. One build serves one vendor, so ROCm is chosen
+        // only where there is no NVIDIA card to prefer; on a mixed box
+        // the CUDA branch below runs instead.
+        let amd: Vec<_> = gpus
+            .iter()
+            .filter(|g| g.vendor == system::GpuVendor::Amd)
+            .collect();
+        if !amd.is_empty() {
+            let covered = download::rocm_covered(gpus);
+            if !majors.is_empty() {
+                println!();
+                println!("  AMD GPU(s) detected alongside NVIDIA. One libtorch build");
+                println!("  serves one vendor, so the NVIDIA cards are set up here.");
+                println!("  For the AMD cards: fdl libtorch download --rocm 7.0");
+            } else if covered.is_empty() {
+                let names: Vec<String> = amd
+                    .iter()
+                    .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+                    .collect();
+                println!();
+                println!("  AMD GPU(s) detected ({}) outside the ROCm 7.0", names.join(", "));
+                println!("  build's targets, so only CPU libtorch is installed.");
+                println!("  Covered targets: {}", download::rocm_archs());
+            } else {
+                println!();
+                println!("  Downloading ROCm libtorch (rocm7.0 for your AMD GPU)...");
+                let rocm_opts = download::DownloadOpts {
+                    variant: download::Variant::Rocm70,
+                    ..Default::default()
+                };
+                download::run_with_context(rocm_opts, &ctx)?;
+            }
+        }
+
         // CUDA libtorch
-        if !gpus.is_empty() {
-            let lo_major = gpus.iter().map(|g| g.sm_major).min().unwrap_or(0);
-            let hi_major = gpus.iter().map(|g| g.sm_major).max().unwrap_or(0);
+        if !majors.is_empty() {
+            let lo_major = majors.iter().copied().min().unwrap_or(0);
+            let hi_major = majors.iter().copied().max().unwrap_or(0);
 
             if lo_major < 7 && hi_major >= 10 {
                 // Mixed architectures -- no single prebuilt covers both
@@ -236,7 +352,35 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
                 download::run_with_context(cuda_opts, &ctx)?;
             }
         }
+
+        // The CPU download above deliberately does not activate, so a
+        // GPU variant fetched after it wins the pointer. When no GPU
+        // variant follows -- a CPU-only box, or an AMD card outside the
+        // ROCm build's gfx list -- nothing ever writes `.active` and
+        // setup finishes with libtorch on disk that `fdl diagnose` then
+        // reports as "no active variant". Claim the pointer for CPU
+        // only if it is still unclaimed, so this can never demote a GPU
+        // variant.
+        if detect::read_active(root).is_none()
+            && detect::is_valid_variant(root, CPU_VARIANT)
+        {
+            detect::set_active(root, CPU_VARIANT)?;
+        }
     }
+
+    // The active variant, resolved ONCE for every consumer below. Both
+    // the vendor and the warning `variant_vendor` emits on an
+    // unrecognised basename belong to the variant, not to each question
+    // asked about it -- re-deriving per call-site printed the warning
+    // four times.
+    let active = detect::read_active(root);
+    let active_vendor = active
+        .as_ref()
+        .and_then(|info| detect::variant_vendor(&info.path));
+    let active_label = |v: Option<system::GpuVendor>| match v {
+        Some(vendor) => vendor.to_string(),
+        None => "CPU".to_string(),
+    };
 
     // ---- Step 3: Build environment (project-only) ----
 
@@ -246,9 +390,8 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  Setup complete!");
         println!("  ===============");
         println!();
-        if let Some(info) = detect::read_active(root) {
-            let cuda_str = if info.cuda_version.as_deref() != Some("none") { "CUDA" } else { "CPU" };
-            println!("  libtorch:  {} ({})", info.path, cuda_str);
+        if let Some(info) = &active {
+            println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
             println!("  Location:  {}", ctx.libtorch_dir().display());
         }
         println!();
@@ -337,17 +480,20 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
             println!("  Warning: CPU Docker image build failed.");
         }
 
-        // CUDA image if we have GPUs and CUDA libtorch
-        let has_cuda_lt = detect::read_active(root)
-            .is_some_and(|i| i.cuda_version.as_deref() != Some("none"));
+        // GPU image, when there is hardware AND a GPU libtorch to link
+        // against. The compose service is SELECTED from the variant's
+        // vendor rather than hardcoded: a CUDA image and a ROCm image are
+        // genuinely different artifacts (different base, different device
+        // nodes), so building `cuda` on an AMD box builds the wrong one.
+        if let Some(vendor) = active_vendor.filter(|_| !gpus.is_empty()) {
+            let service =
+                crate::run::resolve_docker_service(crate::run::LOGICAL_GPU_SERVICE, root);
+            let _ = std::fs::create_dir_all(format!(".cargo-cache-{service}"));
+            let _ = std::fs::create_dir_all(format!(".cargo-git-{service}"));
 
-        if !gpus.is_empty() && has_cuda_lt {
-            let _ = std::fs::create_dir_all(".cargo-cache-cuda");
-            let _ = std::fs::create_dir_all(".cargo-git-cuda");
-
-            let status = docker::compose_run(".", &["build", "cuda"])?;
+            let status = docker::compose_run(".", &["build", &service])?;
             if !status.success() {
-                println!("  Warning: CUDA Docker image build failed.");
+                println!("  Warning: {vendor} Docker image build failed.");
             }
         }
 
@@ -362,25 +508,20 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     println!();
 
     // Show active libtorch
-    if let Some(info) = detect::read_active(root) {
-        let cuda_str = if info.cuda_version.as_deref() != Some("none") {
-            "CUDA"
-        } else {
-            "CPU"
-        };
-        println!("  libtorch:  {} ({})", info.path, cuda_str);
+    if let Some(info) = &active {
+        println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
     }
+
+    let gpu_ready = !gpus.is_empty() && active_vendor.is_some();
 
     // Docker instructions
     if build_mode == "docker" || build_mode == "both" {
         println!();
         println!("  Build with Docker:");
-        let has_cuda_lt = detect::read_active(root)
-            .is_some_and(|i| i.cuda_version.as_deref() != Some("none"));
-        if !gpus.is_empty() && has_cuda_lt {
-            println!("    fdl cuda-test        # run GPU tests");
-            println!("    fdl cuda-build       # compile with CUDA");
-            println!("    fdl cuda-shell       # interactive shell");
+        if gpu_ready {
+            println!("    fdl gpu-test        # run GPU tests");
+            println!("    fdl gpu-build       # compile for the GPU");
+            println!("    fdl gpu-shell       # interactive shell");
         } else {
             println!("    fdl test             # run tests");
             println!("    fdl build            # compile");
@@ -390,19 +531,17 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     // Native instructions
     if build_mode == "native" || build_mode == "both" {
-        if let Some(info) = detect::read_active(root) {
+        if let Some(info) = &active {
             let lt_path = format!("libtorch/{}", info.path);
             println!();
             println!("  Build natively:");
             println!("    export LIBTORCH_PATH=\"{}\"", lt_path);
-            println!(
-                "    export LD_LIBRARY_PATH=\"$LIBTORCH_PATH/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\""
-            );
-            let has_cuda_lt = info.cuda_version.as_deref() != Some("none");
-            if !gpus.is_empty() && has_cuda_lt {
-                println!("    cargo test --features cuda");
-            } else {
-                println!("    cargo test");
+            for line in detect::ld_library_path_lines(active_vendor, "$LIBTORCH_PATH/lib") {
+                println!("    {line}");
+            }
+            match active_vendor.filter(|_| gpu_ready) {
+                Some(vendor) => println!("    cargo test --features {}", vendor.cargo_feature()),
+                None => println!("    cargo test"),
             }
         }
     }
@@ -431,4 +570,53 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The macOS arms never execute on the Linux dev box or on the Linux
+    // CI legs, and the Apple Silicon one is the case where a wrong answer
+    // installs a libtorch that cannot load inside the container.
+
+    #[test]
+    fn apple_silicon_docker_never_forces_an_x86_download() {
+        // Upstream publishes no Linux aarch64 libtorch, so forcing Linux
+        // here fetches x86_64 into a linux/arm64 container's bind-mount.
+        assert_eq!(
+            macos_docker_plan("macos", "aarch64", true),
+            MacDockerPlan::HostBuildThenManualArm64
+        );
+    }
+
+    #[test]
+    fn intel_mac_docker_forces_the_linux_build() {
+        assert_eq!(
+            macos_docker_plan("macos", "x86_64", true),
+            MacDockerPlan::ForceLinuxX86
+        );
+    }
+
+    #[test]
+    fn a_mac_without_a_docker_project_builds_for_the_host() {
+        for arch in ["aarch64", "x86_64"] {
+            assert_eq!(
+                macos_docker_plan("macos", arch, false),
+                MacDockerPlan::HostBuild,
+                "{arch} native"
+            );
+        }
+    }
+
+    #[test]
+    fn non_macos_hosts_are_unaffected() {
+        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64")] {
+            assert_eq!(
+                macos_docker_plan(os, arch, true),
+                MacDockerPlan::HostBuild,
+                "{os}/{arch}"
+            );
+        }
+    }
 }

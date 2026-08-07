@@ -7,9 +7,8 @@
 
 #include "helpers.h"
 
-#ifdef FLODL_BUILD_CUDA
-#include <c10/cuda/CUDAFunctions.h>
-#include <c10/cuda/CUDACachingAllocator.h>
+#ifdef FLODL_BUILD_GPU
+#include "gpu_compat.h"
 #include <ATen/detail/CUDAHooksInterface.h>
 #include <ATen/Context.h>
 #include <mutex>
@@ -482,29 +481,29 @@ extern "C" char* flodl_to_device_async(FlodlTensor t, int device_type,
     }
 }
 
-extern "C" int flodl_cuda_is_available(void) {
+extern "C" int flodl_gpu_is_available(void) {
     try {
     return torch::cuda::is_available() ? 1 : 0;
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_is_available", e.what());
+        flodl_fatal("flodl_gpu_is_available", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_is_available", nullptr);
+        flodl_fatal("flodl_gpu_is_available", nullptr);
     }
 }
 
-extern "C" int flodl_cuda_device_count(void) {
+extern "C" int flodl_gpu_device_count(void) {
     try {
     return (int)torch::cuda::device_count();
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_device_count", e.what());
+        flodl_fatal("flodl_gpu_device_count", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_device_count", nullptr);
+        flodl_fatal("flodl_gpu_device_count", nullptr);
     }
 }
 
 extern "C" void flodl_set_current_device(int device_index) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     c10::cuda::set_device((c10::DeviceIndex)device_index);
 #else
     (void)device_index;
@@ -518,7 +517,7 @@ extern "C" void flodl_set_current_device(int device_index) {
 
 extern "C" int flodl_get_current_device(void) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     return (int)c10::cuda::current_device();
 #else
     return 0;
@@ -530,9 +529,9 @@ extern "C" int flodl_get_current_device(void) {
     }
 }
 
-extern "C" void flodl_cuda_synchronize(int device_index) {
+extern "C" void flodl_gpu_synchronize(int device_index) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (torch::cuda::is_available()) {
         c10::cuda::set_device((c10::DeviceIndex)device_index);
         cudaDeviceSynchronize();
@@ -541,18 +540,20 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
     (void)device_index;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_synchronize", e.what());
+        flodl_fatal("flodl_gpu_synchronize", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_synchronize", nullptr);
+        flodl_fatal("flodl_gpu_synchronize", nullptr);
     }
 }
 
-// Keeping the CUDA libraries loaded so their aten-kernel registrations run.
+// Keeping the GPU libraries loaded so their aten-kernel registrations run.
 // Without this, `at::empty`/`randn` on a CUDA device fail with
-// "not available for the CUDA backend" even with a GPU present.
+// "not available for the CUDA backend" even with a GPU present. The whole
+// mechanism is vendor-symmetric: ROCm has exactly the same split, with
+// libc10_hip.so and libtorch_hip.so playing the two roles below.
 //
 // c10_cuda.so is pinned by a real symbol reference (c10::cuda::device_count
-// in flodl_force_cuda_link below), resolved at link time so the lib is a
+// in flodl_force_gpu_link below), resolved at link time so the lib is a
 // DT_NEEDED loaded at process start.
 //
 // libtorch_cuda.so is the one that actually registers the CUDA kernels, and
@@ -566,25 +567,24 @@ extern "C" void flodl_cuda_synchronize(int device_index) {
 // runs the library's static initializers and registers the CUDA backend
 // regardless of `--as-needed`. The initializer lives in this always-linked
 // shim TU, so it covers every binary that uses flodl (bins, tests, benches).
-#ifdef FLODL_BUILD_CUDA
-#include <cuda_runtime.h>
+#ifdef FLODL_BUILD_GPU
 #include <dlfcn.h>
 
 namespace {
-struct ForceCudaLibLoad {
-    ForceCudaLibLoad() {
+struct ForceGpuLibLoad {
+    ForceGpuLibLoad() {
         // Non-fatal on failure: a CPU-only deployment that cannot find the
-        // lib simply falls back to reporting CUDA unavailable, honestly.
-        (void)dlopen("libtorch_cuda.so", RTLD_NOW | RTLD_GLOBAL);
+        // lib simply falls back to reporting the GPU unavailable, honestly.
+        (void)dlopen(FLODL_TORCH_GPU_LIB, RTLD_NOW | RTLD_GLOBAL);
     }
 };
-static ForceCudaLibLoad force_cuda_lib_load;
+static ForceGpuLibLoad force_gpu_lib_load;
 }  // namespace
 #endif
 
-extern "C" int flodl_force_cuda_link(void) {
+extern "C" int flodl_force_gpu_link(void) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     // c10_cuda.so dependency (real symbol reference).
     volatile int n = (int)c10::cuda::device_count();
     return n;
@@ -592,18 +592,18 @@ extern "C" int flodl_force_cuda_link(void) {
     return 0;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_force_cuda_link", e.what());
+        flodl_fatal("flodl_force_gpu_link", e.what());
     } catch (...) {
-        flodl_fatal("flodl_force_cuda_link", nullptr);
+        flodl_fatal("flodl_force_gpu_link", nullptr);
     }
 }
 
 // --- CUDA memory info via cudaMemGetInfo ---
 
-extern "C" char* flodl_cuda_mem_info(int device_index,
+extern "C" char* flodl_gpu_mem_info(int device_index,
                                     uint64_t* used_bytes, uint64_t* total_bytes) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -632,7 +632,7 @@ extern "C" char* flodl_cuda_mem_info(int device_index,
 
 // --- CUDA caching allocator stats ---
 
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
 // getDeviceStats reads the allocator's per-device table, which libtorch
 // populates during its lazy CUDA init; each entry is published only after
 // the DeviceCachingAllocator constructor finishes its driver calls. A
@@ -654,9 +654,9 @@ static bool allocator_ready(int device_index) {
 }
 #endif
 
-extern "C" char* flodl_cuda_alloc_bytes(int device_index,
+extern "C" char* flodl_gpu_alloc_bytes(int device_index,
                                          uint64_t* allocated_bytes) {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -684,9 +684,9 @@ extern "C" char* flodl_cuda_alloc_bytes(int device_index,
 
 // Active allocator bytes (tensors actually in use, not cached free blocks).
 // Matches torch.cuda.memory_allocated() semantics (current, not peak).
-extern "C" char* flodl_cuda_active_bytes(int device_index,
+extern "C" char* flodl_gpu_active_bytes(int device_index,
                                           uint64_t* active_bytes) {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -711,9 +711,9 @@ extern "C" char* flodl_cuda_active_bytes(int device_index,
 
 // Peak active allocator bytes (max since last reset).
 // Matches torch.cuda.max_memory_allocated() semantics.
-extern "C" char* flodl_cuda_peak_active_bytes(int device_index,
+extern "C" char* flodl_gpu_peak_active_bytes(int device_index,
                                                uint64_t* peak_bytes) {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -738,9 +738,9 @@ extern "C" char* flodl_cuda_peak_active_bytes(int device_index,
 
 // Peak reserved allocator bytes (max since last reset).
 // Matches torch.cuda.max_memory_reserved() semantics.
-extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
+extern "C" char* flodl_gpu_peak_reserved_bytes(int device_index,
                                                   uint64_t* peak_bytes) {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -765,9 +765,9 @@ extern "C" char* flodl_cuda_peak_reserved_bytes(int device_index,
 
 // Reset peak allocator statistics.
 // Equivalent to torch.cuda.reset_peak_memory_stats().
-extern "C" void flodl_cuda_reset_peak_stats(int device_index) {
+extern "C" void flodl_gpu_reset_peak_stats(int device_index) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     // No context or allocator yet means no peaks to reset; stay passive.
     if (allocator_ready(device_index)) {
         c10::cuda::CUDACachingAllocator::resetPeakStats((c10::DeviceIndex)device_index);
@@ -776,29 +776,29 @@ extern "C" void flodl_cuda_reset_peak_stats(int device_index) {
     (void)device_index;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_reset_peak_stats", e.what());
+        flodl_fatal("flodl_gpu_reset_peak_stats", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_reset_peak_stats", nullptr);
+        flodl_fatal("flodl_gpu_reset_peak_stats", nullptr);
     }
 }
 
 // --- CUDA empty cache ---
 
-extern "C" void flodl_cuda_empty_cache(void) {
+extern "C" void flodl_gpu_empty_cache(void) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_empty_cache", e.what());
+        flodl_fatal("flodl_gpu_empty_cache", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_empty_cache", nullptr);
+        flodl_fatal("flodl_gpu_empty_cache", nullptr);
     }
 }
 
 // --- GPU utilization via NVML (dynamically loaded) ---
 
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
 namespace {
     typedef int nvml_ret_t;
     typedef void* nvml_device_t;
@@ -835,9 +835,9 @@ namespace {
 } // anonymous namespace
 #endif
 
-extern "C" int flodl_cuda_utilization(int device_index) {
+extern "C" int flodl_gpu_utilization(int device_index) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     nvml_try_load();
     if (!nvml.ok) return -1;
     nvml_device_t dev;
@@ -850,9 +850,9 @@ extern "C" int flodl_cuda_utilization(int device_index) {
     return -1;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_utilization", e.what());
+        flodl_fatal("flodl_gpu_utilization", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_utilization", nullptr);
+        flodl_fatal("flodl_gpu_utilization", nullptr);
     }
 }
 
@@ -862,11 +862,11 @@ extern "C" int flodl_cuda_utilization(int device_index) {
 // CUDA context in the calling process, so it is safe from processes
 // that must not touch the CUDA runtime (launcher, pre-Trainer::run).
 // Returns 0 on success, -1 when NVML or the device is unavailable.
-extern "C" int flodl_cuda_nvml_mem_info(int device_index,
+extern "C" int flodl_gpu_smi_mem_info(int device_index,
                                         uint64_t* used_bytes,
                                         uint64_t* total_bytes) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     nvml_try_load();
     if (!nvml.ok || !nvml.getMemInfo) return -1;
     nvml_device_t dev;
@@ -881,9 +881,9 @@ extern "C" int flodl_cuda_nvml_mem_info(int device_index,
     return -1;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_nvml_mem_info", e.what());
+        flodl_fatal("flodl_gpu_smi_mem_info", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_nvml_mem_info", nullptr);
+        flodl_fatal("flodl_gpu_smi_mem_info", nullptr);
     }
 }
 
@@ -893,9 +893,9 @@ extern "C" int flodl_cuda_nvml_mem_info(int device_index,
 // torch.cuda work has touched a device. Gate context-dependent reads
 // (caching-allocator stats) on this so monitoring never initializes
 // CUDA as a side effect. Returns 1 if a context exists, else 0.
-extern "C" int flodl_cuda_has_primary_context(int device_index) {
+extern "C" int flodl_gpu_has_primary_context(int device_index) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) return 0;
     return at::detail::getCUDAHooks()
         .hasPrimaryContext((c10::DeviceIndex)device_index) ? 1 : 0;
@@ -904,17 +904,17 @@ extern "C" int flodl_cuda_has_primary_context(int device_index) {
     return 0;
 #endif
     } catch (const std::exception& e) {
-        flodl_fatal("flodl_cuda_has_primary_context", e.what());
+        flodl_fatal("flodl_gpu_has_primary_context", e.what());
     } catch (...) {
-        flodl_fatal("flodl_cuda_has_primary_context", nullptr);
+        flodl_fatal("flodl_gpu_has_primary_context", nullptr);
     }
 }
 
 // --- GPU device name ---
 
-extern "C" char* flodl_cuda_device_name(int device_index, char* buf, int buf_len) {
+extern "C" char* flodl_gpu_device_name(int device_index, char* buf, int buf_len) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#ifdef FLODL_BUILD_GPU
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -936,10 +936,106 @@ extern "C" char* flodl_cuda_device_name(int device_index, char* buf, int buf_len
     }
 }
 
+// Is this an APU -- a device whose memory is carved out of system RAM
+// rather than being its own pool?
+//
+// `integrated` is one of the very few properties both vendors spell the
+// same: HIP documents the field as literally "APU vs dGPU", and CUDA as
+// "device is integrated as opposed to discrete". So no vendor branch.
+//
+// This is load-bearing for memory budgeting, not informational. On an
+// integrated part the host-RAM budget and the VRAM pool are pricing the
+// SAME DRAM, and sizing them independently over-commits: measured on a
+// gfx1036 box, a 15 GiB aperture plus a MemAvailable-derived host share
+// came to ~33 GiB of claims against 30 GiB of physical memory.
+//
+// Returns 1 / 0 through `out`. A caller that gets an error should treat
+// the answer as unknown and budget conservatively, NOT assume discrete.
+extern "C" char* flodl_gpu_is_integrated(int device_index, int* out) {
+    try {
+#ifdef FLODL_BUILD_GPU
+    if (!torch::cuda::is_available()) {
+        return make_error("no GPU available");
+    }
+    cudaDeviceProp prop;
+    auto err = cudaGetDeviceProperties(&prop, device_index);
+    if (err != cudaSuccess) {
+        return make_error(cudaGetErrorString(err));
+    }
+    *out = prop.integrated ? 1 : 0;
+    return nullptr;
+#else
+    (void)device_index; (void)out;
+    return make_error("no GPU available (built without a gpu feature)");
+#endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
+// The vendor-neutral "which architecture is this device" query, read from
+// the GPU RUNTIME (so it describes the device libtorch actually sees, not
+// the provisioning view flodl-hw builds from nvidia-smi / KFD sysfs --
+// the two can disagree under visibility masks and index remapping).
+//
+// NVIDIA gets `sm_<major><minor>`; AMD gets `gcnArchName` verbatim, e.g.
+// "gfx1100" or "gfx90a:sramecc+:xnack-" (the part before the first ':'
+// is the code-object target, the rest are feature qualifiers -- returned
+// unmodified rather than silently trimmed).
+//
+// This exists because compute capability does NOT port. A gfx target is
+// major/minor/STEP with the step in hex, and hipDeviceProp_t exposes only
+// major+minor: of the ten gfx targets a ROCm libtorch typically carries
+// kernels for, eight collapse into three ambiguous (major, minor) pairs
+// (906/908/90a, 1100/1101/1102, 1200/1201). Those are not interchangeable
+// -- each needs its own code object -- so a numeric pair is at its most
+// wrong exactly where it gets consulted: a "no kernel image" failure.
+extern "C" char* flodl_gpu_arch_name(int device_index, char* buf, int buf_len) {
+    try {
+#ifdef FLODL_BUILD_GPU
+    if (!torch::cuda::is_available()) {
+        return make_error("no GPU available");
+    }
+#ifdef __HIP_PLATFORM_AMD__
+    hipDeviceProp_t prop;
+    auto err = hipGetDeviceProperties(&prop, device_index);
+    if (err != hipSuccess) {
+        return make_error(hipGetErrorString(err));
+    }
+    snprintf(buf, buf_len, "%s", prop.gcnArchName);
+#else
+    cudaDeviceProp prop;
+    auto err = cudaGetDeviceProperties(&prop, device_index);
+    if (err != cudaSuccess) {
+        return make_error(cudaGetErrorString(err));
+    }
+    snprintf(buf, buf_len, "sm_%d%d", prop.major, prop.minor);
+#endif
+    return nullptr;
+#else
+    (void)device_index; (void)buf; (void)buf_len;
+    return make_error("no GPU available (built without a gpu feature)");
+#endif
+    } catch (const std::exception& e) {
+        return make_error(e.what());
+    } catch (...) {
+        return make_error("flodl: non-standard C++ exception");
+    }
+}
+
+// Deliberately NOT renamed to flodl_gpu_*: "compute capability" is an
+// NVIDIA concept with no AMD counterpart. `hipDeviceProp_t` does carry
+// major/minor fields, so a neutral name here would COMPILE on ROCm and
+// hand back a gfx architecture dressed up as a compute capability --
+// a silent wrong answer, which is exactly what this rename exists to
+// stop. The vendor-neutral "what architecture is this device" query is
+// already served, CUDA-free, by flodl-hw's GpuInfo::arch_label().
 extern "C" char* flodl_cuda_compute_capability(int device_index,
                                                  int* major, int* minor) {
     try {
-#ifdef FLODL_BUILD_CUDA
+#if defined(FLODL_BUILD_GPU) && !defined(__HIP_PLATFORM_AMD__)
     if (!torch::cuda::is_available()) {
         return make_error("CUDA not available");
     }
@@ -951,9 +1047,12 @@ extern "C" char* flodl_cuda_compute_capability(int device_index,
     *major = prop.major;
     *minor = prop.minor;
     return nullptr;
+#elif defined(FLODL_BUILD_GPU)
+    (void)device_index; (void)major; (void)minor;
+    return make_error("compute capability is NVIDIA-only; this is a ROCm build");
 #else
     (void)device_index; (void)major; (void)minor;
-    return make_error("CUDA not available (built without cuda feature)");
+    return make_error("CUDA not available (built without a gpu feature)");
 #endif
     } catch (const std::exception& e) {
         return make_error(e.what());

@@ -231,11 +231,13 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         transform: None,
         vram_max_usage: 0.90,
         ram_max_usage: 0.50,
+        gpu_ram_share: None,
         sample_cache: true,
         disk_stage_gb: 0,
         disk_stage_dir: None,
         batch_size: 4,
         seed: 42,
+        epoch_splits: 1,
         max_grad_norm: None,
         vram_pool: false,
         easgd_alpha: None,
@@ -244,6 +246,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         timeline: None,
         policy: ApplyPolicy::Sync,
         save_path: Some(stem_str.clone()),
+        model_sig: [0u8; 32],
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -325,4 +328,4 @@ fn shutdown_with_save_no_path_exits_without_write() {
 // 2-GPU end-to-end DDP validation lived here via the in-process engine
 // (`DdpHandle::auto` + thread-per-GPU). That engine was removed; multi-GPU
 // end-to-end training is now validated by the `ddp-bench` binary under
-// `fdl cuda-test-nccl`, and the process-path logic by `cluster_worker_tests`.
+// `fdl gpu-test-nccl`, and the process-path logic by `cluster_worker_tests`.

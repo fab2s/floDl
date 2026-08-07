@@ -512,3 +512,44 @@ Resume was epoch-granular (`start_epoch`, fresh pool). The async work added
 A one-shot trigger (`checkpoint_at_epoch`) drives validation; the recurring
 cadence (and eval-on-consensus, the callback report-and-wait gate) is a
 follow-on.
+
+---
+
+## Open: the sub-batch tail (partial final batches)
+
+Separate from the lone-1 window above, and unsolved. An epoch trains whole
+batches, so `epoch_samples % batch_size` picks fall outside its last batch.
+Today they are excluded from the pool *before* allocation, which is what
+makes the coverage argument in this document hold — the pool still drains to
+exactly 0 and every allocated sample is realized. The cost is that those
+picks are not trained on that pass.
+
+`epoch_splits` raises the stakes: the drop applies once per epoch, so a pass
+sheds it `epoch_splits` times instead of once.
+
+Mitigated today rather than fixed:
+
+- **Where the corpus size is a free parameter** (staged token shards),
+  `ddp-bench`'s `--train-tokens` snaps it to a multiple of
+  `epoch_splits * batch_size`, so the pass divides and nothing is dropped.
+- **Where it is fixed** (a downloaded image dataset), the tail is re-drawn
+  each pass, so multi-pass training averages it away: across `E` passes a
+  sample is missed `E * dropped / N` times, i.e. ~0.3 times over a 200-epoch
+  CIFAR-10 run at batch 128. A single-pass run averages with nothing and is
+  warned.
+
+The real fix is a short final batch (`drop_last = false`). Three things block
+it, in increasing order of difficulty:
+
+1. **The worker cannot emit one.** `partition[start..start + batch_size]` is
+   unclamped in both the prefetch submission loop and the sync path, and
+   `num_batches` floors at five sites.
+2. **A final batch of 1 breaks BatchNorm training** (variance over one
+   sample), so any implementation needs a batch-of-1 guard for models
+   carrying BN buffers.
+3. **It would bias ElChe.** The scheduler derives its ratios from per-batch
+   *delivered cost*, and a systematically cheaper final batch every epoch
+   skews them — `epoch_splits` times per pass. This is the open question: a
+   short batch would have to be excluded from the delivered-cost sample, or
+   normalized by its actual pick count, before the tail could be trained
+   without distorting the schedule that allocates it.

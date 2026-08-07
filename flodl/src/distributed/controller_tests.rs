@@ -38,6 +38,7 @@
         MuxRecord::control(RelayControlMsg::Hello {
             host: "test-host".into(),
             ranks: ranks.clone(),
+            model_sigs: vec![],
         })
         .write_to(&mut stream, &salt)?;
         match MuxRecord::read_from(&mut stream, &salt)? {
@@ -256,6 +257,7 @@
         MuxRecord::control(RelayControlMsg::Hello {
             host: "rogue".into(),
             ranks: vec![5], // >= world_size (1)
+            model_sigs: vec![],
         })
         .write_to(&mut s, &TEST_SALT)
         .unwrap();
@@ -471,6 +473,7 @@
         MuxRecord::control(RelayControlMsg::Hello {
             host: "test".into(),
             ranks: vec![0],
+            model_sigs: vec![],
         })
         .write_to(&mut stream, &controller_salt)
         .unwrap();
@@ -1040,6 +1043,7 @@
         MuxRecord::control(RelayControlMsg::Hello {
             host: "stale".into(),
             ranks: vec![0],
+            model_sigs: vec![],
         })
         .write_to(&mut stream, &TEST_SALT)
         .unwrap();

@@ -81,12 +81,29 @@ membership change.
 A worker dials the controller port and sends a **join hello**:
 protocol version, host name, GPU inventory (count, arch), libtorch
 variant, dataset signature, and the deployment credential when the
-trust mode requires one (see below). The controller validates
-compatibility immediately - version, arch/libtorch coherence, dataset
-signature (a stale worker from a previous run is rejected loudly at
-the door, not discovered mid-epoch) - and runs its per-host prechecks
-right away rather than waiting for the window to close. By start
-time, everything admitted is already validated.
+trust mode requires one (see below). What admission validates today,
+immediately rather than at window close: protocol version, host-name
+uniqueness, device-list sanity, GPU-vendor coherence when the data
+plane is NCCL/RCCL (a mixed NCCL+RCCL cohort passes every structural
+check and hangs at formation, so the libtorch label's vendor is checked
+at the door; CPU averaging modes mix legally), **run identity** (the
+`.fdl-run.yml` nonce `fdl publish` stamps — a cohort straddling a
+publish boundary holds two different runs, and boxes carrying no id
+gate nothing), **NCCL/RCCL major.minor** (read on each worker from the
+library its binary actually loads; skew refuses the handshake at
+formation, and a walk-in fleet has no roster for a probe to sweep, so
+the window is the only place this check can live), and the dataset
+signature — with one honest caveat on the last: `fdl join` does not yet
+stamp a real dataset signature into the hello (workers send zeros), so
+that check bites only for binaries that set it themselves. Every one of
+these is first-member-seeded consistency among joiners, never an
+authority the controller asserts. As-designed per-host prechecks beyond
+these were deliberately NOT built: the controller cannot reach back
+through a NAT'd tunnel, and the worker has the filesystem — that
+precheck dissolved into `fdl join`'s prepare phase (which also gates
+libtorch↔GPU arch coverage, the other half of the promised coherence,
+where the `.arch` metadata lives). The next admission fact is the
+cohort code signature (param names+shapes at formation).
 
 The join reply carries the **session salt**, the assigned global rank
 ids (one per local GPU, assigned in admission order), and the cluster
@@ -119,7 +136,12 @@ Until elastic scale-up lands, the world is formed once, at start:
   forms).
 
 All four are tunable; the timeouts scale with `FLODL_NET_TIMEOUT_SCALE`
-like the rest of the deadline set. When the window closes, world_size
+like the rest of the deadline set. Shipped alongside them (documented
+in the cluster guide, listed here so this section is not read as the
+whole knob set): `discovery` (a roster-free window that requires an
+explicit `min_rank_start`), `open_admission`, `token` (pre-shared
+session salt), `tunnel_only`, and `start: auto|manual|hybrid` (the
+staging hold). When the window closes, world_size
 freezes: seed-derived sharding, the cadence scheduler, and the
 window≤epoch invariant all see a static world. Elastic *death*
 (dead-rank detection, membership shrink, NCCL rebuild) continues to
@@ -157,9 +179,13 @@ is gated on bind scope:
 | non-loopback (rig mode) | **pre-shared salt** as today (fdl fan-out delivers it), or explicit `open_admission: true` with a loud warning | reaching a LAN/WAN port proves nothing; silent open admission would let a network neighbor *participate in* (poison) training, which is strictly worse than observing cleartext |
 
 Deployment hardening that falls out for free: the worker's SSH key
-can be a restricted `authorized_keys` entry on the controller host -
-`no-pty,permitopen="127.0.0.1:<port>"` - granting exactly the tunnel
-and nothing else. That makes the credential safe to bake into cloud
+can be a restricted `authorized_keys` entry on the controller host,
+granting exactly the tunnel and nothing else - `restrict`,
+`port-forwarding`, `permitopen="127.0.0.1:<port>"` and a forced
+`command=`, that last one load-bearing because `no-pty` alone still
+leaves `ssh host <cmd>` wide open (full recipe, including what the
+forced command costs a walk-in's data mount, in
+[the cluster guide](../ddp/02-cluster-guide.md)). That makes the credential safe to bake into cloud
 images: a leaked key lets someone join a training run if they can
 also reach the controller's sshd, and nothing more.
 
@@ -191,7 +217,8 @@ deployments with zero new dependencies.
 One small state struct on the controller, three renderings:
 
 - **Phase**: `waiting(joined/quorum/target, window countdown, cap
-  countdown)` → `forming` → `training` → `done/failed`.
+  countdown)` → `staging` (manual/hybrid start: quorum met, roster
+  held for the operator) → `forming` → `training` → `done/failed`.
 - **Members**: per host - name, ranks, GPU inventory, join
   timestamp, precheck result.
 
@@ -282,7 +309,10 @@ collapsed the wire bytes.
    - **One agent per host** (`Role::Agent`, bootstrapped by
      `FLODL_INTERNAL_AGENT_JSON`) replaces per-rank SSH spawn; the
      minimal self-deploy spec is `{host, controller_host,
-     controller_port}` - the worker resolves its own GPUs. The join
+     controller_port}` - the worker resolves its own GPUs. As shipped
+     the spec also carries what only that box knows: its libtorch
+     variant label (the vendor-coherence fact), the session token, an
+     explicit device scope, and its resolved `data_path`. The join
      connection stays open as the host control link (`RankExited` up,
      `Abort` down, EOF = host death).
    - **Launcher-local hosts join in-process** (a thread dialing

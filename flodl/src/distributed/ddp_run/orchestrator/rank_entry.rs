@@ -22,7 +22,7 @@ use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::{
     ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy,
-    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig,
+    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig, pick_space,
 };
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -203,8 +203,7 @@ impl DdpHandle {
         let save_path = config.save_path.clone();
         let (global_rank, device) = cluster.my_rank()?;
         let world_size = cluster.world_size();
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * config.augment.max(1);
+        let total_samples = pick_space(dataset.len(), config.augment);
 
         let policy_label = match policy {
             ApplyPolicy::Sync => "Sync",
@@ -462,9 +461,17 @@ impl DdpHandle {
             eval_dataset,
             outer_optimizer_factory,
         } = rank_callbacks;
+        // The envelope's integrated-GPU RAM share fills an unset config,
+        // never overrides a set one — an explicit `with_gpu_ram_share`
+        // in the binary keeps the last word, exactly like a passed
+        // `--data-dir` does over the envelope's `data_path`. This is
+        // the one consumption point: both the managed and cooperative
+        // entries route through here before anything reads the field
+        // (`check_apu_sizing` included).
+        let mut config = config;
+        config.gpu_ram_share = config.gpu_ram_share.or(cluster.gpu_ram_share());
         let save_path = config.save_path.clone();
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * config.augment.max(1);
+        let total_samples = pick_space(dataset.len(), config.augment);
 
         // Controller-driven role assignment: every rank holds the callback
         // closures; the coord's runtime role push gates who fires. Validates
@@ -501,10 +508,10 @@ impl DdpHandle {
         // (main) thread — `ncclCommInitRank` from a freshly spawned thread
         // corrupts the CUDA context on heterogeneous GPUs; CPU dials the relay
         // data loopback for the reduce channel.
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         if matches!(backend, AverageBackend::Nccl) {
             if let crate::tensor::Device::CUDA(idx) = device {
-                crate::tensor::set_current_cuda_device(idx);
+                crate::tensor::set_current_gpu_device(idx);
             }
         }
         let nccl_comm = match backend {
@@ -547,6 +554,14 @@ impl DdpHandle {
         )?;
         let initial_buffers_local: Vec<Tensor> = tmp_model
             .buffers().iter().map(|b| b.get()).collect();
+        // Hashed while the constructed model is still in hand: the
+        // coordinator refuses a formation whose ranks disagree on this
+        // (names/shapes/dtypes), instead of hanging at the first
+        // collective.
+        let model_sig = crate::distributed::model_sig::model_sig(
+            &tmp_model.parameters(),
+            &tmp_model.buffers(),
+        );
         // Model-derived frame ceiling for this rank's length-prefixed readers,
         // installed BEFORE the first framed read (the bootstrap consensus).
         {
@@ -650,10 +665,12 @@ impl DdpHandle {
             seed: crate::distributed::ddp_run::resolve_shuffle_seed(
                 config.resume_from.as_deref(),
             )?,
+            epoch_splits: config.epoch_splits.max(1),
             max_grad_norm: config.max_grad_norm,
             vram_pool: config.vram_pool,
             vram_max_usage: config.vram_max_usage,
             ram_max_usage: config.ram_max_usage,
+            gpu_ram_share: config.gpu_ram_share,
             sample_cache: config.sample_cache,
             disk_stage_gb: config.disk_stage_gb,
             disk_stage_dir: config.disk_stage_dir.clone(),
@@ -673,6 +690,7 @@ impl DdpHandle {
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
                 ),
             ),
+            model_sig,
         };
 
         // ClusterWorker bridges set up heartbeat + NCCL watchdog + inbound

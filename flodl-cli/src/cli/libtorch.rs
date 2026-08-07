@@ -171,14 +171,24 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
     use libtorch::download::{DownloadOpts, Variant};
     use std::path::PathBuf;
 
-    // --cpu and --cuda are mutually exclusive.
-    if cli.cpu && cli.cuda.is_some() {
-        cli_error!("--cpu and --cuda are mutually exclusive");
+    // --cpu / --cuda / --rocm each name a different build; at most one.
+    let picked = [cli.cpu, cli.cuda.is_some(), cli.rocm.is_some()]
+        .iter()
+        .filter(|p| **p)
+        .count();
+    if picked > 1 {
+        cli_error!("--cpu, --cuda and --rocm are mutually exclusive");
         return ExitCode::FAILURE;
     }
 
     let variant = if cli.cpu {
         Variant::Cpu
+    } else if cli.rocm.is_some() {
+        match cli.rocm.as_deref() {
+            Some("7.0") => Variant::Rocm70,
+            Some("7.1") => Variant::Rocm71,
+            _ => unreachable!("validated by #[option(choices = ...)]"),
+        }
     } else {
         match cli.cuda.as_deref() {
             Some("12.6") => Variant::Cuda126,
@@ -197,7 +207,7 @@ fn cmd_libtorch_download(cli: LibtorchDownloadArgs) -> ExitCode {
     };
 
     match libtorch::download::run(opts) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             cli_error!("{e}");
             ExitCode::FAILURE
@@ -278,6 +288,10 @@ fn print_libtorch_usage() {
     println!("    download           Download pre-built libtorch");
     println!("        --cpu          Force CPU variant");
     println!("        --cuda <ver>   Specific CUDA version (12.6, 12.8)");
+    println!("        --rocm <ver>   AMD ROCm build instead of CUDA (7.0, 7.1)");
+    println!("        --path <dir>   Install here (default: project libtorch/)");
+    println!("        --no-activate  Do not activate after download");
+    println!("        --dry-run      Print the resolved URL and stop");
     println!("    build              Build libtorch from source");
     println!("        --docker       Force Docker build (isolated, reproducible)");
     println!("        --native       Force native build (faster, requires host toolchain)");

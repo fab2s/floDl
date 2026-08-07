@@ -17,6 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     pkg-config \
     graphviz \
+    # rsync: the source-fetch resolver's mtime-preserving transport. Present
+    # so its tests exercise the real tool rather than skipping.
+    rsync \
+    # python3: Ubuntu's rrsync (in the rsync package) is a python3 script,
+    # and the publish rrsync-pairing test runs the real thing — without the
+    # interpreter the test skips instead of covering.
+    python3-minimal \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Rust ---

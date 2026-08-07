@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::cluster::{ClusterConfig, DdpConfig, OutputConfig, TrainingConfig, WorkerJoin};
+use super::cluster::{
+    ClusterConfig, DdpConfig, OutputConfig, PublishBlock, TrainingConfig, WorkerJoin,
+};
 
 /// Root fdl.yaml at project root.
 ///
@@ -40,6 +42,11 @@ pub struct ProjectConfig {
     /// so a boot-time `fdl join` needs no flags.
     #[serde(default)]
     pub join: Option<WorkerJoin>,
+    /// Controller-side standing answers for `fdl publish`, so chaining
+    /// runs on a fleet is one bare command. Flags win over the block;
+    /// a `--` tail replaces its `args:`.
+    #[serde(default)]
+    pub publish: Option<PublishBlock>,
 }
 
 // ── Sub-command config ──────────────────────────────────────────────────

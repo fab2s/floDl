@@ -16,6 +16,11 @@ commands:
     run: cargo test
     append: -- --nocapture --skip leakcheck
     docker: dev
+  bench-test:
+    description: Run ddp-bench's own unit tests (workspace-excluded, so `test` misses them)
+    run: cd ddp-bench && cargo test
+    append: -- --nocapture
+    docker: dev
   test-release:
     description: Run tests in release mode
     run: cargo test --release
@@ -52,46 +57,72 @@ commands:
     run: bash
     docker: dev
 
-  # --- CUDA targets ---
-  cuda-build:
-    description: Build with CUDA feature
-    run: cargo build --features cuda
-    docker: cuda
+  # --- RHEL-family reproduction (uncomment to use) ---
+  # A RHEL question answered on a RHEL userland rather than by reasoning
+  # about one: dnf package names, rrsync shipping as documentation, and
+  # which libtorch baselines EL9 can load (cpu and cu128 yes, rocm no --
+  # its archive wants a glibc EL9 cannot reach). Needs one build first:
+  #   docker compose build rhel
+  #
+  # rhel-shell:
+  #   description: Interactive shell on a RHEL userland
+  #   run: bash
+  #   docker: rhel
+  # rhel-build:
+  #   description: Build on a RHEL userland
+  #   run: cargo build
+  #   docker: rhel
+  # rhel-probe:
+  #   description: What `fdl probe` reports on a RHEL box
+  #   run: cargo run -q -p flodl-cli --bin fdl -- probe
+  #   docker: rhel
+
+  # --- GPU targets ---
+  #
+  # Both vendor-dependent bits are derived from the active libtorch
+  # variant, so these entries work unchanged on NVIDIA or AMD:
+  #   --features "$FDL_GPU_FEATURE"   -> cuda / rocm   (fdl exports it)
+  #   docker: gpu                   -> the matching container service
+  # Pin either explicitly (`docker: cuda`) if you want to override.
+  gpu-build:
+    description: Build with GPU support
+    run: cargo build --features "$FDL_GPU_FEATURE"
+    docker: gpu
   # Scoping: -p flodl -p flodl-hf — only crates that carry the `cuda`
   # feature have CUDA tests. flodl-cli / flodl-cli-macros are config +
   # dispatch (no GPU code, no CUDA tests); flodl-sys has no tests at
   # all. Without `-p` cargo would still compile + invoke their test
   # binaries on every pass, filter everything out, and dump hundreds
   # of `running 0 tests` lines into the output.
-  cuda-test:
-    description: Run CUDA tests (parallel, excludes NCCL/Graph)
-    run: cargo test -p flodl -p flodl-hf --features cuda
+  gpu-test:
+    description: Run GPU tests (parallel, excludes NCCL/Graph)
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE"
     append: -- --nocapture
-    docker: cuda
-  cuda-test-all:
-    description: Full CUDA suite (parallel + NCCL isolated + serial)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
-    docker: cuda
-  cuda-test-nccl:
+    docker: gpu
+  gpu-test-all:
+    description: Full GPU suite (parallel + NCCL isolated + serial)
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 graph_distribute && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    docker: gpu
+  gpu-test-nccl:
     description: NCCL/DDP tests only (isolated processes)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 graph_distribute
-    docker: cuda
-  cuda-test-serial:
-    description: Serial CUDA tests (Graphs, manual_seed, probes)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
-    docker: cuda
-  cuda-test-graph:
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 nccl && cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 graph_distribute
+    docker: gpu
+  gpu-test-serial:
+    description: Serial GPU tests (Graphs, manual_seed, probes)
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 --skip nccl --skip graph_distribute --skip _live
+    docker: gpu
+  gpu-test-graph:
     description: CUDA Graph tests only (exclusive GPU, single-threaded)
-    run: cargo test -p flodl -p flodl-hf --features cuda -- --nocapture --ignored --test-threads=1 cuda_graph
-    docker: cuda
-  cuda-clippy:
-    description: Lint with CUDA feature (all targets incl. tests + examples, workspace + ddp-bench)
-    run: cargo clippy --features cuda --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features cuda -- -W clippy::all
-    docker: cuda
-  cuda-shell:
-    description: Interactive shell in CUDA container
+    run: cargo test -p flodl -p flodl-hf --features "$FDL_GPU_FEATURE" -- --nocapture --ignored --test-threads=1 cuda_graph
+    docker: gpu
+  gpu-clippy:
+    description: Lint with GPU support (all targets incl. tests + examples, workspace + ddp-bench)
+    run: cargo clippy --features "$FDL_GPU_FEATURE" --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests --features "$FDL_GPU_FEATURE" -- -W clippy::all
+    docker: gpu
+  gpu-shell:
+    description: Interactive shell in the GPU container
     run: bash
-    docker: cuda
+    docker: gpu
 
   # --- Benchmarks (see ./benchmarks/fdl.yml) ---
   bench:
@@ -107,7 +138,14 @@ commands:
 # workers walking into a controller's join window — the mirror image of
 # a cluster overlay's `controller.join:`). Bake it into a golden image
 # so a boot-time `fdl join` needs no flags; every field is overridable
-# on the command line (flags win). See docs/ddp.md "Walking in".
+# on the command line (flags win). See docs/ddp/02-cluster-guide.md
+# "Walking in".
+#
+# `fdl join-config <label>` (on the controller) GENERATES this block
+# ready to paste (keys, token, guardrailed authorized_keys line and a
+# cloud-init variant included) and scaffolds the matching controller
+# overlay fdl.<label>.yml. Assemble by hand only when the wizard's
+# doors don't fit.
 # ---------------------------------------------------------------------------
 # join:
 #   controller: 10.0.0.1:1337       # controller mux address, host[:port]
@@ -121,10 +159,152 @@ commands:
 #     # options: ["StrictHostKeyChecking=accept-new"]
 #   token: <hex>                    # pre-shared credential (the run's
 #                                   # controller.join.token); unset = open admission
-#   bin: target/release/train       # training binary run in agent role (required)
+#   bin: target/release/train       # training binary run in agent role: run
+#                                   # this path as given. Exactly one of
+#                                   # bin: / source: is required.
 #   args: ["--model", "resnet"]     # the binary's own arguments (a `--` tail
 #                                   # on the command line replaces this list)
 #   # host: worker-7                # logical roster name (default: hostname)
 #   # devices: [0, 1]               # CUDA ids to offer (default: all GPUs)
 #   # persist: true                 # re-dial with backoff when the agent
 #   #                               # exits — the systemd / fleet mode
+#
+#   # --- build the binary here, instead of naming one -----------------------
+#   # The box fetches the tree to LOCAL disk and compiles it against its OWN
+#   # libtorch, so the ABI matches by construction rather than by manifest
+#   # discipline. Never build from a mount: cargo stats every source file on
+#   # every invocation, and the attribute caching that would hide that
+#   # latency makes it serve a stale binary. The fetch preserves mtimes,
+#   # which is what keeps the loop incremental.
+#   #
+#   # `from` transports, three of them:
+#   #   file:///abs/path                      a directory on this box
+#   #   rsync://[user@]host[:port]:/abs/path  a working tree over ssh
+#   #   git+https://host/owner/repo#<ref>     a pinned checkout (git+ssh:// too)
+#   # rsync is the one that carries UNCOMMITTED work, which a training crate
+#   # living in no repo at all needs; git+ wants a #<tag|branch|sha>, because
+#   # a default branch floats and a floating ref is not a pin. Over ssh the
+#   # key comes from the ssh: block above, and that key's forced command has
+#   # to permit rsync (`rrsync -ro <dir>`; the nologin join key does not).
+#   #
+#   # No toolchain field: the tree carries its own rust-toolchain.toml and
+#   # lockfile if the operator pinned them, and RUSTUP_TOOLCHAIN set here
+#   # would silently override that.
+#   # source:
+#   #   from: rsync://flodl@ctrl.example.com:/home/op/my-train
+#   #   cwd: ddp-bench                # project dir inside the tree (default:
+#   #                                 # its root); governs build AND run
+#   #   build: cargo build --release --features "$FDL_GPU_FEATURE" --bin ddp-bench
+#   #                                 # default: `cargo build --release`. A
+#   #                                 # shell line, so it can be a script in
+#   #                                 # the tree (./ci/node-build.sh). Gets
+#   #                                 # LIBTORCH_PATH, FDL_GPU_FEATURE and
+#   #                                 # LD_LIBRARY_PATH. Re-runs every dial,
+#   #                                 # so it must be cheap when nothing
+#   #                                 # changed (cargo is).
+#   #   bin: target/release/ddp-bench # artifact, relative to cwd. Not guessed:
+#   #                                 # a workspace member's build lands in the
+#   #                                 # WORKSPACE target/, not the member's.
+#   #
+#   # cwd / build / bin / args are all OPTIONAL here, because a tree the
+#   # controller published with `fdl publish` carries a run manifest that
+#   # names them, and that manifest is the authority when present. Declare
+#   # them for a box you drive by hand; leave them out and the worker
+#   # config holds only what is stable for THIS box (its credentials, its
+#   # libtorch policy, where to pull from) while everything belonging to
+#   # the run comes from the controller. That is what makes chaining runs
+#   # on a standing fleet one command: `fdl publish` again, and every box
+#   # picks the new run up on its next dial with nothing to edit here.
+#   #
+#   # args matter most: they must match the run, because rank children
+#   # re-enter the binary with them, so a fleet carrying its own copy
+#   # would train the next run with the previous one's hyperparameters.
+#   # A published manifest replaces this block's args and says so.
+#
+#   # --- libtorch on THIS box ----------------------------------------------
+#   # Acquire a variant into ~/.flodl/libtorch/ (never the project tree,
+#   # which on a walk-in is often a read-only mount) and make it active.
+#   # `auto` routes on the devices THIS box has, so one golden image serves
+#   # NVIDIA and AMD instances. Unset leaves the box on what it already has.
+#   # libtorch: auto                  # or cpu / cu126 / cu128 / rocm7.0 / rocm7.1
+#
+#   # --- the dataset source root on THIS box -------------------------------
+#   # data_path is the LOCAL path this box's ranks read their training data
+#   # from, the same role cluster.workers[].data_path plays for a fan-out
+#   # host: `fdl join` verifies it before dialing and ships it to the ranks,
+#   # so the training binary needs no data flag. Unset ships nothing and the
+#   # binary keeps its own default.
+#   #
+#   # data_source is optional and only for a root that is NOT already there:
+#   # fdl mounts it at data_path (default /flodl/data) before dialing. One
+#   # scheme ships today, and the mount goes up READ-ONLY, because a rank
+#   # reads the source root and never writes it (anything missing is
+#   # acquired into ~/.flodl/data instead). A source your provisioning
+#   # already mounted needs no scheme at all — name its path in data_path
+#   # and leave data_source unset. Credentials come from the ssh: block
+#   # above: same box, same key — and that key has to permit sftp, which a
+#   # join key guardrailed with command="/usr/sbin/nologin" does not (the
+#   # tunnel still works, the mount says permission denied). Use
+#   # command="internal-sftp -R -d /flodl/data", or mount during
+#   # provisioning and declare a bare data_path. Recipe:
+#   # docs/ddp/02-cluster-guide.md.
+#   # data_path: /flodl/data
+#   # data_source: sshfs://flodl@ctrl.example.com:/flodl/data
+#   #                               # or sshfs://host:2222/flodl/data
+#
+#   # --- integrated-GPU RAM share on THIS box ------------------------------
+#   # APU boxes only (GPU and system RAM are one pool; discrete GPUs ignore
+#   # it): the fraction of physical RAM the GPU aperture claims, e.g. 0.5
+#   # (above 1.0 is legal where the platform under-states the aperture).
+#   # Host-hardware truth like data_path, riding the same road: the agent
+#   # writes it into this host's envelope block, where it overrides any
+#   # cluster-scope default the controller declared, and it fills the
+#   # training binary's config when that left the knob unset (an explicit
+#   # with_gpu_ram_share in code still wins).
+#   # gpu_ram_share: 0.5
+#
+#   # Model-signature probe (default on): the binary is re-run CPU-only to
+#   # print the signature of the model it builds (parameter names, shapes,
+#   # dtypes), and admission refuses a box whose model differs from the
+#   # cohort's — at the door, where the refusal costs only this box's
+#   # attempt. The outcome is cached across --persist re-dials (keyed on
+#   # the binary + the run's args; a rebuild or re-publish re-probes).
+#   # Disable for a binary whose startup is too heavy even for that, or
+#   # one built against a flodl that predates the probe (it would run its
+#   # whole main until the probe timeout kills it, once per change); the
+#   # formation-time check remains either way.
+#   # sig_probe: false
+#
+#   # Preparation (GPU stack, data source root, writable stage dirs, then
+#   # libtorch and the built binary) runs before every dial, so a --persist
+#   # box picks up a changed source on its next re-dial. A failure retrying
+#   # cannot fix exits 2 and does NOT re-dial — no GPU, a spec that does not
+#   # parse, a missing toolchain. Source that does not COMPILE is transient
+#   # instead: the fix is a push away, and a box that stopped permanently
+#   # over a typo would be powered off by the recipe below. (Exception: a
+#   # compile failure with the vendor toolkit headers missing is permanent —
+#   # re-dialing cannot install a package.)
+#   # In a unit file, act on the code instead of parsing stderr. The recipe
+#   # assumes persist: true — one-shot mode passes the agent's own exit code
+#   # through, so a binary exiting 2 would read as permanent:
+#   #   Restart=always
+#   #   RestartPreventExitStatus=2   # stop hot-looping a misprovisioned box
+#   #   FailureAction=poweroff       # ... and self-deprovision it
+
+# ---------------------------------------------------------------------------
+# publish: controller-side standing answers for `fdl publish`, so
+# chaining runs on a fleet is one bare `fdl publish`. Every field
+# mirrors a flag 1:1 and the flag wins; a `--` tail on the command line
+# replaces `args:` outright (even an empty tail — the args belong to
+# the run, so "explicitly none" must be sayable). `--no-build` has no
+# field here ON PURPOSE: a standing config that skips the gate would
+# ship every future typo to the fleet.
+# ---------------------------------------------------------------------------
+# publish:
+#   source: file:///home/op/my-train  # or rsync://…, git+https://…#<ref>
+#   bin: target/release/my-train      # what workers run, relative to cwd
+#   # cwd: member-crate               # project dir inside the tree
+#   # build: ./ci/build.sh            # gate recipe (default: cargo build --release)
+#   # to: /srv/flodl/run              # served dir (default: ~/.flodl/run)
+#   # identity: ~/.ssh/publish_key    # key for an ssh-pulled source
+#   # args: [--model, olmo, --epochs, "3"]   # the RUN's args (manifest-bound)

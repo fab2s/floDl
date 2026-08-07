@@ -452,6 +452,19 @@ pub struct TrainerConfig<M: Module> {
     /// Pure scheduling — data variation comes exclusively from
     /// [`Self::transform`], keyed per pick. Default: `1`.
     pub augment: usize,
+    /// How finely one data pass is sliced into epochs.
+    ///
+    /// At the default `1`, an epoch is a full pass. Above `1`, an epoch
+    /// becomes a slice of a pass: [`Self::num_epochs`] `* epoch_splits`
+    /// epochs run in total and each sample is still seen exactly
+    /// `num_epochs` times. Eval cadence, checkpointing and the reduce
+    /// window all follow the finer boundary.
+    ///
+    /// The reason to reach for it is single-pass training
+    /// (`num_epochs: 1`, the normal regime for LLM pretraining): such a
+    /// run has no interior epoch boundary, so no checkpoint and no eval
+    /// until it ends. Default: `1`.
+    pub epoch_splits: usize,
     /// Deterministic delivery transform (the augmentation seam), keyed
     /// by [`crate::data::PickKey`] and applied on each rank at its
     /// delivery point, on freshly assembled raw rows. Default: `None`.
@@ -467,6 +480,20 @@ pub struct TrainerConfig<M: Module> {
     /// `0.0` disables staging. Default `0.50` — same knob and default
     /// as `DataLoaderBuilder::ram_max_usage` on the solo path.
     pub ram_max_usage: f64,
+    /// Fraction of **physical** host RAM (`MemTotal`) to hand the GPU on
+    /// an **integrated (APU) target**, where device memory is carved out
+    /// of system RAM rather than being a pool of its own — so the host
+    /// staging tiers and the VRAM pool otherwise price the same DRAM
+    /// twice and over-commit it.
+    ///
+    /// `None` (default) reserves whatever aperture the device reports.
+    /// Ignored on discrete GPUs, where the two pools are genuinely
+    /// separate. Values above `1.0` are allowed and meaningful: if a
+    /// platform under-reports `MemTotal` relative to what the APU can
+    /// address, a share above 1.0 is how you still express the true
+    /// reservation. Same knob as `DataLoaderBuilder::gpu_ram_share` on
+    /// the solo path.
+    pub gpu_ram_share: Option<f64>,
     /// Pinned RAM sample retention on rank workers (default `true`):
     /// the staging tier's read-through cache keeps fetched samples for
     /// later epochs within the [`Self::ram_max_usage`] budget. `false`
@@ -615,9 +642,11 @@ impl<M: Module> TrainerConfig<M> {
             max_grad_norm: None,
             vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
             augment: 1,
+            epoch_splits: 1,
             transform: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            gpu_ram_share: None,
             sample_cache: true,
             disk_stage_gb: 0,
             disk_stage_dir: None,
@@ -672,6 +701,9 @@ impl<M: Module> TrainerConfig<M> {
     /// Augmentation multiplicity (see [`Self::augment`]).
     pub fn with_augment(mut self, k: usize) -> Self { self.augment = k.max(1); self }
 
+    /// Slices per data pass (see [`Self::epoch_splits`]).
+    pub fn with_epoch_splits(mut self, n: usize) -> Self { self.epoch_splits = n.max(1); self }
+
     /// VRAM share for each rank's data plane (see [`Self::vram_max_usage`]).
     pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {
         self.vram_max_usage = max_usage.clamp(0.50, 0.99);
@@ -684,6 +716,15 @@ impl<M: Module> TrainerConfig<M> {
         self.ram_max_usage = max_usage.clamp(0.0, 0.90);
         self
     }
+    /// Fraction of physical host RAM (`MemTotal`) reserved for the GPU on
+    /// an integrated (APU) target (see [`Self::gpu_ram_share`]). Ignored
+    /// on discrete GPUs. Same knob as
+    /// `DataLoaderBuilder::gpu_ram_share` on the solo path.
+    pub fn with_gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share.max(0.0));
+        self
+    }
+
 
     /// Pinned RAM sample retention on rank workers (see
     /// [`Self::sample_cache`]).

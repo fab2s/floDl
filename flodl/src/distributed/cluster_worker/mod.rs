@@ -59,7 +59,7 @@
 //! - `#[ignore = "cuda"]` end-to-end NCCL smoke test: two ranks share a
 //!   NcclRankComm, do real AllReduce(Avg) on their parameters after a
 //!   few batches, verify weights converge to consensus. Runs via
-//!   `fdl cuda-test-nccl` on a multi-GPU rig.
+//!   `fdl gpu-test-nccl` on a multi-GPU rig.
 
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -223,6 +223,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
             &mut handshake_stream,
             rank_id,
             config.world_size as u32,
+            &config.model_sig,
             &salt,
         )?;
         read_handshake_ack(&mut handshake_stream, &salt)?;

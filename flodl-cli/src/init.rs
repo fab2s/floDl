@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use crate::util::prompt;
 
@@ -208,27 +207,20 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The scaffold's flodl dependency line: the latest published version
+/// when crates.io answers (through the update check's probe — the one
+/// client that sends the User-Agent crates.io's data-access policy
+/// requires; a bare curl gets a policy rejection, which for a long time
+/// silently routed EVERY scaffold to a fallback), and fdl's own version
+/// otherwise — fdl and flodl are workspace-versioned twins, so the pin
+/// is right whenever this fdl came from crates.io itself. Always a
+/// pinnable registry version, never a git dependency: a default branch
+/// floats under the scaffold, and `fdl add flodl-hf` refuses git deps
+/// by design ("needs a pinnable crates.io version").
 fn resolve_flodl_dep() -> String {
-    // Try crates.io for the latest version
-    if let Some(version) = crates_io_version() {
-        format!("flodl = \"{}\"", version)
-    } else {
-        "flodl = { git = \"https://github.com/flodl-labs/flodl.git\" }".into()
-    }
-}
-
-fn crates_io_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-sL", "https://crates.io/api/v1/crates/flodl"])
-        .output()
-        .ok()?;
-    let body = String::from_utf8_lossy(&output.stdout);
-    // Extract "max_stable_version":"X.Y.Z"
-    let marker = "\"max_stable_version\":\"";
-    let start = body.find(marker)? + marker.len();
-    let end = start + body[start..].find('"')?;
-    let version = &body[start..end];
-    if version.is_empty() { None } else { Some(version.to_string()) }
+    let version = crate::update_check::probe_crates_io("flodl")
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    format!("flodl = \"{version}\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +239,10 @@ fn scaffold_docker(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(), 
     write_file(
         &format!("{}/Dockerfile.cuda", name),
         DOCKERFILE_CUDA,
+    )?;
+    write_file(
+        &format!("{}/Dockerfile.rocm", name),
+        DOCKERFILE_ROCM,
     )?;
     write_file(
         &format!("{}/docker-compose.yml", name),
@@ -271,6 +267,10 @@ fn scaffold_mounted(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(),
     write_file(
         &format!("{}/Dockerfile.cuda", name),
         DOCKERFILE_CUDA_MOUNTED,
+    )?;
+    write_file(
+        &format!("{}/Dockerfile.rocm", name),
+        DOCKERFILE_ROCM_MOUNTED,
     )?;
     write_file(
         &format!("{}/docker-compose.yml", name),
@@ -306,6 +306,14 @@ edition = "2024"
 
 [dependencies]
 {flodl_dep}
+
+# GPU support is opt-in. `fdl gpu-*` picks the right one for you through
+# $FDL_GPU_FEATURE, derived from the libtorch variant you have active.
+# (Without this section `cargo build --features cuda` fails outright with
+# "does not contain this feature" -- cargo resolves it against THIS
+# package, not the dependency.)
+[features]
+cuda = ["flodl/cuda"]
 
 # Optimize floDl in dev builds -- your code stays fast to compile.
 # After the first build, only your graph code recompiles (~2s).
@@ -474,6 +482,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 
   cuda:
     build:
@@ -494,6 +508,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
     deploy:
       resources:
         reservations:
@@ -501,6 +521,45 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${{ROCM_VERSION:-7.0}}
+    image: {crate_name}-rocm
+    user: "${{UID:-1000}}:${{GID:-1000}}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      # flodl runtime knobs, forwarded from the host (or `.env`):
+      # verbosity is what `fdl -v/-vv/...` sets per invocation, and the
+      # timeout scale stretches distributed network deadlines on slow links.
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 "#
         )
     } else {
@@ -531,6 +590,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 
   cuda:
     build:
@@ -554,6 +619,12 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
       # timeout scale stretches distributed network deadlines on slow links.
       - FLODL_VERBOSITY
       - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
     deploy:
       resources:
         reservations:
@@ -561,6 +632,43 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  rocm:
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_VERSION: ${{ROCM_VERSION:-7.0}}
+    image: {crate_name}-rocm
+    user: "${{UID:-1000}}:${{GID:-1000}}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    # HSA needs these to map queues; without them the runtime fails at
+    # device init rather than at first op.
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    volumes:
+      - .:/workspace
+      - ./.cargo-cache-rocm:/usr/local/cargo/registry
+      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ${{LIBTORCH_HOST_PATH:-./libtorch/precompiled/rocm70}}:/usr/local/libtorch:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - FLODL_VERBOSITY
+      - FLODL_NET_TIMEOUT_SCALE
+      # The cargo feature the active libtorch variant needs, computed by
+      # fdl from the variant path, so a run: line can say
+      # `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
+      # Compose only passes variables listed here into the container —
+      # without this line that spelling breaks inside every service.
+      - FDL_GPU_FEATURE
 "#
         )
     }
@@ -681,6 +789,75 @@ ENV CUDA_HOME="/usr/local/cuda"
 WORKDIR /workspace
 "#;
 
+// ROCm images. The `/opt/rocm/lib` FIRST ordering below is load-bearing,
+// not cosmetic: libtorch-rocm bundles the ENTIRE userspace ROCm stack in
+// its own lib/ (libamdhip64, libhsa-runtime64, libamd_comgr, librocm-core,
+// and the kernel-interface-coupled libdrm / libdrm_amdgpu / libnuma). With
+// libtorch's lib/ first that bundle wins over the system runtime, and when
+// it disagrees with the host's amdkfd driver the process segfaults at the
+// FIRST GPU OP -- a failure that looks nothing like a link problem, which
+// is what makes it the lowest-discoverability item in a ROCm bring-up.
+
+const DOCKERFILE_ROCM: &str = r#"# ROCm dev image for floDl projects.
+# Requires: docker run --device /dev/kfd --device /dev/dri ...
+ARG ROCM_VERSION=7.0
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl unzip ca-certificates git gcc g++ pkg-config graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+ENV CARGO_HOME="/usr/local/cargo"
+ENV RUSTUP_HOME="/usr/local/rustup"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+# libtorch (ROCm 7.0)
+ARG LIBTORCH_VERSION=2.10.0
+RUN wget -q "https://download.pytorch.org/libtorch/rocm7.0/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Brocm7.0.zip" \
+    && unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip" -d /usr/local \
+    && rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+rocm7.0.zip"
+
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV ROCM_PATH="/opt/rocm"
+# System ROCm FIRST -- see the note above this template.
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+
+WORKDIR /workspace
+"#;
+
+const DOCKERFILE_ROCM_MOUNTED: &str = r#"# ROCm dev image for floDl projects (libtorch mounted at runtime).
+# Requires: docker run --device /dev/kfd --device /dev/dri ...
+ARG ROCM_VERSION=7.0
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget curl unzip ca-certificates git gcc g++ pkg-config graphviz \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust
+ENV CARGO_HOME="/usr/local/cargo"
+ENV RUSTUP_HOME="/usr/local/rustup"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+ENV LIBTORCH_PATH="/usr/local/libtorch"
+ENV ROCM_PATH="/opt/rocm"
+# System ROCm FIRST -- see the note above this template.
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+ENV LIBRARY_PATH="${ROCM_PATH}/lib:${LIBTORCH_PATH}/lib"
+
+WORKDIR /workspace
+"#;
+
 // ---------------------------------------------------------------------------
 // fdl.yml.example template
 // ---------------------------------------------------------------------------
@@ -725,6 +902,11 @@ fn env_example_template(mode: Mode) -> String {
 # libtorch variant's `.arch` metadata and overrides whatever is set here.
 #CUDA_VERSION=12.8.0
 #CUDA_TAG=12.8
+
+# ROCm base image version for the `rocm` service (same rule). The service
+# mounts LIBTORCH_HOST_PATH like the cuda one, so the variant override above
+# covers both vendors.
+#ROCM_VERSION=7.0
 ",
         );
     }
@@ -749,15 +931,18 @@ fn env_example_template(mode: Mode) -> String {
 
 fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
     let use_docker = matches!(mode, Mode::Mounted | Mode::Docker);
-    let (cpu_svc, cuda_svc) = if use_docker {
-        ("\n    docker: dev", "\n    docker: cuda")
+    // `gpu` is fdl's logical service: it resolves to the container
+    // matching the active libtorch variant (`cuda` / `rocm`), so a
+    // scaffolded project does not hardcode a vendor either.
+    let (cpu_svc, gpu_svc) = if use_docker {
+        ("\n    docker: dev", "\n    docker: gpu")
     } else {
         ("", "")
     };
-    let cuda_note = if use_docker {
-        "(requires NVIDIA Container Toolkit)"
+    let gpu_note = if use_docker {
+        "(NVIDIA: Container Toolkit; AMD: /dev/kfd + render group)"
     } else {
-        "(requires a matching CUDA toolkit on the host)"
+        "(requires the vendor toolkit on the host)"
     };
     let preamble = if use_docker {
         "# Run any of these with `./fdl <cmd>` (or `fdl <cmd>` once installed\n\
@@ -765,11 +950,11 @@ fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
          # `libtorch/.active` automatically; missing libtorch surfaces as a\n\
          # clean linker error, with `./fdl setup` one call away."
     } else {
-        "# Native mode: commands run on the host. Make sure libtorch is\n\
-         # installed (`./fdl libtorch download --cpu` or `--cuda 12.8`)\n\
-         # and that `$LIBTORCH` / `$LD_LIBRARY_PATH` are exported so\n\
-         # cargo can link. `./fdl libtorch info` prints the commands you\n\
-         # need after a download."
+        "# Native mode: commands run on the host. Install libtorch first\n\
+         # (`./fdl libtorch download --cpu` or `--cuda 12.8`); `./fdl`\n\
+         # commands then export `LIBTORCH_PATH` / `LD_LIBRARY_PATH` from\n\
+         # the active variant automatically. Bypassing fdl (bare cargo)\n\
+         # needs them by hand — `./fdl libtorch info` prints the exports."
     };
 
     let shell_block = if use_docker {
@@ -785,11 +970,11 @@ fn fdl_yml_example_template(project_name: &str, mode: Mode) -> String {
         String::new()
     };
 
-    let cuda_shell_block = if use_docker {
+    let gpu_shell_block = if use_docker {
         format!(
-            r#"  cuda-shell:
-    description: Interactive shell (CUDA container)
-    run: bash{cuda_svc}
+            r#"  gpu-shell:
+    description: Interactive shell (GPU container)
+    run: bash{gpu_svc}
 "#
         )
     } else {
@@ -818,17 +1003,19 @@ commands:
   clippy:
     description: Lint
     run: cargo clippy -- -W clippy::all{cpu_svc}
-{shell_block}  # --- CUDA {cuda_note} ---
-  cuda-build:
-    description: Build with CUDA feature
-    run: cargo build --features cuda{cuda_svc}
-  cuda-test:
-    description: Run CUDA tests
-    run: cargo test --features cuda -- --nocapture{cuda_svc}
-  cuda-run:
-    description: cargo run --features cuda
-    run: cargo run --features cuda{cuda_svc}
-{cuda_shell_block}"#
+{shell_block}  # --- GPU {gpu_note} ---
+  # $FDL_GPU_FEATURE is exported by fdl from the active libtorch variant,
+  # so these stay correct if you switch variants.
+  gpu-build:
+    description: Build with GPU support
+    run: cargo build --features "$FDL_GPU_FEATURE"{gpu_svc}
+  gpu-test:
+    description: Run GPU tests
+    run: cargo test --features "$FDL_GPU_FEATURE" -- --nocapture{gpu_svc}
+  gpu-run:
+    description: cargo run with GPU support
+    run: cargo run --features "$FDL_GPU_FEATURE"{gpu_svc}
+{gpu_shell_block}"#
     )
 }
 

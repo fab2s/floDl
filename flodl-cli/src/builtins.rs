@@ -136,9 +136,25 @@ pub struct StartArgs {
 /// through its guardrailed sshd (reachability = authentication); with
 /// neither, the controller must run open admission.
 ///
-/// Exit code: the agent's exit code (0 = this host finished cleanly).
-/// `--persist` re-dials on every exit instead — the systemd /
-/// golden-image mode.
+/// Before dialing, the box is prepared: the GPU stack is checked, the
+/// dataset source root is put where the ranks will look for it
+/// (`--data-source` mounts it read-only when it is not already there),
+/// the directories the data plane writes are proven writable, and
+/// anything this box does not have yet is acquired — a libtorch variant
+/// (`--libtorch`) and the training binary itself (`--source`, fetched to
+/// local disk and built here, which is what makes its ABI match the
+/// libtorch it holds). Preparation re-runs per attempt, so a `--persist`
+/// box picks up a changed source on its next re-dial.
+///
+/// Exit code: the agent's exit code (0 = this host finished cleanly);
+/// 2 for a failure retrying cannot fix (no GPU, a spec that does not
+/// parse, a missing binary or toolchain), which `--persist` does not
+/// re-dial; 1 for a transient one, which it does — the systemd /
+/// golden-image mode. Source that does not compile counts as transient
+/// on purpose: the fix is a push away at the source, and a box that
+/// stopped permanently over a typo would be powered off by the systemd
+/// recipe. Exception: a compile failure with the vendor toolkit headers
+/// missing is permanent, since re-dialing cannot install a package.
 #[derive(crate::FdlArgs, Debug)]
 pub struct JoinArgs {
     /// Controller mux address, `host[:port]` (default port 1337).
@@ -158,14 +174,41 @@ pub struct JoinArgs {
     /// `controller.join.token`).
     #[option]
     pub token: Option<String>,
-    /// Training binary to run in agent role.
+    /// Training binary to run in agent role, as a path on this box.
+    /// Mutually exclusive with `--source`.
     #[option]
     pub bin: Option<String>,
+    /// Build the training binary here instead: a source spec, one of
+    /// `file:///abs/path`, `rsync://[user@]host[:port]:/abs/path` or
+    /// `git+https://host/owner/repo#<tag|branch|sha>`. Fetched to local
+    /// disk, then built against this box's libtorch.
+    #[option]
+    pub source: Option<String>,
+    /// Project directory inside the fetched source tree (default: its
+    /// root). Governs the build and the run both.
+    #[option]
+    pub source_cwd: Option<String>,
+    /// Build recipe for the fetched source, a shell line (default:
+    /// `cargo build --release`). Gets `LIBTORCH_PATH`,
+    /// `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`.
+    #[option]
+    pub source_build: Option<String>,
+    /// Built artifact, relative to the project directory, e.g.
+    /// `target/release/train`.
+    #[option]
+    pub source_bin: Option<String>,
+    /// libtorch variant to acquire into `~/.flodl/libtorch/` before
+    /// building or running: `auto`, `cpu`, `cu126`, `cu128`, `rocm7.0`,
+    /// `rocm7.1`.
+    /// `auto` routes on this box's own devices, so one image serves
+    /// both vendors. Default: whatever is already active here.
+    #[option]
+    pub libtorch: Option<String>,
     /// Logical host name in the roster (default: this machine's
     /// hostname).
     #[option]
     pub host: Option<String>,
-    /// CUDA device ids to offer, comma-separated (default: all GPUs
+    /// GPU device ids to offer, comma-separated (default: all GPUs
     /// on this host).
     #[option]
     pub devices: Option<String>,
@@ -173,6 +216,184 @@ pub struct JoinArgs {
     /// when the agent does.
     #[option]
     pub persist: bool,
+    /// Dataset source root on this box, shipped to this host's ranks
+    /// (with `--data-source`, the mountpoint; default `/flodl/data`).
+    #[option]
+    pub data_path: Option<String>,
+    /// Transport that establishes the source root when it is not
+    /// already mounted, e.g. `sshfs://user@ctrl:/flodl/data`.
+    #[option]
+    pub data_source: Option<String>,
+    /// Integrated-GPU host-RAM share of this box, a fraction of its
+    /// physical RAM, e.g. 0.5 (APU boxes only; discrete GPUs ignore
+    /// it). Ships to this host's ranks like `--data-path` does.
+    #[option]
+    pub gpu_ram_share: Option<f64>,
+    /// Skip the pre-dial model-signature probe (a short CPU-only
+    /// re-run of the training binary; admission uses the signature to
+    /// refuse a box building a different model). Skip it for a binary
+    /// whose startup is too heavy to run twice per dial.
+    #[option]
+    pub no_sig_probe: bool,
+}
+
+/// Provision a walk-in farm in one pass: the farm overlay
+/// (`fdl.<label>.yml`, token stamped), an ed25519 join key born in
+/// `./.fdl/<label>/` so it cannot be shared across farms by
+/// construction, the guardrailed `authorized_keys` line for the chosen
+/// door, the paste-ready worker yml, a publish recipe derived from the
+/// training crate's own manifest, and a build-freshness report. A farm
+/// IS an env overlay: `fdl @<label> <cmd>` targets it afterwards.
+/// Regenerating credentials for a new farm instantiation is
+/// `fdl join-config <label> --regen`.
+#[derive(crate::FdlArgs, Debug)]
+pub struct JoinConfigArgs {
+    /// Farm label — names `fdl.<label>.yml` and `.fdl/<label>/`.
+    /// Defaults to the active env (`fdl @<label> join-config`).
+    #[arg]
+    pub label: Option<String>,
+    /// How workers reach the join sshd: `[user@]host[:port]` (default:
+    /// this box's hostname, the invoking user, port 22).
+    #[option]
+    pub controller: Option<String>,
+    /// Guardrail door the join key opens: `b` (rrsync source pull, the
+    /// publish-then-join default), `a` (read-only sftp data mount), or
+    /// `nologin` (tunnel only).
+    #[option(choices = &["b", "a", "nologin"])]
+    pub door: Option<String>,
+    /// Training crate to derive the publish recipe from (default: the
+    /// current directory; no crate there is fine — a farm can be
+    /// config-only).
+    #[option]
+    pub crate_dir: Option<String>,
+    /// Dataset source root workers read; under door `a` it is also the
+    /// sshfs mountpoint (default /flodl/data there).
+    #[option]
+    pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share stamped into the worker yml
+    /// (APU fleets; discrete GPUs ignore it).
+    #[option]
+    pub gpu_ram_share: Option<f64>,
+    /// Regenerate credentials (key and token) without asking. Workers
+    /// holding the old ones stop being admitted.
+    #[option]
+    pub regen: bool,
+    /// Install the guardrailed line into this user's own
+    /// `~/.ssh/authorized_keys` without asking (the wizard's default
+    /// offer). Only the wizard's own line is ever touched; `/etc/ssh`
+    /// never is.
+    #[option]
+    pub install_key: bool,
+    /// Also emit a cloud-init user-data file: the worker yml, private
+    /// key and systemd unit embedded, so a cloud instance boots
+    /// straight into `fdl join`. A SECRET artifact (key + token
+    /// inside).
+    #[option]
+    pub cloud_init: bool,
+    /// The instance user the cloud-init variant provisions for
+    /// (default: ubuntu). Images that log in as root want `root`;
+    /// DigitalOcean and the AMD Developer Cloud are that shape.
+    #[option]
+    pub cloud_init_user: Option<String>,
+    /// Skip the authorized_keys install (print + notes only).
+    #[option]
+    pub no_install_key: bool,
+    /// Install into this authorized_keys file instead of the invoking
+    /// user's `~/.ssh/authorized_keys` — for a door the default cannot
+    /// reach, such as an sshd in a container (its key file is a bind
+    /// mount) or a host using `AuthorizedKeysFile
+    /// /etc/ssh/authorized_keys.d/%u`. Still consent-gated, still
+    /// touches only the wizard's own line; `/etc/ssh` is refused.
+    #[option]
+    pub authorized_keys: Option<String>,
+    /// Accept every default without prompting (non-interactive; reuses
+    /// existing credentials unless `--regen`). Never consents to the
+    /// authorized_keys install: that takes the prompt or `--install-key`.
+    #[option]
+    pub yes: bool,
+    /// Report as JSON on stdout. Secrets appear as file paths, never
+    /// payloads.
+    #[option]
+    pub json: bool,
+}
+
+/// Publish a training run for a fleet to pull.
+///
+/// The controller side of compiling on the node: resolves a source spec
+/// into a served directory, builds it once as a gate, and writes the run
+/// manifest workers read. Chaining runs on a standing fleet is then one
+/// command — publish again and every box picks the new run up on its next
+/// dial, with nothing to edit on any worker.
+///
+/// Arguments after a standalone `--` are the training binary's own, and
+/// they go in the manifest rather than into any worker's config: they must
+/// match the run, because rank children re-enter the binary with them, so
+/// a fleet carrying its own copy would train the next run with the
+/// previous one's hyperparameters.
+///
+/// The build proves the tree for THIS box's libtorch variant, and one
+/// build is all it is: every worker still compiles its own, since a
+/// controller producing binaries for N variants is a build matrix. A gate
+/// needs no GPU libtorch — `fdl libtorch download --cpu` is enough —
+/// because it is catching user-code errors, not shipping an artifact.
+///
+/// Exit code: 0 when the run is published; 1 otherwise, and a failed gate
+/// publishes nothing, so the fleet keeps running whatever it had.
+#[derive(crate::FdlArgs, Debug)]
+pub struct PublishArgs {
+    /// Source to publish: `file:///abs/path`,
+    /// `rsync://[user@]host[:port]:/abs/path`, or
+    /// `git+https://host/owner/repo#<tag|branch|sha>`.
+    #[arg]
+    pub source: Option<String>,
+    /// Built artifact, relative to the project directory — what workers
+    /// run. Required: a workspace member's build lands in the WORKSPACE
+    /// `target/`, so no rule fdl invented would be right for everyone.
+    #[option]
+    pub bin: Option<String>,
+    /// Project directory inside the tree (default: its root). Governs
+    /// the build and the run both.
+    #[option]
+    pub cwd: Option<String>,
+    /// Build recipe, a shell line (default: `cargo build --release`).
+    /// Gets `LIBTORCH_PATH`, `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`.
+    #[option]
+    pub build: Option<String>,
+    /// Served directory (default: `~/.flodl/run`). The tree lands in
+    /// `<dir>/tree`, which is what a worker's source spec points at.
+    #[option]
+    pub to: Option<String>,
+    /// Skip the build gate. Publishes source nothing has compiled, so
+    /// the first worker to fetch it is where a broken build surfaces.
+    #[option]
+    pub no_build: bool,
+    /// Identity file for a source pulled over ssh (`rsync -e ssh -i`).
+    #[option]
+    pub identity: Option<String>,
+    /// Emit the report as JSON on stdout (notes stay on stderr). The
+    /// machine twin of the human report, for dashboards and scripts.
+    #[option]
+    pub json: bool,
+    /// Extra check-build against another libtorch variant (a subpath
+    /// under `<project>/libtorch/`, e.g. `precompiled/rocm70`).
+    /// Repeatable. The primary gate proves only this box's variant, so
+    /// a break that exists only under the other vendor's feature would
+    /// land on a worker. Needs no GPU; a flodl-linking crate still
+    /// needs that vendor's dev headers here (a package install, and
+    /// the failure names the exact one).
+    #[option]
+    pub gate: Vec<String>,
+}
+
+impl PublishArgs {
+    /// Credentials for a source pulled over ssh. The spec itself carries
+    /// user, host and port, so only the key can be missing.
+    pub fn ssh_config(&self) -> Option<crate::config::SshConfig> {
+        self.identity.as_ref().map(|id| crate::config::SshConfig {
+            identity_file: Some(id.clone()),
+            ..Default::default()
+        })
+    }
 }
 
 /// Generate flodl API reference.
@@ -279,6 +500,11 @@ pub struct LibtorchDownloadArgs {
     /// Pick a specific CUDA version (instead of auto-detect).
     #[option(choices = &["12.6", "12.8"])]
     pub cuda: Option<String>,
+    /// Pick an AMD ROCm build instead of CUDA. Both cover the same gfx
+    /// targets; pick the one matching this host's own ROCm, since the
+    /// host runtime loads ahead of the bundled one.
+    #[option(choices = &["7.0", "7.1"])]
+    pub rocm: Option<String>,
     /// Install libtorch to this directory (default: project libtorch/).
     #[option]
     pub path: Option<String>,
@@ -476,11 +702,23 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(StartArgs::schema),
         },
         BuiltinSpec {
+            path: &["publish"],
+            description: Some("Publish a training run for a fleet to pull"),
+            schema_fn: Some(PublishArgs::schema),
+        },
+        BuiltinSpec {
             path: &["join"],
             description: Some(
                 "Join a cluster run's window as a self-deployed worker",
             ),
             schema_fn: Some(JoinArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["join-config"],
+            description: Some(
+                "Provision a walk-in farm: overlay, credentials, worker yml",
+            ),
+            schema_fn: Some(JoinConfigArgs::schema),
         },
         BuiltinSpec {
             path: &["install"],
@@ -634,8 +872,9 @@ mod tests {
         // documents the coupling explicitly.
         let dispatched = [
             "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "start", "join", "api-ref", "init", "add", "install", "skill",
-            "schema", "completions", "autocomplete", "config", "version",
+            "start", "publish", "join", "join-config", "api-ref", "init",
+            "add", "install", "skill", "schema", "completions",
+            "autocomplete", "config", "version",
         ];
         for name in &dispatched {
             assert!(
@@ -654,8 +893,9 @@ mod tests {
             names,
             vec![
                 "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "start", "join", "install", "skill",
-                "api-ref", "config", "schema", "completions", "autocomplete",
+                "probe", "status", "start", "publish", "join",
+                "join-config", "install", "skill", "api-ref", "config",
+                "schema", "completions", "autocomplete",
             ]
         );
     }

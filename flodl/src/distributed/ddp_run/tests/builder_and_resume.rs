@@ -12,7 +12,7 @@ fn test_builder_single_gpu_fallback() {
     // in production and is gated off under cfg(test); the only cfg(test)
     // reachable behavior is the single-device fallback (<2 visible devices).
     // Skip on a multi-GPU box so this stays a deterministic fallback test.
-    if crate::tensor::usable_cuda_devices().len() >= 2 {
+    if crate::tensor::usable_gpu_devices().len() >= 2 {
         return;
     }
     let ddp = crate::distributed::Trainer::builder(
@@ -38,7 +38,7 @@ fn test_builder_single_gpu_fallback() {
 // `test_async_ddp_multi_gpu_nccl` drove the in-process multi-GPU engine via
 // the builder entry; that engine was removed (production auto-promotes to
 // process-per-rank). End-to-end multi-GPU training is validated by the
-// `ddp-bench` binary under `fdl cuda-test-nccl`, not a cfg(test) unit test.
+// `ddp-bench` binary under `fdl gpu-test-nccl`, not a cfg(test) unit test.
 
 #[test]
 fn test_ddp_handle_send_sync() {
@@ -448,4 +448,80 @@ fn unset_max_overshoot_leaves_auto_tune_defaults() {
         "unset max_overshoot keeps auto-tune on"
     );
     assert_eq!(coord_config.overshoot_ceiling, 15);
+}
+
+// Same failure class as H13 above: `epoch_splits` reaches every rank
+// through WorkerConfig, so a coordinator that kept the default would not
+// error — it would size its ledger over the whole pass while the ranks
+// expanded a slice of it, and the cohort would train on mismatched
+// permutations in silence. The knob only means anything if BOTH sides
+// read the same value.
+#[test]
+fn epoch_splits_plumbs_into_coord_config() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let user_config = DdpRunConfig::new().with_epoch_splits(20);
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &user_config,
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert_eq!(coord_config.epoch_splits, 20);
+}
+
+#[test]
+fn unset_epoch_splits_leaves_the_epoch_a_full_pass() {
+    use super::orchestrator::build_coord_config_from_builder;
+
+    let coord_config = build_coord_config_from_builder(
+        ApplyPolicy::Async,
+        AverageBackend::Cpu,
+        &DdpRunConfig::new(),
+        None, None, None,
+        2, 100, 4, 1,
+    )
+    .expect("build");
+    assert_eq!(coord_config.epoch_splits, 1);
+}
+
+
+// The bug this pins: `num_epochs` is the user's count of DATA PASSES, so a
+// split run must execute `num_epochs * epoch_splits` epochs. Without the
+// multiplication it ran `num_epochs` slices and silently trained
+// `1/epoch_splits` of the data — geometry all correct, run a quarter as
+// long. Every geometry unit test passed while this was broken, because
+// none of them observed how many epochs actually run.
+#[test]
+fn epoch_splits_multiply_the_epochs_actually_run() {
+    if crate::tensor::usable_gpu_devices().len() >= 2 {
+        return; // auto-promote path; this pins the in-process fallback
+    }
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+
+    let ddp = crate::distributed::Trainer::builder(
+        |dev| Linear::on_device(4, 2, dev),
+        |params| crate::nn::SGD::new(params, 0.01, 0.0),
+        mse_train,
+    )
+    .dataset(Arc::new(TestDataset { n: 64 }))
+    .batch_size(4)
+    .num_epochs(2)      // two passes over the data ...
+    .epoch_splits(4)    // ... delivered as four epochs each
+    .backend(AverageBackend::Cpu)
+    .epoch_fn(move |_epoch, _worker| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })
+    .run()
+    .unwrap();
+    ddp.join().unwrap();
+
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::Relaxed),
+        8,
+        "2 passes x 4 splits must run 8 epochs, not 2",
+    );
 }

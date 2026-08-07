@@ -99,6 +99,31 @@ pub mod status;
 /// bootstrap-spec synthesis, training-binary supervision.
 pub mod join;
 
+/// The once-per-farm wizard (`fdl join-config`): farm overlay,
+/// credentials, guardrail artifacts, worker yml, publish recipe.
+pub mod join_config;
+
+/// Training preparation for a dial-in worker: the GPU gate, the dataset
+/// source root, libtorch, the training binary, and the node-local
+/// directories the data plane writes. Runs before this box dials in,
+/// once per attempt.
+pub mod prepare;
+
+/// The scheme-plus-path grammar shared by the artifact specs (dataset
+/// source, libtorch, training source). Grammar only — the resolvers
+/// have no common shape worth abstracting.
+pub mod spec;
+
+/// The training source: materialise a spec into a local tree, then
+/// build it there. Never build from a mount, and never lose an mtime.
+pub mod source;
+
+/// `fdl publish`: put a run where the fleet can pull it — resolve a
+/// source spec into a served directory, build it once as a gate, and
+/// write the manifest that makes the controller the authority for what a
+/// run is.
+pub mod publish;
+
 /// Project scaffolding (`fdl init`): generates Dockerfile, `fdl.yml`,
 /// training template, `.gitignore`.
 pub mod init;

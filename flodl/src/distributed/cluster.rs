@@ -93,6 +93,12 @@ pub fn is_reserved_cluster_env_key(key: &str) -> bool {
     key.starts_with("FLODL_INTERNAL_")
         || key == "CUDA_VISIBLE_DEVICES"
         || key == "CUDA_DEVICE_ORDER"
+        // The AMD masks outrank CUDA_VISIBLE_DEVICES for HIP (first one
+        // set wins), so an env-block value would silently defeat the
+        // launcher's per-rank pin — the same reservation, other vendor.
+        || key == "HIP_VISIBLE_DEVICES"
+        || key == "ROCR_VISIBLE_DEVICES"
+        || key == "GPU_DEVICE_ORDINAL"
         || key == ENV_HOST_OVERRIDE
         || key == crate::distributed::launcher::ENV_FDL_ENV
 }
@@ -226,6 +232,57 @@ pub struct WorkerBlock {
     /// by convention. Hint for the launcher only; the library does not
     /// consume this field.
     pub arch: Option<String>,
+
+    /// Dataset source root on this worker: the directory its ranks READ
+    /// training data from. May be a shared mount visible to every host
+    /// or a node-local directory, and the library does not distinguish
+    /// them: it forwards the path, the training binary reads it.
+    ///
+    /// `None` when the host did not declare `data_path:`. Only an
+    /// EXPLICIT declaration travels, so the convention default never
+    /// arrives as a path that may not exist. Reach it through
+    /// [`LocalCluster::data_path`] rather than this field, so
+    /// single-host runs take the same code path.
+    pub data_path: Option<String>,
+
+    /// Integrated-GPU host-RAM share for this host: the fraction of
+    /// `MemTotal` the GPU aperture claims (same knob as
+    /// `DataLoaderBuilder::gpu_ram_share`; discrete GPUs ignore it).
+    /// Already resolved by the controller (per-host declaration over
+    /// cluster-scope default) and overwritten by a walk-in's own
+    /// `join.gpu_ram_share:` at envelope localization. The trainer
+    /// fills `DdpRunConfig::gpu_ram_share` from it only when the
+    /// binary's config left it `None` — explicit code keeps the last
+    /// word, like a passed `--data-dir` does for `data_path`.
+    pub gpu_ram_share: Option<f64>,
+}
+
+/// This process's dataset source root, or `None` when nothing declared
+/// one.
+///
+/// The one call a training binary needs to honour a cluster's
+/// `data_path:` without knowing whether it is running under a cluster
+/// at all. `None` covers both "no cluster envelope" (a solo run) and
+/// "cluster, but this host declared no source root", which want the
+/// same answer: keep whatever default the binary defines.
+///
+/// Returns `Err` only on a malformed envelope, which is the same error
+/// the rank would hit moments later during rendezvous. Propagate it
+/// rather than treating a corrupt envelope as an absent one.
+///
+/// ```no_run
+/// # fn main() -> flodl::tensor::Result<()> {
+/// let data_dir = match flodl::distributed::cluster_data_path()? {
+///     Some(p) => p,
+///     None => std::path::PathBuf::from("data"),
+/// };
+/// # let _ = data_dir;
+/// # Ok(())
+/// # }
+/// ```
+pub fn cluster_data_path() -> Result<Option<std::path::PathBuf>> {
+    Ok(LocalCluster::from_env()?
+        .and_then(|c| c.data_path().map(std::path::PathBuf::from)))
 }
 
 impl LocalCluster {
@@ -384,6 +441,24 @@ impl LocalCluster {
         self.world_size
     }
 
+    /// This worker's dataset source root, when its host declared one.
+    ///
+    /// Unlike [`Self::this_worker`] this does not verify the hostname:
+    /// the envelope carries exactly one worker block and it is this
+    /// process's own, so reading a path out of it needs no identity
+    /// check and stays usable before the logger label is set.
+    pub fn data_path(&self) -> Option<&str> {
+        self.worker.data_path.as_deref()
+    }
+
+    /// This host's integrated-GPU RAM share, when anything declared one
+    /// (per-host entry, cluster-scope default, or a walk-in's own join
+    /// config — resolved in that reverse order before the envelope
+    /// reached this process). See [`WorkerBlock::gpu_ram_share`].
+    pub fn gpu_ram_share(&self) -> Option<f64> {
+        self.worker.gpu_ram_share
+    }
+
     /// Consistency check: resolved hostname must match the envelope's
     /// `worker.host`. If they mismatch, the launcher shipped this envelope to
     /// the wrong host -- loud error.
@@ -436,7 +511,18 @@ impl LocalCluster {
         // return `CUDA(0)`; fall back to the envelope when unset or
         // when multi-value (in which case the child sees the same
         // physical layout as the cluster spec).
-        if let Ok(visible) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        //
+        // The variable consulted is the one the child's runtime actually
+        // reads: HIP prefers its own masks over CUDA_VISIBLE_DEVICES
+        // (the first one SET wins), so on a ROCm build checking only the
+        // CUDA spelling would miss the mask that scoped the child.
+        let mask_vars: &[&str] = match crate::sys::build_vendor() {
+            Some(flodl_hw::GpuVendor::Amd) => {
+                &["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"]
+            }
+            _ => &["CUDA_VISIBLE_DEVICES"],
+        };
+        if let Some(visible) = mask_vars.iter().find_map(|k| std::env::var(k).ok()) {
             if !visible.is_empty() && !visible.contains(',') {
                 return Ok((worker.ranks[idx], Device::CUDA(0)));
             }
@@ -514,6 +600,23 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         .and_then(Value::as_str)
         .map(String::from);
 
+    let data_path = obj
+        .get("data_path")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    // Emitted by the controller as a plain JSON number; anything else
+    // (or out of range) means a corrupt envelope, not user input — the
+    // yml-side validation already happened at topology parse.
+    let gpu_ram_share = match obj.get("gpu_ram_share") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| {
+            TensorError::new(&format!(
+                "cluster.worker ({name:?}): gpu_ram_share must be a number, got {v}"
+            ))
+        })?),
+    };
+
     Ok(WorkerBlock {
         host: name,
         ranks,
@@ -521,6 +624,8 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         nccl_socket_ifname,
         path,
         arch,
+        data_path,
+        gpu_ram_share,
     })
 }
 
@@ -528,7 +633,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
 ///
 /// - An explicit array of CUDA device indices, paired positionally with
 ///   `ranks` (length must match).
-/// - The string `"all"`, resolved here via [`crate::tensor::cuda_device_count`]
+/// - The string `"all"`, resolved here via [`crate::tensor::gpu_device_count`]
 ///   to indices `0..ranks_len`. The host must have at least `ranks_len`
 ///   visible CUDA devices, otherwise loud error.
 ///
@@ -546,11 +651,11 @@ fn parse_local_devices(v: Option<&Value>, host_name: &str, ranks_len: usize) -> 
                 "cluster.worker.local_devices: expected \"all\" or array, got string {s:?}"
             )));
         }
-        let available = crate::tensor::cuda_device_count();
+        let available = crate::tensor::gpu_device_count();
         if available < 0 {
             return Err(TensorError::new(
                 "cluster.worker.local_devices: \"all\" requires CUDA support; \
-                 cuda_device_count() returned a negative value",
+                 gpu_device_count() returned a negative value",
             ));
         }
         let available = available as usize;

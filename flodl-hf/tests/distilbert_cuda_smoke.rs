@@ -6,7 +6,7 @@
 //! `position_ids` (baked into the embedding module) and no
 //! `token_type_ids` (DistilBERT drops segment embeddings entirely).
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "gpu")]
 
 mod common;
 

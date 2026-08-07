@@ -8,6 +8,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use flodl::data::datasets::{Cifar10, Mnist, Shakespeare};
+// The two-tier source/cache invariant and its mechanism live in flodl:
+// every flodl binary reading a dataset faces them, and flodl still never
+// learns a URL (acquisition arrives as a closure). ddp-bench keeps only
+// what is its own: the URLs, the byte ranges, and what counts as valid.
+use flodl::data::{data_cache_dir, publish_atomically, resolve_cached, write_error};
 use flodl::tensor::{Result, TensorError};
 
 // ---------------------------------------------------------------------------
@@ -39,20 +44,12 @@ pub fn ensure_mnist_test(data_dir: &Path) -> Result<Mnist> {
 fn ensure_mnist_split(
     data_dir: &Path, images_file: &str, labels_file: &str, split: &str,
 ) -> Result<Mnist> {
-    let dir = data_dir.join("mnist");
-    ensure_dir(&dir)?;
-
-    let images_path = dir.join(images_file);
-    let labels_path = dir.join(labels_file);
-
-    if !images_path.exists() {
-        let url = format!("{MNIST_BASE}/{images_file}");
-        download_to_file(&url, &images_path)?;
-    }
-    if !labels_path.exists() {
-        let url = format!("{MNIST_BASE}/{labels_file}");
-        download_to_file(&url, &labels_path)?;
-    }
+    let images_path = resolve_cached(data_dir, "mnist", images_file, exists, |dst| {
+        download_to_file(&format!("{MNIST_BASE}/{images_file}"), dst)
+    })?;
+    let labels_path = resolve_cached(data_dir, "mnist", labels_file, exists, |dst| {
+        download_to_file(&format!("{MNIST_BASE}/{labels_file}"), dst)
+    })?;
 
     eprintln!("  parsing MNIST {split}...");
     let images_gz = read_file(&images_path)?;
@@ -74,25 +71,48 @@ const CIFAR10_TRAIN_BATCHES: [&str; 5] = [
 ];
 const CIFAR10_TEST_BATCH: &str = "test_batch.bin";
 
-/// Ensure CIFAR-10 archive is downloaded and extracted. Returns the cache dir.
+/// Ensure the CIFAR-10 batches are available and return the directory
+/// holding them.
+///
+/// Directory-level rather than file-level two-tier lookup, because the
+/// parsers take a set of six batch files and mixing tiers per file would
+/// make the returned dir meaningless. A fully populated source root is
+/// used in place; otherwise everything is extracted into the node-local
+/// cache. Ranks never write the source root.
 pub fn ensure_cifar10_extracted(data_dir: &Path) -> Result<std::path::PathBuf> {
-    let dir = data_dir.join("cifar10");
-    ensure_dir(&dir)?;
+    let complete = |dir: &Path| {
+        CIFAR10_TRAIN_BATCHES
+            .iter()
+            .chain(std::iter::once(&CIFAR10_TEST_BATCH))
+            .all(|name| dir.join(name).exists())
+    };
 
-    let all_present = CIFAR10_TRAIN_BATCHES
-        .iter()
-        .chain(std::iter::once(&CIFAR10_TEST_BATCH))
-        .all(|name| dir.join(name).exists());
-
-    if !all_present {
-        // CIFAR-10 tar.gz is ~170MB, exceeds ureq default body limit.
-        // Stream to a temp file, then extract.
-        let tar_path = dir.join("cifar-10-binary.tar.gz");
-        download_large_to_file(CIFAR10_URL, &tar_path)?;
-        let tar_gz = read_file(&tar_path)?;
-        extract_cifar10(&tar_gz, &dir)?;
-        let _ = fs::remove_file(&tar_path); // clean up
+    let from_source = data_dir.join("cifar10");
+    if complete(&from_source) {
+        return Ok(from_source);
     }
+    let dir = data_cache_dir().join("cifar10");
+    if complete(&dir) {
+        return Ok(dir);
+    }
+    fs::create_dir_all(&dir).map_err(|e| write_error(&dir, &e))?;
+
+    // Stream the ~170 MB archive straight through the decoder: it never
+    // lands on disk and never sits in RAM whole. So there is no staging
+    // file to name uniquely, none to clean up, and no transient
+    // duplication when several ranks on one host acquire concurrently --
+    // which a staged tar would have cost N times over on both disk and
+    // RAM, for the largest dataset the bench uses. Their concurrent
+    // extraction stays safe on per-file atomic publish alone.
+    //
+    // A mid-stream failure leaves a partial SET of batches, each one
+    // whole; `complete` then reports false and the next attempt
+    // re-acquires.
+    eprintln!("    downloading {CIFAR10_URL}...");
+    let resp = ureq::get(CIFAR10_URL)
+        .call()
+        .map_err(|e| TensorError::new(&format!("GET {CIFAR10_URL}: {e}")))?;
+    extract_cifar10(resp.into_body().into_reader(), &dir)?;
 
     Ok(dir)
 }
@@ -126,7 +146,7 @@ pub fn ensure_cifar10_test(data_dir: &Path) -> Result<Cifar10> {
 }
 
 /// Extract CIFAR-10 batch files from the tar.gz archive.
-fn extract_cifar10(tar_gz: &[u8], out_dir: &Path) -> Result<()> {
+fn extract_cifar10(tar_gz: impl Read, out_dir: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(tar_gz);
     let mut archive = tar::Archive::new(gz);
 
@@ -151,8 +171,11 @@ fn extract_cifar10(tar_gz: &[u8], out_dir: &Path) -> Result<()> {
             entry
                 .read_to_end(&mut buf)
                 .map_err(|e| TensorError::new(&format!("read {name}: {e}")))?;
-            fs::write(&dest, &buf).map_err(|e| {
-                TensorError::new(&format!("write {}: {e}", dest.display()))
+            // Atomic per file, so the `complete()` check above cannot see a
+            // half-extracted batch, and two ranks extracting the same
+            // archive concurrently just rename identical bytes into place.
+            publish_atomically(&dest, |f| {
+                f.write_all(&buf).map_err(|e| write_error(&dest, &e))
             })?;
             eprintln!("    extracted {name} ({} bytes)", buf.len());
         }
@@ -184,13 +207,9 @@ const SHAKESPEARE_TRAIN_RATIO: f64 = 0.9;
 ///
 /// The file is cached in `{data_dir}/shakespeare/input.txt`.
 pub fn ensure_shakespeare(data_dir: &Path, seq_len: usize) -> Result<Shakespeare> {
-    let dir = data_dir.join("shakespeare");
-    ensure_dir(&dir)?;
-
-    let path = dir.join("input.txt");
-    if !path.exists() {
-        download_to_file(SHAKESPEARE_URL, &path)?;
-    }
+    let path = resolve_cached(data_dir, "shakespeare", "input.txt", exists, |dst| {
+        download_to_file(SHAKESPEARE_URL, dst)
+    })?;
 
     let text = fs::read_to_string(&path)
         .map_err(|e| TensorError::new(&format!("read {}: {e}", path.display())))?;
@@ -254,19 +273,9 @@ fn shakespeare_split(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ensure_dir(dir: &Path) -> Result<()> {
-    // Fast-path when the dir already exists. `fs::create_dir_all` on
-    // Linux issues `mkdir(2)` first and only catches `EEXIST` — on a
-    // read-only mount it fails with `EROFS` even when the dir is
-    // already populated. Workers running off a ro project share (e.g.
-    // a libvirt virtiofs export marked `<readonly/>`) hit this when
-    // the dataset cache is already there: the controller populated it
-    // long ago, no actual write is needed, but the syscall fails.
-    if dir.is_dir() {
-        return Ok(());
-    }
-    fs::create_dir_all(dir)
-        .map_err(|e| TensorError::new(&format!("mkdir {}: {e}", dir.display())))
+/// Existence-only validity, the default for fixed-content datasets.
+fn exists(p: &Path) -> bool {
+    p.exists()
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -275,8 +284,10 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 
 fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     let bytes = download_bytes(url)?;
-    fs::write(dest, &bytes)
-        .map_err(|e| TensorError::new(&format!("write {}: {e}", dest.display())))
+    publish_atomically(dest, |f| {
+        f.write_all(&bytes)
+            .map_err(|e| write_error(dest, &e))
+    })
 }
 
 fn download_bytes(url: &str) -> Result<Vec<u8>> {
@@ -298,18 +309,18 @@ fn download_large_to_file(url: &str, dest: &Path) -> Result<()> {
         .call()
         .map_err(|e| TensorError::new(&format!("GET {url}: {e}")))?;
     let mut reader = resp.into_body().into_reader();
-    let mut file = fs::File::create(dest)
-        .map_err(|e| TensorError::new(&format!("create {}: {e}", dest.display())))?;
-    let mut buf = [0u8; 65536];
     let mut total = 0usize;
-    loop {
-        let n = reader.read(&mut buf)
-            .map_err(|e| TensorError::new(&format!("read {url}: {e}")))?;
-        if n == 0 { break; }
-        file.write_all(&buf[..n])
-            .map_err(|e| TensorError::new(&format!("write {}: {e}", dest.display())))?;
-        total += n;
-    }
+    publish_atomically(dest, |file| {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = reader.read(&mut buf)
+                .map_err(|e| TensorError::new(&format!("read {url}: {e}")))?;
+            if n == 0 { break; }
+            file.write_all(&buf[..n]).map_err(|e| write_error(dest, &e))?;
+            total += n;
+        }
+        Ok(())
+    })?;
     eprintln!("    {total} bytes");
     Ok(())
 }
@@ -324,11 +335,12 @@ fn download_large_to_file(url: &str, dest: &Path) -> Result<()> {
 /// dump is itself a valid shard.
 const OLMO_TRAIN_URL: &str = "https://olmo-data.org/preprocessed/olmo-mix/v1_6-decontaminated/books/gpt-neox-olmo-dolma-v1_5/part-0-00000.npy";
 
-/// Bytes of the train shard to stage. In real-data mode the dataset
-/// size IS the epoch length, so this is the bench's epoch knob:
-/// 4 MiB = ~2.1M u16 tokens = ~4095 windows at seq 512 (~510 batches
-/// per epoch at batch 8). Bump for longer runs (the full shard is
-/// 1.46 GB).
+/// Default bytes of the train shard to stage, when `--train-tokens` is
+/// not given. In real-data mode the staged slice IS one data pass:
+/// 4 MiB = 2,097,152 u16 tokens = 8191 windows at seq 256 (2047 batches
+/// at batch 4). `--train-tokens` overrides it, and either way the size is
+/// snapped so a pass divides into whole batched events
+/// (`models::olmo::resolve_train_corpus`). The full shard is 1.46 GB.
 pub const OLMO_TRAIN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Held-out C4-English validation shard from OLMo's perplexity suite
@@ -339,15 +351,20 @@ const OLMO_EVAL_URL: &str = "https://olmo-data.org/eval-data/perplexity/v3_small
 /// Bytes of the eval shard to stage: 512 KiB = ~262k tokens.
 pub const OLMO_EVAL_BYTES: u64 = 512 * 1024;
 
-/// Download the leading `OLMO_TRAIN_BYTES` of the olmo-mix books shard
-/// (if not cached) and return its path. Cached in `{data_dir}/olmo/`.
-pub fn ensure_olmo_train(data_dir: &Path) -> Result<std::path::PathBuf> {
+/// Download the leading `bytes` of the olmo-mix books shard (if not
+/// cached at that exact size) and return its path. Cached in
+/// `{data_dir}/olmo/`.
+///
+/// `ensure_olmo_shard` validates the cached file's length against
+/// `bytes`, so changing the staged size re-downloads rather than
+/// silently training on the previous corpus.
+pub fn ensure_olmo_train(data_dir: &Path, bytes: u64) -> Result<std::path::PathBuf> {
     ensure_olmo_shard(
         data_dir,
         OLMO_TRAIN_URL,
         "books-part-0-00000.head.npy",
-        Some(OLMO_TRAIN_BYTES),
-        OLMO_TRAIN_BYTES,
+        Some(bytes),
+        bytes,
     )
 }
 
@@ -370,24 +387,27 @@ fn ensure_olmo_shard(
     range_bytes: Option<u64>,
     expected_bytes: u64,
 ) -> Result<std::path::PathBuf> {
-    let dir = data_dir.join("olmo");
-    ensure_dir(&dir)?;
-    let path = dir.join(file_name);
+    // Exact-length validity, not mere existence: changing the staged
+    // corpus size must re-fetch rather than silently train on the
+    // previous one. It does NOT protect against interleaved writes of
+    // the same length, which is why acquisition publishes atomically.
+    let right_size =
+        |p: &Path| fs::metadata(p).map(|m| m.len() == expected_bytes).unwrap_or(false);
 
-    let cached_ok = fs::metadata(&path).map(|m| m.len() == expected_bytes).unwrap_or(false);
-    if !cached_ok {
-        download_range_to_file(url, &path, range_bytes)?;
-        let got = fs::metadata(&path)
-            .map_err(|e| TensorError::new(&format!("stat {}: {e}", path.display())))?
+    let path = resolve_cached(data_dir, "olmo", file_name, right_size, |dst| {
+        download_range_to_file(url, dst, range_bytes)?;
+        let got = fs::metadata(dst)
+            .map_err(|e| TensorError::new(&format!("stat {}: {e}", dst.display())))?
             .len();
         if got != expected_bytes {
             return Err(TensorError::new(&format!(
                 "olmo shard {}: got {got} bytes, expected {expected_bytes} — \
                  partial download or upstream change; delete the file and retry",
-                path.display()
+                dst.display()
             )));
         }
-    }
+        Ok(())
+    })?;
     Ok(path)
 }
 
@@ -410,18 +430,18 @@ fn download_range_to_file(url: &str, dest: &Path, bytes: Option<u64>) -> Result<
                 )));
             }
             let mut reader = resp.into_body().into_reader();
-            let mut file = fs::File::create(dest)
-                .map_err(|e| TensorError::new(&format!("create {}: {e}", dest.display())))?;
-            let mut buf = [0u8; 65536];
             let mut total = 0usize;
-            loop {
-                let n_read = reader.read(&mut buf)
-                    .map_err(|e| TensorError::new(&format!("read {url}: {e}")))?;
-                if n_read == 0 { break; }
-                file.write_all(&buf[..n_read])
-                    .map_err(|e| TensorError::new(&format!("write {}: {e}", dest.display())))?;
-                total += n_read;
-            }
+            publish_atomically(dest, |file| {
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n_read = reader.read(&mut buf)
+                        .map_err(|e| TensorError::new(&format!("read {url}: {e}")))?;
+                    if n_read == 0 { break; }
+                    file.write_all(&buf[..n_read]).map_err(|e| write_error(dest, &e))?;
+                    total += n_read;
+                }
+                Ok(())
+            })?;
             eprintln!("    {total} bytes");
             Ok(())
         }

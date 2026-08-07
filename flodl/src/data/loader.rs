@@ -36,7 +36,7 @@ fn can_fit_resident(n: usize, per_sample_bytes: usize, device: Device) -> bool {
     let total_bytes = per_sample_bytes as u64 * n as u64;
     let idx = device.index() as i32;
 
-    match crate::tensor::cuda_memory_info_idx(idx) {
+    match crate::tensor::gpu_memory_info_idx(idx) {
         // The probe returns (used, total) — used first, not free.
         Ok((used, total)) => {
             let cap = (total as f64 * VRAM_MAX_USAGE) as u64;
@@ -120,6 +120,7 @@ pub struct DataLoaderBuilder {
     names: Option<Vec<String>>,
     vram_max_usage: f64,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     activation_reserve: Option<usize>,
     /// Read-through sample cache created by `from_dataset` (None for
     /// opaque `BatchDataSet` loaders). The adapter inside `dataset`
@@ -148,6 +149,7 @@ impl DataLoaderBuilder {
             names: None,
             vram_max_usage: 0.90,
             ram_max_usage: 0.50,
+            gpu_ram_share: None,
             activation_reserve: None,
             sample_cache: None,
             sample_cache_enabled: true,
@@ -303,6 +305,32 @@ impl DataLoaderBuilder {
         self
     }
 
+    /// Fraction of **physical** host RAM (`MemTotal`) to hand the GPU on
+    /// an **integrated (APU) target**, where device memory is carved out
+    /// of system RAM rather than being a pool of its own.
+    ///
+    /// Ignored on discrete GPUs: there the two pools are genuinely
+    /// separate and there is nothing to divide.
+    ///
+    /// Default: unset — flodl reserves whatever aperture the device
+    /// reports. Set this when you know better, typically to claw back
+    /// host RAM on a box whose aperture is far larger than the model and
+    /// data plane will ever use.
+    ///
+    /// The base is `MemTotal` deliberately: on an APU "the GPU's memory"
+    /// and "the host's memory" are the same silicon, so every other
+    /// candidate base is the ambiguity this knob exists to resolve.
+    /// Values above `1.0` are allowed and meaningful — if a platform
+    /// under-reports `MemTotal` relative to what the APU can address, a
+    /// share above 1.0 is how you still express the true reservation.
+    ///
+    /// Also the way past the hard error on a multi-package APU, where
+    /// host budgets cannot be sized from system-wide totals.
+    pub fn gpu_ram_share(mut self, share: f64) -> Self {
+        self.gpu_ram_share = Some(share.max(0.0));
+        self
+    }
+
     /// Enable / disable the read-through sample cache (streaming mode,
     /// [`DataSet`]-backed loaders). Default: enabled.
     ///
@@ -455,6 +483,11 @@ impl DataLoaderBuilder {
         if self.batch_size == 0 {
             return Err(TensorError::new("DataLoader: batch_size must be > 0"));
         }
+        // Whether this target can be budgeted at all. Static for the
+        // process, so it is answered once here rather than per epoch
+        // inside the arithmetic, which has no way to report it.
+        crate::data::budget::check_apu_sizing(self.device, self.gpu_ram_share)
+            .map_err(|e| TensorError::new(&format!("DataLoader: {e}")))?;
 
         // Destructure to avoid partial-move issues
         let DataLoaderBuilder {
@@ -469,6 +502,7 @@ impl DataLoaderBuilder {
             names,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             activation_reserve,
             sample_cache,
             sample_cache_enabled,
@@ -583,13 +617,13 @@ impl DataLoaderBuilder {
                     } else {
                         Box::new(SequentialSampler::new(picks))
                     };
-                    crate::tensor::cuda_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+                    crate::tensor::gpu_empty_cache();
+                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
         }
     }
 }
@@ -649,6 +683,7 @@ fn build_streaming(
     per_sample_bytes: usize,
     vram_max_usage: f64,
     ram_max_usage: f64,
+    gpu_ram_share: Option<f64>,
     user_set_depth: bool,
     activation_reserve: Option<usize>,
     sample_cache: Option<Arc<SampleCache>>,
@@ -698,6 +733,7 @@ fn build_streaming(
             per_sample_bytes,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             sample_cache,
             user_set_depth,
             activation_reserve: reserve,
@@ -815,10 +851,14 @@ impl DataLoader {
     }
 
     /// Number of batches per epoch.
+    ///
+    /// Reads the sampler's *epoch* length, not the dataset length: under a
+    /// splitting sampler an epoch covers a slice of a pass, and this count
+    /// is nominal there (balanced slicing gives some epochs one more pick).
     pub fn num_batches(&self) -> usize {
         let (n, bs, dl) = match &self.inner {
-            LoaderInner::Resident(l) => (l.sampler.len(), l.batch_size, l.drop_last),
-            LoaderInner::Streaming(l) => (l.sampler.len(), l.batch_size, l.drop_last),
+            LoaderInner::Resident(l) => (l.sampler.epoch_len(), l.batch_size, l.drop_last),
+            LoaderInner::Streaming(l) => (l.sampler.epoch_len(), l.batch_size, l.drop_last),
         };
         if dl { n / bs } else { n.div_ceil(bs) }
     }
@@ -1042,6 +1082,10 @@ pub(crate) struct StreamingLoader {
     /// Host RAM ceiling for the reader-stage ring (see
     /// [`DataLoaderBuilder::ram_max_usage`]). `0.0` = single-stage.
     ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target (see
+    /// [`DataLoaderBuilder::gpu_ram_share`]). `None` = the device's
+    /// reported aperture.
+    gpu_ram_share: Option<f64>,
     /// Read-through sample cache shared with the adapter inside the
     /// worker's dataset. `None` = opaque `BatchDataSet` loader or
     /// `.sample_cache(false)`. Budgeted at each `epoch()`.
@@ -1115,7 +1159,18 @@ impl StreamingLoader {
         };
 
         // One RAM probe per epoch serves both RAM consumers below.
-        let mem = crate::sys::mem_info().map(|m| m.available_bytes);
+        //
+        // Corrected once, here, for a unified-memory (APU) target: there
+        // the VRAM pool is carved out of this same DRAM, so pricing the
+        // host tiers against the raw figure counts one pool twice. Both
+        // consumers below inherit the corrected number.
+        let mem = crate::sys::mem_info().map(|m| {
+            crate::data::budget::unified_adjusted_available(
+                m.available_bytes,
+                self.device,
+                self.gpu_ram_share,
+            )
+        });
 
         // Reader-ring sizing: CUDA targets only. On CPU targets the
         // batch channel itself is the read-ahead buffer (no transfer
@@ -1350,7 +1405,7 @@ impl StreamingEpochIter<'_> {
             Ok(Ok(batch)) => {
                 // Wait for async H2D copy to complete (typically instant
                 // since the batch was submitted prefetch_depth steps ago)
-                #[cfg(feature = "cuda")]
+                #[cfg(feature = "gpu")]
                 if let Some(ref event) = batch.ready_event {
                     if let Err(e) = event.synchronize() {
                         return Some(Err(e));
@@ -1363,7 +1418,7 @@ impl StreamingEpochIter<'_> {
                     // flight — freed, the blocks guard only against the
                     // copy stream and the next upload can overwrite them
                     // mid-read.
-                    match crate::tensor::cuda_stream::CudaStream::current(self.device) {
+                    match crate::tensor::cuda_stream::GpuStream::current(self.device) {
                         Ok(cur) => {
                             for t in &batch.tensors {
                                 if let Err(e) = t.record_stream(&cur) {

@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::nn::buffer::Buffer;
-use crate::tensor::cuda_event::CudaEvent;
-use crate::tensor::cuda_stream::CudaStream;
+use crate::tensor::cuda_event::GpuEvent;
+use crate::tensor::cuda_stream::GpuStream;
 use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::nn::{Module, Optimizer};
 use crate::tensor::{Device, Tensor};
@@ -77,11 +77,11 @@ pub struct GpuWorker<M: Module> {
     device: Device,
 
     // -- CUDA streams for overlap (None on CPU) --
-    compute_stream: Option<CudaStream>,
-    comm_stream: Option<CudaStream>,
+    compute_stream: Option<GpuStream>,
+    comm_stream: Option<GpuStream>,
     /// Recorded on comm_stream after param copy/AllReduce.
     /// compute_stream waits on this before each forward.
-    copy_done: Option<CudaEvent>,
+    copy_done: Option<GpuEvent>,
     /// Pending H2D wait flag for the cpu-avg path. Set in `load_averaged`
     /// when params are copy_(non_blocking) on `comm_stream`, cleared in
     /// `sync_before_forward` after host-synchronizing the comm stream.
@@ -181,6 +181,10 @@ pub struct GpuWorker<M: Module> {
     pub(super) partition: Vec<usize>,
     batch_size: usize,
     base_seed: u64,
+    /// Slices per data pass (see [`super::WorkerConfig::epoch_splits`]).
+    /// `1` means an epoch is a full pass; above that, `epoch` counts
+    /// events and this rank resolves its slice of the pass permutation.
+    epoch_splits: usize,
     /// Augmentation multiplicity: the partition is a PICK stream and a
     /// pick decodes as `(pick / augment, pick % augment)`.
     augment: usize,
@@ -314,6 +318,10 @@ pub struct GpuWorker<M: Module> {
     /// Host-RAM share for this worker's data plane; feeds the per-plan
     /// reader-ring sizing (same knob the stager budgets from).
     ram_max_usage: f64,
+    /// GPU share of host RAM on an integrated target; corrects the
+    /// staging budget for a unified-memory part (see
+    /// [`super::DdpRunConfig::gpu_ram_share`]).
+    gpu_ram_share: Option<f64>,
     /// Measured activation peak (activations + gradients) from training.
     /// Used as a reserve in the VRAM gauge so prefetch doesn't fill
     /// memory that forward/backward will need. Zero = not yet measured;

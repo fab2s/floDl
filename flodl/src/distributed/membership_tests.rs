@@ -23,19 +23,29 @@ fn sig(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
+/// A bare offer: every coherence fact at its "gates nothing" value, so
+/// tests exercising OTHER checks stay independent of the fact set.
+fn offer(host: &str, devices: Vec<u8>, libtorch: &str, dsig: [u8; 32]) -> JoinOffer {
+    JoinOffer {
+        host: host.to_string(),
+        local_devices: devices,
+        gpus: vec![],
+        libtorch: libtorch.to_string(),
+        dataset_sig: dsig,
+        run_id: None,
+        nccl_version: None,
+        model_sig: None,
+    }
+}
+
 fn admit_host(
     ledger: &mut MembershipLedger,
     host: &str,
     rank_count: usize,
 ) -> std::result::Result<Vec<usize>, String> {
-    ledger.admit(
-        host,
-        (0..rank_count as u8).collect(),
-        vec!["GPU".to_string(); rank_count],
-        "builds/test".to_string(),
-        sig(7),
-        Duration::from_secs(1),
-    )
+    let mut o = offer(host, (0..rank_count as u8).collect(), "builds/test", sig(7));
+    o.gpus = vec!["GPU".to_string(); rank_count];
+    ledger.admit(o, Duration::from_secs(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +54,7 @@ fn admit_host(
 
 #[test]
 fn admission_assigns_contiguous_ranks_in_order() {
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     assert_eq!(admit_host(&mut ledger, "a", 1).unwrap(), vec![0]);
     assert_eq!(admit_host(&mut ledger, "b", 2).unwrap(), vec![1, 2]);
     assert_eq!(admit_host(&mut ledger, "c", 3).unwrap(), vec![3, 4, 5]);
@@ -53,7 +63,7 @@ fn admission_assigns_contiguous_ranks_in_order() {
 
 #[test]
 fn duplicate_host_rejected() {
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     let why = admit_host(&mut ledger, "a", 1).unwrap_err();
     assert!(why.contains("already joined"), "got: {why}");
@@ -64,44 +74,163 @@ fn duplicate_host_rejected() {
 #[test]
 fn dataset_sig_reference_and_mismatch() {
     // No expected sig: the first joiner sets the reference.
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     ledger
-        .admit("a", vec![0], vec![], String::new(), sig(1), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(1)), Duration::ZERO)
         .unwrap();
     let why = ledger
-        .admit("b", vec![0], vec![], String::new(), sig(2), Duration::ZERO)
+        .admit(offer("b", vec![0], "", sig(2)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("dataset signature mismatch"), "got: {why}");
 
     // Expected sig provided: the very first mismatch is rejected.
-    let mut ledger = MembershipLedger::new(test_config(), Some(sig(9))).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), Some(sig(9)), None).unwrap();
     let why = ledger
-        .admit("a", vec![0], vec![], String::new(), sig(1), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(1)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("dataset signature mismatch"), "got: {why}");
     ledger
-        .admit("a", vec![0], vec![], String::new(), sig(9), Duration::ZERO)
+        .admit(offer("a", vec![0], "", sig(9)), Duration::ZERO)
         .unwrap();
 }
 
 #[test]
+fn a_vendor_mixed_cohort_is_refused_under_an_nccl_data_plane() {
+    // NCCL and RCCL export the same symbols and unique-id format, so
+    // nothing structural rejects a mixed cohort — it hangs at formation
+    // AFTER the window deadline was spent. The window is where the one
+    // piece of information needed to refuse it early already is.
+    let admit = |ledger: &mut MembershipLedger, host: &str, label: &str| {
+        ledger.admit(offer(host, vec![0], label, sig(7)), Duration::ZERO)
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
+    admit(&mut ledger, "green", "precompiled/cu128").unwrap();
+    let why = admit(&mut ledger, "red", "precompiled/rocm70").unwrap_err();
+    assert!(why.contains("vendor mismatch"), "got: {why}");
+    assert!(why.contains("cpu_sync"), "the fix must be named: {why}");
+    // The refusal names the label that seeded the cohort's vendor.
+    assert!(why.contains("cu128"), "got: {why}");
+    // A refused joiner burns nothing: the same box re-dialing with the
+    // right build (or the right fleet) is welcome.
+    assert_eq!(ledger.joined_ranks(), 1);
+
+    // Labels that classify to no vendor gate nothing, in either order:
+    // fan-out agents may send an empty label, and an out-of-convention
+    // name is not an admission crime.
+    admit(&mut ledger, "bare", "").unwrap();
+    admit(&mut ledger, "odd", "builds/mystery").unwrap();
+    admit(&mut ledger, "green2", "builds/sm61-sm120").unwrap();
+
+    // A CPU data plane genuinely works cross-vendor, so the gate is off.
+    let cpu_plane = JoinConfig { nccl_backend: false, ..test_config() };
+    let mut ledger = MembershipLedger::new(cpu_plane, None, None).unwrap();
+    admit(&mut ledger, "green", "precompiled/cu128").unwrap();
+    admit(&mut ledger, "red", "precompiled/rocm70").unwrap();
+    assert_eq!(ledger.joined_ranks(), 2);
+}
+
+#[test]
+fn a_cohort_straddling_a_publish_boundary_is_refused() {
+    // Two boxes that fetched across a publish boundary hold two
+    // different runs — different args at minimum, and rank children
+    // re-enter the binary with them. Same first-member seeding as the
+    // dataset signature; `--bin` boxes carry no id and gate nothing.
+    let with_run = |host: &str, run: Option<&str>| {
+        let mut o = offer(host, vec![0], "", sig(7));
+        o.run_id = run.map(str::to_string);
+        o
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
+    ledger.admit(with_run("a", Some("run-aaaa1111")), Duration::ZERO).unwrap();
+    ledger.admit(with_run("bare", None), Duration::ZERO).unwrap();
+    let why = ledger
+        .admit(with_run("b", Some("run-bbbb2222")), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("run identity mismatch"), "got: {why}");
+    assert!(why.contains("run-aaaa"), "the seeded id must be named: {why}");
+    assert!(why.contains("next dial"), "the fix must be named: {why}");
+    assert_eq!(ledger.joined_ranks(), 2);
+    // The matching id keeps joining — the refusal condemned one
+    // attempt, not the window.
+    ledger.admit(with_run("c", Some("run-aaaa1111")), Duration::ZERO).unwrap();
+}
+
+#[test]
+fn a_box_building_a_different_model_is_refused_at_admission() {
+    // Mismatched parameter manifests corrupt CPU averaging exactly as
+    // they hang NCCL, so the check is not plane-gated. Refusing here
+    // costs the box only its own dial; the formation-time handshake
+    // check stays the backstop for boxes that carry no signature.
+    let with_model = |host: &str, m: Option<[u8; 32]>| {
+        let mut o = offer(host, vec![0], "", sig(7));
+        o.model_sig = m;
+        o
+    };
+    // Controller-seeded: the launcher's own CPU-built model is the
+    // run's truth, so the very first mismatching walk-in is refused —
+    // no first-member luck.
+    let mut ledger =
+        MembershipLedger::new(test_config(), None, Some(sig(0xAA))).unwrap();
+    let why = ledger
+        .admit(with_model("odd", Some(sig(0xBB))), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("model mismatch"), "got: {why}");
+    assert!(why.contains("bin:"), "the usual cause must be named: {why}");
+    assert_eq!(ledger.joined_ranks(), 0);
+    ledger.admit(with_model("good", Some(sig(0xAA))), Duration::ZERO).unwrap();
+    // No signature gates nothing (a probe-less box is not an admission
+    // crime — formation still checks the model it actually builds).
+    ledger.admit(with_model("bare", None), Duration::ZERO).unwrap();
+
+    // First-member seeding when the controller passed no seed.
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
+    ledger.admit(with_model("a", Some(sig(1))), Duration::ZERO).unwrap();
+    ledger.admit(with_model("bare", None), Duration::ZERO).unwrap();
+    let why = ledger
+        .admit(with_model("b", Some(sig(2))), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("model mismatch"), "got: {why}");
+    assert_eq!(ledger.joined_ranks(), 2);
+}
+
+#[test]
+fn nccl_version_skew_is_refused_where_that_plane_forms() {
+    let with_nccl = |host: &str, v: Option<(u32, u32, u32)>| {
+        let mut o = offer(host, vec![0], "", sig(7));
+        o.nccl_version = v;
+        o
+    };
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
+    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
+    // Patch skew is interoperable, and an unknown version (a CPU build,
+    // a failed read) gates nothing.
+    ledger.admit(with_nccl("b", Some((2, 27, 3))), Duration::ZERO).unwrap();
+    ledger.admit(with_nccl("cpu-build", None), Duration::ZERO).unwrap();
+    let why = ledger
+        .admit(with_nccl("c", Some((2, 26, 2))), Duration::ZERO)
+        .unwrap_err();
+    assert!(why.contains("NCCL version skew"), "got: {why}");
+    assert!(why.contains("2.27"), "got: {why}");
+    assert!(why.contains("fdl nccl build"), "the bridge must be named: {why}");
+    // A CPU data plane has no NCCL handshake to protect: gate off.
+    let cpu = JoinConfig { nccl_backend: false, ..test_config() };
+    let mut ledger = MembershipLedger::new(cpu, None, None).unwrap();
+    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
+    ledger.admit(with_nccl("b", Some((2, 26, 2))), Duration::ZERO).unwrap();
+    assert_eq!(ledger.joined_ranks(), 2);
+}
+
+#[test]
 fn hostile_device_lists_rejected() {
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     let why = admit_host(&mut ledger, "zero", 0).unwrap_err();
     assert!(why.contains("must be non-empty"), "got: {why}");
     let why = ledger
-        .admit(
-            "huge",
-            vec![0u8; 100_000],
-            vec![],
-            String::new(),
-            sig(7),
-            Duration::ZERO,
-        )
+        .admit(offer("huge", vec![0u8; 100_000], "", sig(7)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("exceeds the per-worker cap"), "got: {why}");
     let why = ledger
-        .admit("dup", vec![0, 0], vec![], String::new(), sig(7), Duration::ZERO)
+        .admit(offer("dup", vec![0, 0], "", sig(7)), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("duplicate local device"), "got: {why}");
     let why = admit_host(&mut ledger, "  ", 1).unwrap_err();
@@ -111,7 +240,7 @@ fn hostile_device_lists_rejected() {
 
 #[test]
 fn retract_last_returns_rank_ids_to_the_pool() {
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     assert_eq!(admit_host(&mut ledger, "b", 2).unwrap(), vec![1, 2]);
     // Only the tail can be retracted.
@@ -131,7 +260,7 @@ fn config_cross_field_validation() {
     assert!(test_config().validate().is_ok());
 
     let zero_quorum = JoinConfig { min_rank_start: 0, ..test_config() };
-    let msg = MembershipLedger::new(zero_quorum, None).unwrap_err().to_string();
+    let msg = MembershipLedger::new(zero_quorum, None, None).unwrap_err().to_string();
     assert!(msg.contains("min_rank_start"), "got: {msg}");
 
     let target_below_quorum = JoinConfig {
@@ -161,7 +290,7 @@ const CAP: Duration = Duration::from_secs(600);
 #[test]
 fn verdict_target_closes_early() {
     let config = JoinConfig { target_ranks: Some(2), ..test_config() };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
     admit_host(&mut ledger, "b", 1).unwrap();
@@ -175,7 +304,7 @@ fn verdict_target_closes_early() {
 fn verdict_quorum_early_does_not_close_the_window() {
     // Quorum of 1 met immediately, but no target: the window stays open
     // so late workers within it are still admitted.
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     assert_eq!(
         ledger.verdict(Duration::from_secs(10), WINDOW, CAP, false),
@@ -191,7 +320,7 @@ fn verdict_quorum_early_does_not_close_the_window() {
 #[test]
 fn verdict_grace_range_waits_for_quorum_then_forms() {
     let config = JoinConfig { min_rank_start: 2, ..test_config() };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Window expired below quorum, cap not yet: keep waiting.
     let in_grace = WINDOW + Duration::from_secs(30);
@@ -207,7 +336,7 @@ fn verdict_grace_range_waits_for_quorum_then_forms() {
 #[test]
 fn verdict_cap_expiry_fails_loudly() {
     let config = JoinConfig { min_rank_start: 2, ..test_config() };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     match ledger.verdict(CAP, WINDOW, CAP, false) {
         WindowVerdict::Failed(why) => {
@@ -226,7 +355,7 @@ fn verdict_manual_holds_until_operator_start() {
         start_mode: StartMode::Manual,
         ..test_config()
     };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Quorum met, window expired: a manual hold stays open where auto
     // would have formed.
@@ -259,7 +388,7 @@ fn verdict_manual_start_is_quorum_gated() {
         start_mode: StartMode::Manual,
         ..test_config()
     };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Armed below quorum: inert (the HTTP layer refuses this too, but
     // the verdict is the authority).
@@ -281,7 +410,7 @@ fn verdict_hybrid_keeps_the_clock_and_adds_the_operator() {
         start_mode: StartMode::Hybrid,
         ..test_config()
     };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Clock semantics intact: below target, inside the window → open.
     assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
@@ -310,7 +439,7 @@ fn verdict_hybrid_keeps_the_clock_and_adds_the_operator() {
 fn verdict_auto_ignores_the_start_switch() {
     // The HTTP layer refuses /start in auto mode; if a flag ever leaks
     // through anyway, the verdict must not honor it.
-    let mut ledger = MembershipLedger::new(test_config(), None).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     assert_eq!(
         ledger.verdict(Duration::from_secs(1), WINDOW, CAP, true),
@@ -352,7 +481,7 @@ fn open_admission_resolution_follows_bind_scope_then_knob() {
 #[test]
 fn snapshot_serializes_phase_and_countdowns() {
     let config = JoinConfig { target_ranks: Some(3), ..test_config() };
-    let mut ledger = MembershipLedger::new(config, None).unwrap();
+    let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 2).unwrap();
 
     let snap = ledger.snapshot(ClusterPhase::Waiting, Duration::from_secs(10), false);
@@ -396,6 +525,9 @@ fn join_messages_round_trip_through_control_frames() {
             gpus: vec!["GP106".to_string(), "GP106".to_string()],
             libtorch: "builds/sm61-sm120".to_string(),
             dataset_sig: sig(5),
+            run_id: Some("a1b2c3d4e5f6".to_string()),
+            nccl_version: Some((2, 27, 5)),
+            model_sig: Some(sig(6)),
         },
         JoinMsgWire::Accept {
             ranks: vec![1, 2],
@@ -469,7 +601,8 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
     let gate_board = board.clone();
     let gate = std::thread::spawn(move || {
         run_join_window(
-            &join_source, &config, &gate_salt, true, None, &gate_abort, &gate_board,
+            &join_source, &config, &gate_salt, true, None, None, &gate_abort,
+            &gate_board,
         )
     });
 
@@ -518,7 +651,7 @@ fn spawn_window(
         let source = StreamSource::from_listener(listener, "membership-test")?;
         let status = crate::distributed::status::StatusBoard::new();
         run_join_window(
-            &source, &config, &salt, pre_shared_salt, None, &abort, &status,
+            &source, &config, &salt, pre_shared_salt, None, None, &abort, &status,
         )
     });
     (port, handle)
@@ -543,6 +676,9 @@ fn dial_and_join(
         gpus: vec!["TestGPU".to_string(); rank_count as usize],
         libtorch: "builds/test".to_string(),
         dataset_sig: sig(7),
+        run_id: None,
+        nccl_version: None,
+        model_sig: None,
     };
     ControlFrame::encode(key, MsgKind::Join, &hello)
         .unwrap()
@@ -613,6 +749,9 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
         gpus: vec![],
         libtorch: String::new(),
         dataset_sig: sig(7),
+        run_id: None,
+        nccl_version: None,
+        model_sig: None,
     };
     ControlFrame::encode(&zero_key, MsgKind::Join, &hello)
         .unwrap()

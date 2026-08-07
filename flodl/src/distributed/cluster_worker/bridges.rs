@@ -400,7 +400,7 @@ pub(super) fn outbound_loop(
     // neither worth paying for runs with no consumer.
     let pending = crate::distributed::cluster_dashboard_emit::drain();
     // Per-rank assigned CUDA device. On hosts where
-    // `CUDA_VISIBLE_DEVICES` is scoped per rank (`cuda_device_count()
+    // `CUDA_VISIBLE_DEVICES` is scoped per rank (`gpu_device_count()
     // == 1`) the sampler returns a single GPU and the filter is a
     // no-op. On hosts where multiple physical GPUs are visible to
     // every rank (Pascal-via-VFIO observed: r1 uses cuda 0, r2 uses

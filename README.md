@@ -104,7 +104,11 @@ curl -sL https://flodl.dev/fdl -o fdl && chmod +x fdl
 The `fdl` script auto-downloads a pre-compiled CLI binary (~750KB, pure Rust,
 no libtorch dependency). It detects your GPUs, downloads the right libtorch
 variant, and configures Docker or native builds. See the [full CLI
-reference](docs/cli/01-install.md) for all commands.
+reference](https://github.com/flodl-labs/flodl/blob/main/docs/cli/01-install.md) for all commands.
+
+**On Windows**, run the above inside WSL2 - a WSL2 distribution is ordinary
+Linux, so it gets full CUDA and multi-GPU NCCL with nothing cut down. See
+[Windows / WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md).
 
 **One-liner with Docker** (no Rust, no setup):
 
@@ -118,20 +122,22 @@ cd my-project
 **Native** - [Rust](https://rustup.rs/) 1.85+ and libtorch:
 
 ```bash
-./fdl libtorch download    # auto-detects CPU or CUDA
+./fdl libtorch download    # auto-detects CPU, CUDA or ROCm
 cargo add flodl && cargo build
 ```
 
 For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.nvidia.com/cuda-downloads).
 
-For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
+For AMD: `cargo add flodl --features rocm` + [ROCm](https://rocm.docs.amd.com/) (Linux only). `fdl probe` lists any missing toolkit packages with the command to install them.
+
+For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
 
 > **Using tch-rs or PyTorch C++?** `fdl` also works as a standalone
 > libtorch manager outside of flodl: download any CPU/CUDA variant,
 > switch between installs, compile from source for mixed GPU
 > architectures (e.g. sm_61 + sm_120 in one build), and emit a
 > machine-readable diagnostics report. No flodl buy-in required.
-> See [Setup commands](docs/cli/02-setup-commands.md)
+> See [Setup commands](https://github.com/flodl-labs/flodl/blob/main/docs/cli/02-setup-commands.md)
 > and the [`flodl-cli` crate](https://crates.io/crates/flodl-cli).
 
 Both paths generate an annotated training template. Edit `src/main.rs` to
@@ -517,7 +523,7 @@ membership only shrinks, rejoin/scale-up is not yet implemented).
 
 > **Invariant - no CUDA before `Trainer::run`.** User binaries must
 > not touch libtorch's CUDA context in `main()` (no
-> `cuda_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
+> `gpu_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
 > tensors). The launcher exits without training; touching CUDA there
 > poisons spawned children's contexts on heterogeneous rigs. Use
 > `flodl::sys::detect_gpus()` (CUDA-free) for pre-run GPU queries.
@@ -739,7 +745,7 @@ path, autograd tracking, and graph execution.
 | `GradScaler` | Dynamic loss scaling for fp16 training |
 | `cast_parameters` | Cast model parameters to any dtype |
 | `CpuWorker` / `ModelSnapshot` | Background checkpoint saving |
-| `CudaGraph` | Capture/replay training steps for fixed-shape models |
+| `GpuGraph` | Capture/replay training steps for fixed-shape models |
 
 </details>
 
@@ -798,7 +804,7 @@ codegen-units = 1
 | `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards - TrendGuard is default. Guard is authoritative over `overhead_target`. |
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
-| `CudaEvent` / `CudaStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
+| `GpuEvent` / `GpuStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |
 | `Ddp::wrap(&model, device, rank, &rdv)` | Bypass tier - manual thread-based per-rank gradient sync, for GAN / RL / explicit replica control. Production multi-GPU auto-promotes to process-per-rank instead. |
 
 </details>
@@ -817,6 +823,25 @@ Developed and tested from NVIDIA Pascal (GTX 1060 6GB) to Blackwell
 (RTX 5060 Ti 16GB). PyTorch dropped Pascal support after 2.5.1 - floDl
 links libtorch's stable C API, which supports every architecture the driver
 supports. If `nvidia-smi` works, floDl trains on it.
+
+**AMD (ROCm)** builds, links and detects: `fdl libtorch download --rocm 7.0`
+installs the ROCm build, `--features rocm` compiles against it, and GPUs are
+enumerated from the kernel's KFD topology. Training on AMD is **not yet
+validated on hardware** - the vendor axis is in place, the runtime numbers
+are not. A libtorch build serves one vendor, so a host picks CUDA or ROCm,
+never both in one process (and a join window refuses a cohort mixing the
+two under NCCL/RCCL; the CPU averaging modes mix legally). Vendor-plural
+today: detection (`fdl probe` / `diagnose`), variant install, the walk-in
+path (`fdl join` / `fdl publish`), the container services and per-rank
+device pinning. Still NVIDIA-only: fan-out's remote `local_devices: all`
+probe, `fdl --gpus all` resolution, `fdl libtorch build` (source builds)
+and `fdl nccl build` (RCCL ships inside libtorch-rocm).
+
+Linux and [Windows via WSL2](https://github.com/flodl-labs/flodl/blob/main/docs/windows-wsl.md)
+are the trained-on platforms - the benchmarks above were produced under
+Docker on WSL2, so it is a measured path rather than a claimed one. Apple
+Silicon runs CPU-only through Docker
+([guide](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md)).
 
 ## Documentation
 

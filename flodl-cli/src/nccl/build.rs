@@ -157,9 +157,12 @@ fn detect_arch_list() -> Result<String, String> {
         );
     }
 
+    // nvcc gencode targets: NVIDIA devices only. (RCCL, the AMD
+    // counterpart, ships prebuilt inside libtorch-rocm and needs no
+    // source build, so there is no AMD arm to add here.)
     let mut caps: Vec<(u32, u32)> = gpus
         .iter()
-        .map(|g| (g.sm_major, g.sm_minor))
+        .filter_map(|g| Some((g.sm_major()?, g.sm_minor()?)))
         .collect();
     caps.sort();
     caps.dedup();
@@ -167,10 +170,7 @@ fn detect_arch_list() -> Result<String, String> {
 
     println!("  GPUs detected:");
     for g in &gpus {
-        println!(
-            "    [{}] {} (sm_{}{})",
-            g.index, g.short_name(), g.sm_major, g.sm_minor
-        );
+        println!("    [{}] {} ({})", g.index, g.short_name(), g.arch_label());
     }
 
     Ok(caps.join(";"))

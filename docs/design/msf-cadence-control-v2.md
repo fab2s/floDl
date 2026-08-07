@@ -967,7 +967,7 @@ so any number in the doc can be traced to its source.
 - **Run script:** `runs/overnight-2026-05-05-relaxed-easgd/run.sh`
   (12 runs: 10 nccl-async × `--elche-relax-up` × 5 seeds × 2 guards
   + 2 cpu-async × `--easgd-alpha 0.5` × seed 0 × 2 guards). Uses
-  `fdl cuda-shell -- -c "..."` pattern to bypass the fdl-preset
+  `fdl gpu-shell -- -c "..."` pattern to bypass the fdl-preset
   clobber. Output paths stripped of `ddp-bench/` prefix to avoid the
   2026-05-04 doubling bug.
 - **Run log:** `runs/overnight-2026-05-05-relaxed-easgd/_runlog.txt`
@@ -993,7 +993,7 @@ so any number in the doc can be traced to its source.
 - **Run script:** `runs/overnight-2026-05-05-sweep-b2-cliff/run.sh` (18
   runs: 3 seeds × 6 k values × 200 epochs, `nccl-async`, `--guard none`,
   `--min-anchor=k --max-anchor=k` to pin cadence at fixed k). Same
-  `fdl cuda-shell -- -c "cd /workspace/ddp-bench && ./target/release/ddp-bench …"`
+  `fdl gpu-shell -- -c "cd /workspace/ddp-bench && ./target/release/ddp-bench …"`
   pattern as Phase 2.
 - **Run log:** `runs/overnight-2026-05-05-sweep-b2-cliff/_runlog.txt`
   (sweep started 2026-05-05T20:46:28Z, completed 2026-05-06T06:15:58Z,
@@ -1055,7 +1055,7 @@ families:
   - `ddp-bench/src/config.rs`: `RunConfig.easgd_alpha` field.
   - `ddp-bench/src/harness.rs`: builder wiring.
 
-Both change families pass `fdl cuda-clippy` clean and `fdl
+Both change families pass `fdl gpu-clippy` clean and `fdl
 cuda-test-nccl` (12 tests pass).
 
 ### Sweep names map to numbered phases

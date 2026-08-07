@@ -83,13 +83,16 @@ Open an issue to discuss before investing significant effort on these.
 
 ## Testing
 
-Every PR should pass the existing test suite on **both CPU and CUDA**:
+Every PR should pass the existing test suite on **both CPU and GPU**:
 
 ```bash
 fdl test            # CPU tests
-fdl cuda-test       # CUDA tests (parallel, excludes NCCL/Graph)
-fdl cuda-test-all   # full CUDA suite (parallel + NCCL isolated + serial)
+fdl gpu-test       # GPU tests (parallel, excludes NCCL/Graph)
+fdl gpu-test-all   # full GPU suite (parallel + NCCL isolated + serial)
 ```
+
+The `gpu-*` commands take their cargo feature from the active libtorch
+variant (`cuda` or `rocm`), so the same command line covers either vendor.
 
 All tests use `test_device()` / `test_opts()` from `tensor.rs` so the same
 test code runs on whichever device is available. When writing new tests:
@@ -134,8 +137,8 @@ container can fail there.
 make docs-rs    # simulates docs.rs build for every publishable crate
 ```
 
-Since 0.5.0 this covers all three published crates (`flodl`, `flodl-cli`,
-`flodl-cli-macros`) in one disposable container. It catches:
+This covers every publishable crate in the workspace, in one disposable
+container. It catches:
 - Broken intra-doc links (`rustdoc::broken_intra_doc_links`)
 - Dependencies that don't compile on nightly with `--cfg docsrs`
 - Example scraping failures (examples need libtorch)

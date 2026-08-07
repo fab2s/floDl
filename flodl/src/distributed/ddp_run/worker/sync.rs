@@ -128,7 +128,7 @@ fn h2d_copy_via_bounce(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn weighted_allreduce_nccl(
     comm: &crate::distributed::nccl::NcclRankComm,
-    stream: Option<&crate::tensor::cuda_stream::CudaStream>,
+    stream: Option<&crate::tensor::cuda_stream::GpuStream>,
     param_refs: &[&Tensor],
     buffer_refs: &[&Tensor],
     n_i: f64,
@@ -427,7 +427,7 @@ impl<M: Module> GpuWorker<M> {
     /// Load averaged parameters from the coordinator (CPU averaging path).
     ///
     /// Uses `copy_(non_blocking=true)` on the comm stream for GPU overlap.
-    /// Records a `CudaEvent` so the compute stream waits before the next forward.
+    /// Records a `GpuEvent` so the compute stream waits before the next forward.
     ///
     /// The overlap is only real when the SOURCE is pinned — a pageable
     /// source silently degrades `cudaMemcpyAsync` to a synchronous

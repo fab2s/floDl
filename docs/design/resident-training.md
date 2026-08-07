@@ -375,7 +375,7 @@ data. The budget is dominated by dataset size.
 
 ### 3. CUDA Graph captured training pattern
 
-Not a new API - this is a usage pattern combining existing `CudaGraph` with
+Not a new API - this is a usage pattern combining existing `GpuGraph` with
 `ResidentLoader`. Documented as the recommended high-performance path.
 
 ```rust
@@ -407,7 +407,7 @@ let x_buf = Tensor::empty(&[batch_size as i64, input_dim as i64], device.opts())
 let y_buf = Tensor::empty(&[batch_size as i64, output_dim as i64], device.opts())?;
 
 // --- Capture training step ---
-let graph = cuda_graph_capture(3, None, || {
+let graph = gpu_graph_capture(3, None, || {
     let input = Variable::new(x_buf.shallow_clone(), true);
     let target = Variable::new(y_buf.shallow_clone(), false);
     optimizer.zero_grad();
@@ -448,7 +448,7 @@ pass, amortized over many batches.
 
 ```rust
 // Every 100 batches or at epoch end:
-cuda_synchronize(0);
+gpu_synchronize(0);
 let eval_loss = no_grad(|| {
     let input = Variable::new(x_buf.shallow_clone(), false);
     let target = Variable::new(y_buf.shallow_clone(), false);
@@ -492,7 +492,7 @@ model can read (confidence above threshold) or max attempts is reached.
 // --- Capture individual phases ---
 
 // Phase 1: one "attempt" (subscan predicts, letter reads)
-let attempt_graph = cuda_graph_capture(3, pool, || {
+let attempt_graph = gpu_graph_capture(3, pool, || {
     // Subscan predicts letter position from the glimpse
     position_buf.copy_(&subscan.forward(&glimpse_var)?.data(), false)?;
     // Letter model reads at that position (frozen, no grad)
@@ -502,7 +502,7 @@ let attempt_graph = cuda_graph_capture(3, pool, || {
 })?;
 
 // Phase 2: loss + backward + optimizer step (runs once per sample)
-let update_graph = cuda_graph_capture(3, pool, || {
+let update_graph = gpu_graph_capture(3, pool, || {
     optimizer.zero_grad();
     let loss = cross_entropy_loss(&letter_out_var, &target_var)?;
     loss.backward()?;
@@ -522,7 +522,7 @@ for batch in loader.iter() {
         attempts += 1;
 
         // ONE sync to read the confidence score -- lightweight
-        cuda_synchronize(0);
+        gpu_synchronize(0);
         let confidence = confidence_buf.item::<f32>()?;
 
         if confidence > threshold || attempts >= max_attempts {
@@ -538,7 +538,7 @@ for batch in loader.iter() {
     // Confidence was already synced (needed for the conditional).
     // Attempt count is a CPU counter.
     // Loss needs one sync after update_graph, but once per sample.
-    cuda_synchronize(0);
+    gpu_synchronize(0);
     let loss_val = loss_buf.item::<f32>()?;
 
     model.record_scalar("loss", loss_val as f64);
@@ -586,9 +586,9 @@ and retry mechanisms are structural.
 update_graph), share a memory pool so they can reuse VRAM allocations:
 
 ```rust
-let pool = cuda_graph_pool_handle()?;
-let attempt_graph = cuda_graph_capture(3, Some(pool), || { ... })?;
-let update_graph = cuda_graph_capture(3, Some(pool), || { ... })?;
+let pool = gpu_graph_pool_handle()?;
+let attempt_graph = gpu_graph_capture(3, Some(pool), || { ... })?;
+let update_graph = gpu_graph_capture(3, Some(pool), || { ... })?;
 ```
 
 ### 5. Live dashboard compatibility
@@ -638,7 +638,7 @@ let loss_gpu = Tensor::empty(&[], device.opts())?;        // GPU-side buffer
 let loss_cpu = Tensor::empty(&[], TensorOptions::default())?.pin_memory()?;  // pinned CPU
 
 // --- Capture: graph writes loss to GPU buffer ---
-let graph = cuda_graph_capture(3, pool, || {
+let graph = gpu_graph_capture(3, pool, || {
     let input = Variable::new(x_buf.shallow_clone(), true);
     let target = Variable::new(y_buf.shallow_clone(), false);
     optimizer.zero_grad();
@@ -694,7 +694,7 @@ This means even the **phase-level pattern** can avoid the loss sync:
 // Inner loop: sync needed for confidence (control flow)
 loop {
     attempt_graph.replay()?;
-    cuda_synchronize(0);
+    gpu_synchronize(0);
     let confidence = confidence_buf.item::<f32>()?;  // sync: unavoidable
     if confidence > threshold || attempts >= max_attempts { break; }
     attempts += 1;

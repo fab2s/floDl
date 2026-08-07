@@ -16,7 +16,7 @@ use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::worker::GpuWorker;
 use crate::distributed::ddp_run::{
     self, ApplyPolicy, CheckpointFn, EpochFn, EvalFn, EvalResultFn, MetricsFn, TrainedState,
-    Worker, WorkerConfig,
+    Worker, WorkerConfig, pick_space,
 };
 use crate::graph::GraphExt;
 use crate::nn::{Module, Optimizer, Parameter};
@@ -49,10 +49,12 @@ impl DdpHandle {
         vram_pool: bool,
         vram_max_usage: f64,
         ram_max_usage: f64,
+        gpu_ram_share: Option<f64>,
         sample_cache: bool,
         disk_stage_gb: u64,
         disk_stage_dir: Option<std::path::PathBuf>,
         augment: usize,
+        epoch_splits: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
         eval_fn: Option<EvalFn<M>>,
@@ -69,8 +71,7 @@ impl DdpHandle {
     {
         crate::verbose!("  ddp: single device ({device:?}) | no coordination");
 
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * augment.max(1);
+        let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
@@ -107,12 +108,14 @@ impl DdpHandle {
             total_samples,
             batch_size,
             augment: augment.max(1),
+            epoch_splits: epoch_splits.max(1),
             transform,
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
             vram_pool,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             sample_cache,
             disk_stage_gb,
             disk_stage_dir,
@@ -131,6 +134,9 @@ impl DdpHandle {
             // Inert on this thread-based GpuWorker path (no TCP inbound loop).
             coord_liveness_timeout_secs:
                 crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            // Thread-based path: no control handshake reads it, and a
+            // single process has nothing to disagree with itself about.
+            model_sig: [0u8; 32],
         };
 
         // Keep the worker channels: `run_epoch_plan` calls `worker.report_epoch`
@@ -297,10 +303,12 @@ impl DdpHandle {
         vram_pool: bool,
         vram_max_usage: f64,
         ram_max_usage: f64,
+        gpu_ram_share: Option<f64>,
         sample_cache: bool,
         disk_stage_gb: u64,
         disk_stage_dir: Option<std::path::PathBuf>,
         augment: usize,
+        epoch_splits: usize,
         transform: Option<crate::data::TransformFn>,
         scheduler: Option<Arc<dyn crate::nn::Scheduler>>,
         eval_fn: Option<EvalFn<M>>,
@@ -314,8 +322,7 @@ impl DdpHandle {
     {
         crate::verbose!("  ddp: single device ({device:?}) | cooperative | no coordination");
 
-        // Schedule space: picks (samples × augment views).
-        let total_samples = dataset.len() * augment.max(1);
+        let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
         let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
             .map(|p| p.variable.data())
@@ -337,12 +344,14 @@ impl DdpHandle {
             total_samples,
             batch_size,
             augment: augment.max(1),
+            epoch_splits: epoch_splits.max(1),
             transform,
             seed: crate::distributed::ddp_run::SHUFFLE_BASE_SEED,
             max_grad_norm,
             vram_pool,
             vram_max_usage,
             ram_max_usage,
+            gpu_ram_share,
             sample_cache,
             disk_stage_gb,
             disk_stage_dir,
@@ -355,6 +364,9 @@ impl DdpHandle {
             save_path: None,
             coord_liveness_timeout_secs:
                 crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            // Thread-based path: no control handshake reads it, and a
+            // single process has nothing to disagree with itself about.
+            model_sig: [0u8; 32],
         };
 
         // The worker holds the sender ends; the cooperative Worker never drains

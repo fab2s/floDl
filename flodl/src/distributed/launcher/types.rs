@@ -98,6 +98,16 @@ pub struct FullCluster {
     /// Empty by default. Per-worker envs (see [`FullWorker::env`])
     /// override per-cluster ones for the matching worker.
     pub env: std::collections::BTreeMap<String, String>,
+    /// Cluster-scope default for the integrated-GPU host-RAM share
+    /// (fraction of `MemTotal` the GPU aperture claims; see
+    /// `DataLoaderBuilder::gpu_ram_share`). Meaningful only on APU
+    /// hosts; discrete-GPU hosts ignore it, which is what makes a
+    /// fleet-wide default legal on a mixed fleet. A per-worker
+    /// [`FullWorker::gpu_ram_share`] overrides it, and a walk-in's own
+    /// `join.gpu_ram_share:` overrides both (host truth wins). `None`
+    /// emits nothing, so a cluster that never mentions APUs is
+    /// unaffected by this field existing.
+    pub gpu_ram_share: Option<f64>,
 }
 
 /// Controller-side fields, launcher view.
@@ -197,6 +207,22 @@ pub struct FullWorker {
     /// launcher uses this to build the remote-side LD_LIBRARY_PATH
     /// when no pre-flight envelope overrides it.
     pub arch: Option<String>,
+    /// Dataset source root on this worker: where a rank READS its
+    /// training data from. May be a shared mount visible to every host
+    /// or a node-local directory; the library does not care which, it
+    /// only forwards the path to the rank.
+    ///
+    /// `None` when the host did not declare `data_path:`, in which case
+    /// the run keeps whatever default its own CLI defines. Only an
+    /// EXPLICIT declaration travels, so a cluster that never mentions
+    /// data paths is unaffected by this field existing.
+    pub data_path: Option<String>,
+    /// Integrated-GPU host-RAM share for THIS host (fraction of
+    /// `MemTotal`; see `DataLoaderBuilder::gpu_ram_share`). Overrides
+    /// the cluster-scope [`FullCluster::gpu_ram_share`] default.
+    /// Host-hardware truth like `data_path`: only an explicit
+    /// declaration travels.
+    pub gpu_ram_share: Option<f64>,
     /// SSH endpoint for remote dispatch. `None` means the host runs
     /// on the same machine as the launcher (fork/exec path, no ssh).
     /// When `Some`, all fields inside are optional and fall back to
@@ -348,6 +374,9 @@ impl FullCluster {
         // exported into every rank child. Missing → empty map.
         let env = parse_env_block(obj.get("env"), "cluster.env")?;
 
+        let gpu_ram_share =
+            parse_gpu_ram_share(obj.get("gpu_ram_share"), "cluster.gpu_ram_share")?;
+
         Ok(FullCluster {
             controller: FullController {
                 host: controller_host,
@@ -364,6 +393,7 @@ impl FullCluster {
             // training session (override via [`Self::with_session_salt`]).
             salt: [0u8; crate::distributed::wire::SESSION_SALT_BYTES],
             env,
+            gpu_ram_share,
         })
     }
 
@@ -411,6 +441,12 @@ impl FullCluster {
                 o.insert("path".into(), serde_json::Value::String(h.path.clone()));
                 if let Some(a) = &h.arch {
                     o.insert("arch".into(), serde_json::Value::String(a.clone()));
+                }
+                if let Some(d) = &h.data_path {
+                    o.insert("data_path".into(), serde_json::Value::String(d.clone()));
+                }
+                if let Some(g) = h.gpu_ram_share {
+                    o.insert("gpu_ram_share".into(), serde_json::Value::from(g));
                 }
                 if let Some(s) = &h.ssh {
                     let mut ssh_obj = serde_json::Map::new();
@@ -519,6 +555,9 @@ impl FullCluster {
         }
         top.insert("controller".into(), serde_json::Value::Object(controller_obj));
         top.insert("workers".into(), serde_json::Value::Array(workers));
+        if let Some(g) = self.gpu_ram_share {
+            top.insert("gpu_ram_share".into(), serde_json::Value::from(g));
+        }
         if !self.env.is_empty() {
             let mut env_obj = serde_json::Map::new();
             for (k, v) in &self.env {
@@ -664,6 +703,16 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let data_path = obj
+        .get("data_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let gpu_ram_share = parse_gpu_ram_share(
+        obj.get("gpu_ram_share"),
+        &format!("workers[{i}] ({name:?}).gpu_ram_share"),
+    )?;
+
     let ssh = parse_ssh_block(
         obj.get("ssh"),
         &format!("workers[{i}] ({name:?})"),
@@ -692,10 +741,34 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         nccl_socket_ifname,
         path,
         arch,
+        data_path,
+        gpu_ram_share,
         ssh,
         tunnel,
         env,
     })
+}
+
+/// Parse a `gpu_ram_share` field: a non-negative fraction of `MemTotal`.
+/// Values above 1.0 are deliberately legal — the knob exists partly for
+/// platforms whose `MemTotal` under-states what the APU can address —
+/// so the only refusals are a negative, a non-finite, or a non-number
+/// (the same envelope `with_gpu_ram_share`'s `max(0.0)` clamp draws,
+/// made loud because yml is user input).
+fn parse_gpu_ram_share(
+    v: Option<&serde_json::Value>,
+    label: &str,
+) -> Result<Option<f64>> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => match v.as_f64() {
+            Some(f) if f.is_finite() && f >= 0.0 => Ok(Some(f)),
+            _ => Err(TensorError::new(&format!(
+                "cluster launcher: {label} must be a non-negative fraction \
+                 of host RAM (e.g. 0.5), got {v}"
+            ))),
+        },
+    }
 }
 
 /// Parse a `controller.join:` sub-block into [`JoinKnobs`]. Missing /

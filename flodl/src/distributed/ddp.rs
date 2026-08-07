@@ -97,7 +97,7 @@ impl Ddp {
             )));
         }
         if let Device::CUDA(idx) = device {
-            crate::tensor::set_current_cuda_device(idx);
+            crate::tensor::set_current_gpu_device(idx);
         }
         let comms = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
 
@@ -473,8 +473,8 @@ impl Trainer {
     /// # Invariant — no CUDA before `Trainer::run`
     ///
     /// User code MUST NOT touch libtorch's CUDA context before this
-    /// call. That means: no [`crate::tensor::cuda_device_count`] /
-    /// [`crate::tensor::cuda_devices`] / `Tensor` construction on a
+    /// call. That means: no [`crate::tensor::gpu_device_count`] /
+    /// [`crate::tensor::gpu_devices`] / `Tensor` construction on a
     /// CUDA device / `Module::on_device(Device::CUDA(_))`. Pre-run GPU
     /// queries must go through [`crate::sys::detect_gpus`] (which uses
     /// `nvidia-smi` and does NOT init libtorch).
@@ -516,7 +516,8 @@ impl Trainer {
             .ram_max_usage(cfg.ram_max_usage)
             .sample_cache(cfg.sample_cache)
             .disk_stage(cfg.disk_stage_gb)
-            .augment(cfg.augment);
+            .augment(cfg.augment)
+            .epoch_splits(cfg.epoch_splits);
         if let Some(dir) = cfg.disk_stage_dir {
             b = b.disk_stage_dir(dir);
         }

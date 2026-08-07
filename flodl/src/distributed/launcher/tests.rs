@@ -182,7 +182,7 @@
             start: Some(StartMode::Manual),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 3);
         assert_eq!(cfg.target_ranks, None);
         assert_eq!(cfg.start_mode, StartMode::Manual);
@@ -194,7 +194,7 @@
             target_ranks: Some(4),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         let msg = cfg.validate().unwrap_err().to_string();
         assert!(msg.contains("manual"), "got: {msg}");
     }
@@ -202,7 +202,7 @@
     #[test]
     fn join_config_derivation_defaults_to_capacity_all_or_nothing() {
         // No knobs: quorum = target = capacity, stock timeouts.
-        let cfg = super::derive_join_config(None, 3).unwrap();
+        let cfg = super::derive_join_config(None, 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 3);
         assert_eq!(cfg.target_ranks, Some(3));
         assert_eq!(cfg.join_timeout_secs, 300);
@@ -211,14 +211,14 @@
 
         // Partial overrides keep the rest derived.
         let knobs = JoinKnobs { min_rank_start: Some(2), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.min_rank_start, 2);
         assert_eq!(cfg.target_ranks, Some(3));
 
         // An enlarged window stretches the default hard cap instead of
         // tripping the cap >= window validation.
         let knobs = JoinKnobs { join_timeout_secs: Some(900), ..Default::default() };
-        let cfg = super::derive_join_config(Some(&knobs), 3).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 3, true).unwrap();
         assert_eq!(cfg.join_timeout_secs, 900);
         assert_eq!(cfg.max_join_timeout_secs, 900);
         cfg.validate().unwrap();
@@ -233,7 +233,7 @@
             min_rank_start: Some(2),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 0, true).unwrap();
         assert_eq!(cfg.min_rank_start, 2);
         assert_eq!(cfg.target_ranks, None);
         cfg.validate().unwrap();
@@ -245,12 +245,12 @@
             target_ranks: Some(4),
             ..Default::default()
         };
-        let cfg = super::derive_join_config(Some(&knobs), 0).unwrap();
+        let cfg = super::derive_join_config(Some(&knobs), 0, true).unwrap();
         assert_eq!(cfg.target_ranks, Some(4));
 
         // Discovery without a quorum is loud — no capacity to derive from.
         let knobs = JoinKnobs { discovery: Some(true), ..Default::default() };
-        let msg = super::derive_join_config(Some(&knobs), 0)
+        let msg = super::derive_join_config(Some(&knobs), 0, true)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("min_rank_start"), "got: {msg}");
@@ -500,6 +500,179 @@
         assert_eq!(env["worker"]["nccl_socket_ifname"], "enp1s0");
         // ssh: stripped (launcher-only field; slim envelope is rank-side).
         assert!(env["worker"].get("ssh").is_none(), "ssh must be stripped");
+    }
+
+    /// The whole `data_path` chain in one assert: cluster json ->
+    /// `FullWorker` -> slim envelope -> `LocalCluster::data_path`.
+    ///
+    /// Before this landed the value was parsed on the controller only,
+    /// never written to the slim envelope, and had nowhere to land on
+    /// `WorkerBlock`, so a rank could not see it even in principle. The
+    /// asymmetric fixture pins the other half of the rule: a host that
+    /// declares nothing must carry nothing, because the alternative
+    /// (shipping the convention default) points every run that never
+    /// mentioned data at a directory that is not there.
+    #[test]
+    fn data_path_reaches_the_rank_only_when_declared() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "workers": [
+                {
+                    "host": "declares",
+                    "ranks": [0],
+                    "local_devices": [0],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl",
+                    "data_path": "/mnt/corpus"
+                },
+                {
+                    "host": "silent",
+                    "ranks": [1],
+                    "local_devices": [1],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl"
+                }
+            ]
+        });
+        let full = FullCluster::from_value(&v).unwrap();
+
+        let declares = full.workers.iter().find(|w| w.host == "declares").unwrap();
+        let silent = full.workers.iter().find(|w| w.host == "silent").unwrap();
+        assert_eq!(declares.data_path.as_deref(), Some("/mnt/corpus"));
+        assert_eq!(silent.data_path, None);
+
+        let a = build_slim_envelope_for(&full, declares, &full.controller.host, false);
+        let b = build_slim_envelope_for(&full, silent, &full.controller.host, false);
+        assert_eq!(a["worker"]["data_path"], "/mnt/corpus");
+        assert!(
+            b["worker"].get("data_path").is_none(),
+            "an undeclared host must not carry the key at all"
+        );
+
+        let a = crate::distributed::LocalCluster::from_value(&a).unwrap();
+        let b = crate::distributed::LocalCluster::from_value(&b).unwrap();
+        assert_eq!(a.data_path(), Some("/mnt/corpus"));
+        assert_eq!(b.data_path(), None);
+    }
+
+    /// `to_json` is the symmetric half of `from_value`, and the
+    /// auto-promote path round-trips a programmatic cluster through it.
+    #[test]
+    fn data_path_survives_full_cluster_to_json() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "workers": [{
+                "host": "h",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/opt/flodl",
+                "data_path": "/mnt/corpus"
+            }]
+        });
+        let round = FullCluster::from_value(&FullCluster::from_value(&v).unwrap().to_json())
+            .unwrap();
+        assert_eq!(round.workers[0].data_path.as_deref(), Some("/mnt/corpus"));
+    }
+
+    /// The `gpu_ram_share` precedence chain at its one resolution point:
+    /// a per-host declaration wins over the cluster-scope default, a
+    /// silent host inherits the default, and with neither the envelope
+    /// carries no key at all (the training binary keeps its own config).
+    /// The end of the chain is asserted through `LocalCluster`, the
+    /// parser the rank actually runs.
+    #[test]
+    fn gpu_ram_share_resolves_host_over_cluster_default_in_the_envelope() {
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "gpu_ram_share": 0.5,
+            "workers": [
+                {
+                    "host": "declares",
+                    "ranks": [0],
+                    "local_devices": [0],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl",
+                    "gpu_ram_share": 0.25
+                },
+                {
+                    "host": "silent",
+                    "ranks": [1],
+                    "local_devices": [1],
+                    "nccl_socket_ifname": "lo",
+                    "path": "/opt/flodl"
+                }
+            ]
+        });
+        let full = FullCluster::from_value(&v).unwrap();
+        assert_eq!(full.gpu_ram_share, Some(0.5));
+
+        let declares = full.workers.iter().find(|w| w.host == "declares").unwrap();
+        let silent = full.workers.iter().find(|w| w.host == "silent").unwrap();
+        let a = build_slim_envelope_for(&full, declares, &full.controller.host, false);
+        let b = build_slim_envelope_for(&full, silent, &full.controller.host, false);
+        let a = crate::distributed::LocalCluster::from_value(&a).unwrap();
+        let b = crate::distributed::LocalCluster::from_value(&b).unwrap();
+        assert_eq!(a.gpu_ram_share(), Some(0.25), "the host declaration must win");
+        assert_eq!(b.gpu_ram_share(), Some(0.5), "a silent host inherits the default");
+
+        // No default, no declaration: no key, so a cluster that never
+        // mentions APUs is byte-identical to before the field existed.
+        let mut v = v;
+        v.as_object_mut().unwrap().remove("gpu_ram_share");
+        v["workers"][0].as_object_mut().unwrap().remove("gpu_ram_share");
+        let full = FullCluster::from_value(&v).unwrap();
+        let env = build_slim_envelope_for(
+            &full,
+            &full.workers[0],
+            &full.controller.host,
+            false,
+        );
+        assert!(env["worker"].get("gpu_ram_share").is_none());
+        let parsed = crate::distributed::LocalCluster::from_value(&env).unwrap();
+        assert_eq!(parsed.gpu_ram_share(), None);
+
+        // And the round-trip half: both scopes survive to_json.
+        let v = json!({
+            "controller": { "host": "10.0.0.1", "port": 29500, "path": "/opt/flodl" },
+            "gpu_ram_share": 0.5,
+            "workers": [{
+                "host": "h",
+                "ranks": [0],
+                "local_devices": [0],
+                "nccl_socket_ifname": "lo",
+                "path": "/opt/flodl",
+                "gpu_ram_share": 0.25
+            }]
+        });
+        let round = FullCluster::from_value(&FullCluster::from_value(&v).unwrap().to_json())
+            .unwrap();
+        assert_eq!(round.gpu_ram_share, Some(0.5));
+        assert_eq!(round.workers[0].gpu_ram_share, Some(0.25));
+    }
+
+    /// Negative and non-number are refused loudly at parse in both
+    /// positions; above 1.0 must PASS — the knob is legal there for a
+    /// platform whose MemTotal under-states what the APU can address,
+    /// so a stricter yml rule would fork the API's semantics.
+    #[test]
+    fn gpu_ram_share_refuses_negatives_but_keeps_above_one_legal() {
+        let mut v = canonical_full_json();
+        v["gpu_ram_share"] = json!(-0.1);
+        let err = FullCluster::from_value(&v).unwrap_err().to_string();
+        assert!(
+            err.contains("cluster.gpu_ram_share") && err.contains("non-negative"),
+            "got: {err}"
+        );
+
+        let mut v = canonical_full_json();
+        v["workers"][0]["gpu_ram_share"] = json!("half");
+        let err = FullCluster::from_value(&v).unwrap_err().to_string();
+        assert!(err.contains("gpu_ram_share"), "got: {err}");
+
+        let mut v = canonical_full_json();
+        v["gpu_ram_share"] = json!(1.2);
+        assert_eq!(FullCluster::from_value(&v).unwrap().gpu_ram_share, Some(1.2));
     }
 
     #[test]

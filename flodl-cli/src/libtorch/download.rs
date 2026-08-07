@@ -7,6 +7,7 @@ use crate::context::Context;
 use crate::util::http;
 use crate::util::archive;
 use crate::util::system;
+use crate::util::system::GpuVendor;
 use super::detect;
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,51 @@ const CU128_SPEC: VariantSpec = VariantSpec {
     arch_variant: "cu128",
 };
 
+/// gfx targets the ROCm archives ship rocBLAS Tensile kernels for.
+///
+/// Read out of the published archives rather than inferred: both ROCm
+/// buckets of a given libtorch version carry the same set, and a target
+/// is only listed when the archive holds `.hsaco` or `TensileLibrary*`
+/// payload for it. Targets with nothing but MIOpen performance
+/// databases (`gfx900`, `gfx906`) are deliberately absent -- rocBLAS has
+/// no kernels to load for them, so listing one would let the
+/// arch-coverage gate admit a box that dies at its first BLAS call,
+/// which is the death that gate exists to move before the dial.
+///
+/// Verifiable without downloading the archive: its central directory is
+/// reachable with HTTP range requests (a few MB against ~5 GB), and the
+/// host answers 403 without a User-Agent.
+const ROCM_ARCHS: &str = "gfx908 gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1101 \
+                          gfx1102 gfx1150 gfx1151 gfx1200 gfx1201";
+
+const ROCM70_SPEC: VariantSpec = VariantSpec {
+    label: "ROCm 7.0",
+    // `rocm70` (no dot) matches the cu128 style and satisfies
+    // `detect::variant_vendor`'s `rocm<digit>` rule.
+    dir_name: "rocm70",
+    // `.arch` cuda= is the CUDA toolkit version; an AMD build has none.
+    // The vendor is carried by the variant path, which is what
+    // `variant_vendor` and prebuild's feature derivation read.
+    arch_cuda: "none",
+    arch_archs: ROCM_ARCHS,
+    // Doubles as the URL bucket AND the `+<variant>` filename suffix,
+    // exactly like `cu128` -- PyTorch dropped the `cxx11-abi-` filename
+    // prefix, so the ROCm archives follow the same pattern as CUDA's and
+    // need no special-casing in the URL builder.
+    arch_variant: "rocm7.0",
+};
+
+const ROCM71_SPEC: VariantSpec = VariantSpec {
+    label: "ROCm 7.1",
+    dir_name: "rocm71",
+    arch_cuda: "none",
+    // Identical hardware reach to 7.0: the two buckets ship the same
+    // gfx targets, so this variant exists for runtime matching, not for
+    // coverage.
+    arch_archs: ROCM_ARCHS,
+    arch_variant: "rocm7.1",
+};
+
 // ---------------------------------------------------------------------------
 // Download options
 // ---------------------------------------------------------------------------
@@ -61,6 +107,8 @@ pub enum Variant {
     Cpu,
     Cuda126,
     Cuda128,
+    Rocm70,
+    Rocm71,
     Auto,
 }
 
@@ -93,6 +141,130 @@ impl Default for DownloadOpts {
 // URL construction
 // ---------------------------------------------------------------------------
 
+/// Absolute `libomp` dependencies in one `otool -L` dump.
+///
+/// Pure, so the parse is testable on any host without a Mach-O to hand.
+/// `otool -L` prints the file name on the first line and one indented
+/// dependency per line after it, each followed by version parens; only
+/// the leading path matters. `@rpath/...` and `@loader_path/...` are
+/// already relative and left alone, as is anything that is not libomp:
+/// this rewrites ONE known upstream defect, not every absolute path.
+fn absolute_libomp_refs(otool_output: &str) -> Vec<String> {
+    otool_output
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|p| p.starts_with('/') && p.ends_with("/libomp.dylib"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Point the macOS archive's own dylibs at the `libomp` it ships with.
+///
+/// Upstream's `libtorch-macos-arm64` BUNDLES `lib/libomp.dylib` and then
+/// has `libtorch_cpu.dylib` depend on it by absolute Homebrew path
+/// (`/opt/homebrew/opt/libomp/lib/libomp.dylib`). On a box without that
+/// Homebrew formula the load fails while the library it wants sits in the
+/// same directory as the dylib asking for it, so a scaffolded project
+/// compiles and dies at launch. `brew install libomp` is the wrong answer:
+/// it installs a second, possibly ABI-divergent copy of something already
+/// present.
+///
+/// `@loader_path/libomp.dylib` rather than `@rpath/...` deliberately: the
+/// bundled copy is a sibling of every dylib referencing it, so
+/// `@loader_path` resolves with no dependence on the referrer carrying a
+/// correct `LC_RPATH`.
+///
+/// Advisory, never fatal: libtorch IS installed at this point, and the
+/// docker path does not care about any of this. But the tools are checked
+/// BEFORE anything is modified, because `install_name_tool` invalidates a
+/// Mach-O signature and arm64 refuses to load an unsigned one -- patching
+/// without being able to re-sign would leave the install worse than it
+/// was found.
+fn relink_bundled_libomp(lib_dir: &Path) {
+    // The gate is capability, not `cfg`: `fdl setup` on Apple Silicon
+    // fetches the LINUX archive for a docker project, which has no
+    // dylibs at all and must not be touched.
+    if !lib_dir.join("libomp.dylib").exists() {
+        return;
+    }
+    let dylibs: Vec<PathBuf> = match fs::read_dir(lib_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "dylib"))
+            .collect(),
+        Err(_) => return,
+    };
+
+    let missing: Vec<&str> = ["otool", "install_name_tool", "codesign"]
+        .into_iter()
+        .filter(|t| !crate::util::system::has_command(t))
+        .collect();
+    if !missing.is_empty() {
+        println!(
+            "  note: cannot relink the bundled libomp ({} not found).\n\
+             \x20       Upstream's libtorch_cpu.dylib asks for libomp at an absolute\n\
+             \x20       Homebrew path, so a NATIVE run may fail to start; the docker\n\
+             \x20       path is unaffected. Install the command line tools with\n\
+             \x20       `xcode-select --install` and re-run this download to fix it.",
+            missing.join(", "),
+        );
+        return;
+    }
+
+    let mut patched = 0usize;
+    for f in &dylibs {
+        let out = match std::process::Command::new("otool").arg("-L").arg(f).output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => continue,
+        };
+        let refs = absolute_libomp_refs(&out);
+        if refs.is_empty() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new("install_name_tool");
+        for r in &refs {
+            cmd.arg("-change").arg(r).arg("@loader_path/libomp.dylib");
+        }
+        match cmd.arg(f).output() {
+            Ok(o) if o.status.success() => {}
+            other => {
+                println!(
+                    "  note: install_name_tool failed on {}: {}",
+                    f.display(),
+                    match other {
+                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                );
+                continue;
+            }
+        }
+        // Ad-hoc re-sign, mandatory on arm64: the edit above invalidated
+        // whatever signature the file carried.
+        match std::process::Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(f)
+            .output()
+        {
+            Ok(o) if o.status.success() => patched += 1,
+            other => println!(
+                "  warning: {} was relinked but could NOT be re-signed ({}); \
+                 it may fail to load. Re-run this download after \
+                 `xcode-select --install`.",
+                f.display(),
+                match other {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    Err(e) => e.to_string(),
+                },
+            ),
+        }
+    }
+    if patched > 0 {
+        println!("  relinked {patched} dylib(s) to the bundled libomp");
+    }
+}
+
 fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String> {
     // `force_linux` short-circuits host detection: the binary is destined
     // for a Linux Docker container, so we always want the Linux x86_64
@@ -103,10 +275,27 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
         (std::env::consts::OS, std::env::consts::ARCH)
     };
 
+    download_url_for(spec, os, arch)
+}
+
+/// Pure core of [`download_url`]: the host is a parameter rather than a
+/// global read.
+///
+/// Every platform arm is reachable from any test runner as a result, which
+/// is the point. The Windows filename pattern differs from Linux's, this
+/// function claimed in a comment that it did not, and the resulting 404
+/// shipped unnoticed because nothing had ever evaluated the Windows arm on
+/// a Windows host. Host-as-parameter is what makes that testable without
+/// one.
+fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, String> {
     match (os, arch) {
         ("linux", "x86_64") => {}
         ("macos", "aarch64") => {
-            if spec.arch_cuda != "none" {
+            // `cuda=none` stopped meaning "CPU build" when a second
+            // vendor arrived: a ROCm spec carries it too, and without
+            // the second clause it resolves to the macOS CPU archive
+            // and installs it under a ROCm directory name.
+            if spec.arch_cuda != "none" || spec.arch_variant.starts_with("rocm") {
                 return Err("macOS only supports CPU libtorch".into());
             }
         }
@@ -117,7 +306,17 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
                 arch
             ));
         }
-        ("windows", "x86_64") => {}
+        ("windows", "x86_64") => {
+            // PyTorch publishes no ROCm build for Windows: the `rocm7.0`
+            // bucket carries Linux archives only.
+            if spec.arch_variant.starts_with("rocm") {
+                return Err(format!(
+                    "{} libtorch is not available for Windows.\n\
+                     PyTorch publishes ROCm builds for Linux only.",
+                    spec.label
+                ));
+            }
+        }
         _ => {
             return Err(format!(
                 "Unsupported platform: {} {}.\n\
@@ -135,19 +334,17 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
         ));
     }
 
-    // Linux and Windows use the same URL pattern
-    let filename = match spec.arch_variant {
-        "cpu" => format!(
-            "libtorch-shared-with-deps-{}%2Bcpu.zip",
-            LIBTORCH_VERSION
-        ),
-        variant => format!(
-            "libtorch-shared-with-deps-{}%2B{}.zip",
-            LIBTORCH_VERSION, variant
-        ),
-    };
+    // Linux and Windows share the bucket layout but NOT the filename:
+    // Windows archives carry a `-win-` infix. PyTorch also publishes a
+    // `-debug-` Windows variant (built against the debug CRT); we fetch the
+    // release one, which is what a release-mode consumer must link against.
+    let infix = if os == "windows" { "win-" } else { "" };
+    let filename = format!(
+        "libtorch-{}shared-with-deps-{}%2B{}.zip",
+        infix, LIBTORCH_VERSION, spec.arch_variant
+    );
 
-    let bucket = spec.arch_variant; // "cpu", "cu126", "cu128"
+    let bucket = spec.arch_variant; // "cpu", "cu126", "cu128", "rocm7.0"
     Ok(format!(
         "https://download.pytorch.org/libtorch/{}/{}",
         bucket, filename
@@ -159,15 +356,68 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
 // ---------------------------------------------------------------------------
 
 fn auto_detect_variant() -> &'static VariantSpec {
-    let gpus = system::detect_gpus();
+    let survey = flodl_hw::survey();
+    if survey.devices.is_empty() {
+        // Say WHY before routing to CPU: the sweep deliberately reports
+        // no device for an AMD card with no ROCm runtime, and that
+        // finding names the fix — discarding it turns a provisioning
+        // step ("install ROCm, then re-run") into a silent wrong
+        // variant.
+        for note in survey.notes.iter().filter(|n| n.kind.explains_absence()) {
+            println!("  {}", note.message);
+        }
+    }
+    variant_for_gpus(&survey.devices)
+}
+
+/// Route a detected GPU set to a libtorch variant.
+///
+/// Pure: the device list is a parameter rather than a probe, so every
+/// vendor and coverage arm is testable without hardware and without the
+/// process-global detection spoof.
+fn variant_for_gpus(gpus: &[system::GpuInfo]) -> &'static VariantSpec {
     if gpus.is_empty() {
-        println!("  No NVIDIA GPU detected. Using CPU variant.");
+        println!("  No GPU detected. Using CPU variant.");
         return &CPU_SPEC;
     }
 
-    // Find lowest and highest major compute capability
-    let lo_major = gpus.iter().map(|g| g.sm_major).min().unwrap_or(0);
-    let hi_major = gpus.iter().map(|g| g.sm_major).max().unwrap_or(0);
+    // A libtorch build serves exactly one vendor, so a mixed box has to
+    // pick. NVIDIA wins: in a box holding both, the AMD part is usually
+    // an APU's integrated GPU and the NVIDIA one the training card.
+    let amd: Vec<_> = gpus
+        .iter()
+        .filter(|g| g.vendor == GpuVendor::Amd)
+        .collect();
+    let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
+    if !amd.is_empty() {
+        if has_nvidia {
+            println!(
+                "  Both NVIDIA and AMD GPUs detected. One libtorch build serves\n  \
+                 one vendor, so the NVIDIA cards are used and the AMD ones stay\n  \
+                 idle. For the AMD cards instead: fdl libtorch download --rocm 7.0",
+            );
+        } else {
+            return rocm_variant_for(&amd);
+        }
+    }
+
+    // The CUDA variants below are selected on compute capability, which
+    // only NVIDIA devices carry.
+    let majors: Vec<u32> = gpus.iter().filter_map(|g| g.sm_major()).collect();
+    if majors.is_empty() {
+        let other: Vec<String> = gpus
+            .iter()
+            .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+            .collect();
+        println!(
+            "  Detected a GPU with no known libtorch variant ({}).\n  \
+             Using the CPU variant.",
+            other.join(", "),
+        );
+        return &CPU_SPEC;
+    }
+    let lo_major = majors.iter().copied().min().unwrap_or(0);
+    let hi_major = majors.iter().copied().max().unwrap_or(0);
 
     // cu128 requires Volta+ (sm_70+), cu126 supports down to sm_50
     if lo_major >= 7 {
@@ -189,11 +439,79 @@ fn auto_detect_variant() -> &'static VariantSpec {
     }
 }
 
+/// AMD devices the ROCm variant ships kernels for.
+///
+/// Exposed so the setup wizard routes on the same coverage list this
+/// module downloads against: two independently-maintained copies is how
+/// the wizard came to skip AMD boxes in silence.
+pub fn rocm_covered(gpus: &[system::GpuInfo]) -> Vec<&system::GpuInfo> {
+    gpus.iter()
+        .filter(|g| g.vendor == GpuVendor::Amd && g.covered_by(ROCM_ARCHS))
+        .collect()
+}
+
+/// The gfx targets the ROCm variants cover, for diagnostics.
+pub fn rocm_archs() -> &'static str {
+    ROCM_ARCHS
+}
+
+/// Pick between the ROCm variant and CPU for a set of AMD devices.
+///
+/// The ROCm archive carries pre-built rocBLAS Tensile kernels for a
+/// fixed gfx list; a target outside it has no kernels, so the variant is
+/// only worth downloading when it covers at least one device present.
+///
+/// Which ROCm bucket is not a hardware question: they cover the same
+/// targets, so this routes to the OLDEST offered one on purpose. The
+/// HIP runtime ordering rule puts the host's own ROCm ahead of the
+/// bundle, and within a major version that ABI grows, so a bundle older
+/// than the host loads while a newer one can fail on a symbol the host
+/// runtime does not have. 7.0 therefore serves every 7.x host, where
+/// 7.1 would drop the 7.0 ones. Picking the newest bundle that the
+/// detected host runtime can satisfy is the better rule and needs the
+/// ROCm version resolver; until then, oldest-serves-most. A host that
+/// wants the exact match asks for it: `fdl libtorch download --rocm 7.1`.
+fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
+    let (covered, uncovered): (Vec<_>, Vec<_>) = amd
+        .iter()
+        .partition(|g| g.covered_by(ROCM_ARCHS));
+
+    let describe = |gs: &[&&system::GpuInfo]| {
+        gs.iter()
+            .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if covered.is_empty() {
+        println!(
+            "  Detected AMD GPU(s) ({}) outside the ROCm build's gfx\n  \
+             targets, so the CPU variant is selected.\n  \
+             Covered targets: {}.",
+            describe(&uncovered),
+            ROCM_ARCHS,
+        );
+        return &CPU_SPEC;
+    }
+    if !uncovered.is_empty() {
+        println!(
+            "  Note: {} is not covered by the ROCm build and will be\n  \
+             unusable. Covered targets: {}.",
+            describe(&uncovered),
+            ROCM_ARCHS,
+        );
+    }
+    println!("  Detected AMD GPU(s) ({}). Using ROCm 7.0.", describe(&covered));
+    &ROCM70_SPEC
+}
+
 fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
     match variant {
         Variant::Cpu => &CPU_SPEC,
         Variant::Cuda126 => &CU126_SPEC,
         Variant::Cuda128 => &CU128_SPEC,
+        Variant::Rocm70 => &ROCM70_SPEC,
+        Variant::Rocm71 => &ROCM71_SPEC,
         Variant::Auto => auto_detect_variant(),
     }
 }
@@ -202,13 +520,19 @@ fn resolve_variant(variant: &Variant) -> &'static VariantSpec {
 // Core download logic
 // ---------------------------------------------------------------------------
 
-pub fn run(opts: DownloadOpts) -> Result<(), String> {
+pub fn run(opts: DownloadOpts) -> Result<String, String> {
     let ctx = Context::resolve();
     run_with_context(opts, &ctx)
 }
 
-/// Run with an explicit context (used by `setup` which has its own context).
-pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String> {
+/// Run with an explicit context (used by `setup` which has its own
+/// context).
+///
+/// Returns the variant id it resolved to (`precompiled/<dir>`), because
+/// `Variant::Auto` only decides here: a caller that needs the path or the
+/// label afterwards would otherwise have to re-run the detection, which
+/// re-prints its reasoning and can only agree by accident.
+pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, String> {
     let spec = resolve_variant(&opts.variant);
     let url = download_url(spec, opts.force_linux)?;
 
@@ -229,7 +553,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
     if opts.dry_run {
         println!();
         println!("  [dry-run] Would download and extract to above path.");
-        return Ok(());
+        return Ok(variant_id);
     }
 
     // Check existing installation
@@ -247,7 +571,7 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         if ver_matches {
             println!();
             println!("  Already installed (version {}).", LIBTORCH_VERSION);
-            return Ok(());
+            return Ok(variant_id);
         }
 
         println!();
@@ -259,16 +583,34 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
             .map_err(|e| format!("cannot remove {}: {}", install_path.display(), e))?;
     }
 
-    // Download to temp file
-    let tmp_dir = std::env::temp_dir();
-    let tmp_zip = tmp_dir.join(format!("libtorch-{}-{}.zip", spec.dir_name, LIBTORCH_VERSION));
+    // Stage BESIDE the destination, not in the system temp dir.
+    //
+    // `std::env::temp_dir()` is `/tmp`, which on a great many Linux
+    // setups is a small RAM-backed tmpfs -- 16 GiB on the rig this was
+    // found on. Staging there needs the archive AND its expansion at
+    // once: ~20 GiB for a ROCm build, ~7 GiB even for CUDA. Blowing it
+    // does not merely fail the download, it fills a tmpfs that the rest
+    // of the system (and every shell's temp files) depends on.
+    //
+    // The destination's own filesystem is the one the user actually
+    // sized for libtorch, and staging there makes the final move a
+    // same-filesystem rename rather than a cross-device copy.
+    let stage_root = install_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&stage_root)
+        .map_err(|e| format!("cannot create {}: {}", stage_root.display(), e))?;
+    let stage = Staging::new(stage_root.join(format!(".fdl-staging-{}", std::process::id())))?;
+
+    let tmp_zip = stage.path().join(format!("libtorch-{}.zip", spec.dir_name));
 
     println!();
     println!("  Downloading...");
     http::download_file(&url, &tmp_zip)?;
 
-    // Extract to temp directory (zip contains a top-level "libtorch/" dir)
-    let tmp_extract = tmp_dir.join(format!("libtorch-extract-{}", std::process::id()));
+    // Extract (the zip carries a top-level "libtorch/" dir)
+    let tmp_extract = stage.path().join("extract");
     println!("  Extracting...");
     archive::extract_zip(&tmp_zip, &tmp_extract)?;
 
@@ -283,12 +625,16 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
     fs::create_dir_all(&install_path)
         .map_err(|e| format!("cannot create {}: {}", install_path.display(), e))?;
 
-    // Move all files from extracted dir to install path
+    // Move all files from extracted dir to install path. Same
+    // filesystem now, so `move_contents`'s rename path is the one that
+    // fires.
     move_contents(source, &install_path)?;
 
-    // Cleanup temp files
-    let _ = fs::remove_file(&tmp_zip);
-    let _ = fs::remove_dir_all(&tmp_extract);
+    // `stage` cleans itself up on drop, including on the error paths
+    // above -- the predecessor leaked its temp zip and extract dir
+    // whenever anything failed, which on a tmpfs meant a failed
+    // download left gigabytes behind until reboot.
+    drop(stage);
 
     // Verify
     let lib_dir = install_path.join("lib");
@@ -305,6 +651,8 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
             lib_dir.display()
         ));
     }
+
+    relink_bundled_libomp(&lib_dir);
 
     // Write .arch metadata (always, both project and global)
     let arch_content = format!(
@@ -331,8 +679,12 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
             println!("  .active: libtorch/.active -> {}", variant_id);
         }
         println!();
-        if spec.arch_cuda != "none" {
-            println!("  Run 'fdl cuda-test' to verify.");
+        // From the variant PATH, not `.arch`'s `cuda=`: a ROCm build has
+        // no CUDA toolkit version and writes `cuda=none` there exactly
+        // like a CPU build, so reading that field told anyone who had
+        // just installed ROCm libtorch to run the CPU test suite.
+        if detect::variant_vendor(&variant_id).is_some() {
+            println!("  Run 'fdl gpu-test' to verify.");
         } else {
             println!("  Run 'fdl test' to verify.");
         }
@@ -343,16 +695,19 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
         println!("  To use with tch-rs or flodl, add to your shell profile:");
         println!();
         println!("    export LIBTORCH=\"{}\"", install_path.display());
-        println!(
-            "    export LD_LIBRARY_PATH=\"{}/lib${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"",
-            install_path.display()
-        );
+        // Shared recipe: on a ROCm variant the system runtime has to come
+        // first, and a recipe the user pastes is exactly where getting
+        // that backwards costs a segfault at the first GPU op.
+        let lib = format!("{}/lib", install_path.display());
+        for line in detect::ld_library_path_lines(detect::variant_vendor(&variant_id), &lib) {
+            println!("    {line}");
+        }
         println!();
         println!("  Or start a new floDl project:");
         println!("    fdl init my-project");
     }
 
-    Ok(())
+    Ok(variant_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +715,33 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 /// Move all files and directories from `src` into `dest`.
+/// A staging directory that removes itself on drop, however we leave.
+///
+/// The point is the failure paths: a download or extract that errors
+/// out used to leave its partial archive and expansion behind, which on
+/// a tmpfs is space nothing reclaims until reboot.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        // A leftover from a crashed run would otherwise merge into this
+        // one; start clean.
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path)
+            .map_err(|e| format!("cannot create staging dir {}: {}", path.display(), e))?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn move_contents(src: &Path, dest: &Path) -> Result<(), String> {
     let entries = fs::read_dir(src)
         .map_err(|e| format!("cannot read {}: {}", src.display(), e))?;
@@ -406,4 +788,323 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn libtorch_version() -> &'static str {
     LIBTORCH_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These assert the exact upstream filename grammar, which differs per
+    // OS in ways that are invisible from a Linux dev box. Each expectation
+    // below was confirmed against download.pytorch.org with a bogus-name
+    // control request, not inferred from the neighbouring arms.
+
+    #[test]
+    fn linux_url_has_no_os_infix() {
+        let url = download_url_for(&CU128_SPEC, "linux", "x86_64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cu128/\
+                 libtorch-shared-with-deps-{LIBTORCH_VERSION}%2Bcu128.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_url_carries_the_win_infix() {
+        // Regression: this arm used to build the Linux filename and 404.
+        let url = download_url_for(&CU128_SPEC, "windows", "x86_64").unwrap();
+        assert!(
+            url.contains("libtorch-win-shared-with-deps-"),
+            "windows archives need the `-win-` infix, got {url}"
+        );
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cu128/\
+                 libtorch-win-shared-with-deps-{LIBTORCH_VERSION}%2Bcu128.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_cpu_url_carries_the_win_infix() {
+        let url = download_url_for(&CPU_SPEC, "windows", "x86_64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cpu/\
+                 libtorch-win-shared-with-deps-{LIBTORCH_VERSION}%2Bcpu.zip"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_rejects_rocm() {
+        // The ROCm buckets are Linux-only upstream; a `-win-` URL there is
+        // a 404, so refuse before downloading rather than after.
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let err = download_url_for(spec, "windows", "x86_64").unwrap_err();
+            assert!(err.contains("not available for Windows"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn linux_accepts_rocm() {
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let url = download_url_for(spec, "linux", "x86_64").unwrap();
+            let bucket = spec.arch_variant;
+            assert_eq!(
+                url,
+                format!(
+                    "https://download.pytorch.org/libtorch/{bucket}/\
+                     libtorch-shared-with-deps-{LIBTORCH_VERSION}%2B{bucket}.zip"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_rocm_variants_differ_only_in_runtime_version() {
+        // Same hardware reach, different bundled HIP runtime: the second
+        // variant exists so a host can match its own ROCm, not so it can
+        // reach a card the other one cannot.
+        assert_eq!(ROCM70_SPEC.arch_archs, ROCM71_SPEC.arch_archs);
+        assert_ne!(ROCM70_SPEC.arch_variant, ROCM71_SPEC.arch_variant);
+        assert_ne!(ROCM70_SPEC.dir_name, ROCM71_SPEC.dir_name);
+        // `variant_vendor` reads the directory basename, so both must
+        // still say AMD to the feature derivation.
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            assert_eq!(
+                detect::variant_vendor(&format!("precompiled/{}", spec.dir_name)),
+                Some(GpuVendor::Amd),
+                "{} must derive the AMD feature",
+                spec.dir_name
+            );
+        }
+    }
+
+    #[test]
+    fn macos_arm_uses_its_own_filename_and_is_cpu_only() {
+        let url = download_url_for(&CPU_SPEC, "macos", "aarch64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/libtorch/cpu/\
+                 libtorch-macos-arm64-{LIBTORCH_VERSION}.zip"
+            )
+        );
+
+        let err = download_url_for(&CU128_SPEC, "macos", "aarch64").unwrap_err();
+        assert!(err.contains("only supports CPU"), "got {err}");
+    }
+
+    #[test]
+    fn macos_rejects_rocm_rather_than_serving_the_cpu_archive() {
+        // A ROCm spec has no CUDA version either, so the CUDA-shaped
+        // guard passed it through and the macOS filename branch handed
+        // back the CPU archive: a CPU libtorch installed as `rocm70`,
+        // with nothing anywhere saying so.
+        for spec in [&ROCM70_SPEC, &ROCM71_SPEC] {
+            let err = download_url_for(spec, "macos", "aarch64").unwrap_err();
+            assert!(err.contains("only supports CPU"), "got {err}");
+        }
+    }
+
+    #[test]
+    fn macos_intel_is_rejected_with_a_reason() {
+        let err = download_url_for(&CPU_SPEC, "macos", "x86_64").unwrap_err();
+        assert!(err.contains("Apple Silicon"), "got {err}");
+    }
+
+    #[test]
+    fn unsupported_platform_is_rejected() {
+        // linux-aarch64 has no upstream libtorch archive; `fdl libtorch
+        // build` from source is the path there.
+        let err = download_url_for(&CPU_SPEC, "linux", "aarch64").unwrap_err();
+        assert!(err.contains("Unsupported platform"), "got {err}");
+    }
+
+    /// `otool -L` shape as upstream's arm64 archive actually prints it:
+    /// the file name first, then one indented dependency per line with
+    /// trailing version parens.
+    const OTOOL_LIBTORCH_CPU: &str = "\
+libtorch/lib/libtorch_cpu.dylib:
+\t@rpath/libtorch_cpu.dylib (compatibility version 0.0.0, current version 0.0.0)
+\t/opt/homebrew/opt/libomp/lib/libomp.dylib (compatibility version 5.0.0, current version 5.0.0)
+\t@rpath/libc10.dylib (compatibility version 0.0.0, current version 0.0.0)
+\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 1700.255.0)
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)
+";
+
+    #[test]
+    fn the_absolute_libomp_dependency_is_the_only_one_rewritten() {
+        // Precisely one line qualifies. The self-reference on line 2 and
+        // the two /usr/lib system libraries must NOT be touched: this
+        // fixes one upstream defect, and widening it to "every absolute
+        // path" would repoint libc++ at a sibling that does not exist.
+        assert_eq!(
+            absolute_libomp_refs(OTOOL_LIBTORCH_CPU),
+            vec!["/opt/homebrew/opt/libomp/lib/libomp.dylib".to_string()],
+        );
+    }
+
+    #[test]
+    fn an_already_relative_libomp_is_left_alone() {
+        // Idempotence: the second `fdl libtorch download` over the same
+        // variant must find nothing to do, or it re-signs on every run.
+        let patched = OTOOL_LIBTORCH_CPU.replace(
+            "/opt/homebrew/opt/libomp/lib/libomp.dylib",
+            "@loader_path/libomp.dylib",
+        );
+        assert!(absolute_libomp_refs(&patched).is_empty(), "{patched}");
+        // `@rpath` spelling too, in case upstream fixes it their way.
+        let upstream_fixed =
+            OTOOL_LIBTORCH_CPU.replace("/opt/homebrew/opt/libomp/lib/", "@rpath/");
+        assert!(absolute_libomp_refs(&upstream_fixed).is_empty());
+    }
+
+    #[test]
+    fn a_libomp_at_another_absolute_prefix_still_qualifies() {
+        // The Homebrew prefix is not universal (Intel Macs use
+        // /usr/local, and a custom prefix is legal), so the match is on
+        // the library, not on the directory upstream happened to use.
+        let intel = OTOOL_LIBTORCH_CPU
+            .replace("/opt/homebrew/opt", "/usr/local/opt");
+        assert_eq!(
+            absolute_libomp_refs(&intel),
+            vec!["/usr/local/opt/libomp/lib/libomp.dylib".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_dump_with_no_dependencies_yields_nothing() {
+        assert!(absolute_libomp_refs("").is_empty());
+        assert!(absolute_libomp_refs("libomp.dylib:\n").is_empty());
+    }
+
+    #[test]
+    fn force_linux_ignores_the_host() {
+        // The container is Linux whatever the host is, so the docker path
+        // must never pick up a macOS or Windows filename.
+        let url = download_url(&CU128_SPEC, true).unwrap();
+        assert!(url.contains("libtorch-shared-with-deps-"), "got {url}");
+        assert!(!url.contains("-win-"), "got {url}");
+        assert!(!url.contains("macos"), "got {url}");
+    }
+
+    // Variant routing. Asserted through the pure `variant_for_gpus` so no
+    // arm depends on the host's own hardware.
+
+    fn gpu(vendor: GpuVendor, arch: &str) -> system::GpuInfo {
+        system::GpuInfo {
+            index: 0,
+            vendor,
+            name: format!("test {arch}"),
+            arch: flodl_hw::GpuArch::parse(vendor, arch)
+                .unwrap_or_else(|| panic!("unparsable arch {arch}")),
+            total_memory_mb: 8192,
+        }
+    }
+
+    #[test]
+    fn no_gpu_routes_to_cpu() {
+        assert_eq!(variant_for_gpus(&[]).arch_variant, "cpu");
+    }
+
+    #[test]
+    fn a_covered_amd_gpu_routes_to_rocm() {
+        // The bug this guards: a gfx target the ROCm archive ships kernels
+        // for was routed to the CPU variant, so an AMD box trained on CPU.
+        // gfx950 (MI350 class) and gfx1150/gfx1151 (Strix APUs) are in the
+        // archive and were missing from the covered list.
+        for arch in [
+            "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1151", "gfx1201",
+        ] {
+            let v = variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]);
+            assert_eq!(v.arch_variant, "rocm7.0", "{arch} should route to ROCm");
+        }
+    }
+
+    #[test]
+    fn a_perf_db_only_target_is_not_covered() {
+        // gfx900 and gfx906 appear in the archive with MIOpen performance
+        // databases and no rocBLAS kernels at all. Calling that "covered"
+        // admits a box that dies at its first BLAS call instead of being
+        // told, here, that CPU is what this build can honestly offer.
+        for arch in ["gfx900", "gfx906"] {
+            let v = variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]);
+            assert_eq!(v.arch_variant, "cpu", "{arch} ships no kernels");
+            assert!(rocm_covered(&[gpu(GpuVendor::Amd, arch)]).is_empty());
+        }
+    }
+
+    #[test]
+    fn auto_never_picks_the_newer_rocm_bundle() {
+        // Deliberate: the host's ROCm loads ahead of the bundle, so the
+        // oldest offered bundle is the one that serves every 7.x host.
+        // Reaching 7.1 is an explicit request, not a detection outcome.
+        for arch in ["gfx942", "gfx950", "gfx1151"] {
+            assert_eq!(
+                variant_for_gpus(&[gpu(GpuVendor::Amd, arch)]).arch_variant,
+                "rocm7.0"
+            );
+        }
+        assert_eq!(resolve_variant(&Variant::Rocm71).arch_variant, "rocm7.1");
+    }
+
+    #[test]
+    fn an_uncovered_amd_gpu_routes_to_cpu() {
+        // No bundled Tensile kernels for this target, so ROCm would build
+        // but not run. Proves the previous test is not vacuously green.
+        let v = variant_for_gpus(&[gpu(GpuVendor::Amd, "gfx803")]);
+        assert_eq!(v.arch_variant, "cpu");
+    }
+
+    #[test]
+    fn a_partly_covered_amd_set_still_routes_to_rocm() {
+        let v = variant_for_gpus(&[
+            gpu(GpuVendor::Amd, "gfx942"),
+            gpu(GpuVendor::Amd, "gfx803"),
+        ]);
+        assert_eq!(v.arch_variant, "rocm7.0");
+    }
+
+    #[test]
+    fn a_mixed_vendor_box_routes_to_cuda() {
+        // One libtorch build serves one vendor; NVIDIA is the pick, and
+        // the AMD device must not drag the result to ROCm or to CPU.
+        let v = variant_for_gpus(&[
+            gpu(GpuVendor::Nvidia, "sm_120"),
+            gpu(GpuVendor::Amd, "gfx1100"),
+        ]);
+        assert_eq!(v.arch_variant, "cu128");
+    }
+
+    #[test]
+    fn rocm_covered_selects_only_supported_amd_devices() {
+        // The setup wizard routes on this, so it must not count an NVIDIA
+        // card nor an AMD target the archive ships no kernels for.
+        let gpus = vec![
+            gpu(GpuVendor::Nvidia, "sm_120"),
+            gpu(GpuVendor::Amd, "gfx942"),
+            gpu(GpuVendor::Amd, "gfx803"),
+        ];
+        let covered = rocm_covered(&gpus);
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].arch_label(), "gfx942");
+    }
+
+    #[test]
+    fn nvidia_routing_is_unchanged() {
+        assert_eq!(
+            variant_for_gpus(&[gpu(GpuVendor::Nvidia, "sm_120")]).arch_variant,
+            "cu128"
+        );
+        assert_eq!(
+            variant_for_gpus(&[gpu(GpuVendor::Nvidia, "sm_61")]).arch_variant,
+            "cu126"
+        );
+    }
 }

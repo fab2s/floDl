@@ -301,6 +301,15 @@ pub struct RunConfig {
     /// Per-view additive input-noise amplitude (`--augment-noise`),
     /// installed as a PickKey-keyed delivery transform. 0.0 = off.
     pub augment_noise: f64,
+    /// Slices per data pass (`--epoch-splits`). `1` = an epoch is a full
+    /// pass, the historical meaning. Above 1, `epochs * epoch_splits`
+    /// events run and each sample is still seen exactly `epochs` times.
+    pub epoch_splits: usize,
+    /// Tokens of the training shard to stage (`--train-tokens`), token
+    /// models only. `None` = the model's default corpus. The staged size
+    /// is snapped so the pass divides into whole batched events; see
+    /// `models::olmo::resolve_train_corpus`.
+    pub train_tokens: Option<u64>,
     /// VRAM share for each rank's data plane (`--vram-max-usage`).
     /// `None` preserves the library default (0.90).
     pub vram_max_usage: Option<f64>,
@@ -336,4 +345,63 @@ pub struct RunConfig {
     /// cooperative run is the managed run's parity twin. `DdpMode::Solo`
     /// ignores this (there is no builder path).
     pub tier: Tier,
+}
+
+// ---------------------------------------------------------------------------
+// Token-count parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a token count with an optional `K`/`M`/`G` suffix (`20M`).
+///
+/// Decimal multipliers, not binary: a token budget is a quantity of
+/// training signal, and the field quotes those in powers of ten ("a 300B
+/// token run"). Bytes are the thing that wants KiB; tokens are not.
+pub fn parse_token_count(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty token count".to_string());
+    }
+    let (digits, mult) = match t.chars().last().unwrap().to_ascii_uppercase() {
+        'K' => (&t[..t.len() - 1], 1_000u64),
+        'M' => (&t[..t.len() - 1], 1_000_000),
+        'G' => (&t[..t.len() - 1], 1_000_000_000),
+        _ => (t, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid token count '{s}' (expected e.g. 2097152, 20M, 1G)"))?;
+    n.checked_mul(mult)
+        .filter(|&v| v > 0)
+        .ok_or_else(|| format!("token count '{s}' is zero or overflows"))
+}
+
+#[cfg(test)]
+mod token_count_tests {
+    use super::parse_token_count;
+
+    #[test]
+    fn plain_and_suffixed_counts() {
+        assert_eq!(parse_token_count("2097152"), Ok(2_097_152));
+        assert_eq!(parse_token_count("20M"), Ok(20_000_000));
+        assert_eq!(parse_token_count("500K"), Ok(500_000));
+        assert_eq!(parse_token_count("1G"), Ok(1_000_000_000));
+    }
+
+    #[test]
+    fn suffix_is_case_insensitive_and_space_tolerant() {
+        assert_eq!(parse_token_count("20m"), Ok(20_000_000));
+        assert_eq!(parse_token_count("  20M "), Ok(20_000_000));
+    }
+
+    #[test]
+    fn junk_is_refused_rather_than_coerced() {
+        // A silently-coerced corpus size would change the run's whole
+        // data pass without saying so.
+        assert!(parse_token_count("").is_err());
+        assert!(parse_token_count("20MB").is_err());
+        assert!(parse_token_count("-5").is_err());
+        assert!(parse_token_count("0").is_err());
+        assert!(parse_token_count("1.5M").is_err());
+    }
 }

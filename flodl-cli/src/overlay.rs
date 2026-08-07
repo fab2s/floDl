@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 
 use serde_yaml_ng::{Mapping, Value};
 
+use crate::context::home_dir;
+
 // ── Deep-merge ──────────────────────────────────────────────────────────
 
 /// Deep-merge `over` onto `base`. Maps recurse; scalars and lists replace;
@@ -709,13 +711,27 @@ fn resolve_chain_inner(
     let parent = extract_inherit_from(&mut value, path)?;
 
     if let Some(parent_rel) = parent {
-        let parent_abs = if Path::new(&parent_rel).is_absolute() {
-            PathBuf::from(&parent_rel)
-        } else {
-            canonical
+        // A scheme-shaped value is reserved grammar, refused by name: a
+        // remote parent is config that can change under a standing fleet
+        // between two invocations, so it needs pinning/caching designed
+        // deliberately, not a fetch bolted into config resolution.
+        if parent_rel.contains("://") {
+            return Err(format!(
+                "{INHERIT_KEY} in {}: `{parent_rel}` — remote parents are \
+                 not supported (the value is a local path; `~/` and paths \
+                 relative to the declaring file both work)",
+                path.display(),
+            ));
+        }
+        let parent_abs = match parent_rel.strip_prefix("~/") {
+            // `~` names the invoking user's home wherever the declaring
+            // file lives — the shape a global base under ~/.flodl needs.
+            Some(rest) => home_dir().join(rest),
+            None if Path::new(&parent_rel).is_absolute() => PathBuf::from(&parent_rel),
+            None => canonical
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
-                .join(&parent_rel)
+                .join(&parent_rel),
         };
         resolve_chain_inner(&parent_abs, stack, out)?;
     }
