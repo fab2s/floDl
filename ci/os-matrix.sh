@@ -159,6 +159,11 @@ HOST="$HOST_OS-$HOST_ARCH"
 LT_FLAG=""; LT_DIR=""; LT_LIB=""
 REFUSE_FLAG=""; REFUSE_MSG=""
 COMPILE=0; GPU=0; ALL_VARIANTS=0
+# INSTALL_ADVISORY is live (windows installs but does not compile).
+# COMPILE_ADVISORY is set by NO host now that macOS is green; it stays as
+# the mechanism for the next host added before it has ever run, which is
+# the only honest use for it. Anything left advisory once it passes stops
+# being a report and becomes a warning nobody reads.
 INSTALL_ADVISORY=0; COMPILE_ADVISORY=0
 
 case "$HOST" in
@@ -204,10 +209,19 @@ case "$HOST" in
     macos-aarch64)
         # CPU only, and not a gap to fill later: upstream publishes no
         # CUDA or ROCm libtorch for macOS at all, which the refusal
-        # below asserts. flodl-sys's C++ shim has never been compiled by
-        # clang-on-macOS, so the build is advisory until it is green.
+        # below asserts.
+        #
+        # No longer advisory. It went green on 2026-08-07 -- clang builds
+        # the shim, and a scaffolded project trains -- so it is a gate
+        # like every other host from here. It was advisory while nothing
+        # had ever run, and staying advisory after that is how the two
+        # defects it was carrying stayed invisible: the binary could not
+        # find libtorch (no rpath, and macOS ignores LD_LIBRARY_PATH),
+        # and upstream's own dylibs asked for a bundled libomp by
+        # absolute Homebrew path. Both were reported as a warning nobody
+        # had to act on.
         LT_FLAG="--cpu"; LT_DIR=cpu; LT_LIB="lib/libtorch.dylib"
-        COMPILE=1; COMPILE_ADVISORY=1
+        COMPILE=1
         REFUSE_FLAG="--cuda 12.8"; REFUSE_MSG="macOS only supports CPU libtorch"
         ;;
     windows-x86_64)
