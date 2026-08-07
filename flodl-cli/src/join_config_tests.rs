@@ -572,3 +572,40 @@ fn the_drop_in_names_the_per_platform_trap() {
     let plain = render_sshd_conf("f", Door::Nologin, 22, Platform::Debian);
     assert!(!plain.contains("ssh.socket"), "{plain}");
 }
+
+/// A scaffolded overlay must never cost the project its commands.
+///
+/// The placeholder form is the trap: a `commands:` key whose only
+/// children are comments is YAML *null*, and the overlay merge applies
+/// that null over the base's command map — deleting every command in
+/// the project whenever the farm overlay is active. Caught after
+/// shipping it; the key has to be commented out along with them.
+#[test]
+fn a_scaffolded_overlay_never_deletes_the_projects_commands() {
+    for hint in [None, Some("trainer")] {
+        let tmp = tempdir();
+        let base = tmp.join("fdl.yml");
+        fs::write(&base, "commands:\n  build:\n    run: echo hi\n").unwrap();
+        let token = fresh_token().unwrap();
+        fs::write(
+            tmp.join("fdl.f.yml"),
+            render_overlay_scaffold("f", &token, &tmp, hint),
+        )
+        .unwrap();
+        let merged = crate::config::load_project_with_env(&base, Some("f")).unwrap();
+        assert!(
+            merged.commands.contains_key("build"),
+            "hint={hint:?}: the base command vanished under the overlay",
+        );
+        match hint {
+            Some(name) => assert_eq!(
+                merged.commands.get(name).and_then(|c| c.cluster),
+                Some(true),
+                "a named command must be wired for launcher mode",
+            ),
+            // Nothing named means nothing added, not a wiped map.
+            None => assert_eq!(merged.commands.len(), 1),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

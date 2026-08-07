@@ -183,6 +183,22 @@ impl Platform {
         }
     }
 
+    /// Whether this process is inside a container.
+    ///
+    /// It changes what a fix MEANS, not just where it runs: a package
+    /// installed into a running container lives in a writable layer that
+    /// the next `docker compose run --rm` throws away, so the durable
+    /// answer is the image, and advice that omits that sends the
+    /// operator round the same loop tomorrow.
+    pub fn in_container() -> bool {
+        if std::path::Path::new("/.dockerenv").exists() {
+            return true;
+        }
+        std::fs::read_to_string("/proc/1/cgroup")
+            .map(|c| c.contains("docker") || c.contains("containerd") || c.contains("libpod"))
+            .unwrap_or(false)
+    }
+
     /// A short human name for reports.
     pub fn name(&self) -> &'static str {
         match self {
@@ -236,6 +252,14 @@ mod tests {
         assert!(Platform::Rhel.allow_ssh_port(22).is_none());
         assert!(Platform::Debian.allow_ssh_port(2022).is_none());
         assert!(Platform::MacOs.allow_ssh_port(2022).is_none());
+    }
+
+    #[test]
+    fn container_detection_answers_without_panicking() {
+        // Both answers are legitimate depending on where the suite runs
+        // (this repo's own tests run inside the dev image); what matters
+        // is that the probe is total.
+        let _ = Platform::in_container();
     }
 
     #[test]
