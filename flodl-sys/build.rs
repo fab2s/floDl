@@ -1,6 +1,41 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+/// Whether the C++ compiler resolves `#include <header>`, given the
+/// same include directory the real compile will get.
+///
+/// Kept in sync by hand with flodl-cli's `util/requirements.rs`
+/// (`header_reachable`); build scripts cannot depend on that crate. A
+/// missing or unusable compiler answers `false`, which leaves the header
+/// reported as missing — the honest fallback, since a box with no C++
+/// compiler cannot build this crate anyway and the message names that.
+fn header_reachable(header: &str, root_include: &Path) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+    let Ok(mut child) = Command::new(&cxx)
+        .arg("-I")
+        .arg(root_include)
+        .args(["-E", "-x", "c++", "-", "-o", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin
+            .write_all(format!("#include <{header}>\n").as_bytes())
+            .is_err()
+        {
+            return false;
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
 fn main() {
     // docs.rs builds without libtorch — skip C++ compilation entirely.
     // cargo doc does not link, so unresolved extern symbols are fine.
@@ -164,11 +199,24 @@ fn main() {
         // (Kept in sync by hand with flodl-cli's util/requirements.rs;
         // build.rs cannot depend on that crate.)
         let sys_dirs = ["/usr/include", "/usr/local/include"];
+        let root_include = Path::new(root).join("include");
         let missing: Vec<&(&str, &str)> = headers
             .iter()
             .filter(|(h, _)| {
-                !Path::new(root).join("include").join(h).exists()
-                    && !sys_dirs.iter().any(|d| Path::new(d).join(h).exists())
+                if root_include.join(h).exists()
+                    || sys_dirs.iter().any(|d| Path::new(d).join(h).exists())
+                {
+                    return false;
+                }
+                // The three directories above are a guess at where a
+                // distro put things, and distros disagree: a box can
+                // carry every CUDA header in /usr/include with no
+                // /usr/local/cuda at all and compile perfectly. Before
+                // refusing to build, ask the compiler that would do the
+                // building, with the same -I it will get. Only reached
+                // for a header already believed missing, so the ordinary
+                // build spawns nothing.
+                !header_reachable(h, &root_include)
             })
             .collect();
         if !missing.is_empty() {

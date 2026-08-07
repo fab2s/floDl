@@ -116,17 +116,72 @@ pub fn missing_headers<'a>(
     root: &Path,
     headers: &'a [(&'a str, &'a str)],
 ) -> Vec<&'a (&'a str, &'a str)> {
+    let root_include = root.join("include");
     headers
         .iter()
         .filter(|(h, _)| {
-            if root.join("include").join(h).exists() {
+            if root_include.join(h).exists() {
                 return false;
             }
-            !SYSTEM_INCLUDE_DIRS
+            if SYSTEM_INCLUDE_DIRS
                 .iter()
                 .any(|d| Path::new(d).join(h).exists())
+            {
+                return false;
+            }
+            // The path scan came up empty, which is exactly when its
+            // three-directory view is worth doubting. Ask the compiler
+            // that will do the build, with the same include dir it will
+            // get, before reporting a gap. Unreachable OR unanswerable
+            // (no compiler) both leave it reported.
+            !matches!(header_reachable(h, &[root_include.as_path()]), Some(true))
         })
         .collect()
+}
+
+/// Whether the C++ compiler can actually resolve `#include <header>`.
+///
+/// The path scan above knows three directories. The compiler knows every
+/// rule the real build obeys — its own defaults, `CPATH`, multiarch
+/// directories, spec files, whatever a distro did — so it is the second
+/// opinion worth having before telling someone to install something they
+/// already have. Pascal is the case in point: its CUDA headers live in
+/// `/usr/include` with no `/usr/local/cuda` at all, and it compiles
+/// `flodl-sys --features cuda` in 12s.
+///
+/// `None` when there is no compiler to ask, which is not the same answer
+/// as "missing" and must not be collapsed into one: a box without a C++
+/// compiler has a different problem, and [`missing_host_tools`] reports
+/// it.
+///
+/// Cost is one preprocessor invocation, ~30ms, and it is paid only for a
+/// header the path scan already failed to find — the happy path spawns
+/// nothing.
+pub fn header_reachable(header: &str, include_dirs: &[&Path]) -> Option<bool> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+    if !system::has_command(&cxx) {
+        return None;
+    }
+    let mut cmd = Command::new(&cxx);
+    for dir in include_dirs {
+        cmd.arg("-I").arg(dir);
+    }
+    // Preprocess only: resolving the include is the whole question, and
+    // -fsyntax-only would drag in a parse we do not need.
+    cmd.args(["-E", "-x", "c++", "-", "-o", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    child
+        .stdin
+        .as_mut()?
+        .write_all(format!("#include <{header}>\n").as_bytes())
+        .ok()?;
+    Some(child.wait().ok()?.success())
 }
 
 /// De-duplicated package list for a set of missing headers, in table
@@ -346,6 +401,42 @@ mod tests {
             assert!(h.contains("curl"), "{h}");
             assert!(h.contains("g++") || h.contains("gcc-c++"), "{h}");
         }
+    }
+
+    #[test]
+    fn the_compiler_answers_for_headers_the_path_scan_cannot_see() {
+        // A header every C++ toolchain resolves, in no directory this
+        // module lists: only the compiler's own view finds it.
+        match header_reachable("cstdio", &[]) {
+            Some(true) => {}
+            Some(false) => panic!("the compiler could not resolve <cstdio>"),
+            // No compiler here: unanswerable is a distinct third state
+            // and must not be read as present.
+            None => {}
+        }
+        // And it says no to something that does not exist, rather than
+        // waving everything through.
+        if header_reachable("cstdio", &[]) == Some(true) {
+            assert_eq!(
+                header_reachable("flodl_no_such_header_42.h", &[]),
+                Some(false),
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_outside_the_toolkit_root_is_not_reported_missing() {
+        // The pascal shape: nothing under the toolkit root, but the
+        // compiler resolves the header anyway (there, CUDA lives in
+        // /usr/include). Reporting that as a gap tells the operator to
+        // install what they already have.
+        let root = scratch_root("reach");
+        let table: &[(&str, &str)] = &[("cstdio", "libstdc++-dev")];
+        let missing = missing_headers(&root, table);
+        if header_reachable("cstdio", &[]) == Some(true) {
+            assert!(missing.is_empty(), "compiler-visible header reported missing");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
