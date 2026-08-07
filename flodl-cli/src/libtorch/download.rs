@@ -141,6 +141,130 @@ impl Default for DownloadOpts {
 // URL construction
 // ---------------------------------------------------------------------------
 
+/// Absolute `libomp` dependencies in one `otool -L` dump.
+///
+/// Pure, so the parse is testable on any host without a Mach-O to hand.
+/// `otool -L` prints the file name on the first line and one indented
+/// dependency per line after it, each followed by version parens; only
+/// the leading path matters. `@rpath/...` and `@loader_path/...` are
+/// already relative and left alone, as is anything that is not libomp:
+/// this rewrites ONE known upstream defect, not every absolute path.
+fn absolute_libomp_refs(otool_output: &str) -> Vec<String> {
+    otool_output
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|p| p.starts_with('/') && p.ends_with("/libomp.dylib"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Point the macOS archive's own dylibs at the `libomp` it ships with.
+///
+/// Upstream's `libtorch-macos-arm64` BUNDLES `lib/libomp.dylib` and then
+/// has `libtorch_cpu.dylib` depend on it by absolute Homebrew path
+/// (`/opt/homebrew/opt/libomp/lib/libomp.dylib`). On a box without that
+/// Homebrew formula the load fails while the library it wants sits in the
+/// same directory as the dylib asking for it, so a scaffolded project
+/// compiles and dies at launch. `brew install libomp` is the wrong answer:
+/// it installs a second, possibly ABI-divergent copy of something already
+/// present.
+///
+/// `@loader_path/libomp.dylib` rather than `@rpath/...` deliberately: the
+/// bundled copy is a sibling of every dylib referencing it, so
+/// `@loader_path` resolves with no dependence on the referrer carrying a
+/// correct `LC_RPATH`.
+///
+/// Advisory, never fatal: libtorch IS installed at this point, and the
+/// docker path does not care about any of this. But the tools are checked
+/// BEFORE anything is modified, because `install_name_tool` invalidates a
+/// Mach-O signature and arm64 refuses to load an unsigned one -- patching
+/// without being able to re-sign would leave the install worse than it
+/// was found.
+fn relink_bundled_libomp(lib_dir: &Path) {
+    // The gate is capability, not `cfg`: `fdl setup` on Apple Silicon
+    // fetches the LINUX archive for a docker project, which has no
+    // dylibs at all and must not be touched.
+    if !lib_dir.join("libomp.dylib").exists() {
+        return;
+    }
+    let dylibs: Vec<PathBuf> = match fs::read_dir(lib_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "dylib"))
+            .collect(),
+        Err(_) => return,
+    };
+
+    let missing: Vec<&str> = ["otool", "install_name_tool", "codesign"]
+        .into_iter()
+        .filter(|t| !crate::util::system::has_command(t))
+        .collect();
+    if !missing.is_empty() {
+        println!(
+            "  note: cannot relink the bundled libomp ({} not found).\n\
+             \x20       Upstream's libtorch_cpu.dylib asks for libomp at an absolute\n\
+             \x20       Homebrew path, so a NATIVE run may fail to start; the docker\n\
+             \x20       path is unaffected. Install the command line tools with\n\
+             \x20       `xcode-select --install` and re-run this download to fix it.",
+            missing.join(", "),
+        );
+        return;
+    }
+
+    let mut patched = 0usize;
+    for f in &dylibs {
+        let out = match std::process::Command::new("otool").arg("-L").arg(f).output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => continue,
+        };
+        let refs = absolute_libomp_refs(&out);
+        if refs.is_empty() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new("install_name_tool");
+        for r in &refs {
+            cmd.arg("-change").arg(r).arg("@loader_path/libomp.dylib");
+        }
+        match cmd.arg(f).output() {
+            Ok(o) if o.status.success() => {}
+            other => {
+                println!(
+                    "  note: install_name_tool failed on {}: {}",
+                    f.display(),
+                    match other {
+                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                );
+                continue;
+            }
+        }
+        // Ad-hoc re-sign, mandatory on arm64: the edit above invalidated
+        // whatever signature the file carried.
+        match std::process::Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(f)
+            .output()
+        {
+            Ok(o) if o.status.success() => patched += 1,
+            other => println!(
+                "  warning: {} was relinked but could NOT be re-signed ({}); \
+                 it may fail to load. Re-run this download after \
+                 `xcode-select --install`.",
+                f.display(),
+                match other {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                    Err(e) => e.to_string(),
+                },
+            ),
+        }
+    }
+    if patched > 0 {
+        println!("  relinked {patched} dylib(s) to the bundled libomp");
+    }
+}
+
 fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String> {
     // `force_linux` short-circuits host detection: the binary is destined
     // for a Linux Docker container, so we always want the Linux x86_64
@@ -528,6 +652,8 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, Str
         ));
     }
 
+    relink_bundled_libomp(&lib_dir);
+
     // Write .arch metadata (always, both project and global)
     let arch_content = format!(
         "cuda={}\ntorch={}\narchs={}\nsource=precompiled\nvariant={}\n",
@@ -798,6 +924,64 @@ mod tests {
         // build` from source is the path there.
         let err = download_url_for(&CPU_SPEC, "linux", "aarch64").unwrap_err();
         assert!(err.contains("Unsupported platform"), "got {err}");
+    }
+
+    /// `otool -L` shape as upstream's arm64 archive actually prints it:
+    /// the file name first, then one indented dependency per line with
+    /// trailing version parens.
+    const OTOOL_LIBTORCH_CPU: &str = "\
+libtorch/lib/libtorch_cpu.dylib:
+\t@rpath/libtorch_cpu.dylib (compatibility version 0.0.0, current version 0.0.0)
+\t/opt/homebrew/opt/libomp/lib/libomp.dylib (compatibility version 5.0.0, current version 5.0.0)
+\t@rpath/libc10.dylib (compatibility version 0.0.0, current version 0.0.0)
+\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 1700.255.0)
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)
+";
+
+    #[test]
+    fn the_absolute_libomp_dependency_is_the_only_one_rewritten() {
+        // Precisely one line qualifies. The self-reference on line 2 and
+        // the two /usr/lib system libraries must NOT be touched: this
+        // fixes one upstream defect, and widening it to "every absolute
+        // path" would repoint libc++ at a sibling that does not exist.
+        assert_eq!(
+            absolute_libomp_refs(OTOOL_LIBTORCH_CPU),
+            vec!["/opt/homebrew/opt/libomp/lib/libomp.dylib".to_string()],
+        );
+    }
+
+    #[test]
+    fn an_already_relative_libomp_is_left_alone() {
+        // Idempotence: the second `fdl libtorch download` over the same
+        // variant must find nothing to do, or it re-signs on every run.
+        let patched = OTOOL_LIBTORCH_CPU.replace(
+            "/opt/homebrew/opt/libomp/lib/libomp.dylib",
+            "@loader_path/libomp.dylib",
+        );
+        assert!(absolute_libomp_refs(&patched).is_empty(), "{patched}");
+        // `@rpath` spelling too, in case upstream fixes it their way.
+        let upstream_fixed =
+            OTOOL_LIBTORCH_CPU.replace("/opt/homebrew/opt/libomp/lib/", "@rpath/");
+        assert!(absolute_libomp_refs(&upstream_fixed).is_empty());
+    }
+
+    #[test]
+    fn a_libomp_at_another_absolute_prefix_still_qualifies() {
+        // The Homebrew prefix is not universal (Intel Macs use
+        // /usr/local, and a custom prefix is legal), so the match is on
+        // the library, not on the directory upstream happened to use.
+        let intel = OTOOL_LIBTORCH_CPU
+            .replace("/opt/homebrew/opt", "/usr/local/opt");
+        assert_eq!(
+            absolute_libomp_refs(&intel),
+            vec!["/usr/local/opt/libomp/lib/libomp.dylib".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_dump_with_no_dependencies_yields_nothing() {
+        assert!(absolute_libomp_refs("").is_empty());
+        assert!(absolute_libomp_refs("libomp.dylib:\n").is_empty());
     }
 
     #[test]
