@@ -1038,11 +1038,14 @@ fn gpu_toolkit_warning(
     // told a RHEL box to run `sudo apt install hip-dev`, which is two
     // kinds of wrong at once.
     let install = crate::util::requirements::install_hint(&packages);
+    // No backticks around the install line: it carries its own trailing
+    // caveat ("or your distribution's equivalent"), and quoting the pair
+    // as one span invites a copy-paste that dnf rejects on the paren.
     Some(format!(
         "active libtorch is `{}` but its toolkit headers are missing under \
          `{root}` ({}). Native builds with `--features {feature}` will fail; \
-         building in the dev container is unaffected. Install them with \
-         `{install}`, or set {root_env} if your install is elsewhere.",
+         building in the dev container is unaffected. Install them with: \
+         {install}. Set {root_env} if your install is elsewhere.",
         variant,
         list.join(", "),
     ))
@@ -1471,13 +1474,22 @@ mod tests {
             crate::util::requirements::ROCM_HEADERS, None, "rocm",
         )
         .expect("absent toolkit must warn");
-        for (header, package) in crate::util::requirements::ROCM_HEADERS {
+        for (header, _) in crate::util::requirements::ROCM_HEADERS {
             assert!(w.contains(header), "missing header {header}: {w}");
-            assert!(w.contains(package), "missing package {package}: {w}");
         }
         assert!(w.contains("precompiled/rocm70"), "{w}");
-        assert!(w.contains("sudo apt install"), "{w}");
         assert!(w.contains("ROCM_PATH"), "{w}");
+        // The install line is whatever THIS platform's is: apt names,
+        // dnf names, brew with a caveat, or a WSL2 pointer that names no
+        // package at all. Asserting one family's spelling is how a green
+        // ubuntu run shipped a warning that failed on rocky, macOS and
+        // windows at once; the spellings themselves are pinned where they
+        // are decided, in `requirements::install_hint`.
+        let packages = crate::util::requirements::packages_for(
+            &crate::util::requirements::ROCM_HEADERS.iter().collect::<Vec<_>>(),
+        );
+        let hint = crate::util::requirements::install_hint(&packages);
+        assert!(w.contains(&hint), "install line not `{hint}`: {w}");
     }
 
     #[test]
@@ -1496,7 +1508,11 @@ mod tests {
         .unwrap();
         assert!(w.contains("dev container is unaffected"), "{w}");
         assert!(w.contains("--features cuda"), "{w}");
-        assert!(w.contains("sudo apt install cuda-toolkit libnccl-dev"), "{w}");
+        let hint = crate::util::requirements::install_hint(&[
+            "cuda-toolkit".to_string(),
+            "libnccl-dev".to_string(),
+        ]);
+        assert!(w.contains(&hint), "metapackage line not `{hint}`: {w}");
         assert!(!w.contains("<M>-<m>"), "placeholders must not reach the user: {w}");
     }
 

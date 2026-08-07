@@ -170,8 +170,12 @@ pub fn header_reachable(header: &str, include_dirs: &[&Path]) -> Option<bool> {
         cmd.arg("-I").arg(dir);
     }
     // Preprocess only: resolving the include is the whole question, and
-    // -fsyntax-only would drag in a parse we do not need.
-    cmd.args(["-E", "-x", "c++", "-", "-o", "/dev/null"])
+    // -fsyntax-only would drag in a parse we do not need. The output goes
+    // nowhere via `Stdio::null()` rather than `-o /dev/null`, which is not
+    // a path on Windows: gcc there tries to create a `\dev\` directory,
+    // fails, and the non-zero exit reads as "header missing" for every
+    // header on the box.
+    cmd.args(["-E", "-x", "c++", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

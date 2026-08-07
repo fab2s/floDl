@@ -266,14 +266,21 @@ mod tests {
         path: PathBuf,
     }
 
+    /// Uniqueness within the process comes from a counter, not from the
+    /// clock. `SystemTime::now` is quantised to whatever tick the platform
+    /// keeps, which `as_nanos` does not tell you, and nine of these tests
+    /// share the `sc` tag and start within the same millisecond: two that
+    /// land on one tick get one directory, and the first to finish deletes
+    /// the other's script out from under a running `sh`. Seen once on the
+    /// macOS runner as an exit-127 `bad.sh: No such file or directory`,
+    /// where the timestamp was the only thing keeping the paths apart.
+    static TEST_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl TestDir {
         fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+            let n = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pid = std::process::id();
-            let path = std::env::temp_dir().join(format!("fdl-test-{tag}-{pid}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("fdl-test-{tag}-{pid}-{n}"));
             fs::create_dir_all(&path).expect("create test dir");
             Self { path }
         }

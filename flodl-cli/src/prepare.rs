@@ -1207,6 +1207,10 @@ mod tests {
             next_probe_id(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // `mut` is used only by the cfg(unix) arm below; on Windows
+        // nothing writes it, and an unused_mut warning there is noise
+        // rather than a finding.
+        #[allow(unused_mut)]
         let mut perms = std::fs::metadata(&dir).unwrap().permissions();
         #[cfg(unix)]
         {
@@ -1215,6 +1219,7 @@ mod tests {
         }
         std::fs::set_permissions(&dir, perms).unwrap();
         assert!(verify_source_root(&dir).is_ok());
+        #[allow(unused_mut)]
         let mut perms = std::fs::metadata(&dir).unwrap().permissions();
         #[cfg(unix)]
         {

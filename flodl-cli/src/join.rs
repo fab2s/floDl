@@ -1450,33 +1450,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn model_sig_probe_parses_the_line_and_absorbs_failures() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir()
-            .join(format!("fdl-sig-probe-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = |name: &str, body: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, body).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-            p
+        // Each case is `/bin/sh -c <body>`, not a script this test writes
+        // and then execs. Writing an executable and running it from a
+        // multithreaded process is a race: a `Command` spawned anywhere
+        // else in the binary during the window where the write fd is open
+        // inherits that fd across the fork, and the exec then fails with
+        // ETXTBSY. Reproduced at about 1 run in 60 -- the probe returned
+        // None and the message said "Text file busy", which reads like a
+        // parsing bug and is not one. /bin/sh is never opened for writing.
+        let sh = PathBuf::from("/bin/sh");
+        let run = |body: String| {
+            model_sig_probe(&sh, None, &["-c".to_string(), body], None)
         };
         let sig = "ab".repeat(32);
-        let good = script(
-            "good.sh",
-            &format!("#!/bin/sh\necho main noise\necho '{MODEL_SIG_LINE}{sig}'\n"),
+        assert_eq!(
+            run(format!("echo main noise; echo '{MODEL_SIG_LINE}{sig}'")),
+            Some(sig),
         );
-        assert_eq!(model_sig_probe(&good, None, &[], None), Some(sig));
-        let quiet = script("quiet.sh", "#!/bin/sh\nexit 0\n");
-        assert_eq!(model_sig_probe(&quiet, None, &[], None), None);
-        let failing = script("failing.sh", "#!/bin/sh\nexit 3\n");
-        assert_eq!(model_sig_probe(&failing, None, &[], None), None);
-        let garbled = script(
-            "garbled.sh",
-            &format!("#!/bin/sh\necho '{MODEL_SIG_LINE}not-hex-at-all'\n"),
+        assert_eq!(run("exit 0".to_string()), None);
+        assert_eq!(run("exit 3".to_string()), None);
+        assert_eq!(
+            run(format!("echo '{MODEL_SIG_LINE}not-hex-at-all'")),
+            None,
         );
-        assert_eq!(model_sig_probe(&garbled, None, &[], None), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// zero-dep on flodl by design, so the shape is asserted literally;

@@ -17,7 +17,10 @@ fn header_reachable(header: &str, root_include: &Path) -> bool {
     let Ok(mut child) = Command::new(&cxx)
         .arg("-I")
         .arg(root_include)
-        .args(["-E", "-x", "c++", "-", "-o", "/dev/null"])
+        // Discarded through `Stdio::null()`, not `-o /dev/null`: that is
+        // not a path everywhere, and where it is not, every header comes
+        // back missing.
+        .args(["-E", "-x", "c++", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

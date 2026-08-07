@@ -541,12 +541,17 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&rsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `sh <script>` rather than the script alone: rsync EXECS what
+        // `-e` names, and exec'ing a file this multithreaded test binary
+        // has just written races any other test's fork (the inherited
+        // write fd makes it ETXTBSY). Reading it as sh's argument cannot.
+        let rsh_cmd = format!("sh {}", rsh.display());
         let fetch = |path: &str, dest: &str| {
             Command::new("rsync")
                 .args([
                     "-a",
                     "-e",
-                    &rsh.display().to_string(),
+                    &rsh_cmd,
                     &format!("fake:{path}/"),
                     &base.join(dest).display().to_string(),
                 ])
