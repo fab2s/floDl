@@ -304,6 +304,38 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
             env.push(("LD_LIBRARY_PATH".into(), composed));
         }
 
+        // macOS: bake the runtime search path into the BINARY, because
+        // neither of the two obvious fixes works here.
+        //
+        // Its loader ignores `LD_LIBRARY_PATH` entirely, so everything
+        // above is inert there and a scaffolded project builds and then
+        // dies with `dyld: Library not loaded: @rpath/libtorch.dylib`.
+        // The apparent fix, exporting `DYLD_LIBRARY_PATH` beside it, does
+        // not survive: run lines execute through `sh -c`, /bin/sh is SIP
+        // restricted, and dyld purges every `DYLD_*` from a restricted
+        // process before the shell ever execs the binary. The other
+        // apparent fix, an rpath from `flodl-sys`'s build script, does not
+        // reach here either -- `cargo:rustc-link-arg` does not propagate
+        // to dependents (the same property that forces the libtorch_cuda
+        // dlopen).
+        //
+        // RUSTFLAGS is neither: SIP has no opinion on it, and it applies
+        // to the final link of whatever cargo is building. The binary
+        // then locates libtorch on its own, which also means it still
+        // runs when launched directly rather than through `fdl run`.
+        //
+        // Fill-when-absent, like LIBTORCH_PATH above: a caller's own
+        // RUSTFLAGS is theirs, and appending to it would silently change
+        // a build they had configured. Linux is deliberately untouched --
+        // LD_LIBRARY_PATH already works there, and setting RUSTFLAGS
+        // would invalidate every existing cargo cache for no gain.
+        if cfg!(target_os = "macos") && std::env::var_os("RUSTFLAGS").is_none() {
+            env.push((
+                "RUSTFLAGS".into(),
+                format!("-C link-arg=-Wl,-rpath,{lib}"),
+            ));
+        }
+
         // The cargo feature this variant needs, so a `run:` line can say
         // `--features "$FDL_GPU_FEATURE"` instead of hardcoding a vendor.
         // Run lines execute under `bash -c` / `sh -c`, so the expansion

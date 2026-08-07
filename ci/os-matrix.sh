@@ -636,17 +636,25 @@ FDL_ABS="$PWD/$FDL"
 SCAF_ROOT=$(mktemp -d)
 SCAF="$SCAF_ROOT/fdl-ci-scaffold"
 SCAF_OK=1
-(cd "$SCAF_ROOT" && "$FDL_ABS" init fdl-ci-scaffold --native < /dev/null) || SCAF_OK=0
+# Which step failed, so the advisory can name the real cause. It said
+# "flodl has never compiled on this host" for every failure, which was
+# read off the macOS log as a compile gap while `PASS: built and linted
+# flodl` sat 70 lines above it -- the binary compiles there and does not
+# LOAD. An advisory naming the wrong cause is worse than one saying it
+# does not know.
+SCAF_STEP=""
+(cd "$SCAF_ROOT" && "$FDL_ABS" init fdl-ci-scaffold --native < /dev/null) \
+    || { SCAF_OK=0; SCAF_STEP="fdl init"; }
 
 if [ "$SCAF_OK" = 1 ]; then
     if grep -Eq '^flodl = "[0-9]' "$SCAF/Cargo.toml"; then
         pass "scaffold dependency is a registry pin: $(grep '^flodl' "$SCAF/Cargo.toml")"
     else
-        SCAF_OK=0
+        SCAF_OK=0; SCAF_STEP="registry-pin check"
         echo "dep line is not a registry pin: $(grep '^flodl' "$SCAF/Cargo.toml" || echo '<missing>')"
     fi
     if grep -q 'git *=' "$SCAF/Cargo.toml"; then
-        SCAF_OK=0; echo "scaffold fell back to a git dependency"
+        SCAF_OK=0; SCAF_STEP="registry-pin check"; echo "scaffold fell back to a git dependency"
     fi
 fi
 
@@ -654,7 +662,7 @@ if [ "$SCAF_OK" = 1 ]; then
     # sed -i.bak: the one -i spelling GNU and BSD sed agree on.
     sed -i.bak 's|^flodl = ".*"$|flodl = { path = "'"$PWD"'/flodl" }|' "$SCAF/Cargo.toml"
     ln -s "$PWD/libtorch" "$SCAF/libtorch"
-    (cd "$SCAF" && scrubbed "$FDL_ABS" build) || SCAF_OK=0
+    (cd "$SCAF" && scrubbed "$FDL_ABS" build) || { SCAF_OK=0; SCAF_STEP="fdl build"; }
 fi
 # A variant whose baseline C library is newer than this distribution's
 # will build and link and then refuse to start. That is a real platform
@@ -666,16 +674,16 @@ if [ "$SCAF_OK" = 1 ] && [ "$UNMET" != 0 ]; then
     note "$HOST: the active libtorch cannot load here (older C library than the archive wants) — fdl reported it, so the run step is skipped rather than asserting the impossible"
     "$FDL_ABS" probe --skip-mount 2>&1 | grep -A 2 "cannot load on this host" | sed 's/^/    /'
 elif [ "$SCAF_OK" = 1 ]; then
-    (cd "$SCAF" && scrubbed "$FDL_ABS" run) || SCAF_OK=0
+    (cd "$SCAF" && scrubbed "$FDL_ABS" run) || { SCAF_OK=0; SCAF_STEP="fdl run (it BUILT; this is a load/runtime failure)"; }
 fi
 rm -rf "$SCAF_ROOT"
 
 if [ "$SCAF_OK" = 1 ]; then
     pass "$HOST scaffolded, built and trained a native project"
 elif [ "$COMPILE_ADVISORY" = 1 ]; then
-    soft "$HOST: scaffold smoke failed (flodl has never compiled on this host)"
+    soft "$HOST: scaffold smoke failed at ${SCAF_STEP:-an unrecorded step}; this host is advisory until it is green"
 else
-    fail "$HOST: scaffold smoke (init -> build -> run)"
+    fail "$HOST: scaffold smoke failed at ${SCAF_STEP:-an unrecorded step} (init -> build -> run)"
 fi
 endgroup
 fi
