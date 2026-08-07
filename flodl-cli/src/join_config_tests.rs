@@ -528,3 +528,47 @@ fn an_authorized_keys_path_under_etc_ssh_is_refused() {
     assert!(err.contains("system sshd configuration"), "got: {err}");
     assert!(err.contains("by hand"), "names the way out: {err}");
 }
+
+// ── Generated sshd drop-in ──────────────────────────────────────────────
+
+/// `ForceCommand` belongs only to the tunnel-only door. Doors a and b
+/// carry their command in the key line, and a daemon-level forced
+/// command would override it — the tunnel would keep working while the
+/// mount or the source pull failed, which is the confusing half-failure.
+#[test]
+fn the_drop_in_forces_a_command_only_for_the_tunnel_only_door() {
+    let deb = crate::util::platform::Platform::Debian;
+    let nologin = render_sshd_conf("f", Door::Nologin, 2022, deb);
+    assert!(nologin.contains("ForceCommand /usr/sbin/nologin"), "{nologin}");
+    for door in [Door::A, Door::B] {
+        let conf = render_sshd_conf("f", door, 2022, deb);
+        assert!(!conf.contains("ForceCommand"), "{door:?} must not force one:\n{conf}");
+    }
+}
+
+/// The guardrail is bound to the exposed port, not to a user: that is
+/// what leaves ordinary logins on 22 alone while confining every key
+/// that arrives on the door, including ones added later.
+#[test]
+fn the_drop_in_scopes_the_guardrail_to_the_port() {
+    let conf = render_sshd_conf("f", Door::Nologin, 2022, crate::util::platform::Platform::Debian);
+    assert!(conf.contains("Match LocalPort 2022"), "{conf}");
+    assert!(conf.contains("PermitOpen 127.0.0.1:1337"), "{conf}");
+    // 22 must still be served, or the operator locks themselves out of
+    // the box the moment the drop-in lands.
+    assert!(conf.contains("\nPort 22\n"), "{conf}");
+    assert!(!conf.contains("Match User"), "user-scoped defeats the purpose: {conf}");
+}
+
+/// Each family's trap is named in the file it would bite.
+#[test]
+fn the_drop_in_names_the_per_platform_trap() {
+    use crate::util::platform::Platform;
+    let deb = render_sshd_conf("f", Door::Nologin, 2022, Platform::Debian);
+    assert!(deb.contains("ssh.socket"), "Debian must warn about socket activation: {deb}");
+    let rhel = render_sshd_conf("f", Door::Nologin, 2022, Platform::Rhel);
+    assert!(rhel.contains("SELinux"), "RHEL must warn about the port label: {rhel}");
+    // On the default port neither trap applies, so neither is mentioned.
+    let plain = render_sshd_conf("f", Door::Nologin, 22, Platform::Debian);
+    assert!(!plain.contains("ssh.socket"), "{plain}");
+}

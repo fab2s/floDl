@@ -217,29 +217,6 @@ pub fn rpm_name(deb: &str) -> String {
     }
 }
 
-/// Whether an os-release body describes a RHEL-family system (RHEL,
-/// Rocky, Alma, CentOS, Fedora): `ID` or any `ID_LIKE` token matches.
-/// Pure so the parse is testable; [`rhel_family`] supplies the file.
-fn is_rhel_family(os_release: &str) -> bool {
-    const FAMILY: &[&str] = &["rhel", "fedora", "centos"];
-    os_release
-        .lines()
-        .filter_map(|l| {
-            l.strip_prefix("ID=")
-                .or_else(|| l.strip_prefix("ID_LIKE="))
-        })
-        .flat_map(|v| v.trim_matches('"').split_whitespace())
-        .any(|token| FAMILY.contains(&token) || token == "rocky" || token == "almalinux")
-}
-
-/// Whether this host is RHEL-family, from `/etc/os-release`. Absent or
-/// unreadable (macOS, containers stripped bare) means no.
-fn rhel_family() -> bool {
-    std::fs::read_to_string("/etc/os-release")
-        .map(|c| is_rhel_family(&c))
-        .unwrap_or(false)
-}
-
 /// The install line for a package list, contextual to the platform.
 ///
 /// Debian and RHEL-family are spelled out because those are the
@@ -259,7 +236,9 @@ pub fn install_hint(packages: &[String]) -> String {
         "no native Windows build is supported; use WSL2 \
          (https://flodl.dev/guide/windows-wsl)"
             .to_string()
-    } else if rhel_family() {
+    } else if crate::util::platform::Platform::detect()
+        == crate::util::platform::Platform::Rhel
+    {
         let list = packages.iter().map(|p| rpm_name(p)).collect::<Vec<_>>();
         format!(
             "sudo dnf install {}   (or your distribution's equivalent)",
@@ -391,14 +370,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rhel_family_detection_reads_id_and_id_like() {
-        let rocky = "NAME=\"Rocky Linux\"\nID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n";
-        let fedora = "ID=fedora\n";
-        let ubuntu = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n";
-        assert!(is_rhel_family(rocky));
-        assert!(is_rhel_family(fedora));
-        assert!(!is_rhel_family(ubuntu));
-        assert!(!is_rhel_family(""));
-    }
 }

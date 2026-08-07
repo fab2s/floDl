@@ -493,6 +493,35 @@ never edited: the dedicated-user hardening stays in the notes. After
 installing, the wizard checks something is listening where workers will
 dial and says so if not (on macOS: Remote Login).
 
+The wizard guides the setup, not just the artifacts. Before writing
+anything it reports what THIS box is still missing for the chosen door:
+an ssh daemon, something listening on the door port, `rrsync` for door
+`b` or an sftp server for door `a`, the served directory, plus the two
+traps that produce no useful error on their own (Debian hands the ssh
+listener to `ssh.socket`, and while it holds it the `Port` directive is
+ignored outright; SELinux refuses a non-standard ssh port with a message
+that never mentions SELinux). Each gap is reported with the fix in this
+platform's own spelling — apt, dnf or brew; `ssh.service` or
+`sshd.service`; ufw or firewalld; `semanage` where it applies.
+
+It then writes a ready-to-install `sshd_config.d` drop-in into the farm
+directory and prints the setup as numbered steps whose commands read
+those files rather than repeating their contents, so what you paste is a
+copy of something you can review first. The last of the controller-side
+steps is a door self-test specific to the door: every door must refuse a
+shell and permit the forward, and only `b` must additionally list the
+served tree, only `a` must open sftp.
+
+The drop-in scopes its guardrail with `Match LocalPort`, not `Match
+User`. Binding it to the exposed port confines every key that arrives
+there, including ones added later, while leaving port 22 and your own
+logins untouched — which also means the wizard can install its line into
+your own `~/.ssh/authorized_keys` unaided, where a dedicated no-shell
+account would have needed root. `ForceCommand` appears only for the
+tunnel-only door: doors `a` and `b` carry their command in the key line,
+and a daemon-level forced command would override it, leaving the tunnel
+working while the mount or the source pull failed.
+
 `--authorized-keys <path>` names a different door for the setups the
 default cannot reach at all: an sshd in a container, whose key file is
 a bind mount (writable only from the host, while the in-container run

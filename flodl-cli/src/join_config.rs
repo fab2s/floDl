@@ -26,7 +26,9 @@ use std::process::Command;
 use crate::builtins::JoinConfigArgs;
 use crate::context::home_dir;
 use crate::style;
+use crate::util::platform;
 use crate::util::prompt;
+use crate::util::system;
 
 /// Key file basename inside `<farm>/keys/`.
 const KEY_NAME: &str = "flodl-join";
@@ -120,6 +122,11 @@ struct Report {
     controller: Endpoint,
     install: InstallAction,
     cloud_init_path: Option<PathBuf>,
+    /// What this box still needs for the chosen door to work.
+    checks: Vec<Check>,
+    /// The ready-to-install sshd drop-in written into the farm dir.
+    sshd_conf_path: PathBuf,
+    plat: platform::Platform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +314,20 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     fs::write(&notes_path, notes)
         .map_err(|e| format!("cannot write {}: {e}", notes_path.display()))?;
 
+    // ── The sshd drop-in ────────────────────────────────────────────────
+    // Written as a FILE rather than printed, so the install step is a
+    // copy of something reviewable rather than a heredoc pasted blind.
+    let plat = platform::Platform::detect();
+    let sshd_conf_path = farm_dir.join(format!("sshd-{label}.conf"));
+    fs::write(
+        &sshd_conf_path,
+        render_sshd_conf(&label, door, controller.port, plat),
+    )
+    .map_err(|e| format!("cannot write {}: {e}", sshd_conf_path.display()))?;
+
+    // ── Preflight ───────────────────────────────────────────────────────
+    let checks = preflight(door, controller.port, &served_abs, plat);
+
     // ── The install offer ───────────────────────────────────────────────
     let install = install_authorized_line(cli, &authorized_line, controller.port)?;
 
@@ -346,6 +367,9 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
         controller,
         install,
         cloud_init_path,
+        checks,
+        sshd_conf_path,
+        plat,
     })
 }
 
@@ -486,6 +510,129 @@ fn render_cloud_init(
         key = indent(private_key),
         yml = indent(worker_yml),
     )
+}
+
+// ── Preflight ───────────────────────────────────────────────────────────
+
+/// One thing this setup needs, whether the box has it, and the command
+/// that supplies it here.
+#[derive(Debug, Clone)]
+struct Check {
+    what: String,
+    ok: bool,
+    /// Platform-translated fix, absent when there is nothing to run
+    /// (either it is already satisfied, or no command would be honest).
+    fix: Option<String>,
+}
+
+/// What the chosen door needs before any of this works, checked before
+/// the artifacts are written.
+///
+/// The wizard used to compose a beautiful setup for a machine it never
+/// asked a single question of, so its gaps surfaced one at a time and in
+/// the worst order: after credentials were minted, after a publish, and
+/// sometimes only after a worker had already dialed. Every gap below was
+/// hit for real on this rig.
+fn preflight(door: Door, port: u16, served: &Path, plat: platform::Platform) -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    // The daemon itself. On macOS it ships and is toggled, not installed.
+    let have_sshd = system::has_command("sshd")
+        || Path::new("/usr/sbin/sshd").exists()
+        || Path::new("/usr/libexec/sshd-keygen-wrapper").exists();
+    checks.push(Check {
+        what: "an ssh daemon on this box".into(),
+        ok: have_sshd,
+        fix: (!have_sshd)
+            .then(|| plat.sshd_package().and_then(|pkg| plat.install(&[pkg])))
+            .flatten(),
+    });
+
+    // Something answering where workers will knock. This is the check
+    // that catches the socket-activation trap below in its effect.
+    // Debian hands the ssh listener to a socket unit, and while it holds
+    // it the `Port` directive in sshd_config is IGNORED outright, so a
+    // correct drop-in looks like it did nothing at all. That is the same
+    // gap as "nothing is listening", so it is the same check with the
+    // cause named rather than a second one repeating the fix.
+    let listening = sshd_listening(port);
+    let socket_owns =
+        plat == platform::Platform::Debian && port != 22 && socket_activated();
+    checks.push(Check {
+        what: if socket_owns {
+            format!(
+                "something listening on port {port} — ssh.socket owns the \
+                 listener, so sshd_config's `Port` is ignored until it is \
+                 handed back"
+            )
+        } else {
+            format!("something listening on port {port}")
+        },
+        ok: listening && !socket_owns,
+        fix: (!listening || socket_owns)
+            .then(|| plat.enable_sshd().join(" && "))
+            .filter(|s| !s.is_empty()),
+    });
+
+    // SELinux refuses a non-standard ssh port with an error that never
+    // says SELinux.
+    if let Some(fix) = plat.allow_ssh_port(port) {
+        checks.push(Check {
+            what: format!("SELinux permits sshd on port {port}"),
+            ok: false,
+            fix: Some(fix),
+        });
+    }
+
+    // The door's own tool runs on THIS side, as the forced command.
+    match door {
+        Door::B => {
+            let have = system::has_command("rrsync");
+            checks.push(Check {
+                what: "`rrsync` (door b runs it as the forced command)".into(),
+                ok: have,
+                // Not simply "install rsync": RHEL ships rrsync as
+                // non-executable documentation, so there the fix has to
+                // place it too (see Platform::rrsync_fix).
+                fix: (!have).then(|| plat.rrsync_fix()).flatten(),
+            });
+            let served_ok = served.is_dir();
+            checks.push(Check {
+                what: format!("the served directory {} exists", served.display()),
+                ok: served_ok,
+                fix: (!served_ok).then(|| {
+                    "fdl publish <source> --bin <artifact>   # creates and fills it".to_string()
+                }),
+            });
+        }
+        Door::A => {
+            let have = ["/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server",
+                        "/usr/libexec/sftp-server"]
+                .iter()
+                .any(|p| Path::new(p).exists());
+            checks.push(Check {
+                what: "an sftp server (door a serves the data mount over it)".into(),
+                ok: have,
+                fix: (!have).then(|| plat.sshd_package().and_then(|p| plat.install(&[p]))).flatten(),
+            });
+        }
+        Door::Nologin => {}
+    }
+
+    checks
+}
+
+/// Whether systemd's ssh socket unit currently owns the listener.
+/// Linux-only and best-effort: a missing systemctl answers "no".
+fn socket_activated() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    std::process::Command::new("systemctl")
+        .args(["is-active", "ssh.socket"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false)
 }
 
 // ── authorized_keys install ─────────────────────────────────────────────
@@ -1149,6 +1296,71 @@ fn authorized_keys_line(
     )
 }
 
+/// The ready-to-install sshd drop-in for this farm's door.
+///
+/// A file rather than a printed block: the install step then copies
+/// something the operator can read first, and re-running the wizard
+/// updates it in place instead of asking anyone to re-paste.
+///
+/// The guardrail is scoped to the PORT, not to a user. Scoping it to a
+/// user means either a dedicated no-shell account (whose authorized_keys
+/// only root can write, so the wizard cannot install its own line) or
+/// crippling the operator's own logins. Binding it to the exposed port
+/// restricts every key that arrives there, including ones added later,
+/// and leaves port 22 alone.
+fn render_sshd_conf(label: &str, door: Door, port: u16, plat: platform::Platform) -> String {
+    let door_note = match door {
+        Door::Nologin => "tunnel only",
+        Door::A => "tunnel + read-only sftp data mount (the key carries the command)",
+        Door::B => "tunnel + rrsync source pull (the key carries the command)",
+    };
+    let mut l: Vec<String> = vec![
+        format!("# floDl join door for farm `{label}` — generated by `fdl join-config`."),
+        format!("# Door: {door_note}."),
+        "#".into(),
+        format!(
+            "# Port {port} is the join door and the only one to expose; 22 stays"
+        ),
+        "# for ordinary logins and should NOT be forwarded from a router.".into(),
+    ];
+    if plat == platform::Platform::Debian && port != 22 {
+        l.push("#".into());
+        l.push("# NOTE: while ssh.socket owns the listener, the Port line below is".into());
+        l.push("# IGNORED. The install step disables it and enables ssh.service.".into());
+    }
+    if plat == platform::Platform::Rhel && port != 22 {
+        l.push("#".into());
+        l.push("# NOTE: SELinux must be told this port is for ssh, or the daemon".into());
+        l.push("# fails to bind with an error that never mentions SELinux.".into());
+    }
+    l.push(String::new());
+    l.push("Port 22".into());
+    l.push(format!("Port {port}"));
+    l.push("PermitRootLogin no".into());
+    l.push("PasswordAuthentication no".into());
+    l.push("KbdInteractiveAuthentication no".into());
+    l.push("PubkeyAuthentication yes".into());
+    l.push(String::new());
+    l.push("# The daemon half of the guardrail, bound to the exposed port so".into());
+    l.push("# ordinary logins on 22 are untouched and ANY key arriving here is".into());
+    l.push("# confined to the controller mux forward.".into());
+    l.push(format!("Match LocalPort {port}"));
+    l.push("    AllowTcpForwarding local".into());
+    l.push("    PermitOpen 127.0.0.1:1337".into());
+    // ForceCommand belongs ONLY to the tunnel-only door. Doors a and b
+    // carry their command in the key line, and a daemon-level forced
+    // command would override it: the tunnel would keep working while the
+    // mount or the source pull failed, which is the confusing half.
+    if door == Door::Nologin {
+        l.push("    ForceCommand /usr/sbin/nologin".into());
+    }
+    l.push("    PermitTTY no".into());
+    l.push("    X11Forwarding no".into());
+    l.push("    AllowAgentForwarding no".into());
+    l.push(String::new());
+    l.join("\n")
+}
+
 fn sshd_match_block(user: &str) -> String {
     format!(
         "Match User {user}\n    \
@@ -1634,15 +1846,145 @@ impl Report {
             push(&mut out, &format!("  freshness: {f}"));
         }
         push(&mut out, "");
+        for line in self.steps() {
+            push(&mut out, &line);
+        }
+        push(&mut out, "");
         push(
             &mut out,
             &style::dim(&format!(
-                "  Install steps + hardening: {}. The private key is the \
+                "  Rationale + hardening notes: {}. The private key is the \
                  worker-bound secret; it never prints here.",
                 self.notes_path.display(),
             )),
         );
         push(&mut out, "");
+        out
+    }
+
+    /// The setup as an ordered list of things to run, each command
+    /// reading an artifact the wizard just wrote rather than repeating
+    /// its content inline. A first-timer should be able to work down
+    /// this list without reading anything else.
+    fn steps(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut n = 0;
+        let mut step = |out: &mut Vec<String>, title: &str, cmds: &[String]| {
+            n += 1;
+            out.push(format!("  {n}. {title}"));
+            for c in cmds {
+                out.push(format!("       {c}"));
+            }
+            out.push(String::new());
+        };
+
+        out.push(format!(
+            "  ── setup, in order ({}) ──",
+            self.plat.name()
+        ));
+        out.push(String::new());
+
+        // Anything preflight found missing comes first: the later steps
+        // silently do nothing useful without it.
+        let gaps: Vec<&Check> = self.checks.iter().filter(|c| !c.ok).collect();
+        if !gaps.is_empty() {
+            let mut cmds: Vec<String> = Vec::new();
+            for c in &gaps {
+                cmds.push(format!("# {}", c.what));
+                match &c.fix {
+                    Some(f) => cmds.push(f.clone()),
+                    None => cmds.push("#   (no command for this one here)".to_string()),
+                }
+            }
+            step(&mut out, "this box is missing what the door needs:", &cmds);
+        }
+
+        step(
+            &mut out,
+            "install the sshd drop-in (read it first — it is yours to edit):",
+            &{
+                let mut c = vec![format!(
+                    "sudo install -m 644 {} /etc/ssh/sshd_config.d/flodl-{}.conf",
+                    self.sshd_conf_path.display(),
+                    self.label,
+                )];
+                c.extend(self.plat.enable_sshd());
+                c.push("sudo sshd -t && echo 'sshd config OK'".to_string());
+                if let Some(fw) = self.plat.open_port(self.controller.port) {
+                    c.push(fw);
+                }
+                c
+            },
+        );
+
+        if !matches!(self.install, InstallAction::Installed | InstallAction::Replaced | InstallAction::AlreadyPresent) {
+            step(
+                &mut out,
+                "authorize the join key (the wizard can do this for you):",
+                &[format!("fdl join-config {} --install-key", self.label)],
+            );
+        }
+
+        // Proving the door BEFORE handing keys to workers is what turns a
+        // silent misconfiguration into a two-command answer: under every
+        // door a command must be refused while the forward is allowed,
+        // and port 22 must still behave normally.
+        // Proving the door BEFORE handing keys to workers turns a silent
+        // misconfiguration into a two-command answer. Every door must
+        // refuse a shell and permit the forward; what else it allows is
+        // the door's whole definition, so each gets its own positive
+        // test rather than a generic one that would pass on the wrong
+        // door.
+        let key = self.key_path.display().to_string();
+        let (p, u, h) = (self.controller.port, &self.controller.user, &self.controller.host);
+        let mut verify = vec![format!(
+            "ssh -i {key} -p {p} {u}@{h} true                 # must NOT give a shell"
+        )];
+        match self.door {
+            Door::B => verify.push(format!(
+                "rsync --list-only -e 'ssh -i {key} -p {p}' {u}@{h}:/tree/   # must LIST the served tree"
+            )),
+            Door::A => verify.push(format!(
+                "sftp -i {key} -P {p} {u}@{h}                     # must OPEN (read-only)"
+            )),
+            Door::Nologin => {}
+        }
+        verify.push(format!(
+            "ssh -i {key} -p {p} {u}@{h} -N -L 19337:127.0.0.1:1337   # must CONNECT"
+        ));
+        verify.push(format!(
+            "sudo sshd -T -C user={u},host=x,addr=127.0.0.1,laddr=127.0.0.1,lport={p} \
+             | grep -E 'permitopen|forcecommand'"
+        ));
+        step(&mut out, "prove the door does exactly one thing:", &verify);
+
+        step(
+            &mut out,
+            "land the worker's config and key on each box:",
+            &[
+                format!(
+                    "scp {} <worker>:{}",
+                    self.key_path.display(),
+                    WORKER_KEY_PATH,
+                ),
+                format!("ssh <worker> 'chmod 600 {WORKER_KEY_PATH}'"),
+                format!(
+                    "scp {} <worker>:<project>/fdl.yml",
+                    self.worker_yml_path.display(),
+                ),
+            ],
+        );
+
+        step(
+            &mut out,
+            "open the window here, then let the boxes dial in:",
+            &[
+                format!("fdl @{} <your-run-command>      # holds a join window", self.label),
+                "ssh <worker> 'cd <project> && fdl join'".to_string(),
+                format!("fdl @{} status                  # then: fdl @{} start", self.label, self.label),
+            ],
+        );
+
         out
     }
 
@@ -1675,6 +2017,14 @@ impl Report {
                 Door::Nologin => "nologin",
             },
             "authorized_keys_line": self.authorized_line,
+            "platform": self.plat.name(),
+            "sshd_conf_path": self.sshd_conf_path.display().to_string(),
+            "preflight": self.checks.iter().map(|c| serde_json::json!({
+                "what": c.what,
+                "ok": c.ok,
+                "fix": c.fix,
+            })).collect::<Vec<_>>(),
+            "steps": self.steps(),
             "sshd_match_block": self.match_block,
             "controller": format!(
                 "{}@{}:{}",

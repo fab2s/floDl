@@ -28,6 +28,17 @@
 # Local use:  bash ci/rig-ladder.sh [rung ...]     (default: all)
 # Env:        FDL_RIG_MODE=nccl-sync|cpu-async     averaging backend
 #             FDL_RIG_EPOCHS=1
+#             FDL_RIG_FARM=<label>                 farm overlay for rung 4
+#             FDL_RIG_WALKINS=<cmd>\n<cmd>...      one dial-in per box
+#
+# Rung 4 example, this box as controller for a container-local GPU and a
+# remote VM (quorum lives in the overlay's min_rank_start, in RANKS):
+#
+#   export FDL_RIG_WALKINS="docker exec -w /workspace rdl-cuda-rank-1 fdl join 127.0.0.1:1337 --token \$TOK --host exa-cuda --devices 0 --bin <cu128-bin> -- <args>
+#   ssh flodl-pascal 'cd /mnt/rdl && FDL_LIBTORCH_CASE=pascal fdl join 127.0.0.1:1337 --ssh ubuntu@<host>:2222 --identity <key> --token \$TOK --bin <sm61-bin> -- <args>'"
+#
+# A box on the controller's own host needs no door at all: the mux is
+# loopback-bound and a host-network container reaches it directly.
 #
 # Not a CI job: it needs a rig. Overlays (`fdl.cluster*.yml`) are
 # user-local, so a missing one is a SKIP, not a failure.
@@ -110,39 +121,44 @@ rung_3() {
     verify "rung 3 (heterogeneous, mode=$MODE)" "$?" "$log"
 }
 
-# --- rung 4: walk-in through a guardrailed door -----------------------
-# The cloud shape: controller here, worker dials in. Three processes and
-# an operator gesture, so it is scripted rather than a single command --
-# the controller holds a join window in the background, the worker walks
-# in, and `fdl start` fires the topology freeze once quorum is met.
+# --- rung 4: walk-in cohort, this box as controller --------------------
+# The cloud shape: the controller runs HERE and every rank box dials in.
+# Several processes and an operator gesture, so it is scripted rather
+# than a single command -- the controller holds a join window in the
+# background, each box walks in, and `fdl start` fires the topology
+# freeze once quorum is met.
 #
-# Needs, and SKIPS loudly without: a farm overlay, a reachable worker,
-# and a door whose authorized_keys already carries the farm's guardrailed
-# line (`fdl join-config` composes it; installing it into a CONTAINER's
-# key file is manual, since the installer only writes the invoking
-# user's own ~/.ssh/authorized_keys).
+# `FDL_RIG_WALKINS` is a newline-separated list of shell commands, one
+# per box, each run FROM HERE. That is deliberately untyped: a remote
+# box needs `ssh <host> '...'` and a local container needs `docker exec
+# ... fdl join ...`, and inventing a runner taxonomy to cover both would
+# buy nothing over letting the caller write the command.
+#
+# Quorum is the farm overlay's `min_rank_start`, so it decides how many
+# of these must land before `fdl start` fires. Set it to the cohort's
+# rank count, not its box count: a 2-GPU walk-in brings two.
+#
+# Needs, and SKIPS loudly without: a farm overlay and that list. Boxes
+# dialing through a door also need its authorized_keys to carry the
+# farm's guardrailed line -- `fdl join-config` composes it and, with
+# `--authorized-keys`, installs it into a door the default cannot reach.
 rung_4() {
-    echo; echo "===== rung 4: walk-in through the guardrailed door ====="
+    echo; echo "===== rung 4: walk-in cohort, controller here ====="
     local farm="${FDL_RIG_FARM:-rig}"
-    local worker="${FDL_RIG_WORKER:-}"
     if ! have_overlay "$farm"; then
         skipped "rung 4: no fdl.$farm.yml (run: fdl join-config $farm)"
         return
     fi
-    if [ -z "$worker" ]; then
-        skipped "rung 4: set FDL_RIG_WORKER=<ssh-host> to name the walk-in box"
+    if [ -z "${FDL_RIG_WALKINS:-}" ]; then
+        skipped "rung 4: set FDL_RIG_WALKINS to one dial-in command per box (newline-separated)"
         return
     fi
-    if [ -z "${FDL_RIG_WALKIN_CMD:-}" ]; then
-        skipped "rung 4: set FDL_RIG_WALKIN_CMD to the walk-in box's own fdl join line"
-        return
-    fi
-    local clog="$LOGDIR/rung4-controller.log" wlog="$LOGDIR/rung4-walkin.log"
+    local clog="$LOGDIR/rung4-controller.log"
 
     "$FDL" "@$farm" ddp-bench --model mlp --mode cpu-async \
         --epochs "$EPOCHS" --batch-size 256 > "$clog" 2>&1 &
     local cpid=$!
-    # The window has to be open before the worker dials, or the dial is
+    # The window has to be open before anyone dials, or the dial is
     # refused and the rung fails for a reason that is not the one under
     # test.
     local waited=0
@@ -156,31 +172,45 @@ rung_4() {
         fi
     done
 
-    ssh "$worker" "$FDL_RIG_WALKIN_CMD" > "$wlog" 2>&1 &
-    local wpid=$!
+    local pids="" logs="" n=0
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        n=$((n+1))
+        local wlog="$LOGDIR/rung4-walkin-$n.log"
+        sh -c "$cmd" > "$wlog" 2>&1 &
+        pids="$pids $!"
+        logs="$logs $wlog"
+    done <<EOF
+$FDL_RIG_WALKINS
+EOF
+    echo "rung 4: $n box(es) dialing in"
 
     waited=0
     until "$FDL" "@$farm" status 2>/dev/null | grep -q "roster startable"; do
         sleep 3; waited=$((waited+3))
         if [ "$waited" -ge 300 ]; then
-            failed "rung 4: quorum never reached"
-            tail -15 "$wlog" | sed 's/^/    /'
-            kill "$cpid" "$wpid" 2>/dev/null; wait 2>/dev/null
+            failed "rung 4: quorum never reached (overlay min_rank_start counts RANKS)"
+            "$FDL" "@$farm" status 2>&1 | sed 's/^/    /' | tail -8
+            # shellcheck disable=SC2086
+            kill "$cpid" $pids 2>/dev/null; wait 2>/dev/null
             return 1
         fi
     done
     "$FDL" "@$farm" start >> "$clog" 2>&1
 
     wait "$cpid"; local crc=$?
-    wait "$wpid" 2>/dev/null
-    # The worker's own exit matters as much as the controller's: an agent
-    # that died still lets the controller finish with the ranks it had.
-    if ! grep -aq "finished cleanly" "$wlog"; then
-        failed "rung 4: the walk-in agent did not finish cleanly"
-        tail -15 "$wlog" | sed 's/^/    /'
-        return 1
-    fi
-    verify "rung 4 (walk-in, farm=$farm, worker=$worker)" "$crc" "$clog"
+    # shellcheck disable=SC2086
+    wait $pids 2>/dev/null
+    # Each agent's own exit matters as much as the controller's: one that
+    # died still lets the controller finish with the ranks it had.
+    for wlog in $logs; do
+        if ! grep -aq "finished cleanly" "$wlog"; then
+            failed "rung 4: a walk-in agent did not finish cleanly ($wlog)"
+            tail -12 "$wlog" | sed 's/^/    /'
+            return 1
+        fi
+    done
+    verify "rung 4 (walk-in cohort of $n, farm=$farm)" "$crc" "$clog"
 }
 
 # --- dispatch ---------------------------------------------------------

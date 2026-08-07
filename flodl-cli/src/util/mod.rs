@@ -4,6 +4,7 @@ pub mod docker;
 pub mod fdl_yml;
 pub mod http;
 pub mod install_prompt;
+pub mod platform;
 pub mod prompt;
 pub mod requirements;
 pub mod shell;
