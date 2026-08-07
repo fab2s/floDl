@@ -840,6 +840,10 @@ fn probe_recipe_digest(bin: &Path, args: &[String]) -> Option<u64> {
     Some(h.finish())
 }
 
+/// How many trailing stdout lines the probe keeps as evidence when no
+/// signature appears.
+const PROBE_TAIL_LINES: usize = 8;
+
 /// Probe-run marker env (flodl's launcher contract: with it set,
 /// `Trainer::run` builds the model on CPU, prints the signature line
 /// and exits — before auto-promote, before any cluster role).
@@ -900,13 +904,21 @@ fn model_sig_probe(
     let reader = std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
         let mut sig = None;
+        // Last few lines kept as evidence: when no signature turns up,
+        // what the binary actually said beats anything we could infer
+        // about why. Bounded so a chatty binary cannot grow this.
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             if let Some(rest) = line.strip_prefix(MODEL_SIG_LINE) {
                 sig = Some(rest.trim().to_string());
             }
+            if tail.len() == PROBE_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
         }
-        sig
+        (sig, tail)
     });
     let deadline = Instant::now() + MODEL_SIG_PROBE_TIMEOUT;
     let status = loop {
@@ -925,11 +937,8 @@ fn model_sig_probe(
             }
         }
     };
-    let sig = reader
-        .join()
-        .ok()
-        .flatten()
-        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    let (sig, tail) = reader.join().unwrap_or_default();
+    let sig = sig.filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
     match (&status, &sig) {
         (Some(st), Some(_)) if st.success() => sig,
         (None, _) => {
@@ -958,11 +967,27 @@ fn model_sig_probe(
             None
         }
         _ => {
+            // Exit 0 and no signature has two very different causes: a
+            // binary older than the probe contract, or one that failed
+            // before reaching `Trainer::run` while still exiting 0.
+            // Guessing the first was wrong often enough to matter (a
+            // read-only project dir defeats a binary that creates an
+            // output directory in main, which is the walk-in's normal
+            // condition), so quote what it said and let the reader
+            // judge.
             eprintln!(
-                "fdl join: model-sig probe exited cleanly without printing a \
-                 signature (a flodl that predates the probe?); joining \
-                 without one — the formation-time check still applies",
+                "fdl join: model-sig probe exited 0 without printing a \
+                 signature; joining without one — the formation-time check \
+                 still applies. Either the binary predates the probe, or it \
+                 failed before reaching the trainer (check its output above, \
+                 and that this box can write wherever it writes).",
             );
+            if !tail.is_empty() {
+                eprintln!("fdl join: last lines of the probe's output:");
+                for line in &tail {
+                    eprintln!("    {line}");
+                }
+            }
             None
         }
     }

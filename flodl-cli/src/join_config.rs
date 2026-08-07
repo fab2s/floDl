@@ -183,8 +183,9 @@ impl Endpoint {
 fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     let label = resolve_label(cli)?;
     validate_label(&label)?;
-    let door = Door::parse(cli.door.as_deref())?;
-    let controller = Endpoint::parse(cli.controller.as_deref())?;
+    // Door and controller are resolved after the farm dir is known: an
+    // existing farm's own answers are better defaults than the flag
+    // defaults (see `recover_shape`).
 
     // The farm sits beside a base fdl.yml (overlays are siblings). No
     // project at all gets a minimal base, confirm-gated — the /training
@@ -216,6 +217,21 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     };
 
     let farm_dir = root.join(".fdl").join(&label);
+    // What a previous pass decided, so a re-run does not silently
+    // re-render the farm from flag defaults. A flag still wins: naming
+    // one is how you intend a change.
+    let prior = recover_shape(&farm_dir);
+    let door = match cli.door.as_deref() {
+        Some(d) => Door::parse(Some(d))?,
+        None => prior.as_ref().map(|p| p.0).unwrap_or(Door::B),
+    };
+    let controller = match cli.controller.as_deref() {
+        Some(c) => Endpoint::parse(Some(c))?,
+        None => match prior.as_ref().map(|p| p.1.clone()) {
+            Some(spec) => Endpoint::parse(Some(&spec))?,
+            None => Endpoint::parse(None)?,
+        },
+    };
     let keys_dir = farm_dir.join("keys");
     fs::create_dir_all(&keys_dir)
         .map_err(|e| format!("cannot create {}: {e}", keys_dir.display()))?;
@@ -237,7 +253,19 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
 
     // ── Token + overlay ─────────────────────────────────────────────────
     let overlay_path = root.join(format!("fdl.{label}.yml"));
-    let (token, overlay_action) = ensure_overlay(cli, &overlay_path, &label, &root)?;
+    // The command whose entry the scaffold names. Read from the crate's
+    // own manifest by the repo convention that a run command carries its
+    // binary's name; `None` scaffolds a commented placeholder rather than
+    // inventing one.
+    let cmd_hint = command_hint(match &cli.crate_dir {
+        Some(d) => {
+            let p = PathBuf::from(d);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        }
+        None => cwd.clone(),
+    });
+    let (token, overlay_action) =
+        ensure_overlay(cli, &overlay_path, &label, &root, cmd_hint.as_deref())?;
 
     // A yml-referenced identity outside the farm dir is a key shared
     // with something else — legal, but exactly the reuse a per-farm key
@@ -513,14 +541,57 @@ fn install_authorized_line(
         return Ok(InstallAction::Skipped("declined".to_string()));
     }
 
-    let ssh_dir = home_dir().join(".ssh");
-    let ak_path = ssh_dir.join("authorized_keys");
-    if !ssh_dir.is_dir() {
-        fs::create_dir_all(&ssh_dir)
-            .map_err(|e| format!("cannot create {}: {e}", ssh_dir.display()))?;
-        set_mode(&ssh_dir, 0o700)?;
-    } else {
-        fix_perms_confirmed(cli, &ssh_dir, 0o700)?;
+    // Default: the invoking user's own file. `--authorized-keys` names a
+    // different door, for the setups the default cannot reach at all —
+    // an sshd in a container (its key file is a bind mount, so the
+    // in-container run hits a read-only filesystem and the host run
+    // writes a file no sshd reads), or a host with
+    // `AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u`. The uid
+    // already bounds what this can touch; what the refusal below keeps
+    // is the promise that the wizard never edits system sshd config.
+    let ak_path = match cli.authorized_keys.as_deref() {
+        Some(p) => {
+            // `~/` names the invoking user's home, matching how
+            // `inherit-from:` reads a path in overlay.rs.
+            let p = match p.strip_prefix("~/") {
+                Some(rest) => home_dir().join(rest),
+                None => PathBuf::from(p),
+            };
+            if p.starts_with("/etc/ssh") {
+                return Err(format!(
+                    "{} is system sshd configuration — the wizard installs \
+                     door keys, never /etc/ssh. Install it there by hand \
+                     (the line is in the install notes)",
+                    p.display(),
+                ));
+            }
+            p
+        }
+        None => home_dir().join(".ssh").join("authorized_keys"),
+    };
+    let ssh_dir = ak_path
+        .parent()
+        .ok_or("the authorized_keys path has no parent directory")?
+        .to_path_buf();
+    // The 0700 rule is about the invoking user's own `~/.ssh`, which
+    // sshd's StrictModes checks and which the wizard may have to create.
+    // A named door lives in a layout the operator already owns — it may
+    // be a bind-mount source, or a shared directory like /tmp that must
+    // not be narrowed — so its parent is left exactly as found.
+    if cli.authorized_keys.is_none() {
+        if !ssh_dir.is_dir() {
+            fs::create_dir_all(&ssh_dir)
+                .map_err(|e| format!("cannot create {}: {e}", ssh_dir.display()))?;
+            set_mode(&ssh_dir, 0o700)?;
+        } else {
+            fix_perms_confirmed(cli, &ssh_dir, 0o700)?;
+        }
+    } else if !ssh_dir.is_dir() {
+        return Err(format!(
+            "{} does not exist — create the directory holding the \
+             authorized_keys file first",
+            ssh_dir.display(),
+        ));
     }
     // sshd refuses to follow surprises here and so does the wizard: a
     // symlinked authorized_keys is someone's deliberate setup, not a
@@ -838,10 +909,11 @@ fn ensure_overlay(
     overlay_path: &Path,
     label: &str,
     root: &Path,
+    cmd_hint: Option<&str>,
 ) -> Result<(String, OverlayAction), String> {
     if !overlay_path.is_file() {
         let token = fresh_token()?;
-        let scaffold = render_overlay_scaffold(label, &token, root);
+        let scaffold = render_overlay_scaffold(label, &token, root, cmd_hint);
         fs::write(overlay_path, scaffold)
             .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
         return Ok((token, OverlayAction::Scaffolded));
@@ -938,7 +1010,68 @@ fn replace_token_line(content: &str, new_token: &str) -> Option<String> {
 /// The scaffolded farm overlay: the cluster-join recipe with this
 /// farm's token inline. Deliberately compact — per-key documentation
 /// lives in fdl.cluster-join.yml.example and the guide.
-fn render_overlay_scaffold(label: &str, token: &str, root: &Path) -> String {
+/// The door and controller a previous pass wrote, read back from the
+/// farm's own worker yml.
+///
+/// The wizard reuses credentials across runs but re-rendered every other
+/// decision from flag defaults, so `fdl join-config <label>` with no
+/// flags silently rewrote an existing farm: the door reverted to `b` and
+/// the controller to this box's hostname, leaving the printed
+/// authorized_keys line describing a different farm than the one on
+/// disk. Reprinting that line is the obvious reason to run the wizard
+/// twice, so the previous answers are the right defaults.
+///
+/// The worker yml is the wizard's own deterministic output, which is why
+/// it can be read back: door B writes an `rsync://` source, door A an
+/// `sshfs://` data source, and `nologin` neither.
+fn recover_shape(farm_dir: &Path) -> Option<(Door, String)> {
+    let yml = fs::read_to_string(farm_dir.join("worker.yml")).ok()?;
+    let door = if yml.contains("from: rsync://") {
+        Door::B
+    } else if yml.contains("data_source: sshfs://") {
+        Door::A
+    } else {
+        Door::Nologin
+    };
+    let field = |key: &str| -> Option<String> {
+        yml.lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+    };
+    // `target:` is the only required piece; a farm yml without one is
+    // not this wizard's output, so recover nothing rather than guess.
+    let host = field("target:")?;
+    let user = field("user:")?;
+    let spec = match field("port:") {
+        Some(p) => format!("{user}@{host}:{p}"),
+        None => format!("{user}@{host}"),
+    };
+    Some((door, spec))
+}
+
+/// The command name the scaffold should wire for launcher mode: the
+/// training crate's package name, by the convention that a run command
+/// carries its binary's name. `None` when there is no crate here, which
+/// scaffolds a commented placeholder instead of inventing a name.
+fn command_hint(crate_dir: PathBuf) -> Option<String> {
+    let manifest = fs::read_to_string(crate_dir.join("Cargo.toml")).ok()?;
+    package_name(&manifest)
+}
+
+fn render_overlay_scaffold(
+    label: &str,
+    token: &str,
+    root: &Path,
+    cmd_hint: Option<&str>,
+) -> String {
+    // Active when the manifest named it, commented when it would be a
+    // guess: a wrong active entry defines a command that does not exist,
+    // which is a worse failure than one the reader has to uncomment.
+    let cmd = match cmd_hint {
+        Some(name) => format!("\x20 {name}:\n\x20   cluster: true\n"),
+        None => "\x20 # <your-run-command>:\n\x20 #   cluster: true\n".to_string(),
+    };
     format!(
         "# fdl.{label}.yml — farm overlay, generated by `fdl join-config`.\n\
          # Activate with `fdl @{label} <cmd>`. Regenerate credentials with\n\
@@ -961,10 +1094,20 @@ fn render_overlay_scaffold(label: &str, token: &str, root: &Path) -> String {
          \x20     tunnel_only: true            # sshd forward is the only road in (CPU modes)\n\
          \x20     token: {token}\n\
          \n\
-         \x20 workers: []                      # walk-ins fill it\n",
+         \x20 workers: []                      # walk-ins fill it\n\
+         \n\
+         # A join window only opens for a command that runs in launcher\n\
+         # mode, and `cluster:` is what puts it there. Without an entry\n\
+         # here `fdl @{label} <cmd>` resolves the base command and runs it\n\
+         # LOCALLY: no window, no walk-ins, and nothing says so, because\n\
+         # training on this box is a legitimate thing to do. Name the\n\
+         # command that starts your run.\n\
+         commands:\n\
+         {cmd}",
         label = label,
         token = token,
         root = root.display(),
+        cmd = cmd,
     )
 }
 

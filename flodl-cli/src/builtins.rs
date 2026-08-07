@@ -298,6 +298,14 @@ pub struct JoinConfigArgs {
     /// Skip the authorized_keys install (print + notes only).
     #[option]
     pub no_install_key: bool,
+    /// Install into this authorized_keys file instead of the invoking
+    /// user's `~/.ssh/authorized_keys` — for a door the default cannot
+    /// reach, such as an sshd in a container (its key file is a bind
+    /// mount) or a host using `AuthorizedKeysFile
+    /// /etc/ssh/authorized_keys.d/%u`. Still consent-gated, still
+    /// touches only the wizard's own line; `/etc/ssh` is refused.
+    #[option]
+    pub authorized_keys: Option<String>,
     /// Accept every default without prompting (non-interactive; reuses
     /// existing credentials unless `--regen`). Never consents to the
     /// authorized_keys install: that takes the prompt or `--install-key`.

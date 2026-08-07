@@ -192,6 +192,17 @@ pub(crate) fn dispatch_config(
         // Non-cluster path (test/clippy/etc., or recursive child).
         // `--gpus`, if present, restricts CUDA_VISIBLE_DEVICES for the single
         // child process. No cluster dispatch.
+        //
+        // A farm overlay whose join window nothing opens is the one case
+        // here that is almost certainly a mistake, and it is otherwise
+        // silent: the command trains locally and never mentions the
+        // window it did not open. Recursive children are excluded --
+        // there the local run IS the point.
+        if !cluster::is_recursive_invocation() {
+            if let Some(hint) = cluster::unused_join_window_hint(&project, cmd) {
+                eprintln!("fdl: warning: {hint}");
+            }
+        }
         if let Some(spec) = gpus_spec {
             let devs = match spec.resolve() {
                 Ok(d) => d,

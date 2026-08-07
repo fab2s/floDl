@@ -493,10 +493,34 @@ never edited: the dedicated-user hardening stays in the notes. After
 installing, the wizard checks something is listening where workers will
 dial and says so if not (on macOS: Remote Login).
 
-Credentials are reused on re-runs; `--regen` (or the prompt) rotates
-key and token together for a new farm instantiation, after which
-workers holding the old ones stop being admitted. `--json` emits the
-machine twin; secrets appear as file paths, never payloads.
+`--authorized-keys <path>` names a different door for the setups the
+default cannot reach at all: an sshd in a container, whose key file is
+a bind mount (writable only from the host, while the in-container run
+sees a read-only filesystem), or a host configured with
+`AuthorizedKeysFile /etc/ssh/authorized_keys.d/%u`. Every other rule
+holds — the same explicit consent, only the wizard's own line, the same
+atomic rewrite — except that the named file's parent directory is left
+exactly as found, since it belongs to a layout the operator already
+owns rather than to a `~/.ssh` the wizard may have to create. A path
+under `/etc/ssh` is still refused by name.
+
+The scaffolded overlay also carries a `commands:` entry, because a join
+window only opens for a command running in launcher mode and `cluster:
+true` is what puts it there. Without one, `fdl @<label> <cmd>` resolves
+the base command and trains locally: no window, no walk-ins, and no
+complaint, since training on that box is a legitimate thing to do. The
+wizard names the entry after the training crate when it can read one,
+and comments a placeholder when it would be guessing. Running a
+non-cluster command under a farm overlay warns for the same reason.
+
+Credentials are reused on re-runs, and so is the farm's shape: a re-run
+without `--door` or `--controller` recovers both from the farm's own
+worker yml rather than falling back to flag defaults, so reprinting the
+`authorized_keys` line cannot silently re-render the farm around it.
+Naming either flag is how you intend a change. `--regen` (or the
+prompt) rotates key and token together for a new farm instantiation,
+after which workers holding the old ones stop being admitted. `--json`
+emits the machine twin; secrets appear as file paths, never payloads.
 
 Exit code: **0** with the report, **1** on any refusal (contradictory
 flags, a decision needed without a tty, an unfixable permission).

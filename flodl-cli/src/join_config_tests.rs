@@ -224,6 +224,7 @@ fn no_flags() -> JoinConfigArgs {
         regen: false,
         install_key: false,
         no_install_key: false,
+        authorized_keys: None,
         cloud_init: false,
         cloud_init_user: None,
         yes: false,
@@ -364,7 +365,7 @@ fn the_scaffolded_overlay_loads_through_the_real_config_path() {
     let token = fresh_token().unwrap();
     fs::write(
         tmp.join("fdl.b300.yml"),
-        render_overlay_scaffold("b300", &token, &tmp),
+        render_overlay_scaffold("b300", &token, &tmp, Some("trainer")),
     )
     .unwrap();
     let project = crate::config::load_project_with_env(&base, Some("b300")).unwrap();
@@ -373,6 +374,13 @@ fn the_scaffolded_overlay_loads_through_the_real_config_path() {
     assert_eq!(join.token.as_deref(), Some(token.as_str()));
     assert_eq!(join.discovery, Some(true));
     assert_eq!(join.start.as_deref(), Some("manual"));
+    // Without a launcher-mode command the farm cannot host a run: the
+    // command resolves against the base and executes locally.
+    let cmd = project
+        .commands
+        .get("trainer")
+        .expect("the scaffold wires the named command");
+    assert_eq!(cmd.cluster, Some(true));
     assert!(cluster.workers.is_empty(), "walk-ins fill the roster");
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -469,4 +477,54 @@ fn fresh_tokens_are_32_hex_and_unique() {
     assert_eq!(a.len(), 32);
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     assert_ne!(a, b);
+}
+
+// ── Farm shape recovery ─────────────────────────────────────────────────
+
+/// Every door's worker yml must read back as the door that wrote it.
+/// The wizard reuses credentials across runs, so before this the second
+/// run silently re-rendered the farm from flag defaults: the door fell
+/// back to `b` and the controller to this box's hostname, leaving the
+/// printed authorized_keys line describing a farm that no longer matched
+/// the one on disk.
+#[test]
+fn a_farms_door_and_controller_survive_a_flagless_rerun() {
+    for door in [Door::B, Door::A, Door::Nologin] {
+        let farm = tempdir();
+        fs::create_dir_all(&farm).unwrap();
+        let ctrl = Endpoint::parse(Some("op@ctrl.example:2222")).unwrap();
+        let yml = render_worker_yml("f", &ctrl, "tok", door, &no_flags());
+        fs::write(farm.join("worker.yml"), yml).unwrap();
+
+        let (got_door, got_ctrl) = recover_shape(&farm).expect("the farm reads back");
+        assert_eq!(got_door, door, "door for {door:?}");
+        let round = Endpoint::parse(Some(&got_ctrl)).unwrap();
+        assert_eq!(round.host, "ctrl.example");
+        assert_eq!(round.port, 2222);
+        assert_eq!(round.user, "op");
+        let _ = fs::remove_dir_all(&farm);
+    }
+}
+
+#[test]
+fn a_farm_dir_without_a_worker_yml_recovers_nothing() {
+    // Nothing to recover must stay None rather than a guess: a first run
+    // has to keep taking the flag defaults.
+    let farm = tempdir();
+    fs::create_dir_all(&farm).unwrap();
+    assert!(recover_shape(&farm).is_none());
+    let _ = fs::remove_dir_all(&farm);
+}
+
+/// `--authorized-keys` exists for doors the default cannot reach, but
+/// the promise it must not break is that the wizard installs door keys
+/// and never edits system sshd configuration.
+#[test]
+fn an_authorized_keys_path_under_etc_ssh_is_refused() {
+    let mut cli = no_flags();
+    cli.install_key = true;
+    cli.authorized_keys = Some("/etc/ssh/authorized_keys.d/op".to_string());
+    let err = install_authorized_line(&cli, "ssh-ed25519 AAAA test", 22).unwrap_err();
+    assert!(err.contains("system sshd configuration"), "got: {err}");
+    assert!(err.contains("by hand"), "names the way out: {err}");
 }

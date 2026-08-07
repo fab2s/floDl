@@ -1017,6 +1017,12 @@ fn run() -> flodl::tensor::Result<()> {
     }
 
     let mut all_results: Vec<Vec<harness::RunResult>> = Vec::new();
+    // A cell that failed must reach the exit code. Reporting it only on
+    // stderr made `ddp-bench` exit 0 after training nothing, which reads
+    // as success to everything upstream — `fdl join`'s model-sig probe
+    // concluded the binary was too old to carry the contract when it had
+    // in fact failed on a read-only output directory.
+    let mut failed_cells = 0usize;
 
     for model_def in &model_defs {
         let defaults = &model_def.defaults;
@@ -1108,6 +1114,7 @@ fn run() -> flodl::tensor::Result<()> {
                 Ok(result) => model_results.push(result),
                 Err(e) => {
                     eprintln!("  FAILED: {} / {}: {}", model_def.name, mode, e);
+                    failed_cells += 1;
                 }
             }
         }
@@ -1155,6 +1162,13 @@ fn run() -> flodl::tensor::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    if failed_cells > 0 {
+        eprintln!(
+            "\nddp-bench: {failed_cells} cell(s) failed (see FAILED above)"
+        );
+        std::process::exit(1);
     }
 
     Ok(())

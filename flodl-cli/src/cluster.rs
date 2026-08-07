@@ -168,6 +168,31 @@ pub fn is_recursive_invocation() -> bool {
     std::env::var_os(ENV_CLUSTER_JSON).is_some()
 }
 
+/// A configured join window that this command will not open.
+///
+/// A farm overlay declares `controller.join.discovery`, but the window
+/// only opens for a command running in launcher mode, which is what
+/// `cluster: true` selects. Miss that and the command resolves against
+/// the base config and trains locally — and nothing about the run says
+/// so, because training on this box is a legitimate thing to do. Silence
+/// here reads as "my GPUs were not detected" rather than "my farm never
+/// engaged", so the mismatch is worth one line on stderr.
+///
+/// Pure: takes the merged config, returns the text. Returns `None` when
+/// there is no discovery window to miss.
+pub fn unused_join_window_hint(project: &ProjectConfig, command: &str) -> Option<String> {
+    let join = project.cluster.as_ref()?.controller.join.as_ref()?;
+    if join.discovery != Some(true) {
+        return None;
+    }
+    Some(format!(
+        "this env declares a join window (controller.join.discovery), but \
+         `{command}` is not a cluster command, so it runs HERE and no \
+         window opens. Add it to the env's `commands:` with `cluster: \
+         true` to put it in launcher mode."
+    ))
+}
+
 /// Prepare the env vars needed for the user binary's flodl launcher to
 /// detect launcher role and fan out. Caller continues to normal
 /// dispatch (`RunScript` / `ExecCommand`); the spawned subprocess
@@ -1165,5 +1190,40 @@ commands:
             warnings.iter().any(|w| w.contains("did not resolve")),
             "missing ssh.target should keep the warning, got warnings: {warnings:?}"
         );
+    }
+
+    /// A farm overlay declares a join window; a command that is not a
+    /// cluster command will not open it and trains here instead. The run
+    /// looks entirely normal, which is why this needs saying out loud.
+    #[test]
+    fn a_declared_join_window_that_no_command_opens_is_called_out() {
+        let with_window = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /opt/flodl
+    join:
+      discovery: true
+      token: aaaabbbbccccddddaaaabbbbccccdddd
+  workers: []
+";
+        let project: ProjectConfig = serde_yaml_ng::from_str(with_window).unwrap();
+        let hint = unused_join_window_hint(&project, "train").expect("a window nobody opens");
+        assert!(hint.contains("train"), "names the command: {hint}");
+        assert!(hint.contains("cluster:"), "names the fix: {hint}");
+
+        // A roster-style cluster block without a discovery window has
+        // nothing to miss: fan-out is the command's own business.
+        let no_window = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 1337
+    path: /opt/flodl
+  workers: []
+";
+        let project: ProjectConfig = serde_yaml_ng::from_str(no_window).unwrap();
+        assert!(unused_join_window_hint(&project, "train").is_none());
     }
 }
