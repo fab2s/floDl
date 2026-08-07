@@ -42,6 +42,15 @@ jobs:
       - name: Skill assets in sync with ai/
         run: sh ci/release/09-skill-assets.sh
 
+      # Also toolchain-free, and here rather than only in the release
+      # suite because of what it catches: the second pass parses every
+      # script under bash 3.2 (what macOS ships), and a local `bash -n`
+      # on a modern box cannot see those failures. The macOS leg in
+      # os.yml does see them -- after downloading libtorch, minutes in,
+      # for a syntax error. This says it in seconds.
+      - name: Shell scripts parse (incl. bash 3.2, what macOS ships)
+        run: sh ci/release/04-shell.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

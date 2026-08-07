@@ -232,6 +232,21 @@ esac
 
 note "host $HOST${LT_FLAG:+ -> installs '$LT_FLAG' ($LT_DIR)}"
 
+# The cargo feature the vendor phases build with, derived from the
+# variant directory ONCE -- LT_DIR is final above and two phases need
+# this. Matched on the `rocm` PREFIX rather than a literal, so adding a
+# rocm71 variant cannot silently build `--features cuda`.
+#
+# A plain case, deliberately not `FEATURE=$(case ...)`: bash 3.2 (what
+# macOS ships, and the oldest shell in this matrix) cannot parse a case
+# inside a command substitution -- the `)` of the first pattern closes
+# the `$(`, and the leg dies with "syntax error near unexpected token
+# `;;'" before running anything.
+case "$LT_DIR" in
+    rocm*) FEATURE=rocm ;;
+    *)     FEATURE=cuda ;;
+esac
+
 find_fdl
 
 # =====================================================================
@@ -427,7 +442,6 @@ group "Vendor toolkit: fdl says what is missing, then we do it"
 # Package names were read out of the dev images with `dpkg -S` on the
 # readlink -f'd path (/opt/rocm is a versioned symlink, so the naive
 # lookup reports "not owned").
-FEATURE=$(case "$LT_DIR" in rocm*) echo rocm ;; *) echo cuda ;; esac)
 
 OUT=$(cargo build -p flodl-sys --features "$FEATURE" 2>&1) && RC=0 || RC=$?
 if [ "$RC" -eq 0 ]; then
@@ -568,7 +582,6 @@ if [ "$GPU" = 1 ]; then
     # the force-load invariant says keeps passing), and one is enough for
     # a link check while 60-odd would add ~8 GB beside a libtorch that is
     # 11 GB on the rocm rotation. Linked, never run -- no GPU here.
-    FEATURE=$(case "$LT_DIR" in rocm*) echo rocm ;; *) echo cuda ;; esac)
     BUILD_CMD="cargo build --features $FEATURE"
     CLIPPY_CMD="cargo clippy --features $FEATURE --all-targets -- -W clippy::all"
     LINK_CMD="cargo build --features $FEATURE -p flodl-hf --test bert_cuda_smoke"
