@@ -124,10 +124,14 @@ jobs:
   # likelier to hand out than Ubuntu, and it is where apt-flavoured
   # assumptions surface. Each EL release is given only variants it can
   # actually run: what a distro cannot run is not a test, it is a
-  # scheduled failure that never heals (see the matrix below). EL10
-  # carries the vendor rotation on the opposite phase from the ubuntu
-  # host, so every run still covers both vendors across the two
-  # families.
+  # scheduled failure that never heals (see the matrix below).
+  #
+  # These two do not rotate, and that is not a loss of coverage. The two
+  # releases happen to be capable of opposite vendors -- EL9 can install
+  # CUDA and not ROCm, EL10 the reverse -- so pinning each to the one it
+  # can serve covers BOTH vendors on EVERY run, where the rotation only
+  # covered both across two. The ubuntu hosts still rotate, because they
+  # are the ones that can genuinely take either.
   rocky:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
@@ -135,20 +139,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # EL9 ships glibc 2.34. The cpu and cu128 archives need 2.29 and
-          # run there; the rocm7.0 archive needs 2.35 and CANNOT, and no
-          # package fixes that (glibc is pinned to the release). So EL9 is
-          # given a variant it can actually run — scheduling the other one
-          # would be scheduling a failure that never heals.
+          # EL9 ships glibc 2.34, so the cu128 archive (needs 2.29) runs
+          # and the rocm7.0 one (needs 2.35) cannot — glibc is pinned to
+          # the release, so no package fixes it. NVIDIA's rhel9 repo
+          # installs cleanly here.
           - name: rockylinux-9
             image: rockylinux:9
-            variant: cpu
-          # EL10 ships glibc 2.39, which clears the rocm baseline, so this
-          # is where the RHEL-family vendor path is exercised. Note the
-          # image moved off Docker Hub.
+            variant: cuda
+          # EL10 clears every archive's glibc floor (2.39), but it is the
+          # NVIDIA repo that cannot follow: the rhel10 repo starts at CUDA
+          # 13 (which fdl does not offer a variant for), and the rhel9 one
+          # dies in the GPG import because EL10's rpm-sequoia policy
+          # rejects that key. AMD publishes el10 from 7.0.2 on, verified
+          # installing here. Note the image moved off Docker Hub.
           - name: rockylinux-10
             image: quay.io/rockylinux/rockylinux:10
-            variant: rotate-alt
+            variant: rocm
     steps:
       - uses: actions/checkout@v4
 

@@ -169,14 +169,15 @@ case "$HOST" in
         # stays at one toolkit install; deterministic, so a re-run
         # repeats the same variant rather than testing something else.
         #
-        # os.yml runs this leg twice per push: the ubuntu matrix host on
-        # `rotate`, the rockylinux:9 container on `rotate-alt` -- the
-        # opposite phase, so every run covers BOTH vendors, one per
-        # distro family, and the dnf spelling of the toolkit advice gets
-        # exercised as routinely as the apt one. `cpu` stays available
-        # for dispatch and local runs: the cheapest full pass (no
-        # toolkit phase, and with it no sudo -- what a root container
-        # needs), installing the cpu variant through fdl.
+        # Only the ubuntu hosts rotate. The two EL containers are pinned
+        # (EL9 cuda, EL10 rocm) because each release can install exactly
+        # one of the vendors, so between them the dnf spelling of the
+        # toolkit advice gets exercised for BOTH on every run -- see the
+        # repo-setup block below for which half blocks where. `rotate-alt`
+        # stays supported for dispatch even though nothing schedules it.
+        # `cpu` likewise: the cheapest full pass (no toolkit phase, and
+        # with it no sudo -- what a root container needs), installing the
+        # cpu variant through fdl.
         GPU=1; COMPILE=1; ALL_VARIANTS=1
         VARIANT="${FDL_CI_VARIANT:-}"
         if [ -z "$VARIANT" ] || [ "$VARIANT" = rotate ] || [ "$VARIANT" = rotate-alt ]; then
@@ -426,7 +427,7 @@ group "Vendor toolkit: fdl says what is missing, then we do it"
 # Package names were read out of the dev images with `dpkg -S` on the
 # readlink -f'd path (/opt/rocm is a versioned symlink, so the naive
 # lookup reports "not owned").
-FEATURE=$([ "$LT_DIR" = rocm70 ] && echo rocm || echo cuda)
+FEATURE=$(case "$LT_DIR" in rocm*) echo rocm ;; *) echo cuda ;; esac)
 
 OUT=$(cargo build -p flodl-sys --features "$FEATURE" 2>&1) && RC=0 || RC=$?
 if [ "$RC" -eq 0 ]; then
@@ -473,19 +474,48 @@ elif [ "$RC" -ne 0 ]; then
     # Root (the rocky container) has no sudo and needs none.
     SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=""
     if [ "$PKG_MGR" = dnf ]; then
-        # RHEL-family repo setup. NVIDIA ships a .repo carrying its own
-        # gpgkey; AMD publishes the key URL for the .repo to reference,
-        # so neither needs a separate import step.
+        # RHEL-family repo setup, and the vendor repos do NOT track the
+        # EL releases together -- each is pinned to what that release can
+        # actually install, measured 2026-08-07:
+        #
+        #   EL9   cuda 12.8 from rhel9      rocm: NO (glibc 2.34 < 2.35)
+        #   EL10  cuda: NO (see below)      rocm 7.0.2/7.1 from el10
+        #
+        # NVIDIA ships a .repo carrying its own gpgkey; AMD publishes the
+        # key URL for the .repo to reference, so neither needs a separate
+        # import step.
+        EL_MAJOR=$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID%%.*}")
         if [ "$FEATURE" = rocm ]; then
-            $SUDO tee /etc/yum.repos.d/rocm.repo >/dev/null <<'ROCMREPO'
+            # AMD publishes el10 only from 7.0.2 on: there is no
+            # el10/7.0, so the EL10 pin is a patch newer than the
+            # rocm70 archive it supplies headers for. That is fine --
+            # this phase compiles the shim, and the libtorch archive
+            # brings its own runtime libraries.
+            case "$EL_MAJOR" in
+                9|8) ROCM_REPO="rhel9/7.0" ;;
+                *)   ROCM_REPO="el10/7.0.2" ;;
+            esac
+            $SUDO tee /etc/yum.repos.d/rocm.repo >/dev/null <<ROCMREPO
 [ROCm]
 name=ROCm
-baseurl=https://repo.radeon.com/rocm/rhel9/7.0/main
+baseurl=https://repo.radeon.com/rocm/$ROCM_REPO/main
 enabled=1
 gpgcheck=1
 gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
 ROCMREPO
         else
+            # There is no CUDA 12.8 an EL10 box can install. NVIDIA's
+            # rhel10 repo starts at CUDA 13 (`libcublas-devel-13-0` is
+            # its oldest), and fdl offers no 13.x variant; pointing EL10
+            # at the rhel9 repo instead dies in the GPG import, because
+            # EL10's rpm uses rpm-sequoia and its policy rejects that
+            # key outright ("No binding signature at time ...") where
+            # EL9's legacy parser accepts it. Neither half heals on its
+            # own, so say which one blocked rather than failing in a key
+            # import 2.6 GB later.
+            if [ "${EL_MAJOR:-9}" -ge 10 ] 2>/dev/null; then
+                fail "$HOST: no CUDA $LT_DIR toolkit is installable on EL$EL_MAJOR (nvidia's rhel10 repo starts at CUDA 13; the rhel9 key is rejected by rpm-sequoia here). Give this leg the rocm variant."
+            fi
             $SUDO dnf install -y -q dnf-plugins-core
             $SUDO dnf config-manager --add-repo \
                 https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
@@ -538,7 +568,7 @@ if [ "$GPU" = 1 ]; then
     # the force-load invariant says keeps passing), and one is enough for
     # a link check while 60-odd would add ~8 GB beside a libtorch that is
     # 11 GB on the rocm rotation. Linked, never run -- no GPU here.
-    FEATURE=$([ "$LT_DIR" = rocm70 ] && echo rocm || echo cuda)
+    FEATURE=$(case "$LT_DIR" in rocm*) echo rocm ;; *) echo cuda ;; esac)
     BUILD_CMD="cargo build --features $FEATURE"
     CLIPPY_CMD="cargo clippy --features $FEATURE --all-targets -- -W clippy::all"
     LINK_CMD="cargo build --features $FEATURE -p flodl-hf --test bert_cuda_smoke"
