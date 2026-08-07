@@ -1,4 +1,32 @@
 services:
+  # RHEL-family reproduction box. Not part of any routine flow: it
+  # exists so a RHEL question can be answered on a RHEL userland instead
+  # of by reasoning about one — the dnf package names, rrsync shipping
+  # as documentation, and which libtorch baselines EL9 can actually
+  # load. Deliberately NOT what CI uses: the rocky legs run a stock
+  # image and install prerequisites the way the docs tell a user to,
+  # which is the step a pre-baked image would skip.
+  #
+  #   docker compose build rhel
+  #   docker compose run --rm rhel bash
+  rhel:
+    build:
+      context: .
+      dockerfile: Dockerfile.rhel
+    image: flodl-rhel
+    volumes:
+      - .:/workspace
+      # Its own cargo cache: a tree built against this glibc has no
+      # business landing in the Debian images' registry cache.
+      - ./.cargo-cache-rhel:/root/.cargo/registry
+      - ${LIBTORCH_CPU_PATH:-./libtorch/precompiled/cpu}:/usr/local/libtorch:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      - FLODL_VERBOSITY
+      - FDL_GPU_FEATURE
+
   dev:
     build:
       context: .

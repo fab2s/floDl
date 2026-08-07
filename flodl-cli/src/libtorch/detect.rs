@@ -569,3 +569,87 @@ mod tests {
         assert_eq!(info.archs.as_deref(), Some("1.0"));
     }
 }
+
+/// Unmet dynamic-linker requirements of a libtorch variant on THIS host,
+/// as the loader itself reports them.
+///
+/// A libtorch archive is built against some baseline C library, and the
+/// baseline is not the same across variants: measured on 2.10.0, the cpu
+/// and cu128 trees need `GLIBC_2.29` / `GLIBCXX_3.4.26` while the rocm7.0
+/// tree needs `GLIBC_2.35` / `GLIBCXX_3.4.30`. RHEL 9 ships glibc 2.34
+/// and cannot be upgraded past it, so that last combination cannot run
+/// there at all — and without this check the operator finds out after a
+/// download, a compile and a link, from a loader error naming symbol
+/// versions rather than the actual problem.
+///
+/// Asks `ldd`, so it answers by the same rules the real load obeys
+/// instead of a table of baselines that would rot at the next release.
+/// An empty vector means "nothing unmet", which is also what a missing
+/// `ldd` returns: this reports a problem it can prove, never a doubt.
+pub fn unmet_loader_requirements(variant_dir: &Path) -> Vec<String> {
+    let core = variant_dir.join("lib/libtorch_cpu.so");
+    if !core.is_file() {
+        return Vec::new();
+    }
+    let Ok(out) = std::process::Command::new("ldd").arg(&core).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    parse_unmet_versions(&text)
+}
+
+/// The symbol versions an `ldd` run reported as missing, de-duplicated
+/// in first-seen order. Pure so the parse is testable against real
+/// loader output rather than only on a host that happens to fail.
+pub(crate) fn parse_unmet_versions(ldd_output: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for line in ldd_output.lines() {
+        // `... version `GLIBC_2.35' not found (required by ...)`
+        if !line.contains("not found") {
+            continue;
+        }
+        let Some(rest) = line.split("version `").nth(1) else { continue };
+        let Some(sym) = rest.split('\'').next() else { continue };
+        if !seen.iter().any(|s| s == sym) {
+            seen.push(sym.to_string());
+        }
+    }
+    seen
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use super::parse_unmet_versions;
+
+    /// Real `ldd` output, captured 2026-08-07 from the rocm7.0 variant
+    /// on rockylinux:9 — the pair CI hit.
+    #[test]
+    fn it_reads_the_versions_the_loader_could_not_satisfy() {
+        let real = "\
+/lt/libtorch_cpu.so: /lib64/libm.so.6: version `GLIBC_2.35' not found (required by /lt/libtorch_cpu.so)
+/lt/libtorch_cpu.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.30' not found (required by /lt/libtorch_cpu.so)
+/lt/libtorch_cpu.so: /lib64/libstdc++.so.6: version `GLIBCXX_3.4.30' not found (required by /lt/libc10.so)
+\tlinux-vdso.so.1 (0x00007ffd0d7f9000)
+\tlibm.so.6 => /lib64/libm.so.6 (0x00007f0e8a000000)
+";
+        assert_eq!(
+            parse_unmet_versions(real),
+            vec!["GLIBC_2.35".to_string(), "GLIBCXX_3.4.30".to_string()],
+            "de-duplicated, in first-seen order",
+        );
+    }
+
+    /// A host that CAN load it says nothing, and neither do we: this
+    /// reports a problem it can prove, never a doubt.
+    #[test]
+    fn a_satisfied_load_reports_nothing() {
+        let ok = "\
+\tlinux-vdso.so.1 (0x00007ffd0d7f9000)
+\tlibtorch_cpu.so => /lt/libtorch_cpu.so (0x00007f0e88000000)
+\tlibm.so.6 => /lib64/libm.so.6 (0x00007f0e8a000000)
+";
+        assert!(parse_unmet_versions(ok).is_empty());
+        assert!(parse_unmet_versions("").is_empty());
+    }
+}

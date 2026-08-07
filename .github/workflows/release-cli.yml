@@ -22,12 +22,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # PINNED, and the pin is the point. A dynamically linked
+          # binary cannot run on a system whose glibc is older than the
+          # one it was built against, so the build base is a FLOOR on
+          # who can use the release. `ubuntu-latest` floats: the day
+          # GitHub moves it, that floor rises silently and the binary
+          # stops running on older distributions with no code change and
+          # no release note. Raise this deliberately or not at all --
+          # the gate below fails the build if the floor moves.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: flodl-cli-linux-x86_64
 
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             artifact: flodl-cli-linux-aarch64
 
           - target: aarch64-apple-darwin
@@ -76,6 +84,27 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           copy target\${{ matrix.target }}\release\fdl.exe ${{ matrix.artifact }}
+
+      # The floor, asserted rather than assumed. A released binary that
+      # silently demands a newer glibc than the last release stops
+      # running on distributions we claim to support, and nothing else
+      # in this pipeline would notice: it builds, it uploads, and it
+      # fails on the user's machine with a symbol-version error. RHEL 9
+      # (glibc 2.34) is below this floor today, which is a known
+      # limitation and the reason the number is written down.
+      - name: Glibc floor
+        if: startsWith(matrix.target, 'x86_64-unknown-linux')
+        run: |
+          FLOOR=2.39
+          MAX=$(objdump -p ${{ matrix.artifact }} \
+                | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 | sed 's/GLIBC_//')
+          echo "artifact needs at most GLIBC_$MAX (declared floor $FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$FLOOR" "$MAX" | sort -V | tail -1)" != "$FLOOR" ]; then
+            echo "::error::this build needs GLIBC_$MAX, above the declared floor $FLOOR."
+            echo "The build base moved. Either pin it back, or raise FLOOR here"
+            echo "deliberately and say so in the release notes -- it drops users."
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

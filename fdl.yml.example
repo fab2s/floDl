@@ -57,6 +57,26 @@ commands:
     run: bash
     docker: dev
 
+  # --- RHEL-family reproduction (uncomment to use) ---
+  # A RHEL question answered on a RHEL userland rather than by reasoning
+  # about one: dnf package names, rrsync shipping as documentation, and
+  # which libtorch baselines EL9 can load (cpu and cu128 yes, rocm no --
+  # its archive wants a glibc EL9 cannot reach). Needs one build first:
+  #   docker compose build rhel
+  #
+  # rhel-shell:
+  #   description: Interactive shell on a RHEL userland
+  #   run: bash
+  #   docker: rhel
+  # rhel-build:
+  #   description: Build on a RHEL userland
+  #   run: cargo build
+  #   docker: rhel
+  # rhel-probe:
+  #   description: What `fdl probe` reports on a RHEL box
+  #   run: cargo run -q -p flodl-cli --bin fdl -- probe
+  #   docker: rhel
+
   # --- GPU targets ---
   #
   # Both vendor-dependent bits are derived from the active libtorch

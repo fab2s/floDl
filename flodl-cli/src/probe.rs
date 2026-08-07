@@ -718,6 +718,33 @@ pub fn probe_local(
 /// pointer-file shape of [`check_libtorch_at`]; mirrors the
 /// arch-check and valid-dir logic from [`check_libtorch`] without
 /// duplicating its `.active` walk.
+/// Report a variant the dynamic linker cannot satisfy on this host.
+///
+/// A libtorch archive is built against some baseline C library and the
+/// baseline differs per variant: measured on 2.10.0, cpu and cu128 want
+/// `GLIBC_2.29` while rocm7.0 wants `GLIBC_2.35`. RHEL 9 ships 2.34 and
+/// cannot go further, so that pair compiles, links, and then dies in the
+/// loader quoting symbol versions. Naming it here costs one `ldd`.
+///
+/// Called from every arm that produces a [`LibtorchStatus`]: the first
+/// version of this check lived in one of them, and the explicit
+/// `--libtorch-path` arm builds its status inline, so a real RHEL box
+/// reported nothing at all.
+fn push_loader_issue(variant_dir: &Path, label: &str, issues: &mut Vec<String>) {
+    let unmet = detect::unmet_loader_requirements(variant_dir);
+    if unmet.is_empty() {
+        return;
+    }
+    issues.push(format!(
+        "libtorch variant `{label}` cannot load on this host: the dynamic \
+         linker is missing {}. The archive was built against a newer C \
+         library than this distribution ships, so it compiles and links and \
+         then fails to start. Use a variant with an older baseline (cpu and \
+         cu128 need less than the rocm archives) or a newer distribution.",
+        unmet.join(", "),
+    ));
+}
+
 fn libtorch_status_from_info(
     info: Option<LibtorchInfo>,
     libtorch_root: &Path,
@@ -728,6 +755,9 @@ fn libtorch_status_from_info(
         Some(i) => libtorch_root.join(&i.path).join("lib").is_dir(),
         None => false,
     };
+    if let Some(i) = &info {
+        push_loader_issue(&libtorch_root.join(&i.path), &i.path, issues);
+    }
     let archs_match = match &info {
         Some(i) => detect::arch_coverage(i, gpus, issues),
         None => {
@@ -794,6 +824,7 @@ fn check_libtorch_at(
     }
     let info = detect::libtorch_info_from_dir(dir.display().to_string(), dir);
     let archs_match = detect::arch_coverage(&info, gpus, issues);
+    push_loader_issue(dir, &info.path, issues);
     LibtorchStatus { info: Some(info), valid_dir: true, archs_match }
 }
 
@@ -996,18 +1027,22 @@ fn gpu_toolkit_warning(
     if missing.is_empty() {
         return None;
     }
-    let packages = match metapackages {
-        Some(m) => m.to_string(),
-        None => crate::util::requirements::packages_for(&missing).join(" "),
+    let packages: Vec<String> = match metapackages {
+        Some(m) => m.split_whitespace().map(str::to_string).collect(),
+        None => crate::util::requirements::packages_for(&missing),
     };
     let list: Vec<&str> = missing.iter().map(|(h, _)| *h).collect();
     let root = root.display();
+    // Through `install_hint`, so the command names this family's package
+    // manager and its own spelling of the packages. Hardcoding apt here
+    // told a RHEL box to run `sudo apt install hip-dev`, which is two
+    // kinds of wrong at once.
+    let install = crate::util::requirements::install_hint(&packages);
     Some(format!(
         "active libtorch is `{}` but its toolkit headers are missing under \
          `{root}` ({}). Native builds with `--features {feature}` will fail; \
          building in the dev container is unaffected. Install them with \
-         `sudo apt install {packages}`, or set {root_env} if your install is \
-         elsewhere.",
+         `{install}`, or set {root_env} if your install is elsewhere.",
         variant,
         list.join(", "),
     ))

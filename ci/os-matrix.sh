@@ -613,7 +613,16 @@ if [ "$SCAF_OK" = 1 ]; then
     ln -s "$PWD/libtorch" "$SCAF/libtorch"
     (cd "$SCAF" && scrubbed "$FDL_ABS" build) || SCAF_OK=0
 fi
-if [ "$SCAF_OK" = 1 ]; then
+# A variant whose baseline C library is newer than this distribution's
+# will build and link and then refuse to start. That is a real platform
+# limit with no fix on our side (RHEL 9 ships glibc 2.34 and cannot go
+# further, while the rocm7.0 archive wants 2.35), so the honest test is
+# that fdl SAYS SO rather than that the binary runs.
+UNMET=$("$FDL_ABS" probe --skip-mount 2>&1 | grep -c "cannot load on this host" || true)
+if [ "$SCAF_OK" = 1 ] && [ "$UNMET" != 0 ]; then
+    note "$HOST: the active libtorch cannot load here (older C library than the archive wants) — fdl reported it, so the run step is skipped rather than asserting the impossible"
+    "$FDL_ABS" probe --skip-mount 2>&1 | grep -A 2 "cannot load on this host" | sed 's/^/    /'
+elif [ "$SCAF_OK" = 1 ]; then
     (cd "$SCAF" && scrubbed "$FDL_ABS" run) || SCAF_OK=0
 fi
 rm -rf "$SCAF_ROOT"
