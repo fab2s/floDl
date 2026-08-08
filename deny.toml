@@ -1,0 +1,108 @@
+# cargo-deny policy.
+#
+# Replaces cargo-audit rather than sitting beside it: the `[advisories]`
+# section below IS the RustSec database, so audit would be a strict
+# subset running a second tool with a second config.
+#
+# Cargo.lock is deliberately NOT committed (a library's consumers resolve
+# their own tree, and letting security patches reach people who compile
+# is worth more than a reproducible release build). Two consequences,
+# both accepted rather than worked around:
+#
+#   1. This check can go red on a morning nobody touched the code, when a
+#      new advisory lands or a dependency moves. That is the check doing
+#      its job, and it runs as its own CI job so it never masks the test
+#      signal.
+#   2. The MSRV floor tracks the ecosystem for the same reason. See the
+#      note on `rust-version` in Cargo.toml.
+
+[graph]
+# Every target the project actually ships to. Without this, deny walks
+# platform-specific dependencies for targets nobody builds -- which is
+# how `r-efi` (a UEFI crate, reachable only through getrandom on UEFI
+# targets) ends up in a license report for a Linux GPU framework.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+# Yanked crates are a warning, not a failure: with no lockfile the
+# resolver avoids them anyway, and a yank mid-flight should not redden a
+# build that has nothing to fix.
+yanked = "warn"
+
+# Unmaintained advisories fire for OUR OWN dependencies only. A crate we
+# chose is a decision we can revisit; one arriving four levels down
+# through `tokenizers` is not, and every such advisory currently says
+# "No safe upgrade is available!" -- `paste` and `number_prefix` are
+# both in that state. Denying those would mean a permanently red gate
+# with no action attached, which teaches everyone to ignore the gate.
+# Vulnerabilities remain errors regardless of depth.
+unmaintained = "workspace"
+
+# Empty, and worth keeping that way. The one entry this file ever held was
+# bincode 2 (RUSTSEC-2025-0141), removed once the dependency moved to
+# `bincode-next` -- an ignore is a deferral with a name, not a place to
+# park things.
+ignore = []
+
+[licenses]
+version = 2
+# Grounded in what the tree actually contains (surveyed 2026-08-08), not
+# a generic permissive list copied from elsewhere. flodl itself is MIT.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "BSL-1.0",
+    "Zlib",
+    "Unlicense",
+    # unicode-ident is `(MIT OR Apache-2.0) AND Unicode-3.0`, so the
+    # Unicode term is required even though the MIT term is satisfied.
+    # The icu_* crates are Unicode-3.0 outright.
+    "Unicode-3.0",
+    # webpki-roots only. A data license for the Mozilla CA bundle, not a
+    # code license, and permissive by name and terms.
+    "CDLA-Permissive-2.0",
+    # The one non-permissive license in the tree, and a deliberate call
+    # rather than an oversight: `option-ext`, reached through
+    # `dirs -> dirs-sys`. MPL-2.0 is FILE-level copyleft, so linking it
+    # unmodified imposes nothing on flodl's own MIT terms; the obligation
+    # would only attach to modifications of option-ext's own files, and
+    # there are none. If that ever changes, this line is the place the
+    # decision is recorded.
+    "MPL-2.0",
+]
+confidence-threshold = 0.93
+
+# `r-efi` is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. The OR means the
+# LGPL term is never forced on anyone, and deny picks an allowed branch,
+# so no exception is needed. Noted because "LGPL in the dependency tree"
+# reads alarming in a report and is not: the only way it binds is if MIT
+# and Apache are both disallowed.
+
+[bans]
+# Warn, not deny. Duplicate versions here are transitive and not ours to
+# fix (rand 0.8/0.9/0.10 and getrandom 0.2/0.3/0.4 arrive through
+# different dependencies), so denying would mean a permanently red gate
+# that teaches everyone to ignore it.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+
+[sources]
+# The check that has already earned its place: a scaffold once shipped a
+# floating `git =` dependency for every generated project, because a
+# crates.io query failed and the fallback was silent. Nothing may come
+# from outside the public registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

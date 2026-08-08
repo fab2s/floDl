@@ -34,7 +34,15 @@ flate2 = "1"
 hmac-sha256 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bincode = { version = "2", features = ["serde"] }
+# bincode's successor, and the reason is not a version bump: bincode 2 is
+# unmaintained (RUSTSEC-2025-0141) and its `3.0.0` on crates.io is a
+# TOMBSTONE -- a README plus a lib.rs containing only a compiler error,
+# published because crates.io cannot archive a crate. bincode-next is the
+# continuation, and the swap is safe in the way that matters here: same
+# API, and a BYTE-IDENTICAL wire encoding, each decoding the other's
+# output (verified 2026-08-08 across u32/String/Vec<i64>/Option<f32>).
+# So no CONTROL_PROTOCOL_VERSION bump. It is what sets the workspace MSRV.
+bincode-next = { version = "3.1.1", features = ["serde"] }
 rand = { version = "0.10", optional = true }
 # `_exit` for cluster roles that finish and must terminate without running
 # libtorch's C++ static destructors (which GP-fault when the launcher force-

@@ -6,7 +6,21 @@ resolver = "2"
 [workspace.package]
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.85"
+# Measured, not aspirational: `ci.yml`'s msrv job checks the workspace on
+# exactly this toolchain, so a wrong value here is a failing build rather
+# than a promise nobody tests.
+#
+# Two floors stack here, and the higher one wins:
+#   1.88  our own source -- let-chains, used across graph/, monitor/ and
+#         distributed/ (rewriting them to go lower would be a large and
+#         gratuitous refactor)
+#   1.90  `bincode-next`, taken to replace the unmaintained bincode 2
+#
+# With no committed Cargo.lock this also tracks the ECOSYSTEM: consumers
+# resolve fresh, so a transitive dep raising its own rust-version raises
+# ours, and pinning it back in a lockfile nobody ships would not help.
+# Expect to bump it; the job says when.
+rust-version = "1.90"
 license = "MIT"
 repository = "https://github.com/flodl-labs/flodl"
 homepage = "https://flodl.dev"

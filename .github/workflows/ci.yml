@@ -29,6 +29,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The declared MSRV, actually compiled. `rust-version` in Cargo.toml is
+  # a promise to every consumer -- cargo refuses the build and names the
+  # version when it is right, and lets rustc die in a confusing E0658
+  # when it is wrong. It WAS wrong: 0.7.0 shipped `1.85` while the source
+  # has used let-chains (1.88) all along, so the floor was understated by
+  # three minor versions in a published release.
+  #
+  # No libtorch here. `DOCS_RS=1` is flodl-sys's build script skipping its
+  # C++ compile, which is what docs.rs itself relies on; `cargo check`
+  # never links, so the Rust side is still fully type-checked. That keeps
+  # this job to a bare toolchain and about a minute.
+  #
+  # Its own job on purpose: an MSRV break is a dependency-ecosystem event,
+  # not a code failure, and it must not sit in front of the test signal.
+  msrv:
+    name: MSRV (declared floor compiles)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          V=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares rust-version = $V"
+
+      # Pinned to whatever Cargo.toml says, so the two can never disagree.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: cargo check on the declared floor
+        env:
+          DOCS_RS: 1
+        run: cargo check --workspace --all-targets
+
+  # Supply chain: advisories, licenses, sources, duplicate versions.
+  # Policy and the reasoning behind each choice live in deny.toml.
+  #
+  # Its own job, and that is the point rather than tidiness. Cargo.lock is
+  # not committed, so this resolves fresh every run and CAN go red on a
+  # morning nobody touched the code -- a new advisory, or a dependency
+  # moving. That is the check working. It must not sit in front of the
+  # test suite when it happens, and a red test run must not hide behind
+  # it either.
+  #
+  # No libtorch, no toolchain pinning: cargo-deny reads the dependency
+  # graph, it never builds the crates.
+  deny:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
+
   cpu:
     name: CPU (test + clippy)
     runs-on: ubuntu-24.04

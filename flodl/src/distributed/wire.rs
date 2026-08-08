@@ -809,17 +809,17 @@ pub fn salt_from_hex(s: &str) -> Result<SessionSalt> {
 // Bincode helpers
 // ---------------------------------------------------------------------------
 
-fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard()
+fn bincode_config() -> impl bincode_next::config::Config {
+    bincode_next::config::standard()
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(value, bincode_config())
+    bincode_next::serde::encode_to_vec(value, bincode_config())
         .map_err(|e| TensorError::new(&format!("wire: bincode encode failed: {e}")))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    let (v, _used) = bincode::serde::decode_from_slice(bytes, bincode_config())
+    let (v, _used) = bincode_next::serde::decode_from_slice(bytes, bincode_config())
         .map_err(|e| TensorError::new(&format!("wire: bincode decode failed: {e}")))?;
     Ok(v)
 }
