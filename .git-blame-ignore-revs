@@ -4,7 +4,9 @@
 #
 #     git config blame.ignoreRevsFile .git-blame-ignore-revs
 #
-# Add the rustfmt adoption commit's full SHA below after committing it
-# (`git rev-parse HEAD`). Only ever list commits that changed NO
-# semantics -- the whole value of this file is that its entries are safe
-# to skip when hunting who wrote a line and why.
+# Only ever list commits that changed NO semantics -- the whole value of
+# this file is that its entries are safe to skip when hunting who wrote a
+# line and why.
+
+# style: adopt rustfmt (383 files, formatting only; 3026 tests unchanged)
+024eb4106f1584aab3ed4889f605baf470917384

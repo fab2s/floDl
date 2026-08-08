@@ -261,6 +261,12 @@ mod tests {
     }
 
     #[test]
+    // The closure is the subject, not an accident: this test covers the
+    // `F: FnOnce() -> R` entry point, where `test_autocast_guard_lifecycle`
+    // above covers the RAII one. Clippy's suggestion (pass the function
+    // itself) compiles and asserts the same thing while no longer passing a
+    // closure, which leaves the case this test is named for uncovered.
+    #[allow(clippy::redundant_closure)]
     fn test_autocast_closure() {
         assert!(!is_autocast_enabled());
         let was_enabled = autocast(DType::Float16, || is_autocast_enabled());
