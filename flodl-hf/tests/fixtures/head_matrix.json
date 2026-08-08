@@ -1,42 +1,42 @@
 {
-  "_doc": "Head matrix for `fdl flodl-hf verify-matrix`. 30 cells: 6 families x {base, seqcls, tokcls, qa, mlm}. Repo ids mirror the existing _live tests in flodl-hf/tests/{family}_export_roundtrip.rs and {family}_head_export_roundtrip.rs (see flodl-hf/scripts/verify_matrix.py for the runner). Until those tests are refactored to read this file, repo ids are duplicated; keep them in sync when adding/changing cells. `needs_convert: true` flags repos that ship pytorch_model.bin only and require `fdl flodl-hf convert <repo>` before export (matches the bert-seqcls / roberta-seqcls preludes in flodl-hf/parity/fdl.yml). The `base` cells reuse the same pretraining repos as the `mlm` cells; the runner forces `--head base` on them so they exercise the bare-backbone export path instead of collapsing into the mlm cells (whose auto-dispatch picks `<Family>ForMaskedLM` from `architectures[0]`).",
+  "_doc": "Head matrix for `fdl flodl-hf verify-matrix`. 30 cells: 6 families x {base, seqcls, tokcls, qa, mlm}. Repo ids mirror the existing _live tests in flodl-hf/tests/{family}_export_roundtrip.rs and {family}_head_export_roundtrip.rs (see flodl-hf/scripts/verify_matrix.py for the runner). Until those tests are refactored to read this file, repo ids are duplicated; keep them in sync when adding/changing cells. Every id must be OWNER-QUALIFIED: the runner drives `fdl flodl-hf export --hub`, which resolves through flodl-hf's own Hub client, and the Hub answers a bare legacy name with a 307 that hf-hub 1.0 does not follow. `needs_convert: true` flags repos that ship pytorch_model.bin only and require `fdl flodl-hf convert <repo>` before export. Get it wrong and the cell passes anyway on a box that converted the repo once, because the loader prefers the `flodl-converted/` copy: only a cold cache fails, which is exactly what a release machine has. The `base` cells reuse the same pretraining repos as the `mlm` cells; the runner forces `--head base` on them so they exercise the bare-backbone export path instead of collapsing into the mlm cells (whose auto-dispatch picks `<Family>ForMaskedLM` from `architectures[0]`).",
   "families": ["bert", "roberta", "distilbert", "xlm-roberta", "albert", "deberta-v2"],
   "heads": ["base", "seqcls", "tokcls", "qa", "mlm"],
   "cells": [
-    {"family": "bert",        "head": "base",   "repo": "bert-base-uncased"},
+    {"family": "bert",        "head": "base",   "repo": "google-bert/bert-base-uncased"},
     {"family": "bert",        "head": "seqcls", "repo": "nateraw/bert-base-uncased-emotion", "needs_convert": true},
     {"family": "bert",        "head": "tokcls", "repo": "dslim/bert-base-NER"},
     {"family": "bert",        "head": "qa",     "repo": "csarron/bert-base-uncased-squad-v1"},
-    {"family": "bert",        "head": "mlm",    "repo": "bert-base-uncased"},
+    {"family": "bert",        "head": "mlm",    "repo": "google-bert/bert-base-uncased"},
 
-    {"family": "roberta",     "head": "base",   "repo": "roberta-base"},
+    {"family": "roberta",     "head": "base",   "repo": "FacebookAI/roberta-base"},
     {"family": "roberta",     "head": "seqcls", "repo": "cardiffnlp/twitter-roberta-base-sentiment-latest", "needs_convert": true},
     {"family": "roberta",     "head": "tokcls", "repo": "Jean-Baptiste/roberta-large-ner-english"},
     {"family": "roberta",     "head": "qa",     "repo": "deepset/roberta-base-squad2"},
-    {"family": "roberta",     "head": "mlm",    "repo": "roberta-base"},
+    {"family": "roberta",     "head": "mlm",    "repo": "FacebookAI/roberta-base"},
 
-    {"family": "distilbert",  "head": "base",   "repo": "distilbert-base-uncased"},
+    {"family": "distilbert",  "head": "base",   "repo": "distilbert/distilbert-base-uncased"},
     {"family": "distilbert",  "head": "seqcls", "repo": "lxyuan/distilbert-base-multilingual-cased-sentiments-student"},
     {"family": "distilbert",  "head": "tokcls", "repo": "dslim/distilbert-NER"},
     {"family": "distilbert",  "head": "qa",     "repo": "distilbert/distilbert-base-cased-distilled-squad"},
-    {"family": "distilbert",  "head": "mlm",    "repo": "distilbert-base-uncased"},
+    {"family": "distilbert",  "head": "mlm",    "repo": "distilbert/distilbert-base-uncased"},
 
-    {"family": "xlm-roberta", "head": "base",   "repo": "xlm-roberta-base"},
-    {"family": "xlm-roberta", "head": "seqcls", "repo": "cardiffnlp/twitter-xlm-roberta-base-sentiment"},
+    {"family": "xlm-roberta", "head": "base",   "repo": "FacebookAI/xlm-roberta-base"},
+    {"family": "xlm-roberta", "head": "seqcls", "repo": "cardiffnlp/twitter-xlm-roberta-base-sentiment", "needs_convert": true},
     {"family": "xlm-roberta", "head": "tokcls", "repo": "Davlan/xlm-roberta-large-ner-hrl"},
     {"family": "xlm-roberta", "head": "qa",     "repo": "deepset/xlm-roberta-large-squad2"},
-    {"family": "xlm-roberta", "head": "mlm",    "repo": "xlm-roberta-base"},
+    {"family": "xlm-roberta", "head": "mlm",    "repo": "FacebookAI/xlm-roberta-base"},
 
-    {"family": "albert",      "head": "base",   "repo": "albert-base-v2"},
-    {"family": "albert",      "head": "seqcls", "repo": "bhadresh-savani/albert-base-v2-emotion"},
-    {"family": "albert",      "head": "tokcls", "repo": "ArBert/albert-base-v2-finetuned-ner"},
-    {"family": "albert",      "head": "qa",     "repo": "twmkn9/albert-base-v2-squad2"},
-    {"family": "albert",      "head": "mlm",    "repo": "albert-base-v2"},
+    {"family": "albert",      "head": "base",   "repo": "albert/albert-base-v2"},
+    {"family": "albert",      "head": "seqcls", "repo": "bhadresh-savani/albert-base-v2-emotion", "needs_convert": true},
+    {"family": "albert",      "head": "tokcls", "repo": "ArBert/albert-base-v2-finetuned-ner", "needs_convert": true},
+    {"family": "albert",      "head": "qa",     "repo": "twmkn9/albert-base-v2-squad2", "needs_convert": true},
+    {"family": "albert",      "head": "mlm",    "repo": "albert/albert-base-v2"},
 
-    {"family": "deberta-v2",  "head": "base",   "repo": "microsoft/deberta-v3-base"},
+    {"family": "deberta-v2",  "head": "base",   "repo": "microsoft/deberta-v3-base", "needs_convert": true},
     {"family": "deberta-v2",  "head": "seqcls", "repo": "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"},
     {"family": "deberta-v2",  "head": "tokcls", "repo": "blaze999/Medical-NER"},
     {"family": "deberta-v2",  "head": "qa",     "repo": "deepset/deberta-v3-base-squad2"},
-    {"family": "deberta-v2",  "head": "mlm",    "repo": "microsoft/deberta-v3-base"}
+    {"family": "deberta-v2",  "head": "mlm",    "repo": "microsoft/deberta-v3-base", "needs_convert": true}
   ]
 }
