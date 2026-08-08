@@ -540,11 +540,10 @@ fn docker_services(root: &Path, label: &str) -> Vec<String> {
     };
     let mut seen: Vec<String> = Vec::new();
     for spec in project.commands.values() {
-        if let Some(svc) = &spec.docker {
-            if !seen.contains(svc) {
+        if let Some(svc) = &spec.docker
+            && !seen.contains(svc) {
                 seen.push(svc.clone());
             }
-        }
     }
     seen
 }
@@ -983,11 +982,10 @@ fn resolve_label(cli: &JoinConfigArgs) -> Result<String, String> {
     if let Some(l) = &cli.label {
         return Ok(l.clone());
     }
-    if let Ok(env) = std::env::var("FDL_ENV") {
-        if !env.trim().is_empty() {
+    if let Ok(env) = std::env::var("FDL_ENV")
+        && !env.trim().is_empty() {
             return Ok(env.trim().to_string());
         }
-    }
     Err("a farm needs a label: `fdl join-config <label>` (or target an \
          existing overlay: `fdl @<label> join-config`)"
         .to_string())
@@ -1503,14 +1501,13 @@ fn package_name(manifest: &str) -> Option<String> {
             in_package = t == "[package]";
             continue;
         }
-        if in_package {
-            if let Some(rest) = t.strip_prefix("name") {
+        if in_package
+            && let Some(rest) = t.strip_prefix("name") {
                 let rest = rest.trim_start();
                 if let Some(v) = rest.strip_prefix('=') {
                     return Some(v.trim().trim_matches('"').to_string());
                 }
             }
-        }
     }
     None
 }
@@ -1539,13 +1536,11 @@ fn flodl_path_dep(manifest: &str) -> Option<String> {
             }
             continue;
         }
-        if in_flodl_table {
-            if let Some(rest) = t.strip_prefix("path") {
-                if let Some(v) = rest.trim_start().strip_prefix('=') {
+        if in_flodl_table
+            && let Some(rest) = t.strip_prefix("path")
+                && let Some(v) = rest.trim_start().strip_prefix('=') {
                     return Some(v.trim().trim_matches('"').to_string());
                 }
-            }
-        }
     }
     None
 }
@@ -1614,13 +1609,11 @@ fn workspace_above(crate_abs: &Path, from_root: &Path) -> Option<PathBuf> {
     let mut dir = crate_abs.parent()?;
     loop {
         let m = dir.join("Cargo.toml");
-        if m.is_file() {
-            if let Ok(content) = fs::read_to_string(&m) {
-                if content.lines().any(|l| l.trim() == "[workspace]") {
+        if m.is_file()
+            && let Ok(content) = fs::read_to_string(&m)
+                && content.lines().any(|l| l.trim() == "[workspace]") {
                     return Some(dir.to_path_buf());
                 }
-            }
-        }
         if dir == from_root {
             return None;
         }
@@ -1679,15 +1672,12 @@ fn newest_source_mtime(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> 
                     continue;
                 }
                 stack.push(path);
-            } else if name != "Cargo.lock" {
-                if let Ok(m) = entry.metadata() {
-                    if let Ok(t) = m.modified() {
-                        if newest.as_ref().is_none_or(|(n, _)| t > *n) {
+            } else if name != "Cargo.lock"
+                && let Ok(m) = entry.metadata()
+                    && let Ok(t) = m.modified()
+                        && newest.as_ref().is_none_or(|(n, _)| t > *n) {
                             newest = Some((t, path));
                         }
-                    }
-                }
-            }
         }
     }
     newest
@@ -1758,11 +1748,10 @@ fn render_worker_yml(
             );
         }
     }
-    if door != Door::A {
-        if let Some(dp) = &cli.data_path {
+    if door != Door::A
+        && let Some(dp) = &cli.data_path {
             out.push_str(&format!("  data_path: {dp}\n"));
         }
-    }
     if let Some(share) = cli.gpu_ram_share {
         out.push_str(&format!(
             "  gpu_ram_share: {share}            # this box's APU aperture share\n"

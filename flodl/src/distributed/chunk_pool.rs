@@ -121,8 +121,8 @@ impl ChunkPool {
     /// 3. truing: the tail of the largest-residue span (the rank
     ///    out-ran its reservation; the boundary moves).
     pub fn take_chunk(&mut self, size: usize, rank: usize) -> Option<(usize, usize)> {
-        if size > 0 {
-            if let Some((off, range_size)) = self.reclaimed.pop_front() {
+        if size > 0
+            && let Some((off, range_size)) = self.reclaimed.pop_front() {
                 let actual = size.min(range_size);
                 if actual < range_size {
                     // Partial take: return the tail of the range for the
@@ -134,7 +134,6 @@ impl ChunkPool {
                 self.outstanding[rank].push_back((off, actual));
                 return Some((off, actual));
             }
-        }
 
         // Own span front.
         let residue = self.residue(rank);
@@ -803,14 +802,13 @@ mod tests {
         let mut covered = vec![0u32; 100];
         while resumed.remaining() > 0 {
             for rank in 0..3 {
-                if let Some((o, s)) = resumed.take_chunk(15, rank) {
-                    if s > 0 {
+                if let Some((o, s)) = resumed.take_chunk(15, rank)
+                    && s > 0 {
                         for slot in covered.iter_mut().skip(o).take(s) {
                             *slot += 1;
                         }
                         resumed.mark_completed(rank, s);
                     }
-                }
             }
         }
         assert!(resumed.is_epoch_done(), "resumed epoch completes");

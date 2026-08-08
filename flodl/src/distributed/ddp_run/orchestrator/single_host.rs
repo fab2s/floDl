@@ -205,22 +205,19 @@ impl DdpHandle {
                 let metrics = ddp_run::aggregate_epoch_metrics(
                     epoch, &msgs, &device_indices, &bc_share,
                 );
-                if let Some(f) = &metrics_fn {
-                    if let Err(e) = f(&metrics) {
+                if let Some(f) = &metrics_fn
+                    && let Err(e) = f(&metrics) {
                         eprintln!("  ddp: metrics_fn returned error (epoch {epoch}): {e}");
                     }
-                }
                 let _ = epoch_metrics_tx.send(metrics);
             }
 
             // Single-GPU checkpoint: version = epoch number (monotonic)
-            if let (Some(every), Some(f)) = (checkpoint_every, &checkpoint_fn) {
-                if every > 0 && (epoch + 1) % every == 0 {
-                    if let Err(e) = f((epoch + 1) as u64, worker.model()) {
+            if let (Some(every), Some(f)) = (checkpoint_every, &checkpoint_fn)
+                && every > 0 && (epoch + 1) % every == 0
+                    && let Err(e) = f((epoch + 1) as u64, worker.model()) {
                         eprintln!("  ddp: checkpoint failed (epoch {}): {e}", epoch + 1);
                     }
-                }
-            }
 
             // Single-GPU eval cadence: mirrors the cluster controller's
             // dispatch. Fire after epoch N at (N+1) % every == 0 so the
@@ -229,21 +226,19 @@ impl DdpHandle {
             // batch iteration inside the closure.
             if let (Some(every), Some(efn), Some(ds)) =
                 (eval_every_epochs, &eval_fn, &eval_dataset)
-            {
-                if every > 0 && (epoch + 1) % every == 0 {
+                && every > 0 && (epoch + 1) % every == 0 {
                     worker.model().eval();
                     let result = efn(worker.model(), ds.as_ref());
                     worker.model().train();
                     match result {
                         Ok(metric) => {
-                            if let Some(rf) = &eval_result_fn {
-                                if let Err(e) = rf(epoch + 1, metric) {
+                            if let Some(rf) = &eval_result_fn
+                                && let Err(e) = rf(epoch + 1, metric) {
                                     eprintln!(
                                         "  ddp: eval_result_fn returned error (epoch {}): {e}",
                                         epoch + 1,
                                     );
                                 }
-                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -253,7 +248,6 @@ impl DdpHandle {
                         }
                     }
                 }
-            }
         }
         // Drop the sender so next_metrics() returns None after the queue drains.
         drop(epoch_metrics_tx);

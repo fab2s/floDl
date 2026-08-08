@@ -348,11 +348,10 @@ impl ResourceSampler {
             // the CUDA runtime index (= position in the visible list).
             // Querying them from a process without a context would
             // CREATE one (pinning VRAM); gate on context presence.
-            if crate::tensor::gpu_has_primary_context(i as i32) {
-                if let Ok(alloc) = crate::tensor::gpu_allocated_bytes_idx(i as i32) {
+            if crate::tensor::gpu_has_primary_context(i as i32)
+                && let Ok(alloc) = crate::tensor::gpu_allocated_bytes_idx(i as i32) {
                     gpu.vram_allocated_bytes = Some(alloc);
                 }
-            }
             // Background average if available, else instant NVML sample
             gpu.util_percent = util_averages.get(i).copied().flatten()
                 .or_else(|| {

@@ -705,24 +705,21 @@ fn parse_choices(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Vec<String>> 
 // ── Type classification ─────────────────────────────────────────────────
 
 fn classify_type(ty: &Type) -> (TypeShape, Type) {
-    if let Type::Path(TypePath { path, .. }) = ty {
-        if let Some(seg) = path.segments.last() {
+    if let Type::Path(TypePath { path, .. }) = ty
+        && let Some(seg) = path.segments.last() {
             let name = seg.ident.to_string();
             if name == "bool" {
                 return (TypeShape::Bool, ty.clone());
             }
-            if name == "Option" {
-                if let Some(inner) = first_generic(&seg.arguments) {
+            if name == "Option"
+                && let Some(inner) = first_generic(&seg.arguments) {
                     return (TypeShape::Opt, inner);
                 }
-            }
-            if name == "Vec" {
-                if let Some(inner) = first_generic(&seg.arguments) {
+            if name == "Vec"
+                && let Some(inner) = first_generic(&seg.arguments) {
                     return (TypeShape::List, inner);
                 }
-            }
         }
-    }
     (TypeShape::Scalar, ty.clone())
 }
 
@@ -1052,11 +1049,10 @@ fn schema_type_str(f: &FieldSpec) -> &'static str {
 }
 
 fn inner_ty_name(ty: &Type) -> String {
-    if let Type::Path(TypePath { path, .. }) = ty {
-        if let Some(seg) = path.segments.last() {
+    if let Type::Path(TypePath { path, .. }) = ty
+        && let Some(seg) = path.segments.last() {
             return seg.ident.to_string();
         }
-    }
     String::from("_")
 }
 
@@ -1402,12 +1398,11 @@ fn extract_doc(attrs: &[Attribute]) -> Option<String> {
         if !a.path().is_ident("doc") {
             continue;
         }
-        if let syn::Meta::NameValue(nv) = &a.meta {
-            if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
+        if let syn::Meta::NameValue(nv) = &a.meta
+            && let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
                 let text = s.value();
                 lines.push(text.trim().to_string());
             }
-        }
     }
     if lines.is_empty() {
         return None;

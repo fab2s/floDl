@@ -265,11 +265,10 @@ fn detect_project_crates() -> BTreeMap<String, String> {
     for line in contents.lines() {
         let line = line.trim();
         if line == "[[package]]" {
-            if let (Some(name), Some(version)) = (current_name.take(), current_version.take()) {
-                if FRAMEWORK_CRATES.contains(&name.as_str()) {
+            if let (Some(name), Some(version)) = (current_name.take(), current_version.take())
+                && FRAMEWORK_CRATES.contains(&name.as_str()) {
                     out.insert(name, version);
                 }
-            }
         } else if let Some(rest) = line.strip_prefix("name = ") {
             current_name = unquote(rest);
         } else if let Some(rest) = line.strip_prefix("version = ") {
@@ -277,11 +276,10 @@ fn detect_project_crates() -> BTreeMap<String, String> {
         }
     }
     // Trailing block.
-    if let (Some(name), Some(version)) = (current_name, current_version) {
-        if FRAMEWORK_CRATES.contains(&name.as_str()) {
+    if let (Some(name), Some(version)) = (current_name, current_version)
+        && FRAMEWORK_CRATES.contains(&name.as_str()) {
             out.insert(name, version);
         }
-    }
 
     out
 }
@@ -354,22 +352,20 @@ fn collect_nudges(
 ) -> Vec<String> {
     let mut out = Vec::new();
 
-    if let Some(latest) = latest_known.get("flodl-cli") {
-        if semver_lt(self_version, latest) {
+    if let Some(latest) = latest_known.get("flodl-cli")
+        && semver_lt(self_version, latest) {
             out.push(format!(
                 "flodl-cli {latest} is available (you have {self_version})"
             ));
         }
-    }
 
     for (name, current) in project_versions {
-        if let Some(latest) = latest_known.get(name) {
-            if semver_lt(current, latest) {
+        if let Some(latest) = latest_known.get(name)
+            && semver_lt(current, latest) {
                 out.push(format!(
                     "{name} {latest} is available (your project pins {current})"
                 ));
             }
-        }
     }
 
     out

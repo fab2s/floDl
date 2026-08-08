@@ -28,14 +28,13 @@ fn header_reachable(header: &str, root_include: &Path) -> bool {
     else {
         return false;
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        if stdin
+    if let Some(stdin) = child.stdin.as_mut()
+        && stdin
             .write_all(format!("#include <{header}>\n").as_bytes())
             .is_err()
         {
             return false;
         }
-    }
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 

@@ -336,11 +336,10 @@ pub fn list_variants(root: &Path) -> Vec<String> {
         let dir = lt_dir.join(subdir);
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
-                if entry.path().join("lib").is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
+                if entry.path().join("lib").is_dir()
+                    && let Some(name) = entry.file_name().to_str() {
                         variants.push(format!("{}/{}", subdir, name));
                     }
-                }
             }
         }
     }

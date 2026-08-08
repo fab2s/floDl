@@ -46,11 +46,10 @@ impl ClusterCoordinator {
             | TimingMsgWire::DashboardSetHardware { rank, .. }
             | TimingMsgWire::ResourceSample { rank, .. } => Some(*rank as usize),
         };
-        if let Some(r) = rank_for_liveness {
-            if r < self.last_heartbeat.len() {
+        if let Some(r) = rank_for_liveness
+            && r < self.last_heartbeat.len() {
                 self.last_heartbeat[r] = Instant::now();
             }
-        }
         match msg {
             TimingMsgWire::Batch {
                 rank,
@@ -906,13 +905,12 @@ impl ClusterCoordinator {
                     k_at_epoch_end: snap.k_at_epoch_end,
                 });
             }
-            if let Some(ref f) = self.metrics_fn {
-                if let Err(e) = f(&metrics) {
+            if let Some(ref f) = self.metrics_fn
+                && let Err(e) = f(&metrics) {
                     eprintln!(
                         "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
                     );
                 }
-            }
             // Broadcast the aggregated view back to every rank so the
             // cooperative (`into_worker`) user loop's
             // `monitor.log(&model)` sees the cross-rank picture

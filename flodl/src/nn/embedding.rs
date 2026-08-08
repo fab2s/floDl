@@ -76,13 +76,12 @@ impl Embedding {
     pub fn on_device_with_padding_idx(
         num_embeddings: i64, embedding_dim: i64, padding_idx: Option<i64>, device: Device,
     ) -> Result<Self> {
-        if let Some(p) = padding_idx {
-            if p < 0 || p >= num_embeddings {
+        if let Some(p) = padding_idx
+            && (p < 0 || p >= num_embeddings) {
                 return Err(crate::tensor::TensorError::new(&format!(
                     "padding_idx {p} out of range [0, {num_embeddings})"
                 )));
             }
-        }
 
         let weight = Variable::new(
             Tensor::randn(

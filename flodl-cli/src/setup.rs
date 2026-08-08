@@ -167,8 +167,8 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     let existing = detect::read_active(root);
     let mut skip_download = false;
 
-    if !opts.force {
-        if let Some(ref info) = existing {
+    if !opts.force
+        && let Some(ref info) = existing {
             // The variant PATH carries the vendor, not `.arch`'s `cuda=`
             // field: a ROCm build has no CUDA toolkit version and writes
             // `cuda=none` there, exactly like a CPU build. Reading that
@@ -188,7 +188,6 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
                 None => println!("  Found existing CPU libtorch."),
             }
         }
-    }
 
     if !skip_download {
         // Always download CPU variant (useful as fallback).
@@ -530,8 +529,8 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     }
 
     // Native instructions
-    if build_mode == "native" || build_mode == "both" {
-        if let Some(info) = &active {
+    if (build_mode == "native" || build_mode == "both")
+        && let Some(info) = &active {
             let lt_path = format!("libtorch/{}", info.path);
             println!();
             println!("  Build natively:");
@@ -544,7 +543,6 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
                 None => println!("    cargo test"),
             }
         }
-    }
 
     // No-build-environment fallback: only reachable from the
     // docker-only-no-cargo branch where the user declined Docker

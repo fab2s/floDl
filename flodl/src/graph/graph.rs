@@ -293,9 +293,9 @@ impl Graph {
         // Detect child subgraphs: labeled Graphs become tree children
         let mut children: HashMap<String, usize> = HashMap::new();
         for (idx, node) in nodes.iter().enumerate() {
-            if let Some(ref module) = node.module {
-                if let Some(child_graph) = module.as_graph() {
-                    if let Some(child_label) = child_graph.label() {
+            if let Some(ref module) = node.module
+                && let Some(child_graph) = module.as_graph()
+                    && let Some(child_label) = child_graph.label() {
                         if child_label.contains('.') {
                             return Err(TensorError::new(&format!(
                                 "child graph label {:?} contains a dot — \
@@ -310,21 +310,18 @@ impl Graph {
                             )));
                         }
                         // Validate: label doesn't shadow a tag on a different node
-                        if let Some(&(tag_ni, _)) = tag_names_map.get(child_label) {
-                            if tag_ni != idx {
+                        if let Some(&(tag_ni, _)) = tag_names_map.get(child_label)
+                            && tag_ni != idx {
                                 return Err(TensorError::new(&format!(
                                     "child graph label {:?} collides with a tag \
                                      on a different node",
                                     child_label
                                 )));
                             }
-                        }
                         children.insert(child_label.to_string(), idx);
                         child_graph.composed.set(true);
                     }
                     // Unlabeled graphs: not registered, no tree features, no error
-                }
-            }
         }
 
         // Auto-internal inference: underscore-prefixed tags
@@ -457,11 +454,10 @@ impl Graph {
             aggregated_metrics: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
 
-        if verbose {
-            if let Ok(ref g) = graph {
+        if verbose
+            && let Ok(ref g) = graph {
                 crate::verbose!("{}", g.tree_summary());
             }
-        }
 
         graph
     }

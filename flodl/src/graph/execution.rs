@@ -147,8 +147,8 @@ impl Graph {
                 }
 
                 // Capture tagged outputs for observation
-                if has_tags {
-                    if let Some(captures) = self.tag_capture.get(&ni) {
+                if has_tags
+                    && let Some(captures) = self.tag_capture.get(&ni) {
                         let mut tagged = self.tagged_outputs.borrow_mut();
                         for (tag_name, port_idx) in captures {
                             if *port_idx < node_outputs.len() {
@@ -159,7 +159,6 @@ impl Graph {
                             }
                         }
                     }
-                }
 
                 // Keep output node's results; all others drop here (early release)
                 if ni == self.output_node_idx {

@@ -70,13 +70,11 @@ fn find_project_root() -> Option<PathBuf> {
         }
         // Secondary signal: Cargo.toml mentioning flodl
         let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            if let Ok(contents) = fs::read_to_string(&cargo_toml) {
-                if contents.contains("flodl") {
+        if cargo_toml.exists()
+            && let Ok(contents) = fs::read_to_string(&cargo_toml)
+                && contents.contains("flodl") {
                     return Some(dir);
                 }
-            }
-        }
         if !dir.pop() {
             return None;
         }

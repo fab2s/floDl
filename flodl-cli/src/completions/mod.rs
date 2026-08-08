@@ -389,8 +389,8 @@ pub fn autocomplete(project: Option<(&ProjectConfig, &Path)>) {
     );
 
     // Check if already installed.
-    if let Ok(content) = std::fs::read_to_string(&rc_path) {
-        if content.contains(MARKER) {
+    if let Ok(content) = std::fs::read_to_string(&rc_path)
+        && content.contains(MARKER) {
             eprintln!(
                 "{}  Completions already installed. Updating...",
                 style::yellow("*")
@@ -401,7 +401,6 @@ pub fn autocomplete(project: Option<(&ProjectConfig, &Path)>) {
                 return;
             }
         }
-    }
 
     // Ensure target dir exists (needed for fish's config.fish).
     if let Some(parent) = std::path::Path::new(&rc_path).parent() {

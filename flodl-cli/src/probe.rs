@@ -62,13 +62,11 @@ pub fn run(
     // Cluster fan-out only applies when no explicit libtorch override
     // is passed — overrides are how the *remote* probe is invoked, so
     // we must NOT recurse back into cluster mode on the remote side.
-    if libtorch_path_override.is_none() {
-        if let Ok(env_name) = std::env::var("FDL_ENV") {
-            if let Some(cluster) = load_cluster_for_env(&ctx, &env_name) {
+    if libtorch_path_override.is_none()
+        && let Ok(env_name) = std::env::var("FDL_ENV")
+            && let Some(cluster) = load_cluster_for_env(&ctx, &env_name) {
                 return run_cluster(&cluster, json, skip_mount);
             }
-        }
-    }
     // Single-host (local OR remote-being-probed). When `--data-path` is
     // passed explicitly, treat a missing path as an error; when absent
     // (falling back to DEFAULT_DATA_PATH), treat it as a warning.
@@ -361,8 +359,8 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
         }
     }
 
-    if let Some(lt) = v.get("libtorch") {
-        if !lt.is_null() {
+    if let Some(lt) = v.get("libtorch")
+        && !lt.is_null() {
             let path = lt.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let valid_dir = lt.get("valid_dir").and_then(|v| v.as_bool()).unwrap_or(false);
             let info = LibtorchInfo {
@@ -382,7 +380,6 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
             }
             report.libtorch = LibtorchStatus { info: Some(info), valid_dir, archs_match };
         }
-    }
 
     if let Some(dp) = v.get("data_path") {
         if !dp.is_null() {
@@ -406,8 +403,8 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
         }
     }
 
-    if let Some(nccl) = v.get("nccl") {
-        if !nccl.is_null() {
+    if let Some(nccl) = v.get("nccl")
+        && !nccl.is_null() {
             let p = nccl.get("library_path").and_then(|v| v.as_str()).map(PathBuf::from);
             report.nccl.library_path = p.clone();
             if let Some(p) = p {
@@ -422,7 +419,6 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
                 report.nccl.via_docker = Some(svc.to_string());
             }
         }
-    }
 
     if let Some(issues) = v.get("issues").and_then(|v| v.as_array()) {
         for i in issues {

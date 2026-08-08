@@ -33,11 +33,10 @@ pub use flodl_hw::{
 pub fn cpu_model() -> Option<String> {
     let info = fs::read_to_string("/proc/cpuinfo").ok()?;
     for line in info.lines() {
-        if let Some(rest) = line.strip_prefix("model name") {
-            if let Some(val) = rest.split(':').nth(1) {
+        if let Some(rest) = line.strip_prefix("model name")
+            && let Some(val) = rest.split(':').nth(1) {
                 return Some(val.trim().to_string());
             }
-        }
     }
     None
 }

@@ -989,12 +989,11 @@ fn rank_reader(
                 // Treat any read error as the rank being gone. RankExit is
                 // idempotent on the controller (declare_dead), so a
                 // spurious one during teardown is harmless.
-                if let Some(ctx) = &fold {
-                    if let Err(e) = ctx.mark_dead(rank, &tx) {
+                if let Some(ctx) = &fold
+                    && let Err(e) = ctx.mark_dead(rank, &tx) {
                         eprintln!("relay fold: rank {rank} error-fold: {e}");
                         shutdown.store(true, Ordering::SeqCst);
                     }
-                }
                 let _ = tx.send(MuxRecord::control(RelayControlMsg::RankExit { rank }));
                 break;
             }

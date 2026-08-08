@@ -299,13 +299,12 @@ impl ClusterCoordinator {
                     "  ddp: EvalBroadcast (epoch {epoch}) failed: {e}"
                 );
             }
-            if let Some(ref f) = self.eval_result_fn {
-                if let Err(e) = f(epoch, metric) {
+            if let Some(ref f) = self.eval_result_fn
+                && let Err(e) = f(epoch, metric) {
                     eprintln!(
                         "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
                     );
                 }
-            }
         }
     }
 
@@ -384,27 +383,23 @@ impl ClusterCoordinator {
         }
         // checkpoint_fn cadence: same `epoch > 0 && epoch % every == 0`
         // shape the dispatch site uses.
-        if let Some(every) = self.checkpoint_every {
-            if every > 0 && next_epoch > 0 && next_epoch % every == 0 {
-                if let Some(ewma) = self.last_checkpoint_elapsed_ms_ewma {
+        if let Some(every) = self.checkpoint_every
+            && every > 0 && next_epoch > 0 && next_epoch % every == 0
+                && let Some(ewma) = self.last_checkpoint_elapsed_ms_ewma {
                     let role = self.checkpoint_role;
                     if role < self.world_size {
                         slack_ms[role] += ewma;
                     }
                 }
-            }
-        }
         // eval_fn cadence: mirror of checkpoint cadence.
-        if let Some(every) = self.eval_every_epochs {
-            if every > 0 && next_epoch > 0 && next_epoch % every == 0 {
-                if let Some(ewma) = self.last_eval_elapsed_ms_ewma {
+        if let Some(every) = self.eval_every_epochs
+            && every > 0 && next_epoch > 0 && next_epoch % every == 0
+                && let Some(ewma) = self.last_eval_elapsed_ms_ewma {
                     let role = self.eval_role;
                     if role < self.world_size {
                         slack_ms[role] += ewma;
                     }
                 }
-            }
-        }
         // Guard: drop sub-threshold per-rank entries. Both an absolute
         // floor (100 ms — below noise on any realistic sync cycle) and
         // a relative floor (5 % of anchor wall-time — sub-noise on

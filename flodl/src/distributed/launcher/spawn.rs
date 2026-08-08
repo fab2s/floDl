@@ -341,8 +341,8 @@ pub(super) fn supervise_children(
     // Elastic verdict: the launcher's exit status reflects the RUN, not
     // individual children. Deaths within tolerance on a run that drained
     // to completion are a degraded-but-valid result.
-    if any_failure.is_none() {
-        if let Some(e) = elastic.as_ref() {
+    if any_failure.is_none()
+        && let Some(e) = elastic.as_ref() {
             let dead = e.dead_ranks.dead_count();
             let limit = e.max_failure.map(|t| t.limit_for(e.world_size));
             if dead >= e.world_size {
@@ -350,8 +350,8 @@ pub(super) fn supervise_children(
                     "cluster launcher: every rank was lost; consensus checkpoint \
                      saved if a save path was armed",
                 ));
-            } else if let Some(l) = limit {
-                if dead >= l {
+            } else if let Some(l) = limit
+                && dead >= l {
                     any_failure = Some(TensorError::new(&format!(
                         "cluster launcher: max_failure exceeded ({dead}/{} ranks \
                          dead, threshold {l}); coordinator dispatched \
@@ -360,7 +360,6 @@ pub(super) fn supervise_children(
                         e.world_size,
                     )));
                 }
-            }
             if any_failure.is_none() {
                 if dead > 0 {
                     eprintln!(
@@ -389,7 +388,6 @@ pub(super) fn supervise_children(
                 }
             }
         }
-    }
     any_failure
 }
 
@@ -752,13 +750,12 @@ pub(super) fn build_remote_agent_bash_command(
     // host_env / cluster_env, so the user can override it via
     // host.env: { LD_LIBRARY_PATH: ... } when they need a custom
     // value (e.g. bare-metal libnccl at /usr/local/lib).
-    if let Some(pb) = prebuild {
-        if !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
+    if let Some(pb) = prebuild
+        && !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
             s.push(' ');
             s.push_str("LD_LIBRARY_PATH=");
             s.push_str(&shell_quote(&pb.ld_library_path));
         }
-    }
     // Apply user-declared env: cluster-scope first, host-scope second
     // (host overrides cluster for matching keys). In a shell assignment
     // prefix the LAST duplicate wins, so these WOULD override the

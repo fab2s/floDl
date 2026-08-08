@@ -182,8 +182,8 @@ impl ClusterBuilder {
         // `all_devices()` (unresolved "all") is exempt — its count is
         // resolved at startup on the owning host.
         for w in &self.workers {
-            if let Some(devs) = w.local_devices.as_deref() {
-                if devs.len() != w.ranks.len() {
+            if let Some(devs) = w.local_devices.as_deref()
+                && devs.len() != w.ranks.len() {
                     return Err(TensorError::new(&format!(
                         "ClusterBuilder: host {:?}: devices ({}) and ranks ({}) \
                          length mismatch — supply exactly one device index per \
@@ -193,7 +193,6 @@ impl ClusterBuilder {
                         w.ranks.len(),
                     )));
                 }
-            }
         }
         // Reserved-env-key check: a user env map (cluster- or host-scope)
         // must not carry a key the launcher owns per-rank — the launcher

@@ -981,13 +981,12 @@ where
             }
         }
         // easgd_alpha: blend factor semantics require (0, 1].
-        if let Some(alpha) = self.config.elche.easgd_alpha {
-            if !(alpha > 0.0 && alpha <= 1.0) {
+        if let Some(alpha) = self.config.elche.easgd_alpha
+            && !(alpha > 0.0 && alpha <= 1.0) {
                 return Err(crate::tensor::TensorError::new(&format!(
                     "DdpBuilder: easgd_alpha must be in (0, 1], got {alpha}"
                 )));
             }
-        }
         // gamma: the consensus allocation-weighting exponent must be
         // finite. Wired on BOTH backends: the CPU path applies it in the
         // cluster-worker bridge's frame weighting; the NCCL path folds it

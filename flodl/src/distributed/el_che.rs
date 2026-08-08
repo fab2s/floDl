@@ -613,8 +613,8 @@ impl ElChe {
         if cohort.len() == 1 {
             return Some(cohort[0]);
         }
-        if let Some(c) = self.anchor_rank {
-            if cohort.contains(&c) {
+        if let Some(c) = self.anchor_rank
+            && cohort.contains(&c) {
                 let cur = self.smoothed_ms(c);
                 let challenger = cohort
                     .iter()
@@ -624,14 +624,12 @@ impl ElChe {
                     .max_by(|(_, a), (_, b)| {
                         a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some((other, other_ms)) = challenger {
-                    if other_ms > cur * (1.0 + DOMINANCE_MARGIN) {
+                if let Some((other, other_ms)) = challenger
+                    && other_ms > cur * (1.0 + DOMINANCE_MARGIN) {
                         return Some(other);
                     }
-                }
                 return Some(c);
             }
-        }
         cohort.into_iter().min()
     }
 
@@ -1192,11 +1190,10 @@ impl ElChe {
         // then does the load-bearing work of excluding clearly-fast ranks.
         let allow_election =
             self.anchor_rank.is_none() || self.phase >= Phase::Stable;
-        if allow_election {
-            if let Some(elected) = self.elect_anchor() {
+        if allow_election
+            && let Some(elected) = self.elect_anchor() {
                 self.anchor_rank = Some(elected);
             }
-        }
 
         // No anchor yet (no positive readings on any rank) — bail.
         let anchor_rank = match self.anchor_rank {
@@ -1213,12 +1210,11 @@ impl ElChe {
             // `Phase::Stable`, which requires calibration. Once the rank
             // has missed a full trust window of reports, stop trusting
             // the pin and elect from the ranks that DO have data.
-            if self.consecutive_zero_reports[anchor_rank] >= TRUST_WINDOW_CAP {
-                if let Some(elected) = self.elect_anchor() {
+            if self.consecutive_zero_reports[anchor_rank] >= TRUST_WINDOW_CAP
+                && let Some(elected) = self.elect_anchor() {
                     self.anchor_rank = Some(elected);
                     slow_ms = self.smoothed_ms(elected);
                 }
-            }
             if slow_ms <= 0.0 {
                 return;
             }
@@ -1563,15 +1559,13 @@ impl ElChe {
                 // Hand any rounding remainder to the fastest rank (largest
                 // count) so the cohort still uses the full window budget.
                 let used: usize = self.batch_counts.iter().sum();
-                if let Some(rem) = max_total.checked_sub(used) {
-                    if rem > 0 {
-                        if let Some(fastest) = (0..self.world_size)
+                if let Some(rem) = max_total.checked_sub(used)
+                    && rem > 0
+                        && let Some(fastest) = (0..self.world_size)
                             .max_by_key(|&r| self.batch_counts[r])
                         {
                             self.batch_counts[fastest] += rem;
                         }
-                    }
-                }
             }
         }
         // Slack is consumed exactly once per recompute. Zeroing here

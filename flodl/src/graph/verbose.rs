@@ -59,8 +59,8 @@ impl Graph {
                 format!("{}|   ", indent)
             };
 
-            if let Some(ref module) = self.nodes[*ni].module {
-                if let Some(child_graph) = module.as_graph() {
+            if let Some(ref module) = self.nodes[*ni].module
+                && let Some(child_graph) = module.as_graph() {
                     let child_hash = &child_graph.structural_hash()[..8];
                     let child_params = child_graph.parameters().len();
                     let child_frozen = child_graph.parameters().iter()
@@ -74,7 +74,6 @@ impl Graph {
                     let _ = writeln!(out, "{}+-- {} [hash: {}]{}", indent, label, child_hash, frozen_str);
                     child_graph.write_tree_node(out, &child_indent, false);
                 }
-            }
         }
     }
 
@@ -93,8 +92,8 @@ impl Graph {
 
             let mut accounted = 0usize;
             for (label, ni) in &child_entries {
-                if let Some(ref module) = self.nodes[*ni].module {
-                    if let Some(child_graph) = module.as_graph() {
+                if let Some(ref module) = self.nodes[*ni].module
+                    && let Some(child_graph) = module.as_graph() {
                         let count = child_graph.parameters().len();
                         let frozen = child_graph.parameters().iter()
                             .filter(|p| p.is_frozen()).count();
@@ -109,7 +108,6 @@ impl Graph {
                         let _ = writeln!(out, "  {}: {} ({:.1}%){}", label, count, pct, frozen_str);
                         accounted += count;
                     }
-                }
             }
             let own = total.saturating_sub(accounted);
             if own > 0 {

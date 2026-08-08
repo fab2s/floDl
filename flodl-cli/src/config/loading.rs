@@ -268,11 +268,10 @@ fn validate_gpu_ram_shares(cfg: &ProjectConfig, base_path: &Path) -> Result<(), 
             }
         }
     }
-    if let Some(join) = &cfg.join {
-        if bad(join.gpu_ram_share) {
+    if let Some(join) = &cfg.join
+        && bad(join.gpu_ram_share) {
             return err("join.gpu_ram_share", join.gpu_ram_share.unwrap());
         }
-    }
     Ok(())
 }
 

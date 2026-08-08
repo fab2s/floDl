@@ -1498,14 +1498,13 @@ pub fn run_launcher_with_config(
                                 return;
                             }
                         };
-                        if !kicked {
-                            if let Err(e) = coord.dispatch_epoch(start_epoch) {
+                        if !kicked
+                            && let Err(e) = coord.dispatch_epoch(start_epoch) {
                                 eprintln!(
                                     "cluster launcher: dispatch_epoch({start_epoch}) failed: {e}"
                                 );
                                 return;
                             }
-                        }
                         // Drive ticks until shutdown_workers fires (all
                         // ranks exited) or the process is killed. Paced
                         // on a short blocking timing-drain instead of a

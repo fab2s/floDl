@@ -212,15 +212,14 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
     for (idx, value) in out.positionals.iter().enumerate() {
         match positional_decl_for(spec, idx) {
             Some(d) => {
-                if let Some(choices) = &d.choices {
-                    if !choices.iter().any(|c| c == value) {
+                if let Some(choices) = &d.choices
+                    && !choices.iter().any(|c| c == value) {
                         return Err(format!(
                             "invalid value `{value}` for <{}> -- allowed: {}",
                             d.name,
                             choices.join(", ")
                         ));
                     }
-                }
             }
             None if spec.lenient_unknowns => {}
             None => {

@@ -103,11 +103,10 @@ pub fn find_flodl_src(explicit: Option<&str>) -> Option<PathBuf> {
 
     // Check cached downloads
     if let Some(tag) = fetch_latest_tag() {
-        if let Some(cache) = cache_dir(&tag) {
-            if let Some(src) = find_src_in_cache(&cache) {
+        if let Some(cache) = cache_dir(&tag)
+            && let Some(src) = find_src_in_cache(&cache) {
                 return Some(src);
             }
-        }
         // Download from GitHub
         match download_source(&tag) {
             Ok(src) => return Some(src),
@@ -505,9 +504,9 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
         }
 
         // Extract pub fn inside impl blocks
-        if in_impl && (trimmed.starts_with("pub fn ") || trimmed.starts_with("pub const fn ")) {
-            if let Some((ref type_name, ref trait_name)) = current_impl {
-                if let Some(sig) = extract_fn_sig(trimmed) {
+        if in_impl && (trimmed.starts_with("pub fn ") || trimmed.starts_with("pub const fn "))
+            && let Some((ref type_name, ref trait_name)) = current_impl
+                && let Some(sig) = extract_fn_sig(trimmed) {
                     let fn_name = extract_fn_name(&sig);
                     let fn_sig = FnSig {
                         name: fn_name.clone(),
@@ -516,11 +515,10 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
 
                     if let Some(api_type) = types.get_mut(type_name) {
                         // Record trait implementation
-                        if let Some(t) = &trait_name {
-                            if !api_type.traits.contains(t) {
+                        if let Some(t) = &trait_name
+                            && !api_type.traits.contains(t) {
                                 api_type.traits.push(t.clone());
                             }
-                        }
 
                         // Categorize the method
                         if fn_name == "new"
@@ -538,8 +536,6 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
                         }
                     }
                 }
-            }
-        }
     }
 
     // Pass 3: collect top-level pub fns (not inside impl blocks).
@@ -566,8 +562,8 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
         }
 
         // Top-level pub fn: depth 0 (module level) or 1 (inside mod block)
-        if depth <= 1 && trimmed.starts_with("pub fn ") {
-            if let Some(sig) = extract_fn_sig(trimmed) {
+        if depth <= 1 && trimmed.starts_with("pub fn ")
+            && let Some(sig) = extract_fn_sig(trimmed) {
                 let fn_name = extract_fn_name(&sig);
                 let (doc, _) = extract_docs(&lines, i);
                 free_fns.push(FnSig {
@@ -575,7 +571,6 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
                     signature: sig,
                 });
             }
-        }
     }
 
     if !free_fns.is_empty() {
@@ -656,11 +651,10 @@ fn get_version(src_root: &Path) -> String {
             // Look for version = "x.y.z" (not version.workspace = true)
             for line in content.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("version") && trimmed.contains('"') && !trimmed.contains("workspace") {
-                    if let Some(v) = trimmed.split('"').nth(1) {
+                if trimmed.starts_with("version") && trimmed.contains('"') && !trimmed.contains("workspace")
+                    && let Some(v) = trimmed.split('"').nth(1) {
                         return v.to_string();
                     }
-                }
             }
         }
     }

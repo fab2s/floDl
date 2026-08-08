@@ -275,11 +275,10 @@ pub fn prepare_cluster_env(
         if !extra_hosts.is_empty() {
             std::env::set_var(ENV_CLUSTER_EXTRA_HOSTS, extra_hosts.join(" "));
         }
-        if let Some(e) = overlay_env {
-            if !e.trim().is_empty() {
+        if let Some(e) = overlay_env
+            && !e.trim().is_empty() {
                 std::env::set_var(ENV_FDL_ENV, e);
             }
-        }
     }
     Ok(warnings)
 }

@@ -365,7 +365,7 @@ impl LoopBody for SparseEmitter {
         *self.step_count.borrow_mut() += 1;
         let out = input.add(input)?;
         emit.publish("always", out.clone());
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             emit.publish("even_only", out.clone());
         }
         Ok(out)

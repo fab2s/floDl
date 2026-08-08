@@ -147,7 +147,7 @@ impl ClusterCoordinator {
             // folded.
             let checkpoint_by_cadence = self
                 .checkpoint_every
-                .is_some_and(|every| every > 0 && epoch % every == 0);
+                .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
             if checkpoint_by_cadence || self.pending_checkpoint_intent {
                 self.pending_checkpoint_intent = false;
                 // Targeted dispatch: the coord's `checkpoint_role`
@@ -178,7 +178,7 @@ impl ClusterCoordinator {
             // policy is `Fastest`.
             let eval_by_cadence = self
                 .eval_every_epochs
-                .is_some_and(|every| every > 0 && epoch % every == 0);
+                .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
             if eval_by_cadence || self.pending_eval_intent {
                 self.pending_eval_intent = false;
                 // schedule_id derived from epoch for now (one eval
@@ -998,11 +998,10 @@ impl ClusterCoordinator {
         // (including `cap_to_reduce_budget` — the plan IS the final word, and
         // its fold crumb deliberately runs one batch past the reduce budget on
         // a slow rank). See `docs/design/epoch-tail-allocation.md`.
-        if let Some(plan) = self.final_window_plan.as_ref() {
-            if plan.epoch == epoch {
+        if let Some(plan) = self.final_window_plan.as_ref()
+            && plan.epoch == epoch {
                 return plan.alloc.get(rank).copied().unwrap_or(0);
             }
-        }
 
         // EDGE SCHEDULE (epoch / run tail). When less than a full window of
         // work remains (`remaining < Σ batch_counts`), EVERY progressive

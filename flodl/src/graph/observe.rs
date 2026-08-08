@@ -143,8 +143,8 @@ impl Graph {
         // User code stays identical (`monitor.log(epoch, dur, &model)`);
         // single-GPU / standalone runs fall through to the local
         // history below.
-        if let Ok(slot) = self.aggregated_metrics.lock() {
-            if let Some(ref m) = *slot {
+        if let Ok(slot) = self.aggregated_metrics.lock()
+            && let Some(ref m) = *slot {
                 let mut out = Vec::with_capacity(m.scalars.len() + 1);
                 out.push(("loss".to_string(), m.avg_loss));
                 let mut keys: Vec<&String> = m.scalars.keys().collect();
@@ -154,7 +154,6 @@ impl Graph {
                 }
                 return out;
             }
-        }
         let mut metrics = self.latest_metrics_local();
         // Collect from labeled children with dotted prefixes
         for (label, &ni) in &self.children {

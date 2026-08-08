@@ -243,11 +243,10 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
             let target = m
                 .get(serde_yaml_ng::Value::String("target".into()))
                 .and_then(|v| v.as_str());
-            if matches!(source, Some(".") | Some("./")) {
-                if let Some(t) = target {
+            if matches!(source, Some(".") | Some("./"))
+                && let Some(t) = target {
                     return Some(t.to_string());
                 }
-            }
         }
     }
     None
@@ -357,8 +356,8 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
         ));
 
         // CUDA version from .arch metadata.
-        if let Some(cuda) = &info.cuda_version {
-            if cuda != "none" {
+        if let Some(cuda) = &info.cuda_version
+            && cuda != "none" {
                 let cuda_version = if cuda.matches('.').count() < 2 {
                     format!("{cuda}.0")
                 } else {
@@ -372,7 +371,6 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
                 env.push(("CUDA_VERSION".into(), cuda_version));
                 env.push(("CUDA_TAG".into(), cuda_tag));
             }
-        }
     }
 
     Ok(env)
@@ -872,12 +870,11 @@ pub fn exec_command(
     // fdl-generated args (from the structured ddp/training/output
     // blocks) are intentionally skipped — those are the binary's
     // surface, not the user's.
-    if let Some(schema) = &cmd_config.schema {
-        if let Err(e) = config::validate_tail(extra_args, schema) {
+    if let Some(schema) = &cmd_config.schema
+        && let Err(e) = config::validate_tail(extra_args, schema) {
             cli_error!("{e}");
             return ExitCode::FAILURE;
         }
-    }
 
     // Resolve config: preset overrides merged with root defaults.
     let resolved = match preset_name {
@@ -886,12 +883,11 @@ pub fn exec_command(
                 // Validate *this* preset only (choices + strict unknowns).
                 // Whole-map validation is deferred so a broken sibling
                 // preset doesn't block a correct one from running.
-                if let Some(schema) = &cmd_config.schema {
-                    if let Err(e) = config::validate_preset_for_exec(name, preset, schema) {
+                if let Some(schema) = &cmd_config.schema
+                    && let Err(e) = config::validate_preset_for_exec(name, preset, schema) {
                         cli_error!("{e}");
                         return ExitCode::FAILURE;
                     }
-                }
                 config::merge_preset(cmd_config, preset)
             }
             None => {
@@ -1408,11 +1404,10 @@ fn print_config_field<T: std::fmt::Display>(label: &str, val: &Option<T>) {
 }
 
 fn print_config_value(label: &str, val: &Option<serde_json::Value>) {
-    if let Some(v) = val {
-        if !v.is_null() {
+    if let Some(v) = val
+        && !v.is_null() {
             eprintln!("    {}  {}", style::dim(label), value_to_string(v));
         }
-    }
 }
 
 /// Print the project help with scripts and commands.
@@ -1714,12 +1709,11 @@ fn desc_segments(
             segs.push(Seg::dim(&format!("[default: {}]", format_value(d))));
         }
     }
-    if let Some(choices) = choices {
-        if !choices.is_empty() {
+    if let Some(choices) = choices
+        && !choices.is_empty() {
             let list = choices.iter().map(format_value).collect::<Vec<_>>().join(", ");
             segs.push(Seg::dim(&format!("[possible: {list}]")));
         }
-    }
     // Annotate list types so users know about repeat/comma semantics.
     if ty.starts_with("list[") {
         segs.push(Seg::dim("(repeat or comma-separate)"));

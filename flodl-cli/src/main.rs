@@ -357,11 +357,10 @@ fn resolve_env(
     if let Some(env_name) = cli_env {
         return Ok((Some(env_name), args));
     }
-    if let Some(env_name) = fdl_env {
-        if !env_name.is_empty() {
+    if let Some(env_name) = fdl_env
+        && !env_name.is_empty() {
             return Ok((Some(env_name.to_string()), args));
         }
-    }
 
     Ok((None, args))
 }

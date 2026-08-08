@@ -319,11 +319,10 @@ impl<M: Module + 'static> Worker<M> {
         // Defensive: if a caller advanced without draining the prior shard,
         // close it now so its coverage is reported (a well-formed loop drains
         // via `next_batch` returning `None`, which already ran `end_epoch`).
-        if let Some(mut st) = self.epoch_state.take() {
-            if !st.shutdown() {
+        if let Some(mut st) = self.epoch_state.take()
+            && !st.shutdown() {
                 self.worker_mut().end_epoch(&mut st)?;
             }
-        }
         self.pending_plan = None;
         self.compute_start = None;
 
@@ -473,11 +472,10 @@ impl<M: Module + 'static> Worker<M> {
     pub fn finish(mut self) -> Result<TrainedState> {
         // Release any lingering per-batch guard before the final accounting.
         self.active_guard = None;
-        if let Some(mut st) = self.epoch_state.take() {
-            if !st.shutdown() {
+        if let Some(mut st) = self.epoch_state.take()
+            && !st.shutdown() {
                 self.worker_mut().end_epoch(&mut st)?;
             }
-        }
 
         // Borrow (never move) self.inner — `Worker` has a Drop impl, so moving
         // a field out is illegal; teardown / snapshot both take `&mut`.

@@ -112,8 +112,8 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     // a missing path forever helps nobody. A binary built from source
     // cannot be checked here: it does not exist until the attempt has
     // fetched and compiled the tree.
-    if let BinSource::Given(path) = &eff.bin {
-        if !Path::new(path).is_file() {
+    if let BinSource::Given(path) = &eff.bin
+        && !Path::new(path).is_file() {
             crate::cli_error!(
                 "training binary not found: {path} — build it first and \
                  point `--bin` (or fdl.yml `join.bin`) at it, or hand this \
@@ -121,7 +121,6 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
             );
             return EXIT_PERMANENT;
         }
-    }
 
     // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
     // project root the config walk found: its lib/ rides

@@ -959,11 +959,10 @@ impl<M: Module> GpuWorker<M> {
         let start = Instant::now();
         let max_wait = Duration::from_secs(60);
         loop {
-            if let Ok(mut g) = mailbox.lock() {
-                if let Some(p) = g.take() {
+            if let Ok(mut g) = mailbox.lock()
+                && let Some(p) = g.take() {
                     return Ok(p);
                 }
-            }
             // Lone-NCCL-survivor early exit: NCCL requires `world_size
             // >= 2`. When the local dead-rank ledger reports `dead_count
             // >= world_size - 1`, no surviving peer can rendezvous with

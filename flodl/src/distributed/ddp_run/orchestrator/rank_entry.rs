@@ -721,14 +721,13 @@ impl DdpHandle {
         // Resume: re-seed this rank's replicated outer-optimizer momentum. No-op
         // when not resuming / no outer optimizer / sidecar absent; errors are
         // logged + ignored (resume from zero momentum is a safe fallback).
-        if let Some(stem) = config.resume_from.as_ref() {
-            if let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem) {
+        if let Some(stem) = config.resume_from.as_ref()
+            && let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem) {
                 eprintln!(
                     "cluster_worker: rank {global_rank} outer-momentum resume \
                      failed ({e}); starting from zero momentum"
                 );
             }
-        }
         Ok(cluster_worker)
     }
 }

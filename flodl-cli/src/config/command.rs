@@ -57,11 +57,10 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     // run through `resolve_chain` so `inherit-from:` composes the same
     // way for nested commands as for the project root.
     let mut layers = crate::overlay::resolve_chain(&base_path)?;
-    if let Some(name) = env {
-        if let Some(p) = crate::overlay::find_env_file(&base_path, name) {
+    if let Some(name) = env
+        && let Some(p) = crate::overlay::find_env_file(&base_path, name) {
             layers.extend(crate::overlay::resolve_chain(&p)?);
         }
-    }
     let mut seen = std::collections::HashSet::new();
     layers.retain(|(path, _)| seen.insert(path.clone()));
     let merged = crate::overlay::merge_layers(
@@ -135,8 +134,8 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
         let opts_into_compile = cfg.compile.unwrap_or(false);
         let should_probe =
             !crate::schema_cache::is_cargo_entry(entry) || opts_into_compile;
-        if should_probe {
-            if let Ok(probed) =
+        if should_probe
+            && let Ok(probed) =
                 crate::schema_cache::probe(entry, dir, cfg.docker.as_deref())
             {
                 // Best-effort cache write: if the dir is read-only, the
@@ -145,7 +144,6 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
                 let _ = crate::schema_cache::write_cache(&cache, &probed);
                 cfg.schema = Some(probed);
             }
-        }
     }
 
     Ok(cfg)

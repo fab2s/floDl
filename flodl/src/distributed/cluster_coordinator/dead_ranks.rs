@@ -138,8 +138,8 @@ impl ClusterCoordinator {
                 // and the dead rank happens to be the
                 // checkpoint role, fall over to lowest live as
                 // a best-effort. Eval/epoch roles stay pinned.
-                if r == self.checkpoint_role {
-                    if let Some(next) =
+                if r == self.checkpoint_role
+                    && let Some(next) =
                         (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
                     {
                         self.checkpoint_role = next;
@@ -150,7 +150,6 @@ impl ClusterCoordinator {
                             next,
                         );
                     }
-                }
             }
             crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => {
                 self.re_resolve_callback_roles_on_death(r);
@@ -170,8 +169,8 @@ impl ClusterCoordinator {
         // CPU backend doesn't need this — the controller-side
         // stream shutdown via the shared `DeadRanks` ledger
         // already releases its blocked AllReduce read.
-        if matches!(self.backend, AverageBackend::Nccl) {
-            if let Err(e) = self.broadcast_control(
+        if matches!(self.backend, AverageBackend::Nccl)
+            && let Err(e) = self.broadcast_control(
                 &ControlMsgWire::DeclareDead { rank: r as u64 },
             ) {
                 crate::verbose!(
@@ -180,9 +179,8 @@ impl ClusterCoordinator {
                     e,
                 );
             }
-        }
-        if let Some((remainder_offset, remainder_size)) = remainder_plan {
-            if let Err(e) = self.redistribute_dead_rank_partition(
+        if let Some((remainder_offset, remainder_size)) = remainder_plan
+            && let Err(e) = self.redistribute_dead_rank_partition(
                 r,
                 remainder_offset,
                 remainder_size,
@@ -195,7 +193,6 @@ impl ClusterCoordinator {
                     e,
                 );
             }
-        }
         // PROGRESSIVE-MODE RECLAIM. The `ExtendPartition` path above
         // is non-progressive only (`epoch_plan_cache` is populated by
         // `plans_for_epoch`, which progressive never calls), so
@@ -367,11 +364,10 @@ impl ClusterCoordinator {
             Some(ledger) => (0..self.world_size).filter(|&r| ledger.is_dead(r)).count(),
             None => self.world_size.saturating_sub(self.active_count),
         };
-        if let Some(threshold) = self.max_failure {
-            if dead_count >= threshold.limit_for(self.world_size) {
+        if let Some(threshold) = self.max_failure
+            && dead_count >= threshold.limit_for(self.world_size) {
                 return Some(crate::distributed::SaveReason::MaxFailureExceeded);
             }
-        }
         match self.backend {
             AverageBackend::Nccl if self.active_count < 2 => {
                 // NCCL requires world_size >= 2 to form a comm; the

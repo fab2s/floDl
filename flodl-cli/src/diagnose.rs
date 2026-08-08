@@ -62,11 +62,10 @@ fn print_report(root: &Path, ctx: &Context) {
     let sweep = flodl_hw::survey();
     let devices = &sweep.devices;
     if !devices.is_empty() {
-        if sweep.has_vendor(system::GpuVendor::Nvidia) {
-            if let Some(driver) = system::nvidia_driver_version() {
+        if sweep.has_vendor(system::GpuVendor::Nvidia)
+            && let Some(driver) = system::nvidia_driver_version() {
                 println!("  NVIDIA driver: {}", driver);
             }
-        }
         println!("  Devices:     {}", devices.len());
         for d in devices {
             let vram_gb = d.total_memory_mb / 1024;

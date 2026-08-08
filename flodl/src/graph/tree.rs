@@ -266,13 +266,12 @@ impl Graph {
                 g.set_training(training);
             }
             ResolvedPath::Tag { graph, ref tag } => {
-                if let Some(&(ni, _)) = graph.tag_names.get(tag.as_str()) {
-                    if let Some(ref module) = graph.nodes[ni].module {
+                if let Some(&(ni, _)) = graph.tag_names.get(tag.as_str())
+                    && let Some(ref module) = graph.nodes[ni].module {
                         crate::nn::walk_modules(module.as_ref(), &mut |m| {
                             m.set_training(training);
                         });
                     }
-                }
             }
         }
         Ok(())

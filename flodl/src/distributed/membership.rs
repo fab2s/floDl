@@ -163,8 +163,8 @@ impl JoinConfig {
                  ranks cannot train)",
             ));
         }
-        if let Some(target) = self.target_ranks {
-            if target < self.min_rank_start {
+        if let Some(target) = self.target_ranks
+            && target < self.min_rank_start {
                 return Err(TensorError::new(&format!(
                     "cluster join: target_ranks ({target}) must be >= \
                      min_rank_start ({}) — the early-close target cannot sit \
@@ -172,7 +172,6 @@ impl JoinConfig {
                     self.min_rank_start,
                 )));
             }
-        }
         if self.max_join_timeout_secs < self.join_timeout_secs {
             return Err(TensorError::new(&format!(
                 "cluster join: max_join_timeout ({}s) must be >= join_timeout \
@@ -491,8 +490,8 @@ impl MembershipLedger {
         // empty — fan-out agents may send none) gates nothing: refusing
         // what cannot be classified would turn a naming convention into
         // an admission requirement.
-        if self.config.nccl_backend {
-            if let flodl_hw::VariantClass::Vendor(vendor) =
+        if self.config.nccl_backend
+            && let flodl_hw::VariantClass::Vendor(vendor) =
                 flodl_hw::classify_variant_label(&libtorch)
             {
                 match self.expected_vendor {
@@ -520,7 +519,6 @@ impl MembershipLedger {
                     Some(_) => {}
                 }
             }
-        }
         // Run identity, whatever the data plane: a cohort straddling a
         // publish boundary holds two different runs — different args at
         // minimum, and rank children re-enter the binary with them.
@@ -548,8 +546,8 @@ impl MembershipLedger {
         // window was spent, and a walk-in fleet has no roster for a
         // probe to sweep — this window is the only place the check can
         // live.
-        if self.config.nccl_backend {
-            if let Some((maj, min, _)) = nccl_version {
+        if self.config.nccl_backend
+            && let Some((maj, min, _)) = nccl_version {
                 match self.expected_nccl {
                     None => self.expected_nccl = Some((maj, min)),
                     Some((emaj, emin)) if (emaj, emin) != (maj, min) => {
@@ -564,7 +562,6 @@ impl MembershipLedger {
                     Some(_) => {}
                 }
             }
-        }
         // Model signature, whatever the data plane: mismatched parameter
         // manifests corrupt CPU averaging exactly as they hang NCCL.
         // Refusing here (instead of at the formation handshake, which
@@ -648,11 +645,10 @@ impl MembershipLedger {
         // Early close on target: the launcher started exactly this much
         // capacity, no reason to wait out the window. (Manual mode has
         // no target — validate() refuses the combination.)
-        if let Some(target) = self.config.target_ranks {
-            if !manual && joined >= target {
+        if let Some(target) = self.config.target_ranks
+            && !manual && joined >= target {
                 return WindowVerdict::Formed("target ranks reached");
             }
-        }
         // Inside the window the door stays open no matter what: quorum
         // reached early does not refuse later capacity.
         if elapsed < window {

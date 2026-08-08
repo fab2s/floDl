@@ -264,12 +264,11 @@ impl AvgCycleState {
             // Per-rank sync lag (trigger broadcast → this rank's
             // SyncAck). Captured BEFORE the all-acked elapsed capture
             // takes `started_at`.
-            if let Some(start) = self.started_at {
-                if rank < self.sync_lag_ms.len() {
+            if let Some(start) = self.started_at
+                && rank < self.sync_lag_ms.len() {
                     self.sync_lag_ms[rank] =
                         Some(start.elapsed().as_secs_f64() * 1000.0);
                 }
-            }
             self.capture_sync_elapsed_if_complete();
         }
     }
@@ -280,12 +279,11 @@ impl AvgCycleState {
     /// is a late-arriving straggler and is dropped — the slot keeps
     /// its prior value or `None`.
     pub(super) fn note_snapshot_ready(&mut self, rank: usize) {
-        if rank < self.upload_ms.len() {
-            if let Some(start) = self.started_at {
+        if rank < self.upload_ms.len()
+            && let Some(start) = self.started_at {
                 self.upload_ms[rank] =
                     Some(start.elapsed().as_secs_f64() * 1000.0);
             }
-        }
     }
 
     /// Take `started_at` into `last_sync_ms` once every rank has
@@ -293,11 +291,10 @@ impl AvgCycleState {
     /// deliberately leaving the cycle armed for the settle gates —
     /// see `nccl_sync_settled`.)
     pub(super) fn capture_sync_elapsed_if_complete(&mut self) {
-        if self.acked.iter().all(|&a| a) {
-            if let Some(start) = self.started_at.take() {
+        if self.acked.iter().all(|&a| a)
+            && let Some(start) = self.started_at.take() {
                 self.last_sync_ms = start.elapsed().as_secs_f64() * 1000.0;
             }
-        }
     }
 
     /// Every alive rank has acked (dead ranks count as acked — their

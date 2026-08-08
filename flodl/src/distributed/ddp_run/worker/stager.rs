@@ -725,13 +725,12 @@ fn stager_loop(
                 if let Ok(batch) = dataset.get_batch(&[idx]) {
                     sample_bytes = sample_bytes
                         .max(crate::data::budget::retained_cost_estimate(&batch));
-                    if !cache.contains_ram(idx) {
-                        if let Ok(mut p) = stream.lock() {
+                    if !cache.contains_ram(idx)
+                        && let Ok(mut p) = stream.lock() {
                             let remaining =
                                 sample_counts.get(&idx).copied().unwrap_or(1);
                             let _ = p.offer(idx, batch, pos, remaining);
                         }
-                    }
                     staged.fetch_add(1, Ordering::Relaxed);
                 }
                 pos += 1;

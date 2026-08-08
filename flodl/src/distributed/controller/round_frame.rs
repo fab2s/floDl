@@ -839,7 +839,7 @@ pub(crate) fn scale_payload_bytes(bytes: &mut [u8], dtype: u8, factor: f32) -> R
 /// plain-f32 fixtures.
 #[cfg(test)]
 pub(super) fn bytes_as_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(TensorError::new(&format!(
             "cluster_controller: f32 byte count {} not divisible by 4",
             bytes.len()

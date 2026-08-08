@@ -40,11 +40,10 @@ pub(crate) fn cmd_install(check_only: bool, dev: bool) -> ExitCode {
         let latest = fetch_latest_github_tag();
         println!("Installed: {current_version}");
         // Check if current install is a symlink (dev mode)
-        if dest.is_symlink() {
-            if let Ok(target) = std::fs::read_link(&dest) {
+        if dest.is_symlink()
+            && let Ok(target) = std::fs::read_link(&dest) {
                 println!("Mode:      dev (symlink -> {})", target.display());
             }
-        }
         match &latest {
             Some(tag) => {
                 println!("Latest:    {tag}");

@@ -722,14 +722,13 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
 
     // Pass 1: exact name + shape match
     for (mi, (name, shape, _)) in targets.iter().enumerate() {
-        if let Some(&ci) = name_index.get(name.as_str()) {
-            if !used[ci] && entries[ci].shape == *shape {
+        if let Some(&ci) = name_index.get(name.as_str())
+            && !used[ci] && entries[ci].shape == *shape {
                 unchanged.push(name.clone());
                 used[ci] = true;
                 output.push((name.clone(), ci));
                 continue;
             }
-        }
         unmatched.push(mi);
     }
 

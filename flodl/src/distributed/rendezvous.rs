@@ -592,11 +592,10 @@ fn rejected_cap_error(world_size: usize, accepted: usize) -> TensorError {
 /// case), falls back to `workers[0].ranks[0]`.
 pub fn pick_designated_rank(full: &FullCluster, local_host_name: &str) -> u32 {
     for worker in &full.workers {
-        if worker.host == local_host_name {
-            if let Some(&r) = worker.ranks.first() {
+        if worker.host == local_host_name
+            && let Some(&r) = worker.ranks.first() {
                 return r as u32;
             }
-        }
     }
     full.workers
         .first()

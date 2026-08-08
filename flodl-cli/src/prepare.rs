@@ -340,8 +340,8 @@ fn fetch_source(
                 .unwrap_or_default(),
             if m.built { "" } else { " — NOT built by the controller" },
         ));
-        if let (Some(theirs), Some(ours)) = (&m.rustc, local_rustc()) {
-            if theirs != &ours {
+        if let (Some(theirs), Some(ours)) = (&m.rustc, local_rustc())
+            && theirs != &ours {
                 notes.push(format!(
                     "the controller built this with {theirs}, this box has \
                      {ours} — advisory only, every box compiles its own \
@@ -349,7 +349,6 @@ fn fetch_source(
                      time",
                 ));
             }
-        }
     }
     Ok((dest, manifest))
 }
@@ -410,11 +409,10 @@ fn build_source(
         // toolkit (a cpu-feature crate builds fine without it), but a
         // build that FAILED while the toolkit is demonstrably absent is
         // the case re-dialing provably cannot fix.
-        if let Some((_, variant)) = libtorch {
-            if let flodl_hw::VariantClass::Vendor(vendor) =
+        if let Some((_, variant)) = libtorch
+            && let flodl_hw::VariantClass::Vendor(vendor) =
                 flodl_hw::classify_variant_label(variant)
-            {
-                if let Some(gap) = crate::util::requirements::toolkit_gap(vendor) {
+                && let Some(gap) = crate::util::requirements::toolkit_gap(vendor) {
                     return Fail::Permanent(format!(
                         "{} — and this box is missing the {vendor} toolkit \
                          headers under {} ({}), which a `--features {}` \
@@ -427,8 +425,6 @@ fn build_source(
                         gap.install,
                     ));
                 }
-            }
-        }
         // Still transient, with the worker's next step spelled out: this
         // box cannot fix a compile error, and it must not stop over one.
         Fail::Transient(format!(
@@ -854,17 +850,16 @@ fn check_writable(
         ))
     })?;
 
-    if let Some(fs_type) = crate::probe::detect_fs_type(dir) {
-        if fs_type == "tmpfs" || fs_type == "ramfs" {
+    if let Some(fs_type) = crate::probe::detect_fs_type(dir)
+        && (fs_type == "tmpfs" || fs_type == "ramfs") {
             notes.push(format!(
                 "{label} directory {} is on {fs_type} (RAM-backed) — \
                  staging there spends RAM, not disk",
                 dir.display(),
             ));
         }
-    }
-    if let Some(kib) = available_kib(dir) {
-        if kib < LOW_SPACE_KIB {
+    if let Some(kib) = available_kib(dir)
+        && kib < LOW_SPACE_KIB {
             notes.push(format!(
                 "{label} directory {} has {} MiB free — smaller than any \
                  real corpus",
@@ -872,7 +867,6 @@ fn check_writable(
                 kib / 1024,
             ));
         }
-    }
     Ok(())
 }
 

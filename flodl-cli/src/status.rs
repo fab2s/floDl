@@ -116,8 +116,8 @@ fn resolve_candidates(addr_override: Option<&str>) -> (Vec<String>, String) {
         };
         return (vec![addr], "--addr".to_string());
     }
-    if let Ok(env_name) = std::env::var("FDL_ENV") {
-        if let Some(cluster) = load_cluster_for_env(&env_name) {
+    if let Ok(env_name) = std::env::var("FDL_ENV")
+        && let Some(cluster) = load_cluster_for_env(&env_name) {
             let host = cluster.controller.host.clone();
             let port = cluster.controller.port;
             let mut candidates = vec![format!("{host}:{port}")];
@@ -129,7 +129,6 @@ fn resolve_candidates(addr_override: Option<&str>) -> (Vec<String>, String) {
             }
             return (candidates, format!("fdl.{env_name}.yml controller"));
         }
-    }
     eprintln!(
         "{}",
         style::dim(&format!(

@@ -65,15 +65,14 @@ pub fn classify_path_step(
     // Descent check runs first: `--help` / `--refresh-schema` apply to
     // the level the user is asking about, not to the parent. If the
     // next token names a nested entry, we descend before reading flags.
-    if let Some(next) = tail.first() {
-        if child_cfg.commands.contains_key(next) {
+    if let Some(next) = tail.first()
+        && child_cfg.commands.contains_key(next) {
             return PathOutcome::Descend {
                 child: Box::new(child_cfg),
                 new_dir: child_dir,
                 new_name: next.clone(),
             };
         }
-    }
 
     if tail.iter().any(|a| a == "--help" || a == "-h") {
         return PathOutcome::ShowHelp {

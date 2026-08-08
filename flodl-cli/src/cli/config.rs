@@ -176,15 +176,14 @@ pub(crate) fn dispatch_config(
             (None, None) => {
                 // No YAML cluster, no --gpus, but the command opted into
                 // cluster mode. Print a one-line hint if N>=2 GPUs visible.
-                if let Ok(n) = gpus::local_gpu_count() {
-                    if n >= 2 {
+                if let Ok(n) = gpus::local_gpu_count()
+                    && n >= 2 {
                         eprintln!(
                             "flodl: {n} GPUs visible but cluster mode is off; \
                              running single-device on GPU 0. Use --gpus all \
                              for multi-GPU."
                         );
                     }
-                }
                 None
             }
         }
@@ -198,11 +197,10 @@ pub(crate) fn dispatch_config(
         // silent: the command trains locally and never mentions the
         // window it did not open. Recursive children are excluded --
         // there the local run IS the point.
-        if !cluster::is_recursive_invocation() {
-            if let Some(hint) = cluster::unused_join_window_hint(&project, cmd) {
+        if !cluster::is_recursive_invocation()
+            && let Some(hint) = cluster::unused_join_window_hint(&project, cmd) {
                 eprintln!("fdl: warning: {hint}");
             }
-        }
         if let Some(spec) = gpus_spec {
             let devs = match spec.resolve() {
                 Ok(d) => d,
@@ -247,14 +245,13 @@ pub(crate) fn dispatch_config(
         // `--no-prebuild` is set. The controller's own build is
         // handled by the normal dispatch path below (cargo run in
         // Docker against the local `.active`).
-        if !no_prebuild {
-            if let Err(e) = prebuild::prebuild_remotes(
+        if !no_prebuild
+            && let Err(e) = prebuild::prebuild_remotes(
                 &project_root, &cmd_cwd, &cluster, cmd, &controller,
             ) {
                 cli_error!("{e}");
                 return ExitCode::FAILURE;
             }
-        }
         // Cluster mode: set env vars on this process so the user binary
         // (spawned by the normal dispatch below) detects launcher role
         // and fans out via flodl::distributed::launcher. Fall through —

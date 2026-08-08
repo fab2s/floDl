@@ -543,11 +543,10 @@ fn bundle_system_cudnn(dst_lib: &Path) {
                 // Linux-shaped anyway — so degrade to a resolving copy;
                 // the gate is about compiling on Windows, not behavior.
                 #[cfg(unix)]
-                if let Ok(target) = fs::read_link(&path) {
-                    if std::os::unix::fs::symlink(&target, &dst).is_ok() {
+                if let Ok(target) = fs::read_link(&path)
+                    && std::os::unix::fs::symlink(&target, &dst).is_ok() {
                         copied += 1;
                     }
-                }
                 #[cfg(not(unix))]
                 if fs::copy(&path, &dst).is_ok() {
                     copied += 1;

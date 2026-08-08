@@ -187,8 +187,8 @@ impl RecordStore {
             self.meta = Some(rec);
             return;
         }
-        if kind == "node" {
-            if let Some(path) = rec.get("path").and_then(Value::as_str) {
+        if kind == "node"
+            && let Some(path) = rec.get("path").and_then(Value::as_str) {
                 // A known path always updates; a new one is admitted only
                 // under the cap, so a malformed producer cannot grow the
                 // index without bound.
@@ -200,7 +200,6 @@ impl RecordStore {
                     self.path_cap_hit = true;
                 }
             }
-        }
         if self.ring.len() >= MAX_RECORDS {
             self.ring.pop_front();
         }

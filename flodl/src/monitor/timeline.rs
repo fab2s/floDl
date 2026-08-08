@@ -492,14 +492,13 @@ impl Timeline {
         }
 
         // Close trailing gap
-        if let Some(start) = gap_start {
-            if let Some(last) = samples.last() {
+        if let Some(start) = gap_start
+            && let Some(last) = samples.last() {
                 let duration = last.elapsed_ms.saturating_sub(start);
                 if duration >= min_ms {
                     gaps.push((start, last.elapsed_ms));
                 }
             }
-        }
 
         gaps
     }

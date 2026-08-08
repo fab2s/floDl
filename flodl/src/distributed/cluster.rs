@@ -522,11 +522,10 @@ impl LocalCluster {
             }
             _ => &["CUDA_VISIBLE_DEVICES"],
         };
-        if let Some(visible) = mask_vars.iter().find_map(|k| std::env::var(k).ok()) {
-            if !visible.is_empty() && !visible.contains(',') {
+        if let Some(visible) = mask_vars.iter().find_map(|k| std::env::var(k).ok())
+            && !visible.is_empty() && !visible.contains(',') {
                 return Ok((worker.ranks[idx], Device::CUDA(0)));
             }
-        }
         Ok((worker.ranks[idx], Device::CUDA(worker.local_devices[idx])))
     }
 
@@ -800,7 +799,7 @@ pub(crate) fn resolve_hostname() -> Result<String> {
 /// Used by [`LocalCluster::from_env`]; also exposed for the matching encoder
 /// in test setup. Zero-dep: hand-rolled to keep `flodl` free of `hex` crate.
 pub(crate) fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("odd-length hex string ({} chars)", s.len()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);

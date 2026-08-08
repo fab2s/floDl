@@ -197,11 +197,10 @@ pub(crate) fn warn_cleartext_public_peer(what: &str, peer: std::net::SocketAddr)
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
         std::sync::OnceLock::new();
     let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    if let Ok(mut set) = warned.lock() {
-        if !set.insert(peer.ip()) {
+    if let Ok(mut set) = warned.lock()
+        && !set.insert(peer.ip()) {
             return;
         }
-    }
     eprintln!(
         "flodl: WARNING: {what} peer {peer} is outside any private network \
          range and this channel is CLEARTEXT (frames are HMAC-authenticated, \

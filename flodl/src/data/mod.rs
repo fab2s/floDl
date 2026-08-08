@@ -324,9 +324,9 @@ pub(crate) fn apply_transform(
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static TRANSFORM_PROBED: AtomicBool = AtomicBool::new(false);
-        if !TRANSFORM_PROBED.swap(true, Ordering::Relaxed) {
-            if let (Ok(c1), Ok(c2)) = (deep_copy_rows(&tensors), deep_copy_rows(&tensors)) {
-                if let (Ok(a), Ok(b)) =
+        if !TRANSFORM_PROBED.swap(true, Ordering::Relaxed)
+            && let (Ok(c1), Ok(c2)) = (deep_copy_rows(&tensors), deep_copy_rows(&tensors))
+                && let (Ok(a), Ok(b)) =
                     ((transform.0)(c1, &keys), (transform.0)(c2, &keys))
                 {
                     let identical = a.len() == b.len()
@@ -342,8 +342,6 @@ pub(crate) fn apply_transform(
                          runs in debug builds only."
                     );
                 }
-            }
-        }
     }
     (transform.0)(tensors, &keys)
 }

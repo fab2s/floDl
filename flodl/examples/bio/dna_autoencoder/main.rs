@@ -123,7 +123,7 @@ impl DnaAutoencoder {
     /// `seq_len` must be divisible by 4 (two stride-2 pool/deconv stages).
     fn new(seq_len: usize, latent_dim: usize) -> Result<Self> {
         assert!(
-            seq_len % 4 == 0,
+            seq_len.is_multiple_of(4),
             "seq_len must be divisible by 4 (got {seq_len})"
         );
         let pooled_len = seq_len / 4;

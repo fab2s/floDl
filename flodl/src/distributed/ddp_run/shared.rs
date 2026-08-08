@@ -75,7 +75,7 @@ pub(crate) fn check_epoch_geometry(
     }
 
     let multiple = splits * batch_size;
-    let divides = total_samples % multiple == 0;
+    let divides = total_samples.is_multiple_of(multiple);
     eprintln!(
         "  ddp: pass = {splits} epochs x {} batches x {batch_size} of {total_samples} picks ({})",
         epoch_samples / batch_size,
@@ -297,11 +297,10 @@ pub(crate) fn aggregate_epoch_metrics(
         }
     }
     for (k, v) in &mut scalars {
-        if let Some(w) = weights.get(k) {
-            if *w > 0.0 {
+        if let Some(w) = weights.get(k)
+            && *w > 0.0 {
                 *v /= *w;
             }
-        }
     }
 
     // Per-rank throughput (samples/ms) and batch share.

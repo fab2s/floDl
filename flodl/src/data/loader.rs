@@ -696,8 +696,8 @@ fn build_streaming(
     // Local-disk overflow tier under the sample cache. Attached here,
     // not in build(): the resident path never reads through the cache,
     // so it must not create a pack file it would never use.
-    if disk_stage_bytes > 0 {
-        if let Some(cache) = &sample_cache {
+    if disk_stage_bytes > 0
+        && let Some(cache) = &sample_cache {
             let dir = disk_stage_dir
                 .clone()
                 .unwrap_or_else(std::env::temp_dir);
@@ -707,7 +707,6 @@ fn build_streaming(
                 dataset.len(),
             )?);
         }
-    }
 
     let worker = PrefetchWorker::new(
         Arc::clone(&dataset),
@@ -937,12 +936,11 @@ impl DataLoader {
     /// Never overrides a user-declared reserve; keeps the halved
     /// first-fill discount since activations remain unaccounted for.
     pub(crate) fn set_activation_reserve_auto(&mut self, bytes: usize) {
-        if let LoaderInner::Streaming(l) = &mut self.inner {
-            if l.reserve_source == ReserveSource::Bare {
+        if let LoaderInner::Streaming(l) = &mut self.inner
+            && l.reserve_source == ReserveSource::Bare {
                 l.activation_reserve = bytes;
                 l.reserve_source = ReserveSource::Auto;
             }
-        }
     }
 
     /// Measure free VRAM and resize the prefetch in-flight target to
@@ -1203,8 +1201,8 @@ impl StreamingLoader {
         // new admissions, never drops staged content. Without RAM
         // visibility the budget stays as it was (initially 0: no
         // admissions on hosts we cannot measure).
-        if let Some(cache) = &self.sample_cache {
-            if let Some(available) = mem {
+        if let Some(cache) = &self.sample_cache
+            && let Some(available) = mem {
                 let ring_bytes = (ring_slots as u64)
                     .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
                 let budget = sample_cache_budget(
@@ -1215,7 +1213,6 @@ impl StreamingLoader {
                 );
                 cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
             }
-        }
 
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already

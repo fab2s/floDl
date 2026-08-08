@@ -527,12 +527,11 @@ impl ClusterCoordinator {
     /// Called from the end of both `finish_averaging_nccl` and
     /// `finish_averaging_cpu`.
     pub(super) fn emit_sync_end(&mut self) {
-        if let Some(start) = self.sync_start.take() {
-            if let Some(ref tl) = self.timeline {
+        if let Some(start) = self.sync_start.take()
+            && let Some(ref tl) = self.timeline {
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
                 tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
             }
-        }
     }
 
     /// ARM a one-shot coverage-granular checkpoint at the START of a reduce

@@ -210,11 +210,10 @@ impl SampleCache {
         }
         let sample = fetch()?;
         #[cfg(all(debug_assertions, not(test)))]
-        if !self.purity_probed.swap(true, Ordering::Relaxed) {
-            if let Ok(second) = fetch() {
+        if !self.purity_probed.swap(true, Ordering::Relaxed)
+            && let Ok(second) = fetch() {
                 crate::data::assert_fetch_pure("DataSet::get", &sample, &second);
             }
-        }
         self.admit(index, &sample);
         Ok(sample)
     }
@@ -223,12 +222,11 @@ impl SampleCache {
     /// else disk read. `None` = not staged anywhere, caller fetches
     /// from the source.
     pub(crate) fn lookup(&self, index: usize) -> Option<Result<Vec<Tensor>>> {
-        if let Some(slot) = self.slots.get(index) {
-            if let Some(guard) = Self::read_slot(slot) {
+        if let Some(slot) = self.slots.get(index)
+            && let Some(guard) = Self::read_slot(slot) {
                 let hit = guard.as_ref().expect("read_slot returns occupied");
                 return Some(Ok(hit.clone()));
             }
-        }
         self.disk.get().and_then(|stage| stage.read(index))
     }
 
@@ -248,8 +246,7 @@ impl SampleCache {
             let estimate = crate::data::budget::retained_cost_estimate(sample);
             if self.bytes.load(Ordering::Relaxed) + estimate
                 <= self.budget.load(Ordering::Relaxed)
-            {
-                if let Ok((rows, cost)) = crate::data::budget::retain_rows(sample) {
+                && let Ok((rows, cost)) = crate::data::budget::retain_rows(sample) {
                     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
                     if guard.is_none() {
                         *guard = Some(rows);
@@ -257,13 +254,11 @@ impl SampleCache {
                         ram_admitted = true;
                     }
                 }
-            }
         }
-        if !ram_admitted {
-            if let Some(stage) = self.disk.get() {
+        if !ram_admitted
+            && let Some(stage) = self.disk.get() {
                 stage.admit(index, sample);
             }
-        }
     }
 }
 
@@ -514,15 +509,14 @@ fn warn_if_ram_backed(dir: &Path) {
         return; // non-Linux: nothing to check
     };
     let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    if let Some(fstype) = fs_type_for(&target, &mounts) {
-        if fstype == "tmpfs" || fstype == "ramfs" {
+    if let Some(fstype) = fs_type_for(&target, &mounts)
+        && (fstype == "tmpfs" || fstype == "ramfs") {
             eprintln!(
                 "flodl data: disk_stage directory {} is on {fstype} (RAM-backed): the stage \
                  will spend RAM, not disk. Point .disk_stage_dir() at a real drive.",
                 target.display()
             );
         }
-    }
 }
 
 /// Filesystem type of the longest mount point containing `path`

@@ -604,11 +604,10 @@ pub(super) fn trim_sample_to_assigned_device(
     sample: &mut crate::monitor::ResourceSample,
     assigned_device_idx: Option<u8>,
 ) {
-    if sample.gpus.len() > 1 {
-        if let Some(target) = assigned_device_idx {
+    if sample.gpus.len() > 1
+        && let Some(target) = assigned_device_idx {
             sample.gpus.retain(|g| g.device_index == target);
         }
-    }
 }
 
 /// Emit the rank-side dashboard setup sequence — `DashboardRegister`

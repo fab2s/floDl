@@ -233,14 +233,13 @@ impl<M: Module> GpuWorker<M> {
             if let Some(ref stream) = self.compute_stream {
                 let _ = stream.synchronize();
             }
-            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
-                if let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx)
+                && let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(baseline as usize);
                     let batch_bytes = self.per_sample_bytes * self.batch_size;
                     let activation = overhead.saturating_sub(batch_bytes);
                     self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
                 }
-            }
             crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
@@ -365,8 +364,8 @@ impl<M: Module> GpuWorker<M> {
         // rate-matcher once a capacity tier is active). The channel
         // depth was collapsed to the reserve above, so both sides of
         // the install agree on who owns the free VRAM.
-        if install_pool_budget {
-            if let Some(ref pw) = self.prefetch {
+        if install_pool_budget
+            && let Some(ref pw) = self.prefetch {
                 let batch_bytes = (self.per_sample_bytes * self.batch_size) as u64;
                 let reserve = crate::data::vram_pool::flow_reserve_bytes(
                     pw.prefetch_depth() as u64,
@@ -379,7 +378,6 @@ impl<M: Module> GpuWorker<M> {
                 pw.install_vram_pool_budget(reserve);
                 self.vram_pool_budget_sent = true;
             }
-        }
 
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
@@ -649,20 +647,19 @@ impl<M: Module> GpuWorker<M> {
                 let _ = stream.synchronize();
             }
             let idx = self.device.index() as i32;
-            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx) {
-                if let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx) {
+            if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx)
+                && let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx) {
                     let overhead = (peak as usize).saturating_sub(current as usize);
                     // Floor a completed measurement to 1 byte so a degenerate
                     // reading cannot collide with the sentinel and re-arm
                     // calibration every chunk.
                     self.activation_peak_bytes = overhead.max(1);
                 }
-            }
             // Reset for ongoing monitoring in subsequent chunks.
             crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
-        let norm = if self.steps_since_avg % 10 == 0 {
+        let norm = if self.steps_since_avg.is_multiple_of(10) {
             self.compute_param_norm().ok()
         } else {
             None

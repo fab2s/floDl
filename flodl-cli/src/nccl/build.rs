@@ -180,11 +180,10 @@ fn detect_arch_list() -> Result<String, String> {
 /// naming. `v2.27.5-1` -> `v2.27.5`. Leaves tags without a numeric patch
 /// suffix untouched.
 fn version_dir_part(tag: &str) -> String {
-    if let Some((base, rest)) = tag.rsplit_once('-') {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+    if let Some((base, rest)) = tag.rsplit_once('-')
+        && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
             return base.to_string();
         }
-    }
     tag.to_string()
 }
 

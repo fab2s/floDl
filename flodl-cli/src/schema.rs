@@ -73,15 +73,14 @@ pub fn discover_caches(project_root: &Path) -> Vec<CacheEntry> {
 }
 
 fn walk(dir: &Path, out: &mut Vec<CacheEntry>) {
-    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-        if SKIP_DIRS.contains(&name) {
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+        && SKIP_DIRS.contains(&name) {
             return;
         }
-    }
 
     let cache_dir = dir.join(".fdl").join("schema-cache");
-    if cache_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&cache_dir) {
+    if cache_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -98,7 +97,6 @@ fn walk(dir: &Path, out: &mut Vec<CacheEntry>) {
                 });
             }
         }
-    }
 
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -134,11 +132,10 @@ pub fn clear_caches(project_root: &Path, filter: Option<&str>) -> Result<Vec<Pat
     let mut touched_dirs: Vec<PathBuf> = Vec::new();
 
     for entry in &caches {
-        if let Some(name) = filter {
-            if entry.cmd_name != name {
+        if let Some(name) = filter
+            && entry.cmd_name != name {
                 continue;
             }
-        }
         fs::remove_file(&entry.cache_path)
             .map_err(|e| format!("cannot remove {}: {e}", entry.cache_path.display()))?;
         removed.push(entry.cache_path.clone());
@@ -185,11 +182,10 @@ pub fn refresh_caches(
     let mut results = Vec::new();
 
     for entry in &caches {
-        if let Some(name) = filter {
-            if entry.cmd_name != name {
+        if let Some(name) = filter
+            && entry.cmd_name != name {
                 continue;
             }
-        }
 
         let outcome = refresh_one(entry);
         results.push(RefreshResult {

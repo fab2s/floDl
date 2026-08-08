@@ -411,13 +411,11 @@ fn find_workspace_root(from: &Path) -> Option<PathBuf> {
     let mut dir = from.parent()?.parent()?.to_path_buf();
     loop {
         let candidate = dir.join("Cargo.toml");
-        if candidate.exists() {
-            if let Ok(content) = fs::read_to_string(&candidate) {
-                if content.lines().any(|l| l.trim() == "[workspace]") {
+        if candidate.exists()
+            && let Ok(content) = fs::read_to_string(&candidate)
+                && content.lines().any(|l| l.trim() == "[workspace]") {
                     return Some(candidate);
                 }
-            }
-        }
         if !dir.pop() {
             return None;
         }

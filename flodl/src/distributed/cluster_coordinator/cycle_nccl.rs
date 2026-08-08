@@ -362,14 +362,13 @@ impl ClusterCoordinator {
                 self.nccl_rendezvous_pending = None;
                 if let Some(reason) = self.unrecoverable_reason().or(Some(
                     crate::distributed::SaveReason::SingleSurvivor,
-                )) {
-                    if let Err(e) = self.dispatch_shutdown_with_save(reason) {
+                ))
+                    && let Err(e) = self.dispatch_shutdown_with_save(reason) {
                         crate::verbose!(
                             "  ddp: ShutdownWithSave after rendezvous exhaustion failed: {}",
                             e,
                         );
                     }
-                }
             }
         }
     }
