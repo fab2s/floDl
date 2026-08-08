@@ -52,12 +52,18 @@ ignore = []
 
 [licenses]
 version = 2
-# Grounded in what the tree actually contains (surveyed 2026-08-08), not
-# a generic permissive list copied from elsewhere. flodl itself is MIT.
+# Grounded in what the tree actually contains, not a generic permissive
+# list copied from elsewhere. flodl itself is MIT.
+#
+# Keep it that way: an entry matching nothing raises
+# `license-not-encountered`, which is how the first survey's speculative
+# `Apache-2.0 WITH LLVM-exception` was caught. Nothing in the four pinned
+# targets carries it (it reaches Rust trees mainly through wasm and
+# no-std compiler intrinsics), so it is not listed. If it ever appears,
+# the check goes red and the decision gets recorded here.
 allow = [
     "MIT",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
@@ -90,10 +96,20 @@ confidence-threshold = 0.93
 # and Apache are both disallowed.
 
 [bans]
-# Warn, not deny. Duplicate versions here are transitive and not ours to
-# fix (rand 0.8/0.9/0.10 and getrandom 0.2/0.3/0.4 arrive through
-# different dependencies), so denying would mean a permanently red gate
-# that teaches everyone to ignore it.
+# Warn, not deny, because the duplicates are not ours to fix. Verified by
+# resolving the workspace without flodl-hf: every remaining duplicate
+# arrives under its optional `hub`/`tokenizer` features, through
+# `tokenizers` and `hf-hub` (rand 0.8/0.9/0.10, getrandom 0.2/0.3/0.4,
+# thiserror 1/2, four windows-* pairs). Denying would mean a permanently
+# red gate with no action attached, which teaches everyone to ignore it.
+#
+# The warnings are still worth reading, for two reasons. They are how the
+# one duplicate we DID own surfaced (flodl-cli pinned getrandom 0.3 while
+# flodl resolved 0.4 through rand). And the count moves on its own: serde
+# 1.0.229 switched serde_derive to syn 3, which split syn against the
+# `syn = "2"` pin in flodl-cli-macros without a line of our code
+# changing. That one resolves as proc-macro crates migrate; it is a major
+# version of a build-time dependency, not a bump.
 multiple-versions = "warn"
 wildcards = "deny"
 deny = []
