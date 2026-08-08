@@ -871,6 +871,15 @@ mod tests {
     /// starved well past the 2s that once flaked here — the assertion is
     /// deterministic once the needle appears, so a generous cap costs
     /// nothing on the happy path.
+    /// CHOOSING `needle` IS THE WHOLE CORRECTNESS OF THIS HELPER. It must be
+    /// absent from the endpoint's NOT-READY answer, not merely present in the
+    /// ready one. Both flakes this file has had were the same mistake:
+    /// `"LIVE_HARDWARE"` also appears in the page's own
+    /// `typeof LIVE_HARDWARE!=='undefined'` guard, and `"root"` also appears
+    /// in `snapshot()`'s `{"node":null,"path":"root"}` empty answer. In both
+    /// cases the loop returned on the first poll and the assertion then failed
+    /// on data that had never arrived — which reads like a logic bug, not a
+    /// race. Pick something only the populated response can contain.
     fn get_until(addr: SocketAddr, target: &str, needle: &str) -> String {
         for _ in 0..500 {
             let body = get(addr, target);
@@ -921,13 +930,42 @@ mod tests {
         ]
     }
 
+    /// The invariant behind [`get_until`], made executable.
+    ///
+    /// Pushes NOTHING, so `/node` necessarily answers with the not-ready
+    /// shape. Deterministic: there is no race to lose. It asserts the
+    /// needle the wait uses is absent from that body, and — to keep the
+    /// reason legible — that the OLD needle was present in it, which is
+    /// precisely why the wait was a no-op and the assertion downstream
+    /// saw `node: null`.
+    #[test]
+    fn not_ready_node_body_cannot_match_the_wait_needle() {
+        let srv = DashboardServer::start(0).expect("bind");
+        let body = get(srv.addr, "/node?path=root");
+
+        assert!(
+            !body.contains("\"node\":{"),
+            "the wait needle must not match an un-ingested path: {body}"
+        );
+        assert!(
+            body.contains("\"root\""),
+            "the old needle DID match this body — that was the bug: {body}"
+        );
+    }
+
     #[test]
     fn node_endpoint_serves_one_level_not_the_cluster() {
         let mut srv = DashboardServer::start(0).expect("bind");
         let addr = srv.addr;
         srv.push_records(tree(1));
 
-        let body = get_until(addr, "/node?path=root", "\"root\"");
+        // Needle is `"node":{`, NOT `"root"`. `snapshot()` answers a path it
+        // has not ingested yet with `{"children":[],"node":null,"path":"root"}`
+        // — which already contains `"root"`, so that needle matched the
+        // not-ready body and the wait returned immediately, leaving
+        // `v["node"]["path"]` as Null. `node` is an object only once the
+        // record has landed.
+        let body = get_until(addr, "/node?path=root", "\"node\":{");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["node"]["path"], "root");
         let kids: Vec<&str> = v["children"]
