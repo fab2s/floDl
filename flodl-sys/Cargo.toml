@@ -30,4 +30,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 no-default-features = true
 
 [build-dependencies]
-cc = "1"
+cc.workspace = true

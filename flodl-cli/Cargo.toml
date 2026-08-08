@@ -12,28 +12,19 @@ keywords = ["libtorch", "pytorch", "cuda", "deep-learning", "gpu"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_yaml_ng = "0.10"
-serde_json = "1"
+serde.workspace = true
+serde_yaml_ng.workspace = true
+serde_json.workspace = true
 # OS entropy for the credentials fdl mints (the join token). The one
 # dependency class not worth hand-rolling: cross-platform (getrandom(2)
 # / getentropy / BCryptGenRandom), no build script, and the workspace
-# lock already carries it transitively.
-#
-# 0.4 rather than 0.3 to match what `flodl` already resolves through
-# `rand 0.10` (default feature `rng`): same `fill()` signature, and its
-# 1.85 floor sits under the workspace MSRV.
-#
-# This does not silence cargo-deny's getrandom duplicate warning, which
-# keeps three entries either way: hf-hub's rand 0.9 holds 0.3 and
-# tokenizers holds 0.2. What it removes is the only version split the
-# workspace owned, so resolving without flodl-hf is now duplicate-free.
-getrandom = "0.4"
-flodl-cli-macros = { path = "../flodl-cli-macros", version = "=0.7.0" }
+# already carries it transitively.
+getrandom.workspace = true
+flodl-cli-macros.workspace = true
 # Dependency-free hardware detection, shared with `flodl` so the GPU
 # struct + nvidia-smi parse cannot drift between the two. Does NOT pull
 # libtorch: fdl still builds and runs before libtorch is installed.
-flodl-hw = { path = "../flodl-hw", version = "=0.7.0" }
+flodl-hw.workspace = true
 
 [lib]
 name = "flodl_cli"

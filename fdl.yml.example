@@ -40,6 +40,22 @@ commands:
     description: Type check without building
     run: cargo check
     docker: dev
+  fmt:
+    description: Format the workspace (rustfmt)
+    # Formatting is enforced in CI (`cargo fmt --all --check`, in the msrv
+    # job), so it needs a local command or contributors meet the gate for
+    # the first time as a red build. `fmt-check` is the same test CI runs;
+    # this one writes.
+    #
+    # The bulk reformat that adopted rustfmt is listed in
+    # .git-blame-ignore-revs -- `git config blame.ignoreRevsFile
+    # .git-blame-ignore-revs` keeps `git blame` pointing at real authors.
+    run: cargo fmt --all
+    docker: dev
+  fmt-check:
+    description: Check formatting without writing (exactly what CI runs)
+    run: cargo fmt --all --check
+    docker: dev
   clippy:
     description: Lint (all targets incl. tests + examples, workspace + ddp-bench)
     run: cargo clippy --all-targets -- -W clippy::all && cd ddp-bench && cargo clippy --tests -- -W clippy::all
@@ -77,8 +93,8 @@ commands:
     # native commands as well as docker ones.
     run: bash ci/coverage.sh
   ci:
-    description: Run the full CI CPU job locally (build + test + clippy + doc)
-    run: cargo build && cargo test -- --nocapture --skip leakcheck && cargo test leakcheck -- --test-threads=1 --nocapture && cargo clippy --all-targets -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
+    description: Run the full CI CPU job locally (fmt + build + test + clippy + doc)
+    run: cargo fmt --all --check && cargo build && cargo test -- --nocapture --skip leakcheck && cargo test leakcheck -- --test-threads=1 --nocapture && cargo clippy --all-targets -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
     docker: dev
   shell:
     description: Interactive shell in dev container
