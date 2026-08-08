@@ -72,11 +72,35 @@ use flodl_hf::models::deberta_v2::DebertaV2Model;
 
 const FIXTURE: &str = "tests/fixtures/deberta_v2_parity.safetensors";
 
-/// Same 1e-5 budget as BERT / RoBERTa / XLM-R — same libtorch kernels
-/// under the hood. Disentangled attention recombines more intermediate
-/// tensors so numerical noise accumulates slightly more, but ~1e-5 is
-/// still achievable on reference hardware.
-const HIDDEN_TOL: f32 = 1e-5;
+// 1e-4, and this is the one tolerance in the suite set against a
+// MEASURED noise floor rather than against observed drift.
+//
+// The old 1e-5 was unmeetable in f32 for this architecture. Running HF's
+// own DeBERTa in float64 and comparing it to HF's own float32:
+//
+//     HF f32 vs HF f64  =  1.818e-5
+//
+// So the reference implementation deviates from exact arithmetic by
+// nearly TWICE the tolerance the test demanded. Two independent f32
+// implementations each carrying ~1.8e-5 of their own rounding can differ
+// from each other by up to their sum, ~3.6e-5; flodl measures 2.837e-5
+// against the HF f32 reference, i.e. INSIDE that bound and only ~1.6x
+// HF's own error. There is no disagreement here to fix.
+//
+// Why DeBERTa specifically: disentangled attention computes THREE score
+// matmuls per layer (content-to-content, content-to-position,
+// position-to-content) where a standard encoder computes one, and its
+// hidden states span ~36 (vs ~17 for roberta-base), so both the
+// accumulated rounding and the absolute scale it rides on are larger.
+// Relative error is 7.9e-7 against roberta-base's 2.2e-7 -- a few f32
+// ULP either way.
+//
+// 1e-4 leaves ~3.5x margin over the observed 2.837e-5 and ~2.7x over the
+// theoretical two-implementation bound, while staying far tighter than
+// anything that could hide a real defect (a wrong weight, a missed term,
+// or a transposed index moves this by orders of magnitude, not by 2x).
+// Same budget the MLM logit tests already use.
+const HIDDEN_TOL: f32 = 1e-4;
 
 mod parity_common;
 use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};
@@ -117,7 +141,12 @@ fn deberta_v2_parity_vs_pytorch_live() {
     let hidden_ref_data = parse_f32(&hidden_ref_view);
     let hidden_ref_shape = shape_i64(&hidden_ref_view);
 
-    let graph = DebertaV2Model::from_pretrained("microsoft/deberta-v3-base").unwrap();
+    let Some(graph) = parity_common::or_skip(
+        DebertaV2Model::from_pretrained("microsoft/deberta-v3-base"),
+        "microsoft/deberta-v3-base",
+    ) else {
+        return;
+    };
     // microsoft/deberta-v3-base ships pure f16; flodl now preserves source
     // dtype on load. The reference fixture is f32, so cast to f32 to match
     // the reference's precision budget. (For f16 forward parity one would

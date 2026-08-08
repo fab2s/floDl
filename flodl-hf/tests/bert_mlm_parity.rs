@@ -10,7 +10,7 @@
 //! embedding lookup on the way in and the projection back to vocabulary
 //! space on the way out, with exactly one optimizer-visible Parameter.
 //!
-//! `_live` — pulls `bert-base-uncased` weights from the Hub. Run with
+//! `_live` — pulls `google-bert/bert-base-uncased` weights from the Hub. Run with
 //! `fdl test-live`.
 
 use std::path::Path;
@@ -22,7 +22,7 @@ use flodl::{Device, Tensor, Variable};
 use flodl_hf::models::bert::{BertForMaskedLM, build_extended_attention_mask};
 
 const FIXTURE: &str = "tests/fixtures/bert_mlm_parity.safetensors";
-const MODEL_ID: &str = "bert-base-uncased";
+const MODEL_ID: &str = "google-bert/bert-base-uncased";
 
 // Large matmul against the 30522-entry vocab accumulates slightly more
 // numerical drift than the narrow classifier heads, so loosen from 1e-5

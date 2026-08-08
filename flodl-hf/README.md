@@ -75,7 +75,7 @@ flodl-hf = "=0.5.3"
 ```
 
 Pulls: `safetensors` + `hf-hub` + `tokenizers`. Everything needed to
-load `bert-base-uncased` out of the box.
+load `google-bert/bert-base-uncased` out of the box.
 
 ### Vision-only (hub, no tokenizer)
 

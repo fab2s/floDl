@@ -10,7 +10,7 @@
 //! embedding lookup on the way in and the projection back to vocabulary
 //! space on the way out, with exactly one optimizer-visible Parameter.
 //!
-//! `_live` — pulls `xlm-roberta-base` weights from the Hub. Run with
+//! `_live` — pulls `FacebookAI/xlm-roberta-base` weights from the Hub. Run with
 //! `fdl test-live`.
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use flodl_hf::models::bert::build_extended_attention_mask;
 use flodl_hf::models::xlm_roberta::XlmRobertaForMaskedLM;
 
 const FIXTURE: &str = "tests/fixtures/xlm_roberta_mlm_parity.safetensors";
-const MODEL_ID: &str = "xlm-roberta-base";
+const MODEL_ID: &str = "FacebookAI/xlm-roberta-base";
 
 // Large matmul against the 250000-entry SentencePiece vocab accumulates
 // more numerical drift than the narrow classifier heads, so loosen from

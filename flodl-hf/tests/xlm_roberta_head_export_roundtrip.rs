@@ -14,7 +14,12 @@ use flodl_hf::models::xlm_roberta::{
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn xlm_roberta_seqcls_export_roundtrip_live() {
     let repo = "cardiffnlp/twitter-xlm-roberta-base-sentiment";
-    let head = XlmRobertaForSequenceClassification::from_pretrained(repo).unwrap();
+    let Some(head) = roundtrip_common::or_skip(
+        XlmRobertaForSequenceClassification::from_pretrained(repo),
+        repo,
+    ) else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = XlmRobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -29,7 +34,12 @@ fn xlm_roberta_seqcls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn xlm_roberta_tokencls_export_roundtrip_live() {
     let repo = "Davlan/xlm-roberta-large-ner-hrl";
-    let head = XlmRobertaForTokenClassification::from_pretrained(repo).unwrap();
+    let Some(head) = roundtrip_common::or_skip(
+        XlmRobertaForTokenClassification::from_pretrained(repo),
+        repo,
+    ) else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = XlmRobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -44,7 +54,11 @@ fn xlm_roberta_tokencls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn xlm_roberta_qa_export_roundtrip_live() {
     let repo = "deepset/xlm-roberta-large-squad2";
-    let head = XlmRobertaForQuestionAnswering::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(XlmRobertaForQuestionAnswering::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = XlmRobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -58,8 +72,11 @@ fn xlm_roberta_qa_export_roundtrip_live() {
 #[test]
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn xlm_roberta_mlm_export_roundtrip_live() {
-    let repo = "xlm-roberta-base";
-    let head = XlmRobertaForMaskedLM::from_pretrained(repo).unwrap();
+    let repo = "FacebookAI/xlm-roberta-base";
+    let Some(head) = roundtrip_common::or_skip(XlmRobertaForMaskedLM::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = XlmRobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(

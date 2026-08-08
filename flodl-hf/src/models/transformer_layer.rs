@@ -148,7 +148,7 @@ pub struct TransformerLayerConfig {
     /// `activation` for DistilBERT — via the crate-internal
     /// `optional_hidden_act` JSON helper.
     /// Default [`GeluApprox::Exact`] (erf form) matches the canonical
-    /// `bert-base-uncased` / `roberta-base` / `distilbert-base-uncased`
+    /// `google-bert/bert-base-uncased` / `FacebookAI/roberta-base` / `distilbert/distilbert-base-uncased`
     /// checkpoints. ALBERT both v1 and v2 ship `"gelu_new"` and need
     /// [`GeluApprox::Tanh`].
     pub hidden_act: GeluApprox,

@@ -61,7 +61,12 @@ fn bert_seqcls_parity_vs_pytorch_live() {
     let ref_data = parse_f32(&ref_logits);
     let ref_shape = shape_i64(&ref_logits);
 
-    let head = BertForSequenceClassification::from_pretrained(MODEL_ID).unwrap();
+    let Some(head) = parity_common::or_skip(
+        BertForSequenceClassification::from_pretrained(MODEL_ID),
+        MODEL_ID,
+    ) else {
+        return;
+    };
     head.graph().eval();
 
     let out = head

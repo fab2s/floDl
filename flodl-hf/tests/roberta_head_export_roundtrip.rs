@@ -14,7 +14,12 @@ use flodl_hf::models::roberta::{
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn roberta_seqcls_export_roundtrip_live() {
     let repo = "cardiffnlp/twitter-roberta-base-sentiment-latest";
-    let head = RobertaForSequenceClassification::from_pretrained(repo).unwrap();
+    let Some(head) = roundtrip_common::or_skip(
+        RobertaForSequenceClassification::from_pretrained(repo),
+        repo,
+    ) else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = RobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -29,7 +34,11 @@ fn roberta_seqcls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn roberta_tokencls_export_roundtrip_live() {
     let repo = "Jean-Baptiste/roberta-large-ner-english";
-    let head = RobertaForTokenClassification::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(RobertaForTokenClassification::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = RobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -44,7 +53,11 @@ fn roberta_tokencls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn roberta_qa_export_roundtrip_live() {
     let repo = "deepset/roberta-base-squad2";
-    let head = RobertaForQuestionAnswering::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(RobertaForQuestionAnswering::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = RobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "roberta_qa");
@@ -53,8 +66,11 @@ fn roberta_qa_export_roundtrip_live() {
 #[test]
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn roberta_mlm_export_roundtrip_live() {
-    let repo = "roberta-base";
-    let head = RobertaForMaskedLM::from_pretrained(repo).unwrap();
+    let repo = "FacebookAI/roberta-base";
+    let Some(head) = roundtrip_common::or_skip(RobertaForMaskedLM::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = RobertaConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(

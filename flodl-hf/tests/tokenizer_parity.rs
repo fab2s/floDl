@@ -1,4 +1,4 @@
-//! Round-trip: `HfTokenizer::from_pretrained("bert-base-uncased")` must
+//! Round-trip: `HfTokenizer::from_pretrained("google-bert/bert-base-uncased")` must
 //! produce the input_ids that `parity_bert.py` pinned into the BERT parity
 //! fixture. Closes the loop between step 4 (forward parity on hardcoded
 //! token IDs) and step 5 (tokenizer that reproduces those IDs from text).
@@ -29,7 +29,7 @@ fn bert_tokenizer_matches_parity_fixture_live() {
         .collect();
     let expected_shape: Vec<i64> = view.shape().iter().map(|&d| d as i64).collect();
 
-    let tok = HfTokenizer::from_pretrained("bert-base-uncased").unwrap();
+    let tok = HfTokenizer::from_pretrained("google-bert/bert-base-uncased").unwrap();
     let enc = tok.encode(&["hello world"]).unwrap();
 
     assert_eq!(enc.input_ids.shape(), expected_shape, "shape mismatch");

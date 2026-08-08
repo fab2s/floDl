@@ -22,7 +22,12 @@ use flodl_hf::models::deberta_v2::{
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn deberta_v2_seqcls_export_roundtrip_live() {
     let repo = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli";
-    let head = DebertaV2ForSequenceClassification::from_pretrained(repo).unwrap();
+    let Some(head) = roundtrip_common::or_skip(
+        DebertaV2ForSequenceClassification::from_pretrained(repo),
+        repo,
+    ) else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = DebertaV2Config::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -37,7 +42,11 @@ fn deberta_v2_seqcls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn deberta_v2_tokencls_export_roundtrip_live() {
     let repo = "blaze999/Medical-NER";
-    let head = DebertaV2ForTokenClassification::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(DebertaV2ForTokenClassification::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = DebertaV2Config::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -52,7 +61,11 @@ fn deberta_v2_tokencls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn deberta_v2_qa_export_roundtrip_live() {
     let repo = "deepset/deberta-v3-base-squad2";
-    let head = DebertaV2ForQuestionAnswering::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(DebertaV2ForQuestionAnswering::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = DebertaV2Config::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -72,7 +85,10 @@ fn deberta_v2_mlm_export_roundtrip_live() {
     // the rest. The repo is `.bin`-only, so the comparator triggers
     // `fdl flodl-hf convert` on first run.
     let repo = "microsoft/deberta-v3-base";
-    let head = DebertaV2ForMaskedLM::from_pretrained(repo).unwrap();
+    let Some(head) = roundtrip_common::or_skip(DebertaV2ForMaskedLM::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = DebertaV2Config::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(

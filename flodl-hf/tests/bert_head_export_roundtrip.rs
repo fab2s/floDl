@@ -23,7 +23,11 @@ use flodl_hf::models::bert::{
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn bert_seqcls_export_roundtrip_live() {
     let repo = "nateraw/bert-base-uncased-emotion";
-    let head = BertForSequenceClassification::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(BertForSequenceClassification::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -38,7 +42,11 @@ fn bert_seqcls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn bert_tokencls_export_roundtrip_live() {
     let repo = "dslim/bert-base-NER";
-    let head = BertForTokenClassification::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(BertForTokenClassification::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(
@@ -53,7 +61,11 @@ fn bert_tokencls_export_roundtrip_live() {
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn bert_qa_export_roundtrip_live() {
     let repo = "csarron/bert-base-uncased-squad-v1";
-    let head = BertForQuestionAnswering::from_pretrained(repo).unwrap();
+    let Some(head) =
+        roundtrip_common::or_skip(BertForQuestionAnswering::from_pretrained(repo), repo)
+    else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "bert_qa");
@@ -62,10 +74,12 @@ fn bert_qa_export_roundtrip_live() {
 #[test]
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn bert_mlm_export_roundtrip_live() {
-    // `bert-base-uncased` ships as `BertForPreTraining` (MLM + NSP);
+    // `google-bert/bert-base-uncased` ships as `BertForPreTraining` (MLM + NSP);
     // BertForMaskedLM ignores the NSP keys and loads the rest.
-    let repo = "bert-base-uncased";
-    let head = BertForMaskedLM::from_pretrained(repo).unwrap();
+    let repo = "google-bert/bert-base-uncased";
+    let Some(head) = roundtrip_common::or_skip(BertForMaskedLM::from_pretrained(repo), repo) else {
+        return;
+    };
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
     roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "bert_mlm");

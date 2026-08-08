@@ -10,7 +10,7 @@
 //! shared `roberta.embeddings.word_embeddings.weight` tensor drives
 //! both embedding and projection paths.
 //!
-//! `_live` — pulls `roberta-base` weights from the Hub. Run with
+//! `_live` — pulls `FacebookAI/roberta-base` weights from the Hub. Run with
 //! `fdl test-live`.
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use flodl_hf::models::bert::build_extended_attention_mask;
 use flodl_hf::models::roberta::RobertaForMaskedLM;
 
 const FIXTURE: &str = "tests/fixtures/roberta_mlm_parity.safetensors";
-const MODEL_ID: &str = "roberta-base";
+const MODEL_ID: &str = "FacebookAI/roberta-base";
 
 // Matches BERT MLM — loosened from the 1e-5 classifier-head tol since
 // the full-vocab projection accumulates more drift.

@@ -1,4 +1,4 @@
-//! BERT encoder, compatible with HuggingFace `bert-base-uncased` checkpoints.
+//! BERT encoder, compatible with HuggingFace `google-bert/bert-base-uncased` checkpoints.
 //!
 //! Structure: [`BertEmbeddings`] (token + position + token-type embeddings
 //! with LayerNorm and Dropout), a stack of
@@ -73,7 +73,7 @@ pub struct BertConfig {
     pub hidden_dropout_prob: f64,
     pub attention_probs_dropout_prob: f64,
     /// FFN activation form (parsed from HF `hidden_act`). Default
-    /// `GeluApprox::Exact` (erf form) matches `bert-base-uncased`. Loud
+    /// `GeluApprox::Exact` (erf form) matches `google-bert/bert-base-uncased`. Loud
     /// error from [`Self::from_json_str`] on unrecognised activation
     /// names.
     pub hidden_act: GeluApprox,
@@ -98,7 +98,7 @@ pub struct BertConfig {
 }
 
 impl BertConfig {
-    /// Preset matching `bert-base-uncased` on the HuggingFace Hub.
+    /// Preset matching `google-bert/bert-base-uncased` on the HuggingFace Hub.
     pub fn bert_base_uncased() -> Self {
         BertConfig {
             vocab_size: 30522,
@@ -172,7 +172,7 @@ impl BertConfig {
     /// sidecar to the class actually built, so a subsequent
     /// `save_checkpoint` → `--checkpoint` re-export round-trips through
     /// `classify_architecture` (private to `crate::export`) regardless of what the
-    /// upstream Hub config advertised (e.g. `bert-base-uncased` ships
+    /// upstream Hub config advertised (e.g. `google-bert/bert-base-uncased` ships
     /// `architectures: ["BertForPreTraining"]` but a user loading via
     /// `BertForMaskedLM::from_pretrained` is building an MLM head and the
     /// sidecar should reflect that).
@@ -728,9 +728,9 @@ impl QaHead<BertConfig> {
 ///
 /// Matches HF Python's
 /// [`BertForMaskedLM`](https://huggingface.co/docs/transformers/model_doc/bert#transformers.BertForMaskedLM).
-/// Pre-trained checkpoints ship with `bert-base-uncased` et al. out of
+/// Pre-trained checkpoints ship with `google-bert/bert-base-uncased` et al. out of
 /// the box; for inference fill-mask demos, reach for
-/// `bert-base-uncased` or `bert-base-cased`.
+/// `google-bert/bert-base-uncased` or `bert-base-cased`.
 /// Type alias over the generic [`MaskedLmHead`]; `fill_mask`,
 /// `forward_encoded`, `compute_loss`, `graph`, `config`, and
 /// `with_tokenizer` are inherited. Only the BERT-specific `on_device`

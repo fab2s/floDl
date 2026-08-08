@@ -39,7 +39,7 @@ impl BertModel {
     /// site needs a guaranteed shape regardless of what the Hub repo
     /// happens to ship.
     ///
-    /// `repo_id` is the HF-style identifier, e.g. `"bert-base-uncased"`
+    /// `repo_id` is the HF-style identifier, e.g. `"google-bert/bert-base-uncased"`
     /// or `"google-bert/bert-base-multilingual-cased"`.
     ///
     /// Errors on: hub API init failure, network / HTTP failure,
@@ -54,7 +54,7 @@ impl BertModel {
         } else {
             BertModel::on_device_without_pooler(&config, device)?
         };
-        // HF base checkpoints (e.g. `bert-base-uncased`) ship as
+        // HF base checkpoints (e.g. `google-bert/bert-base-uncased`) ship as
         // `BertForPreTraining`, which carries MLM + NSP heads that a
         // bare `BertModel` has no slot for. `load_weights_with_logging`
         // tolerates those and names them on stderr.
@@ -153,7 +153,7 @@ impl BertForQuestionAnswering {
 }
 
 impl BertForMaskedLM {
-    /// Download a BERT MLM checkpoint (`bert-base-uncased`,
+    /// Download a BERT MLM checkpoint (`google-bert/bert-base-uncased`,
     /// `bert-base-cased`, any `*-mlm` fine-tune) from the Hub.
     ///
     /// The decoder weight is tied to the word-embedding table, so

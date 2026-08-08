@@ -9,7 +9,7 @@
 //! `predictions.decoder.weight` is held in the embedding table, with
 //! exactly one optimizer-visible Parameter for that tensor.
 //!
-//! `_live` — pulls `albert-base-v2` weights from the Hub. Run with
+//! `_live` — pulls `albert/albert-base-v2` weights from the Hub. Run with
 //! `fdl test-live`.
 
 use std::path::Path;
@@ -22,7 +22,7 @@ use flodl_hf::models::albert::AlbertForMaskedLM;
 use flodl_hf::models::bert::build_extended_attention_mask;
 
 const FIXTURE: &str = "tests/fixtures/albert_mlm_parity.safetensors";
-const MODEL_ID: &str = "albert-base-v2";
+const MODEL_ID: &str = "albert/albert-base-v2";
 
 // Large matmul against the 30000-entry SentencePiece vocab accumulates
 // slightly more numerical drift than the narrow classifier heads, so

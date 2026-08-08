@@ -10,7 +10,7 @@
 //! `distilbert.embeddings.word_embeddings.weight` tensor drives both
 //! embedding and projection paths.
 //!
-//! `_live` — pulls `distilbert-base-uncased` weights from the Hub. Run
+//! `_live` — pulls `distilbert/distilbert-base-uncased` weights from the Hub. Run
 //! with `fdl test-live`.
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use flodl_hf::models::bert::build_extended_attention_mask;
 use flodl_hf::models::distilbert::DistilBertForMaskedLM;
 
 const FIXTURE: &str = "tests/fixtures/distilbert_mlm_parity.safetensors";
-const MODEL_ID: &str = "distilbert-base-uncased";
+const MODEL_ID: &str = "distilbert/distilbert-base-uncased";
 
 // Matches the other MLM parity tests — loosened from 1e-5 since the
 // full-vocab projection accumulates more drift than the narrower

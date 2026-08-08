@@ -50,7 +50,7 @@ impl DistilBertForSequenceClassification {
     /// Popular checkpoints:
     /// `lxyuan/distilbert-base-multilingual-cased-sentiments-student`
     /// (3-label multilingual sentiment),
-    /// `distilbert-base-uncased-finetuned-sst-2-english` (2-label
+    /// `distilbert/distilbert-base-uncased-finetuned-sst-2-english` (2-label
     /// sentiment — older, lacks `tokenizer.json`).
     pub fn from_pretrained(repo_id: &str) -> Result<Self> {
         Self::from_pretrained_on_device(repo_id, Device::CPU)
@@ -130,7 +130,7 @@ impl DistilBertForQuestionAnswering {
 }
 
 impl DistilBertForMaskedLM {
-    /// Download a DistilBERT MLM checkpoint (`distilbert-base-uncased`,
+    /// Download a DistilBERT MLM checkpoint (`distilbert/distilbert-base-uncased`,
     /// `distilbert-base-cased`, any `*-mlm` domain-adaptation fine-tune)
     /// from the Hub.
     ///

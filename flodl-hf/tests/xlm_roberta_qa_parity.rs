@@ -19,7 +19,18 @@ use flodl_hf::models::xlm_roberta::XlmRobertaForQuestionAnswering;
 const FIXTURE: &str = "tests/fixtures/xlm_roberta_qa_parity.safetensors";
 const MODEL_ID: &str = "deepset/xlm-roberta-large-squad2";
 
-const LOGITS_TOL: f32 = 1e-5;
+// 5e-5, matching the other 24-layer checkpoints. This drifted at 6.2e-6
+// when the tolerance was first set, comfortably inside 1e-5; it now sits
+// at 1.335e-5 against freshly regenerated fixtures. The cause is not a
+// weight or reference change but flodl's own fused SDPA core (4e9f0e6,
+// 2026-07-28), which replaced the explicit
+// matmul->scale->softmax->matmul chain: same math, different
+// accumulation order, and the difference compounds per layer. Measured
+// across the suite it scales with depth -- 1.2e-6 at 6 layers, ~6e-6 at
+// 12, ~1e-5 to 1.8e-5 at 24 -- so a base-model budget was never the
+// right one here. 5e-5 keeps ~3.7x margin over the empirical drift,
+// the same standard the Davlan checkpoint's tolerance was set to.
+const LOGITS_TOL: f32 = 5e-5;
 
 mod parity_common;
 use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};

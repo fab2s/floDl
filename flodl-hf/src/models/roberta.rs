@@ -1,4 +1,4 @@
-//! RoBERTa encoder, compatible with HuggingFace `roberta-base` checkpoints.
+//! RoBERTa encoder, compatible with HuggingFace `FacebookAI/roberta-base` checkpoints.
 //!
 //! Same encoder shape as [BERT](crate::models::bert) — a stack of
 //! pre-LN-free self-attention + feed-forward blocks — with four
@@ -64,7 +64,7 @@ pub struct RobertaConfig {
     pub hidden_dropout_prob: f64,
     pub attention_probs_dropout_prob: f64,
     /// FFN activation form (parsed from HF `hidden_act`). Default
-    /// `GeluApprox::Exact` (erf form) matches `roberta-base`.
+    /// `GeluApprox::Exact` (erf form) matches `FacebookAI/roberta-base`.
     pub hidden_act: GeluApprox,
     /// See [`crate::models::bert::BertConfig::num_labels`].
     pub num_labels: Option<i64>,
@@ -75,7 +75,7 @@ pub struct RobertaConfig {
 }
 
 impl RobertaConfig {
-    /// Preset matching `roberta-base` on the HuggingFace Hub.
+    /// Preset matching `FacebookAI/roberta-base` on the HuggingFace Hub.
     pub fn roberta_base() -> Self {
         RobertaConfig {
             vocab_size: 50265,
@@ -355,7 +355,7 @@ impl NamedInputModule for RobertaEmbeddings {
 /// Structurally identical to `BertPooler`. Most RoBERTa fine-tunes
 /// don't use the pooler (the sequence-classification head does its own
 /// two-layer projection on the `<s>` state), but the pooler weights
-/// are still published with the base `roberta-base` checkpoint, so the
+/// are still published with the base `FacebookAI/roberta-base` checkpoint, so the
 /// backbone must be able to emit a pooled output when asked.
 pub struct RobertaPooler {
     dense: Linear,
@@ -464,7 +464,7 @@ pub(crate) fn roberta_backbone_flow(
 /// Position ids are computed internally from `input_ids`.
 ///
 /// The default Hub loader ([`RobertaModel::from_pretrained`]) builds
-/// the graph *without* a pooler since `roberta-base` and most
+/// the graph *without* a pooler since `FacebookAI/roberta-base` and most
 /// fine-tunes don't ship pooler weights (RoBERTa pretraining drops
 /// NSP). Use [`RobertaModel::on_device`] explicitly when a specific
 /// checkpoint is known to carry its own pooler.
@@ -474,7 +474,7 @@ impl RobertaModel {
     /// Build a RoBERTa graph on CPU with a pooler node.
     ///
     /// Prefer [`RobertaModel::on_device_without_pooler`] for the
-    /// common case: `roberta-base` and its fine-tunes skip the
+    /// common case: `FacebookAI/roberta-base` and its fine-tunes skip the
     /// pooler, and the default [`from_pretrained`](Self::from_pretrained)
     /// path matches that convention.
     pub fn build(config: &RobertaConfig) -> Result<Graph> {
@@ -779,7 +779,7 @@ impl Module for RobertaLMHeadTransform {
 /// checkpoint carries one.
 ///
 /// Matches HF Python's `RobertaForMaskedLM`. Canonical checkpoints:
-/// `roberta-base`, `roberta-large`, any `*-mlm` domain-adaptation
+/// `FacebookAI/roberta-base`, `roberta-large`, any `*-mlm` domain-adaptation
 /// fine-tune.
 /// Type alias over the generic [`MaskedLmHead`]; `fill_mask`,
 /// `forward_encoded`, `compute_loss`, and tokenizer plumbing are
@@ -944,7 +944,7 @@ mod tests {
     }
 
     /// Position-id computation: real tokens start at `padding_idx + 1`
-    /// (== 2 for `roberta-base`), padding slots stay at `padding_idx`.
+    /// (== 2 for `FacebookAI/roberta-base`), padding slots stay at `padding_idx`.
     #[test]
     fn roberta_position_ids_follow_hf_convention() {
         let config = RobertaConfig::roberta_base();

@@ -10,7 +10,7 @@
 //! tokenizer attach + weight load through each concrete family's
 //! loader.
 
-use hf_hub::api::sync::ApiBuilder;
+use super::{hub_client, hub_download};
 
 use flodl::{Device, Graph, Result, TensorError};
 
@@ -90,8 +90,8 @@ impl AutoModel {
     /// [`BertModel::from_pretrained`](crate::models::bert::BertModel) directly.
     ///
     /// `repo_id` examples:
-    /// - `"bert-base-uncased"` (BERT)
-    /// - `"roberta-base"` (RoBERTa)
+    /// - `"google-bert/bert-base-uncased"` (BERT)
+    /// - `"FacebookAI/roberta-base"` (RoBERTa)
     /// - `"distilbert/distilbert-base-uncased"` (DistilBERT)
     ///
     /// The returned graph's `forward_multi` input count differs by
@@ -117,7 +117,7 @@ impl AutoModel {
         )?;
         load_weights_with_logging(repo_id, &graph, &weights)?;
         // Normalise `architectures` to the base class name actually
-        // being built (e.g. `bert-base-uncased` ships
+        // being built (e.g. `google-bert/bert-base-uncased` ships
         // `architectures: ["BertForPreTraining"]` but this loader
         // builds a bare `BertModel` with the head dropped). Without
         // normalisation, a subsequent `save_checkpoint` sidecar would
@@ -143,7 +143,7 @@ impl AutoModel {
     /// Pooler-bearing families (BERT, RoBERTa, XLM-R, ALBERT) auto-pick
     /// `on_device` vs `on_device_without_pooler` by inspecting the
     /// checkpoint: with-pooler when pooler weights ship, without-pooler
-    /// when the Hub repo is encoder-only (e.g. `roberta-base`,
+    /// when the Hub repo is encoder-only (e.g. `FacebookAI/roberta-base`,
     /// `FacebookAI/xlm-roberta-base`). Pooler-less families (DistilBERT,
     /// DeBERTa-v2) behave identically to
     /// [`from_pretrained`](Self::from_pretrained).
@@ -239,7 +239,7 @@ impl AutoModel {
 
         // Pick with-pooler vs without-pooler dynamically based on what
         // the checkpoint actually ships. Some Hub repos for pooler-
-        // bearing families are encoder-only (e.g. `roberta-base`,
+        // bearing families are encoder-only (e.g. `FacebookAI/roberta-base`,
         // `FacebookAI/xlm-roberta-base`). Building with a pooler whose
         // weights aren't in the checkpoint trips the missing-keys
         // validation in `load_safetensors_into_graph_with_rename_allow_unused`.
@@ -249,7 +249,7 @@ impl AutoModel {
         load_weights_with_logging(repo_id, &graph, &weights)?;
         // Normalise `architectures` to the base class name actually
         // being built. The Hub's source config typically tags a head
-        // class (e.g. `bert-base-uncased` ships
+        // class (e.g. `google-bert/bert-base-uncased` ships
         // `architectures: ["BertForPreTraining"]`) while this loader,
         // mirroring HF's `AutoModel.from_pretrained`, builds the base
         // backbone and silently drops head keys. The sidecar emitted
@@ -273,7 +273,7 @@ impl AutoModel {
 ///
 /// Mirrors `export::HeadKind` but kept separate because the Hub-mode
 /// auto-dispatch policy is more permissive: unrecognised `For{Other}`
-/// suffixes fall back to base instead of erroring (a `bert-base-uncased`
+/// suffixes fall back to base instead of erroring (a `google-bert/bert-base-uncased`
 /// checkpoint advertising `BertForPreTraining` is a real Hub case that
 /// should still produce a base backbone, mirroring HF Python's
 /// `AutoModel.from_pretrained`).
@@ -562,8 +562,8 @@ impl AutoModelForMaskedLM {
     /// and outputs `vocab_size` logits per position.
     ///
     /// Typical use is continued pretraining / domain adaptation on
-    /// base checkpoints (`bert-base-uncased`, `roberta-base`,
-    /// `distilbert-base-uncased`); each family's `from_pretrained`
+    /// base checkpoints (`google-bert/bert-base-uncased`, `FacebookAI/roberta-base`,
+    /// `distilbert/distilbert-base-uncased`); each family's `from_pretrained`
     /// tolerates the redundant decoder-weight key some HF save
     /// formats ship, silently ignoring it during load.
     pub fn from_pretrained(repo_id: &str) -> Result<Self> {
@@ -629,13 +629,8 @@ impl HfTokenizer {
     /// a model already pulled from a given repo won't re-download the
     /// tokenizer either (and vice versa).
     pub fn from_pretrained(repo_id: &str) -> Result<Self> {
-        let api = ApiBuilder::from_env()
-            .build()
-            .map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))?;
-        let repo = api.model(repo_id.to_string());
-        let path = repo.get("tokenizer.json").map_err(|e| {
-            TensorError::new(&format!("hf-hub fetch {repo_id}/tokenizer.json: {e}"))
-        })?;
+        let client = hub_client()?;
+        let path = hub_download(&client, repo_id, "tokenizer.json")?;
         Self::from_file(&path)
     }
 }

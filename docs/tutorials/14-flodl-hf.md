@@ -63,7 +63,7 @@ flodl-hf = "=0.5.3"
 ```
 
 Pulls `safetensors` + `hf-hub` + `tokenizers`. Everything needed to
-load `bert-base-uncased` out of the box, including text tokenization
+load `google-bert/bert-base-uncased` out of the box, including text tokenization
 and Hub downloads.
 
 ### Vision-only (hub, no tokenizer)
@@ -117,9 +117,9 @@ for (label, score) in &results[0] {
 }
 ```
 
-The same three-line caller works for `bert-base-uncased`,
-`roberta-base`, `distilbert-base-uncased`, `albert-base-v2`,
-`xlm-roberta-base`, `microsoft/deberta-v3-base`, or any fine-tune on
+The same three-line caller works for `google-bert/bert-base-uncased`,
+`FacebookAI/roberta-base`, `distilbert/distilbert-base-uncased`, `albert/albert-base-v2`,
+`FacebookAI/xlm-roberta-base`, `microsoft/deberta-v3-base`, or any fine-tune on
 top of those. Swap the repo id and the family wiring happens under the
 hood.
 
@@ -213,7 +213,7 @@ forward.
 ```rust
 use flodl_hf::models::bert::BertForMaskedLM;
 
-let mlm = BertForMaskedLM::from_pretrained("bert-base-uncased")?;
+let mlm = BertForMaskedLM::from_pretrained("google-bert/bert-base-uncased")?;
 let candidates = mlm.fill_mask("The capital of France is [MASK].", /*top_k=*/5)?;
 for (tok, score) in &candidates {
     println!("{} ({:.3})", tok, score);
@@ -234,7 +234,7 @@ DistilBERT's `vocab_layer_norm + vocab_projector`, ALBERT's
 ```rust
 use flodl_hf::models::bert::BertModel;
 
-let model = BertModel::from_pretrained("bert-base-uncased")?;
+let model = BertModel::from_pretrained("google-bert/bert-base-uncased")?;
 // model is a flodl::Graph; run it with forward_multi
 ```
 
@@ -259,7 +259,7 @@ model-specific pre-tokenizer and post-processor.
 ```rust
 use flodl_hf::tokenizer::HfTokenizer;
 
-let tok = HfTokenizer::from_pretrained("bert-base-uncased")?;
+let tok = HfTokenizer::from_pretrained("google-bert/bert-base-uncased")?;
 let batch = tok.encode(&["hello world", "another input"])?;
 // batch.input_ids / attention_mask / token_type_ids / position_ids
 // are i64 [B, S] Variables; sequence_ids carries the paired-segment
@@ -342,7 +342,7 @@ fdl flodl-hf example distilbert-finetune
 ```
 
 It downloads
-`distilbert-base-uncased-finetuned-sst-2-english` once (`~250 MB`
+`distilbert/distilbert-base-uncased-finetuned-sst-2-english` once (`~250 MB`
 cached via `hf-hub`), fine-tunes for 5 steps on a hand-crafted
 domain-specific dataset, prints the loss curve and a final eval probe,
 saves the trained head as a flodl `.fdl` checkpoint, and prints the
@@ -355,11 +355,11 @@ runtime after the cache is warm is about 30 seconds on CPU.
 use flodl_hf::models::distilbert::DistilBertForSequenceClassification;
 use flodl_hf::tokenizer::HfTokenizer;
 
-let model_repo = "distilbert-base-uncased-finetuned-sst-2-english";
+let model_repo = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
 // SST-2 ships only legacy vocab.txt; the fast tokenizer.json lives at
 // the base repo (vocabulary is identical, SST-2 fine-tuning does not
 // retrain it).
-let tok_repo   = "distilbert-base-uncased";
+let tok_repo   = "distilbert/distilbert-base-uncased";
 
 let head = DistilBertForSequenceClassification::from_pretrained(model_repo)?;
 let tok  = HfTokenizer::from_pretrained(tok_repo)?;
@@ -512,12 +512,12 @@ any Hub checkpoint flodl-hf supports.
 
 ```bash
 # Round-trip a Hub checkpoint
-fdl flodl-hf export --hub bert-base-uncased --out /tmp/bert-export
+fdl flodl-hf export --hub google-bert/bert-base-uncased --out /tmp/bert-export
 
 # Force a specific head class instead of dispatching on the upstream
 # `architectures[0]`. Useful for treating a pretraining checkpoint as a
 # feature-extraction encoder:
-fdl flodl-hf export --hub bert-base-uncased --head base --out /tmp/bert-base
+fdl flodl-hf export --hub google-bert/bert-base-uncased --head base --out /tmp/bert-base
 
 # Re-export a local fine-tune
 fdl flodl-hf export --checkpoint ./my-head.fdl --out /tmp/my-head-export
@@ -548,7 +548,7 @@ fdl flodl-hf verify-export /tmp/bert-export
 
 # Override the Hub source (hand-staged dirs, or comparing against a
 # different upstream)
-fdl flodl-hf verify-export /tmp/bert-export --hub-source bert-base-uncased
+fdl flodl-hf verify-export /tmp/bert-export --hub-source google-bert/bert-base-uncased
 
 # Skip forward parity (for fine-tuned heads with no upstream)
 fdl flodl-hf verify-export /tmp/my-head-export --no-hub-source

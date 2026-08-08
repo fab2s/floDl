@@ -75,9 +75,6 @@ allow = [
     # Unicode term is required even though the MIT term is satisfied.
     # The icu_* crates are Unicode-3.0 outright.
     "Unicode-3.0",
-    # webpki-roots only. A data license for the Mozilla CA bundle, not a
-    # code license, and permissive by name and terms.
-    "CDLA-Permissive-2.0",
     # The one non-permissive license in the tree, and a deliberate call
     # rather than an oversight: `option-ext`, reached through
     # `dirs -> dirs-sys`. MPL-2.0 is FILE-level copyleft, so linking it

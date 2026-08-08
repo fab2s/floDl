@@ -399,7 +399,7 @@ pub fn bert_legacy_key_rename(checkpoint_key: &str) -> String {
 /// untouched. Used by the round-trip comparators in
 /// `tests/roundtrip_common/mod.rs` to canonicalise HF-reference
 /// safetensors against flodl exports — flodl always saves the modern
-/// names; older HF checkpoints (e.g. `bert-base-uncased`) ship the
+/// names; older HF checkpoints (e.g. `google-bert/bert-base-uncased`) ship the
 /// legacy names. Distinct from [`bert_legacy_key_rename`], which is
 /// the *load-side* HF-to-flodl rename and additionally maps the MLM
 /// decoder-bias tying alias (no longer needed by the comparator since
@@ -476,8 +476,8 @@ fn is_pooler_key(key: &str) -> bool {
 /// (and `AutoModel::from_pretrained_for_export_on_device`) to pick
 /// `on_device` vs `on_device_without_pooler` based on what the
 /// checkpoint actually ships, rather than baking a per-family default
-/// that's always wrong for some Hub repos (e.g. `roberta-base` has no
-/// pooler; `bert-base-uncased` does).
+/// that's always wrong for some Hub repos (e.g. `FacebookAI/roberta-base` has no
+/// pooler; `google-bert/bert-base-uncased` does).
 pub fn weights_have_pooler(weights: &[u8]) -> Result<bool> {
     let st = SafeTensors::deserialize(weights)
         .map_err(|e| TensorError::new(&format!("safetensors parse error: {e}")))?;
@@ -589,7 +589,9 @@ pub fn save_safetensors_from_graph(graph: &Graph) -> Result<Vec<u8>> {
         })
         .collect::<std::result::Result<_, _>>()?;
 
-    safetensors::serialize(&views, &None)
+    // safetensors 0.8 takes the optional metadata BY VALUE (0.4 took
+    // `&Option<_>`).
+    safetensors::serialize(&views, None)
         .map_err(|e| TensorError::new(&format!("safetensors serialize: {e}")))
 }
 

@@ -64,3 +64,94 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f32, f32::max)
 }
+
+/// True when a `from_pretrained` error is the "`.bin`-only repo" case:
+/// the repo resolved, but ships no `model.safetensors` and no locally
+/// converted copy exists yet.
+///
+/// Matched on `Entry not found` plus the filename rather than on the
+/// whole message, so rewording the surrounding hint does not silently
+/// turn a skip back into a failure. A repo that does not resolve at all
+/// says `Repository not found` and is NOT this case -- that is a real
+/// error and must still fail.
+pub fn is_unconverted_bin_only(err: &str) -> bool {
+    err.contains("Entry not found") && err.contains("model.safetensors")
+}
+
+/// Report a parity test skipped because its Hub repo ships only
+/// `pytorch_model.bin`, and say exactly how to fix it.
+///
+/// WHY A SKIP AND NOT A FAILURE: flodl loads `model.safetensors` while
+/// the Python parity generator reads `.bin` happily, so the fixture
+/// exists while the Rust side cannot reach the weights. That is a
+/// missing local artifact, not a disagreement with PyTorch, and it
+/// recurs on every fresh clone or wiped cache -- a permanent red that
+/// teaches people to ignore red.
+///
+/// WHY IT PRINTS: a silent early return reported as `ok` is the exact
+/// false-green this project refuses elsewhere (see `ci/rig-ladder.sh`).
+/// The line below is the only thing separating "skipped for want of a
+/// provisioning step" from "passed".
+pub fn skip_unconverted(model_id: &str) {
+    eprintln!(
+        "SKIPPED: {model_id} ships only `pytorch_model.bin`, so flodl has no \
+         `model.safetensors` to load.\n  \
+         This is a missing local artifact, not a parity failure. Convert it once:\n    \
+         fdl flodl-hf convert {model_id}\n  \
+         The result lands in `$HF_HOME/flodl-converted/{model_id}/` and \
+         `from_pretrained` picks it up automatically."
+    );
+}
+
+/// Unwrap a `from_pretrained` result, or LOUDLY skip when the repo ships
+/// only `pytorch_model.bin`.
+///
+/// flodl loads `model.safetensors`; the Python parity/reference tooling
+/// reads `.bin` happily. So for a `.bin`-only repo the fixture exists
+/// while the Rust side cannot reach the weights -- a missing local
+/// artifact, not a disagreement, and one that recurs on every fresh
+/// clone or wiped cache. Left as a failure it is a permanent red that
+/// teaches people to ignore red.
+///
+/// Returns `None` after printing; callers `return` on `None`. A repo
+/// that does not resolve at all still PANICS -- that is a real error.
+pub fn or_skip<T, E: std::fmt::Display>(r: Result<T, E>, model_id: &str) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) if is_unconverted_bin_only(&e.to_string()) => {
+            skip_unconverted(model_id);
+            None
+        }
+        Err(e) => panic!("from_pretrained({model_id}): {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unconverted_bin_only;
+
+    #[test]
+    fn bin_only_repo_is_a_skip() {
+        assert!(is_unconverted_bin_only(
+            "hf-hub fetch x/y/model.safetensors: Entry not found: model.safetensors in x/y"
+        ));
+    }
+
+    #[test]
+    fn missing_repo_is_not_a_skip() {
+        // A repo that does not resolve is a real error, not a
+        // provisioning gap -- it must keep failing.
+        assert!(!is_unconverted_bin_only(
+            "hf-hub fetch x/y/model.safetensors: Repository not found: x/y"
+        ));
+    }
+
+    #[test]
+    fn a_missing_tokenizer_is_not_a_skip() {
+        // `Entry not found` alone is not enough: the best-effort
+        // tokenizer attach reports it too, and that path is non-fatal.
+        assert!(!is_unconverted_bin_only(
+            "hf-hub fetch x/y/tokenizer.json: Entry not found: tokenizer.json in x/y"
+        ));
+    }
+}
