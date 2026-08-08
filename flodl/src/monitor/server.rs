@@ -834,7 +834,13 @@ mod tests {
         let addr = srv.addr;
         srv.set_hardware("2x GPU test rig".to_string());
 
-        let body = get_until(addr, "/", "LIVE_HARDWARE");
+        // Wait for the INJECTED constant, not the bare name: dashboard.html
+        // itself carries `typeof LIVE_HARDWARE!=='undefined'`, so the weaker
+        // needle is satisfied by every response and the poll returns before
+        // `set_hardware` has been picked up. Normally injection wins that
+        // race anyway; under coverage instrumentation it does not, which is
+        // how a latent flake became a reproducible failure.
+        let body = get_until(addr, "/", "const LIVE_HARDWARE=");
         assert_eq!(body.matches("const LIVE_HARDWARE=").count(), 1);
         // Constants first, page code second: the page reads them at load.
         let consts = body.find("const LIVE_HARDWARE=").unwrap();
