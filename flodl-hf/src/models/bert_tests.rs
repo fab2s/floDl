@@ -184,7 +184,7 @@ fn tiny_bert_config() -> BertConfig {
     }
 }
 
-/// Standard `bert-base-uncased` config.json — round-trip through
+/// Standard `google-bert/bert-base-uncased` config.json — round-trip through
 /// `from_json_str` must produce a config that matches the hardcoded
 /// `bert_base_uncased()` preset. Exercises every required field plus
 /// a few optional ones and unknown-field tolerance.
@@ -866,7 +866,7 @@ fn masked_lm_parameter_keys_match_hf_tied_layout() {
 /// Structural check: exactly one `[vocab_size, hidden]`-shaped
 /// Parameter in the graph. An untied decoder would double it.
 ///
-/// Uses `bert-base-uncased` config (not `tiny_bert_config`) so the
+/// Uses `google-bert/bert-base-uncased` config (not `tiny_bert_config`) so the
 /// shape test is unambiguous — in the tiny preset
 /// `intermediate_size == vocab_size` collides with the FFN weight
 /// shape.
@@ -1067,7 +1067,7 @@ fn mlm_loader_tolerates_redundant_tied_decoder_key() {
         .iter()
         .map(|(n, d, s, b)| (n.clone(), TensorView::new(*d, s.clone(), b).unwrap()))
         .collect();
-    let bytes = safetensors::serialize(&views, &None).unwrap();
+    let bytes = safetensors::serialize(&views, None).unwrap();
 
     // 1. `allow_unused` variant: accepts the redundant key and
     //    returns it in the `unused` list.

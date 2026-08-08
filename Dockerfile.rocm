@@ -35,6 +35,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
+# --- Coverage tooling (`fdl coverage-all` phases 2-4 on a ROCm box) ---
+# See the same block in Dockerfile: CARGO_HOME/bin is not a mounted
+# volume, so an ad-hoc install cannot survive the container.
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+
 # libtorch is bind-mounted at runtime to /usr/local/libtorch
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV ROCM_PATH="/opt/rocm"

@@ -26,12 +26,12 @@ impl AlbertModel {
     ///
     /// Picks `on_device` (with pooler) when the checkpoint ships pooler
     /// weights and `on_device_without_pooler` when it doesn't.
-    /// `albert-base-v2` ships its pooler as a flat
+    /// `albert/albert-base-v2` ships its pooler as a flat
     /// `albert.pooler.{weight,bias}` (HF's `AlbertModel.pooler` is a
     /// bare `nn.Linear`, not a `BertPooler`-style `.dense` wrapper),
     /// and the dynamic detection picks both shapes.
     ///
-    /// `repo_id` examples: `"albert-base-v2"`, `"albert-large-v2"`,
+    /// `repo_id` examples: `"albert/albert-base-v2"`, `"albert-large-v2"`,
     /// `"albert/albert-base-v2"`.
     pub fn from_pretrained(repo_id: &str) -> Result<Graph> {
         Self::from_pretrained_on_device(repo_id, Device::CPU)
@@ -131,7 +131,7 @@ impl AlbertForQuestionAnswering {
 }
 
 impl AlbertForMaskedLM {
-    /// Download an ALBERT MLM checkpoint (`albert-base-v2`,
+    /// Download an ALBERT MLM checkpoint (`albert/albert-base-v2`,
     /// `albert-large-v2`, any `*-mlm` domain-adaptation fine-tune)
     /// from the Hub.
     ///

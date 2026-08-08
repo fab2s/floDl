@@ -20,10 +20,10 @@
 //! use flodl_hf::tokenizer::HfTokenizer;
 //! use flodl_hf::models::bert::{BertModel, build_extended_attention_mask};
 //!
-//! let tok = HfTokenizer::from_pretrained("bert-base-uncased")?;
+//! let tok = HfTokenizer::from_pretrained("google-bert/bert-base-uncased")?;
 //! let enc = tok.encode(&["hello world"])?;
 //!
-//! let graph = BertModel::from_pretrained("bert-base-uncased")?;
+//! let graph = BertModel::from_pretrained("google-bert/bert-base-uncased")?;
 //! let mask_f32 = enc.attention_mask.data().to_dtype(DType::Float32)?;
 //! let mask = build_extended_attention_mask(&mask_f32)?;
 //! // ... feed enc.input_ids / enc.position_ids / enc.token_type_ids / mask
@@ -283,7 +283,7 @@ mod tests {
             vocab.insert((*w).to_string(), i as u32);
         }
         let wl = WordLevel::builder()
-            .vocab(vocab)
+            .vocab(vocab.into_iter().collect())
             .unk_token("[UNK]".into())
             .build()
             .expect("WordLevel build");

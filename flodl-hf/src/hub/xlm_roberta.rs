@@ -26,11 +26,11 @@ impl XlmRobertaModel {
     /// weights and `on_device_without_pooler` when it doesn't, matching
     /// whatever the Hub repo carries. `FacebookAI/xlm-roberta-base`
     /// keeps the pooler; many encoder-only variants (e.g.
-    /// `xlm-roberta-base`) don't. HF base checkpoints ship as
+    /// `FacebookAI/xlm-roberta-base`) don't. HF base checkpoints ship as
     /// `XLMRobertaForMaskedLM` and the `lm_head.*` keys are tolerated
     /// (logged, ignored) by `load_weights_with_logging`.
     ///
-    /// `repo_id` examples: `"xlm-roberta-base"`, `"xlm-roberta-large"`,
+    /// `repo_id` examples: `"FacebookAI/xlm-roberta-base"`, `"xlm-roberta-large"`,
     /// `"FacebookAI/xlm-roberta-base"`.
     pub fn from_pretrained(repo_id: &str) -> Result<Graph> {
         Self::from_pretrained_on_device(repo_id, Device::CPU)
@@ -135,7 +135,7 @@ impl XlmRobertaForQuestionAnswering {
 }
 
 impl XlmRobertaForMaskedLM {
-    /// Download an XLM-RoBERTa MLM checkpoint (`xlm-roberta-base`,
+    /// Download an XLM-RoBERTa MLM checkpoint (`FacebookAI/xlm-roberta-base`,
     /// `xlm-roberta-large`, any `*-mlm` domain-adaptation fine-tune)
     /// from the Hub.
     ///

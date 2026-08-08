@@ -97,7 +97,7 @@ fn weights_have_pooler_detects_albert_style_flat() {
 #[test]
 fn weights_have_pooler_returns_false_for_encoder_only() {
     // RoBERTa-style: encoder weights only, no pooler. Mirrors
-    // `roberta-base` Hub repo which drops the pooler with the NSP
+    // `FacebookAI/roberta-base` Hub repo which drops the pooler with the NSP
     // objective.
     let bytes = serialize_entries(&[
         (
@@ -397,7 +397,7 @@ fn serialize_entries(entries: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> Vec<u8> 
         .iter()
         .map(|(n, d, s, b)| (n.to_string(), TensorView::new(*d, s.clone(), b).unwrap()))
         .collect();
-    safetensors::serialize(&views, &None).unwrap()
+    safetensors::serialize(&views, None).unwrap()
 }
 
 /// End-to-end: build a tagged Linear graph, pin its parameters to
@@ -786,7 +786,7 @@ fn load_safetensors_rejects_integer_dtype() {
 
 /// Legacy BERT checkpoint key rewriting: only `LayerNorm.gamma`
 /// and `LayerNorm.beta` suffixes are remapped; every other key
-/// passes through untouched. `bert-base-uncased` from the Hub ships
+/// passes through untouched. `google-bert/bert-base-uncased` from the Hub ships
 /// with the legacy suffixes on every LayerNorm parameter, so this
 /// is the one knob that separates "loads" from "doesn't".
 #[test]
@@ -1019,7 +1019,7 @@ fn save_safetensors_uses_hf_dotted_keys_and_le_f32() {
     let bytes = save_safetensors_from_graph(&graph).unwrap();
     let st = SafeTensors::deserialize(&bytes).unwrap();
 
-    let names: HashSet<&str> = st.names().iter().map(|s| s.as_str()).collect();
+    let names: HashSet<&str> = st.names().into_iter().collect();
     assert!(
         names.contains("encoder.layer.0.attention.output.dense.weight"),
         "expected HF-dotted key in output, got {names:?}"
@@ -1081,7 +1081,7 @@ fn save_safetensors_dedups_shared_weights() {
 
     let bytes = save_safetensors_from_graph(&graph).unwrap();
     let st = SafeTensors::deserialize(&bytes).unwrap();
-    let names: HashSet<&str> = st.names().iter().map(|s| s.as_str()).collect();
+    let names: HashSet<&str> = st.names().into_iter().collect();
 
     // Shared weight ships once under whichever tag named_parameters
     // visited first. Each Linear's own bias is a distinct Parameter,

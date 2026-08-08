@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::HFClientSync;
 use safetensors::{SafeTensors, tensor::TensorView};
 
 use flodl::Graph;
@@ -26,6 +26,20 @@ use flodl_hf::export::export_hf_dir;
 use flodl_hf::safetensors_io::{
     bert_legacy_layernorm_rename, save_safetensors_file_from_graph, tensor_view_to_f32_vec,
 };
+
+/// Download one file from a Hub model repo, mirroring
+/// `flodl_hf::hub::hub_download`. hf-hub 1.0 takes owner and name
+/// separately; `split_id` yields `("", id)` for a canonical repo.
+fn hub_get(repo_id: &str, filename: &str) -> Result<PathBuf, String> {
+    let client = HFClientSync::new().expect("hf-hub init (set HF_HOME for cache location)");
+    let (owner, name) = hf_hub::split_id(repo_id);
+    client
+        .model(owner, name)
+        .download_file()
+        .filename(filename)
+        .send()
+        .map_err(|e| e.to_string())
+}
 
 /// Resolve the on-disk safetensors path that `from_pretrained` would
 /// use for `repo_id`. Mirrors `flodl_hf::hub::fetch_safetensors`:
@@ -35,7 +49,7 @@ use flodl_hf::safetensors_io::{
 ///    repos like `microsoft/deberta-v3-base`. When present, this is
 ///    what flodl actually loaded, so the roundtrip's reference IS
 ///    this converted file.
-/// 2. `api.model(repo_id).get("model.safetensors")` — the normal Hub
+/// 2. `client.model(owner, name).download_file()` — the normal Hub
 ///    fetch via `hf-hub`'s on-disk cache.
 fn hf_safetensors_path(repo_id: &str) -> PathBuf {
     let hf_home = std::env::var_os("HF_HOME")
@@ -54,11 +68,7 @@ fn hf_safetensors_path(repo_id: &str) -> PathBuf {
         return converted;
     }
 
-    let api = ApiBuilder::from_env()
-        .build()
-        .expect("hf-hub init (set HF_HOME for cache location)");
-    api.model(repo_id.to_string())
-        .get("model.safetensors")
+    hub_get(repo_id, "model.safetensors")
         .unwrap_or_else(|e| {
             panic!(
                 "fetch {repo_id}/model.safetensors: {e}\n\
@@ -72,12 +82,7 @@ fn hf_safetensors_path(repo_id: &str) -> PathBuf {
 /// (via `*Model::from_pretrained`) AND the family-specific `*Config`
 /// — `from_pretrained` only returns the graph.
 pub fn fetch_hf_config_json(repo_id: &str) -> String {
-    let api = ApiBuilder::from_env()
-        .build()
-        .expect("hf-hub init (set HF_HOME for cache location)");
-    let path = api
-        .model(repo_id.to_string())
-        .get("config.json")
+    let path = hub_get(repo_id, "config.json")
         .unwrap_or_else(|e| panic!("fetch {repo_id}/config.json: {e}"));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
@@ -318,4 +323,50 @@ pub fn run_export_roundtrip(graph: &Graph, config_json: &str, repo_id: &str, fam
     );
 
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// True when a `from_pretrained` error is the "`.bin`-only repo" case.
+///
+/// Matches `Entry not found` PLUS the filename, never the whole message:
+/// the best-effort tokenizer attach also reports `Entry not found`
+/// (for `tokenizer.json`) on healthy runs, and a looser match would
+/// swallow genuine failures as skips.
+pub fn is_unconverted_bin_only(err: &str) -> bool {
+    err.contains("Entry not found") && err.contains("model.safetensors")
+}
+
+/// Report a test skipped for want of a converted checkpoint, and say
+/// exactly how to fix it. A silent early return reported as `ok` is the
+/// false-green this project refuses elsewhere (`ci/rig-ladder.sh`).
+pub fn skip_unconverted(model_id: &str) {
+    eprintln!(
+        "SKIPPED: {model_id} ships only `pytorch_model.bin`, so flodl has no \
+         `model.safetensors` to load.\n  \
+         This is a missing local artifact, not a parity failure. Convert it once:\n    \
+         fdl flodl-hf convert {model_id}\n  \
+         The result lands in `$HF_HOME/flodl-converted/{model_id}/` and \
+         `from_pretrained` picks it up automatically."
+    );
+}
+/// Unwrap a `from_pretrained` result, or LOUDLY skip when the repo ships
+/// only `pytorch_model.bin`.
+///
+/// flodl loads `model.safetensors`; the Python parity/reference tooling
+/// reads `.bin` happily. So for a `.bin`-only repo the fixture exists
+/// while the Rust side cannot reach the weights -- a missing local
+/// artifact, not a disagreement, and one that recurs on every fresh
+/// clone or wiped cache. Left as a failure it is a permanent red that
+/// teaches people to ignore red.
+///
+/// Returns `None` after printing; callers `return` on `None`. A repo
+/// that does not resolve at all still PANICS -- that is a real error.
+pub fn or_skip<T, E: std::fmt::Display>(r: Result<T, E>, model_id: &str) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) if is_unconverted_bin_only(&e.to_string()) => {
+            skip_unconverted(model_id);
+            None
+        }
+        Err(e) => panic!("from_pretrained({model_id}): {e}"),
+    }
 }

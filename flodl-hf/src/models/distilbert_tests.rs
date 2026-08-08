@@ -81,7 +81,7 @@ fn distilbert_parameter_keys_match_hf_dotted_form() {
     );
 }
 
-/// Parameter shapes must match the distilbert-base-uncased reference.
+/// Parameter shapes must match the distilbert/distilbert-base-uncased reference.
 #[test]
 fn distilbert_parameter_shapes_match_base_uncased() {
     let config = DistilBertConfig::distilbert_base_uncased();

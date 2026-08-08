@@ -24,4 +24,4 @@ categories = ["hardware-support", "science"]
 # reader here would mean owning ~275 lines of parser forever to avoid a
 # crate every consumer already builds.
 [dependencies]
-serde_json = "1"
+serde_json.workspace = true

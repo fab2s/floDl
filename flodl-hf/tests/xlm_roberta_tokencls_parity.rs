@@ -19,14 +19,20 @@ use flodl_hf::models::xlm_roberta::XlmRobertaForTokenClassification;
 const FIXTURE: &str = "tests/fixtures/xlm_roberta_tokencls_parity.safetensors";
 const MODEL_ID: &str = "Davlan/xlm-roberta-large-ner-hrl";
 
-// Loosened from 1e-5 to 5e-5 for this specific checkpoint. Same
-// flodl encoder code on the same prompt with `roberta-large-ner-english`
-// (Jean-Baptiste) drifts at 3.8e-6, and `deepset/xlm-roberta-large-squad2`
-// drifts at 6.2e-6 — both well within 1e-5. The Davlan multilingual
-// NER weights accumulate ~1.7e-5 through the same 24-layer stack;
-// relative error against the [-9, 14.5] logit range is ~1.2e-6, at
-// the f32 precision floor. 5e-5 keeps a 3x margin from the empirical
-// drift while still tight enough to catch any real disagreement.
+// 5e-5, and this checkpoint reached it first. The Davlan multilingual
+// NER weights accumulate ~1.8e-5 through the 24-layer stack; relative
+// error against the [-9, 14.5] logit range is ~1.2e-6, at the f32
+// precision floor. 5e-5 keeps a 3x margin from the empirical drift
+// while staying tight enough to catch a real disagreement.
+//
+// The two sibling 24-layer tests originally kept 1e-5 because they
+// drifted at 3.8e-6 (`roberta-large-ner-english`) and 6.2e-6
+// (`deepset/xlm-roberta-large-squad2`). Both roughly DOUBLED -- to
+// 9.060e-6 and 1.335e-5 -- when flodl adopted a fused SDPA core
+// (4e9f0e6, 2026-07-28): same math as the explicit
+// matmul->scale->softmax->matmul chain, different accumulation order,
+// compounding per layer. Both now carry 5e-5 as well, so depth, not
+// checkpoint identity, is what sets this budget.
 const LOGITS_TOL: f32 = 5e-5;
 
 mod parity_common;

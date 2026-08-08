@@ -1,11 +1,11 @@
-//! PyTorch parity for `BertModel::from_pretrained("bert-base-uncased")`.
+//! PyTorch parity for `BertModel::from_pretrained("google-bert/bert-base-uncased")`.
 //!
 //! Loads a committed safetensors fixture built by
 //! `flodl-hf/scripts/parity_bert.py` (run via `fdl flodl-hf parity bert`) and
 //! compares flodl's pooled output against the Python `BertModel` reference on
 //! the same pinned inputs.
 //!
-//! `_live` because it pulls the real `bert-base-uncased` weights from the
+//! `_live` because it pulls the real `google-bert/bert-base-uncased` weights from the
 //! HuggingFace Hub (first run only; hf-hub caches). Run with `fdl test-live`.
 //!
 //! See `.claude/projects/memory/project_flodl_hf_bert_state.md` for the
@@ -93,7 +93,7 @@ fn bert_parity_vs_pytorch_live() {
     let pooler_ref = parse_f32(&pooler_ref_view);
     let pooler_ref_shape = shape_i64(&pooler_ref_view);
 
-    let graph = BertModel::from_pretrained("bert-base-uncased").unwrap();
+    let graph = BertModel::from_pretrained("google-bert/bert-base-uncased").unwrap();
     graph.eval();
 
     let out = graph

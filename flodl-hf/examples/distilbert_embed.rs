@@ -1,4 +1,4 @@
-//! Minimal distilbert-base-uncased embedding example.
+//! Minimal distilbert/distilbert-base-uncased embedding example.
 //!
 //! Closed-loop demo: download a tokenizer and model from the
 //! HuggingFace Hub, encode a batch of sentences, and print the

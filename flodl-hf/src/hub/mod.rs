@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use hf_hub::api::sync::{Api, ApiBuilder};
+use hf_hub::HFClientSync;
 
 use flodl::{Graph, Result, TensorError};
 
@@ -81,12 +81,12 @@ fn flodl_converted_path(repo_id: &str) -> PathBuf {
 /// Order:
 /// 1. `<HF_HOME>/flodl-converted/<repo_id>/model.safetensors` — produced
 ///    by `fdl flodl-hf convert <repo_id>` for `.bin`-only repos.
-/// 2. `api.model(repo_id).get("model.safetensors")` — the normal Hub
-///    fetch, goes through hf-hub's own on-disk cache.
+/// 2. [`hub_download`] for `model.safetensors` — the normal Hub fetch,
+///    goes through hf-hub's own on-disk cache.
 ///
 /// On failure at step 2, the returned error explicitly points the user
 /// at `fdl flodl-hf convert <repo_id>` for the common `.bin`-only case.
-fn fetch_safetensors(api: &Api, repo_id: &str) -> Result<PathBuf> {
+fn fetch_safetensors(client: &HFClientSync, repo_id: &str) -> Result<PathBuf> {
     let converted = flodl_converted_path(repo_id);
     if converted.exists() {
         eprintln!(
@@ -95,15 +95,45 @@ fn fetch_safetensors(api: &Api, repo_id: &str) -> Result<PathBuf> {
         );
         return Ok(converted);
     }
-    api.model(repo_id.to_string())
-        .get("model.safetensors")
-        .map_err(|e| {
-            TensorError::new(&format!(
-                "hf-hub fetch {repo_id}/model.safetensors: {e}\n\
-                 If this repo ships only `pytorch_model.bin`, convert it first:\n  \
-                 fdl flodl-hf convert {repo_id}",
-            ))
-        })
+    hub_download(client, repo_id, "model.safetensors").map_err(|e| {
+        TensorError::new(&format!(
+            "{e}\n\
+             If this repo ships only `pytorch_model.bin`, convert it first:\n  \
+             fdl flodl-hf convert {repo_id}",
+        ))
+    })
+}
+
+/// Build a Hub client.
+///
+/// The cache location follows `HF_HOME` (then `XDG_CACHE_HOME`, then
+/// `~/.cache/huggingface`) inside hf-hub itself, which matters here: the
+/// dev container's `$HOME` is ephemeral, so a client that ignored
+/// `HF_HOME` would redownload every run.
+fn hub_client() -> Result<HFClientSync> {
+    HFClientSync::new().map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))
+}
+
+/// Download one file from a Hub model repo, returning its cached path.
+///
+/// `repo_id` is the usual `owner/name`; hf-hub takes the two halves
+/// separately and `split_id` does the split, yielding `("", id)` for a
+/// bare name.
+///
+/// PREFER THE OWNER-QUALIFIED ID. The Hub answers a bare legacy name
+/// (the pre-2024 short form, no owner segment) with a 307 to its
+/// owner-qualified home; hf-hub 0.4's `ureq` transport followed that
+/// redirect, hf-hub 1.0 does not, and reports `Repository not found`
+/// instead. Every repo id in this crate is owner-qualified for that
+/// reason, which is also the form the Hub itself now documents.
+fn hub_download(client: &HFClientSync, repo_id: &str, filename: &str) -> Result<PathBuf> {
+    let (owner, name) = hf_hub::split_id(repo_id);
+    client
+        .model(owner, name)
+        .download_file()
+        .filename(filename)
+        .send()
+        .map_err(|e| TensorError::new(&format!("hf-hub fetch {repo_id}/{filename}: {e}")))
 }
 
 /// Fetch a Hub repo's `config.json` as a string, going through
@@ -111,18 +141,8 @@ fn fetch_safetensors(api: &Api, repo_id: &str) -> Result<PathBuf> {
 /// [`fetch_config_str_and_weights`] so config-only callers (e.g.
 /// `AutoConfig::from_pretrained`) don't pay the safetensors read.
 fn fetch_config_str(repo_id: &str) -> Result<String> {
-    // `ApiBuilder::from_env()` reads `HF_HOME` for the cache location.
-    // `Api::new()` hardcodes `~/.cache/huggingface/hub/` and silently
-    // ignores `HF_HOME`, so every run would redownload into the dev
-    // container's ephemeral `$HOME`.
-    let api = ApiBuilder::from_env()
-        .build()
-        .map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))?;
-    let repo = api.model(repo_id.to_string());
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| TensorError::new(&format!("hf-hub fetch {repo_id}/config.json: {e}")))?;
+    let client = hub_client()?;
+    let config_path = hub_download(&client, repo_id, "config.json")?;
     std::fs::read_to_string(&config_path)
         .map_err(|e| TensorError::new(&format!("read {}: {e}", config_path.display())))
 }
@@ -134,10 +154,8 @@ fn fetch_config_str(repo_id: &str) -> Result<String> {
 fn fetch_config_str_and_weights(repo_id: &str) -> Result<(String, Vec<u8>)> {
     let config_str = fetch_config_str(repo_id)?;
 
-    let api = ApiBuilder::from_env()
-        .build()
-        .map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))?;
-    let weights_path = fetch_safetensors(&api, repo_id)?;
+    let client = hub_client()?;
+    let weights_path = fetch_safetensors(&client, repo_id)?;
     let weights = std::fs::read(&weights_path)
         .map_err(|e| TensorError::new(&format!("read {}: {e}", weights_path.display())))?;
     Ok((config_str, weights))
@@ -221,7 +239,7 @@ mod tests {
     use crate::models::bert::BertModel;
     use flodl::Device;
 
-    /// Live-network integration test: pulls `bert-base-uncased` from the
+    /// Live-network integration test: pulls `google-bert/bert-base-uncased` from the
     /// HuggingFace Hub, builds the graph, loads the weights, and runs a
     /// forward pass. `#[ignore]` by default — run manually with
     /// `fdl test -- --ignored bert_from_pretrained_live` when the host
@@ -234,7 +252,7 @@ mod tests {
         use flodl::nn::Module;
         use flodl::{DType, Tensor, TensorOptions, Variable};
 
-        let graph = BertModel::from_pretrained("bert-base-uncased").unwrap();
+        let graph = BertModel::from_pretrained("google-bert/bert-base-uncased").unwrap();
         graph.eval();
 
         // Tiny forward pass to prove the loaded graph works end-to-end.
@@ -312,7 +330,7 @@ mod tests {
     /// regardless of what the upstream Hub config advertised. Otherwise
     /// a subsequent `save_checkpoint → --checkpoint re-export` cycle
     /// trips `classify_architecture` on the multi-head class name some
-    /// Hub repos ship (`bert-base-uncased` → `BertForPreTraining`,
+    /// Hub repos ship (`google-bert/bert-base-uncased` → `BertForPreTraining`,
     /// which `classify_architecture` rejects loudly).
     ///
     /// The test simulates the from_pretrained_on_device contract
@@ -328,7 +346,7 @@ mod tests {
         use crate::models::bert::BertForMaskedLM;
 
         // Upstream-style config carrying the multi-head class name a
-        // user pulling `bert-base-uncased` from the Hub would see.
+        // user pulling `google-bert/bert-base-uncased` from the Hub would see.
         let upstream = tiny_bert_config().with_architectures("BertForPreTraining");
 
         // Build the MLM head and stamp source_config exactly the way

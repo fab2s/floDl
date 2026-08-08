@@ -58,7 +58,7 @@ fn distilbert_qa_export_roundtrip_live() {
 #[test]
 #[ignore = "live: HF head export roundtrip; requires network + hf-hub cache"]
 fn distilbert_mlm_export_roundtrip_live() {
-    let repo = "distilbert-base-uncased";
+    let repo = "distilbert/distilbert-base-uncased";
     let head = DistilBertForMaskedLM::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = DistilBertConfig::from_json_str(&config_json).unwrap();

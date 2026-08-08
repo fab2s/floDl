@@ -1,4 +1,4 @@
-//! DistilBERT encoder, compatible with HuggingFace `distilbert-base-uncased`
+//! DistilBERT encoder, compatible with HuggingFace `distilbert/distilbert-base-uncased`
 //! checkpoints.
 //!
 //! DistilBERT is the 6-layer distilled BERT from Sanh et al. (2019). The
@@ -127,7 +127,7 @@ pub struct DistilBertConfig {
     pub layer_norm_eps: f64,
     /// FFN activation form (parsed from HF `activation` — DistilBERT
     /// uses that key, not `hidden_act`). Default `GeluApprox::Exact`
-    /// (erf form) matches `distilbert-base-uncased`.
+    /// (erf form) matches `distilbert/distilbert-base-uncased`.
     pub hidden_act: GeluApprox,
     /// See [`crate::models::bert::BertConfig::num_labels`].
     pub num_labels: Option<i64>,
@@ -138,7 +138,7 @@ pub struct DistilBertConfig {
 }
 
 impl DistilBertConfig {
-    /// Preset matching `distilbert-base-uncased` on the HuggingFace Hub.
+    /// Preset matching `distilbert/distilbert-base-uncased` on the HuggingFace Hub.
     pub fn distilbert_base_uncased() -> Self {
         DistilBertConfig {
             vocab_size: 30522,
@@ -526,7 +526,7 @@ impl Module for ActivationDropoutLinear {
 /// Pre-trained checkpoints:
 /// `lxyuan/distilbert-base-multilingual-cased-sentiments-student`
 /// (3-class sentiment),
-/// `distilbert-base-uncased-finetuned-sst-2-english` (2-class).
+/// `distilbert/distilbert-base-uncased-finetuned-sst-2-english` (2-class).
 /// Type alias over the generic [`ClassificationHead`]; `predict`,
 /// `classify`, `forward_encoded`, `compute_loss`, `labels`, `graph`,
 /// `config`, and `with_tokenizer` are inherited. Only the
@@ -673,7 +673,7 @@ impl QaHead<DistilBertConfig> {
 /// loader silently ignores unused keys.
 ///
 /// Matches HF Python's `DistilBertForMaskedLM`. Canonical checkpoints:
-/// `distilbert-base-uncased`, `distilbert-base-cased`.
+/// `distilbert/distilbert-base-uncased`, `distilbert-base-cased`.
 /// Type alias over the generic [`MaskedLmHead`]; `fill_mask`,
 /// `forward_encoded`, `compute_loss`, and tokenizer plumbing are
 /// inherited. Only the DistilBERT-specific `on_device` constructor

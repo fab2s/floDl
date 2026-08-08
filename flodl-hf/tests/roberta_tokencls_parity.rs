@@ -20,7 +20,14 @@ use flodl_hf::models::roberta::RobertaForTokenClassification;
 const FIXTURE: &str = "tests/fixtures/roberta_tokencls_parity.safetensors";
 const MODEL_ID: &str = "Jean-Baptiste/roberta-large-ner-english";
 
-const LOGITS_TOL: f32 = 1e-5;
+// 5e-5, matching the other 24-layer checkpoints. This drifted at 3.8e-6
+// when the tolerance was first set; it now sits at 9.060e-6 -- 90% of a
+// 1e-5 budget, i.e. green only by luck and one small numeric change away
+// from red. The cause is flodl's fused SDPA core (4e9f0e6, 2026-07-28):
+// same math as the explicit matmul->scale->softmax->matmul chain it
+// replaced, different accumulation order, compounding per layer. 5e-5
+// keeps ~5.5x margin over the empirical drift.
+const LOGITS_TOL: f32 = 5e-5;
 
 mod parity_common;
 use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};

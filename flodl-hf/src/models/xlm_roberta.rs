@@ -1,4 +1,4 @@
-//! XLM-RoBERTa encoder, compatible with HF `xlm-roberta-base` checkpoints.
+//! XLM-RoBERTa encoder, compatible with HF `FacebookAI/xlm-roberta-base` checkpoints.
 //!
 //! Architecturally identical to [RoBERTa](crate::models::roberta):
 //! same encoder layers, same state_dict prefix (`roberta.*`), same
@@ -48,7 +48,7 @@ use crate::models::roberta::{
 /// [`RobertaConfig`].
 ///
 /// Use [`XlmRobertaConfig::xlm_roberta_base`] for the standard
-/// 12-layer / 768-dim preset matching `xlm-roberta-base` on the
+/// 12-layer / 768-dim preset matching `FacebookAI/xlm-roberta-base` on the
 /// HuggingFace Hub.
 #[derive(Debug, Clone)]
 pub struct XlmRobertaConfig {
@@ -67,7 +67,7 @@ pub struct XlmRobertaConfig {
     pub hidden_dropout_prob: f64,
     pub attention_probs_dropout_prob: f64,
     /// FFN activation form (parsed from HF `hidden_act`). Default
-    /// `GeluApprox::Exact` (erf form) matches `xlm-roberta-base`.
+    /// `GeluApprox::Exact` (erf form) matches `FacebookAI/xlm-roberta-base`.
     pub hidden_act: GeluApprox,
     /// See [`crate::models::bert::BertConfig::num_labels`].
     pub num_labels: Option<i64>,
@@ -78,7 +78,7 @@ pub struct XlmRobertaConfig {
 }
 
 impl XlmRobertaConfig {
-    /// Preset matching `xlm-roberta-base` on the HuggingFace Hub.
+    /// Preset matching `FacebookAI/xlm-roberta-base` on the HuggingFace Hub.
     ///
     /// Differs from [`RobertaConfig::roberta_base`](crate::models::roberta::RobertaConfig::roberta_base)
     /// only in `vocab_size` (`250_002` vs `50_265`) — the multilingual
@@ -400,7 +400,7 @@ impl QaHead<XlmRobertaConfig> {
 /// [`Linear::from_shared_weight`](flodl::nn::Linear::from_shared_weight).
 ///
 /// Primary use case: continued multilingual pretraining / domain
-/// adaptation. Canonical checkpoints: `xlm-roberta-base`,
+/// adaptation. Canonical checkpoints: `FacebookAI/xlm-roberta-base`,
 /// `xlm-roberta-large`.
 pub type XlmRobertaForMaskedLM = MaskedLmHead<XlmRobertaConfig>;
 
@@ -457,8 +457,8 @@ mod tests {
         assert!((rc.attention_probs_dropout_prob - c.attention_probs_dropout_prob).abs() < 1e-12,);
     }
 
-    /// `xlm-roberta-base` defaults: 250k vocab (the reason XLM-R
-    /// exists), otherwise identical to `roberta-base`.
+    /// `FacebookAI/xlm-roberta-base` defaults: 250k vocab (the reason XLM-R
+    /// exists), otherwise identical to `FacebookAI/roberta-base`.
     #[test]
     fn xlm_roberta_base_preset_matches_hf_defaults() {
         let c = XlmRobertaConfig::xlm_roberta_base();

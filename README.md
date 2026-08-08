@@ -594,8 +594,8 @@ for (label, score) in &results[0] {
 ```
 
 `AutoModel` reads `config.json`, dispatches to the right family, and
-returns a typed handle. Swap the repo id for `bert-base-uncased`,
-`albert-base-v2`, `xlm-roberta-base`, `microsoft/deberta-v3-base`, or
+returns a typed handle. Swap the repo id for `google-bert/bert-base-uncased`,
+`albert/albert-base-v2`, `FacebookAI/xlm-roberta-base`, `microsoft/deberta-v3-base`, or
 any fine-tune on top of those, and the caller stays identical.
 
 | Entry point | Task | Output |

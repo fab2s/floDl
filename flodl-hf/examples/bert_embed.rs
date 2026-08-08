@@ -22,8 +22,8 @@ use flodl_hf::models::bert::{BertModel, build_extended_attention_mask};
 use flodl_hf::tokenizer::HfTokenizer;
 
 fn main() -> flodl::Result<()> {
-    let tok = HfTokenizer::from_pretrained("bert-base-uncased")?;
-    let graph = BertModel::from_pretrained("bert-base-uncased")?;
+    let tok = HfTokenizer::from_pretrained("google-bert/bert-base-uncased")?;
+    let graph = BertModel::from_pretrained("google-bert/bert-base-uncased")?;
     graph.eval();
 
     let texts = &["hello world", "flodl brings libtorch to Rust"];

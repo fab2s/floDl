@@ -20,10 +20,10 @@
 //! Run with:
 //!
 //! ```text
-//! fdl flodl-hf export --hub bert-base-uncased --out /tmp/bert-exported
+//! fdl flodl-hf export --hub google-bert/bert-base-uncased --out /tmp/bert-exported
 //! fdl flodl-hf export --checkpoint /tmp/my.fdl --out /tmp/my-exported
 //! # or, inside the dev container directly:
-//! cargo run --release --example export_hf --features hub -- --hub bert-base-uncased --out /tmp/bert-exported
+//! cargo run --release --example export_hf --features hub -- --hub google-bert/bert-base-uncased --out /tmp/bert-exported
 //! ```
 //!
 //! Argv parsing + `--help` + `--fdl-schema` are handled by `flodl-cli`'s
@@ -49,7 +49,7 @@ use flodl_hf::safetensors_io::keys_have_pooler;
 /// Export a Hub repo or local flodl checkpoint as a HuggingFace-compatible directory (model.safetensors + config.json) using flodl's own writer. Auto-detects family (bert/roberta/distilbert/xlm-roberta/albert/deberta-v2).
 #[derive(FdlArgs, Debug)]
 struct ExportArgs {
-    /// HuggingFace repo id to fetch (e.g. `bert-base-uncased`).
+    /// HuggingFace repo id to fetch (e.g. `google-bert/bert-base-uncased`).
     /// Mutex with `--checkpoint`; exactly one is required.
     #[option]
     hub: Option<String>,
@@ -236,7 +236,7 @@ fn run_hub(
 
     // Use the graph's source_config (already set by
     // `from_pretrained_for_export` with `architectures` normalised to
-    // the base class — `bert-base-uncased` advertises
+    // the base class — `google-bert/bert-base-uncased` advertises
     // `["BertForMaskedLM"]`, but the loader builds the base backbone
     // and drops the head; the normalised config reflects what was
     // actually built). Falling back to `config.to_json_str()` would

@@ -33,6 +33,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
 ENV PATH="${CARGO_HOME}/bin:${PATH}"
 
+# --- Coverage tooling (`fdl coverage`, `fdl coverage-all`) ---
+# Baked into the image rather than left to the operator: of CARGO_HOME
+# only registry/ and git/ are bind-mounted, so a `cargo install` run
+# inside a `docker compose run` dies with the container and would have to
+# be redone on every single invocation.
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --locked \
+    && chmod -R a+rwx "$CARGO_HOME" "$RUSTUP_HOME"
+
 # libtorch is bind-mounted at runtime to /usr/local/libtorch
 ENV LIBTORCH_PATH="/usr/local/libtorch"
 ENV LD_LIBRARY_PATH="${LIBTORCH_PATH}/lib"

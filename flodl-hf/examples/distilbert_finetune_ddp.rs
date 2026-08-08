@@ -108,10 +108,10 @@ fn train_step(model: &DistilBertForSequenceClassification, batch: &[Tensor]) -> 
 }
 
 fn main() -> Result<()> {
-    let model_repo = "distilbert-base-uncased-finetuned-sst-2-english";
+    let model_repo = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
     // The SST-2 checkpoint ships only the legacy tokenizer triple; grab the
     // fast tokenizer from the base repo (identical vocabulary).
-    let tok_repo = "distilbert-base-uncased";
+    let tok_repo = "distilbert/distilbert-base-uncased";
     let tok = HfTokenizer::from_pretrained(tok_repo)?;
 
     let train: &[(&str, i64)] = &[

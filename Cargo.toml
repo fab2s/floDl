@@ -10,17 +10,93 @@ edition = "2024"
 # exactly this toolchain, so a wrong value here is a failing build rather
 # than a promise nobody tests.
 #
-# Two floors stack here, and the higher one wins:
+# Three floors stack here, and the highest one wins:
 #   1.88  our own source -- let-chains, used across graph/, monitor/ and
 #         distributed/ (rewriting them to go lower would be a large and
 #         gratuitous refactor)
 #   1.90  `bincode-next`, taken to replace the unmaintained bincode 2
+#   1.91  `xet-core-structures`, reached through hf-hub 1.0's MANDATORY
+#         `hf-xet` dependency (no feature gates it). It calls
+#         `str::floor_char_boundary`, stable only from 1.91 -- verified
+#         by compiling a one-line probe on both 1.90.0 and 1.91.0.
+#
+# That third floor is worth reading twice, because nothing warned about
+# it: `xet-core-structures` declares NO `rust-version` of its own, so
+# cargo cannot report the conflict and MSRV-aware resolution has nothing
+# to act on. It simply fails to compile, in a transitive crate, on the
+# declared floor. The msrv job is what caught it.
 #
 # With no committed Cargo.lock this also tracks the ECOSYSTEM: consumers
 # resolve fresh, so a transitive dep raising its own rust-version raises
 # ours, and pinning it back in a lockfile nobody ships would not help.
-# Expect to bump it; the job says when.
-rust-version = "1.90"
+# Expect to bump it; the job says when — this is the job having said so.
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/flodl-labs/flodl"
 homepage = "https://flodl.dev"
+
+# Every dependency any member declares, in one place. Members say
+# `dep.workspace = true` and add only what is theirs (`optional`, extra
+# `features`).
+#
+# WHAT THIS GUARDS, precisely: two members declaring the SAME dependency
+# at DIFFERENT versions. It had already happened in the requirement
+# spelling -- `flodl` asked for `flodl-hw = "0.7.0"` while `flodl-cli`
+# asked for `"=0.7.0"`, two different contracts for one crate.
+#
+# WHAT IT DOES NOT GUARD, so nobody trusts it for more than it does: a
+# direct dependency drifting from a TRANSITIVE one. The getrandom 0.3/0.4
+# split fixed on 2026-08-08 was exactly that (flodl-cli declared 0.3
+# directly, flodl reached 0.4 through `rand`), and a table of our own
+# declarations cannot see the second half of it. `cargo tree -d` and
+# cargo-deny's duplicate warnings are what catch that class.
+#
+# The table is FULL rather than only the shared entries. A partial one
+# needs a judgement call about which deps qualify, and that judgement is
+# itself the drift risk: whoever adds `libc` to a second crate has to
+# notice it belongs here. With every dep listed, they see it already is.
+[workspace.dependencies]
+
+# --- internal, published in lockstep ---------------------------------
+# All members take `version.workspace = true`, so these move together and
+# the requirement is exact: a consumer resolving flodl 0.8 against
+# flodl-sys 0.7 would pair a safe wrapper with a shim it was not built
+# for. Centralised so a release edits ONE line instead of five.
+flodl = { version = "=0.7.0", path = "flodl" }
+flodl-cli = { version = "=0.7.0", path = "flodl-cli" }
+flodl-cli-macros = { version = "=0.7.0", path = "flodl-cli-macros" }
+flodl-hw = { version = "=0.7.0", path = "flodl-hw" }
+flodl-sys = { version = "=0.7.0", path = "flodl-sys" }
+
+# --- third party -----------------------------------------------------
+# bincode's successor, and the reason is not a version bump: bincode 2 is
+# unmaintained (RUSTSEC-2025-0141) and its `3.0.0` on crates.io is a
+# TOMBSTONE -- a README plus a lib.rs containing only a compiler error,
+# published because crates.io cannot archive a crate. bincode-next is the
+# continuation, and the swap is safe in the way that matters: same API,
+# and a BYTE-IDENTICAL wire encoding, each decoding the other's output
+# (verified 2026-08-08 across u32/String/Vec<i64>/Option<f32>), so no
+# CONTROL_PROTOCOL_VERSION bump. It is what sets the workspace MSRV.
+bincode-next = { version = "3.1.1", features = ["serde"] }
+cc = "1"
+flate2 = "1"
+# 0.4, matching what `flodl` already resolves through `rand 0.10`. Same
+# `fill()` signature as 0.3 and a 1.85 floor, under the workspace MSRV.
+getrandom = "0.4"
+# 1.0 renamed the transport feature: `ureq` became `blocking` (the full
+# set is blocking / default / rustls-tls / socks). Naming the old one is
+# a resolution error, not a silent fallback, which is how the rename was
+# found.
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
+hmac-sha256 = "1"
+indexmap = "2"
+libc = "0.2"
+proc-macro2 = "1"
+quote = "1"
+rand = "0.10"
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+syn = { version = "2", features = ["full"] }
+tokenizers = "0.23"

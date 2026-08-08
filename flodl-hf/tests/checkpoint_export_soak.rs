@@ -6,7 +6,7 @@
 //! (`build_for_export` + `load_checkpoint` + `export_hf_dir` reads the
 //! sidecar to rebuild the matching topology) paths actually round-trip:
 //!
-//! 1. `AutoModel::from_pretrained_for_export("bert-base-uncased")`
+//! 1. `AutoModel::from_pretrained_for_export("google-bert/bert-base-uncased")`
 //!    fetches the Hub config, sets it on the returned graph as
 //!    `source_config`.
 //! 2. `graph.save_checkpoint(<tmp>.fdl)` emits both the `.fdl` and the
@@ -51,7 +51,7 @@ fn sidecar_for_checkpoint(checkpoint: &str) -> PathBuf {
 #[test]
 #[ignore = "live: HF checkpoint-mode soak; requires network + hf-hub cache"]
 fn bert_checkpoint_export_pipeline_soak_live() {
-    let repo = "bert-base-uncased";
+    let repo = "google-bert/bert-base-uncased";
     let root = unique_tmp_root("bert");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -164,7 +164,7 @@ fn bert_checkpoint_export_pipeline_soak_live() {
 #[test]
 #[ignore = "live: HF head checkpoint-mode soak; requires network + hf-hub cache"]
 fn distilbert_seqcls_checkpoint_export_pipeline_soak_live() {
-    let repo = "distilbert-base-uncased-finetuned-sst-2-english";
+    let repo = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
     let root = unique_tmp_root("distilbert_seqcls");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();

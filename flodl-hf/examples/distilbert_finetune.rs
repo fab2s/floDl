@@ -3,7 +3,7 @@
 //! ~30 seconds after the one-time weight download (~250 MB cached
 //! via `hf-hub`).
 //!
-//! Starting point: `distilbert-base-uncased-finetuned-sst-2-english`,
+//! Starting point: `distilbert/distilbert-base-uncased-finetuned-sst-2-english`,
 //! a two-class positive / negative sentiment head. The example
 //! continues training on a hand-crafted domain-specific dataset -
 //! the canonical "calibrate a generic sentiment model to your own
@@ -33,12 +33,12 @@ use flodl_hf::models::distilbert::DistilBertForSequenceClassification;
 use flodl_hf::tokenizer::HfTokenizer;
 
 fn main() -> Result<()> {
-    let model_repo = "distilbert-base-uncased-finetuned-sst-2-english";
+    let model_repo = "distilbert/distilbert-base-uncased-finetuned-sst-2-english";
     // The SST-2 checkpoint only ships the legacy vocab.txt / tokenizer_config
     // triple, not a fast `tokenizer.json`. Grab the tokenizer from the base
     // repo - the vocabulary is identical since SST-2 fine-tuning does not
     // retrain it.
-    let tok_repo = "distilbert-base-uncased";
+    let tok_repo = "distilbert/distilbert-base-uncased";
 
     // Load pre-trained model. The head has 2 classes:
     // id 0 = NEGATIVE, id 1 = POSITIVE (matches HF convention).

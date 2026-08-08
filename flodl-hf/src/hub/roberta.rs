@@ -21,7 +21,7 @@ impl RobertaModel {
     /// weights and `on_device_without_pooler` when it doesn't, so the
     /// graph shape matches the Hub repo regardless of whether the
     /// checkpoint kept BERT's pooler. Most RoBERTa checkpoints
-    /// (including `roberta-base`) drop the pooler with the NSP
+    /// (including `FacebookAI/roberta-base`) drop the pooler with the NSP
     /// objective, but some downstream-tuned variants keep it. HF
     /// Python silently random-initialises a missing pooler on load,
     /// producing non-reproducible `pooler_output`; flodl-hf instead
@@ -30,7 +30,7 @@ impl RobertaModel {
     /// directly when a graph slot for the pooler is needed regardless
     /// of what the checkpoint ships.
     ///
-    /// `repo_id` is the HF-style identifier, e.g. `"roberta-base"` or
+    /// `repo_id` is the HF-style identifier, e.g. `"FacebookAI/roberta-base"` or
     /// `"FacebookAI/roberta-large"`. HF base checkpoints ship as
     /// `RobertaForMaskedLM` with an `lm_head` that a bare
     /// `RobertaModel` has no slot for; `load_weights_with_logging`
@@ -140,7 +140,7 @@ impl RobertaForQuestionAnswering {
 }
 
 impl RobertaForMaskedLM {
-    /// Download a RoBERTa MLM checkpoint (`roberta-base`,
+    /// Download a RoBERTa MLM checkpoint (`FacebookAI/roberta-base`,
     /// `roberta-large`, any `*-mlm` domain-adaptation fine-tune) from
     /// the Hub.
     ///

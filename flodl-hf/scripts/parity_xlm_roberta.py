@@ -24,7 +24,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
 from huggingface_hub import model_info
 from safetensors.torch import save_file
 from transformers import AutoTokenizer, XLMRobertaModel
@@ -39,7 +38,25 @@ FIXTURE_PATH = (
     / "tests" / "fixtures" / "xlm_roberta_base_parity.safetensors"
 )
 
-# FLORES-200 language codes covering 7 distinct scripts.
+# FLORES-200 devtest row 0, concatenated across 7 distinct scripts
+# (eng_Latn, zho_Hans, arb_Arab, rus_Cyrl, hin_Deva, jpn_Jpan, kor_Hang).
+#
+# PINNED, not fetched. This used to call `load_dataset("facebook/flores",
+# ..., trust_remote_code=True)`, which stopped working when HF `datasets`
+# 3.x removed script-based dataset loaders -- `fdl flodl-hf parity
+# xlm-roberta` was the only target that could not regenerate.
+#
+# Pinning is the right shape regardless of that breakage: a parity
+# fixture's INPUT must be fixed, or the reference it encodes silently
+# changes whenever upstream does. Every other parity script already
+# pins a literal `PROMPT`. Verified byte-exact: re-tokenising this
+# string reproduces the committed fixture's 199 `inputs.input_ids`
+# exactly, so the pin changed nothing about what the fixture asserts.
+PROMPT = "\"We now have 4-month-old mice that are non-diabetic that used to be diabetic,\" he added. 他补充道:“我们现在有 4 个月大没有糖尿病的老鼠,但它们曾经得过该病。” أضاف قائلاً، \"لدينا الآن فئران تبلغ من العمر 4 أشهر التي كانت تعاني في السابق من مرض السكري، ولكنها لم تعد تعاني منه الآن. \"Теперь у нас есть четырёхмесячные мыши, у которых больше нет диабета\", — добавил он. उन्होंने कहा “कि अब हमारे पास 4 महीने उम्र वाले चूहे हैं जिन्हें मधुमेह नहीं है जो मधुमेह के रोगी थे। ” 「我々が飼っている生後4か月のマウスはかつて糖尿病でしたが現在は糖尿病ではない、」と彼は付け加えました。 \"그는 \"\"현재 4개월 된 당뇨병에서 치료된 생쥐가 있다\"\"고 덧붙였다.\""
+
+# Provenance of PROMPT. No longer used to FETCH anything -- kept because
+# these values are written into the fixture's metadata, and that metadata
+# must keep matching what the committed fixture already carries.
 FLORES_LANGS = [
     "eng_Latn",
     "zho_Hans",
@@ -67,18 +84,7 @@ def sequence_ids_tensor(enc) -> torch.Tensor:
 
 
 def build_prompt() -> str:
-    pieces = []
-    for lang in FLORES_LANGS:
-        # `facebook/flores` ships a loader script that unzips the
-        # release tarball — `trust_remote_code=True` runs it. This is
-        # contained to the parity Docker image, which is rebuilt from
-        # `Dockerfile.parity` and never executes user input.
-        ds = load_dataset(
-            "facebook/flores", lang, split=FLORES_SPLIT,
-            trust_remote_code=True,
-        )
-        pieces.append(ds[FLORES_ROW]["sentence"])
-    return " ".join(pieces)
+    return PROMPT
 
 
 def main() -> None:

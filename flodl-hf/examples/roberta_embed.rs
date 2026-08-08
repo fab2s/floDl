@@ -1,4 +1,4 @@
-//! Minimal roberta-base embedding example.
+//! Minimal FacebookAI/roberta-base embedding example.
 //!
 //! Closed-loop demo of the flodl-hf API for RoBERTa: download a
 //! tokenizer and model from the HuggingFace Hub, encode a batch of
@@ -22,8 +22,8 @@ use flodl_hf::models::roberta::RobertaModel;
 use flodl_hf::tokenizer::HfTokenizer;
 
 fn main() -> flodl::Result<()> {
-    let tok = HfTokenizer::from_pretrained("roberta-base")?;
-    let graph = RobertaModel::from_pretrained("roberta-base")?;
+    let tok = HfTokenizer::from_pretrained("FacebookAI/roberta-base")?;
+    let graph = RobertaModel::from_pretrained("FacebookAI/roberta-base")?;
     graph.eval();
 
     let texts = &["hello world", "flodl brings libtorch to Rust"];

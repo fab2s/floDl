@@ -564,7 +564,7 @@ impl AutoModelForMaskedLM {
 mod tests {
     use super::*;
 
-    /// `bert-base-uncased`-style config.json dispatches to
+    /// `google-bert/bert-base-uncased`-style config.json dispatches to
     /// `AutoConfig::Bert` and round-trips through `BertConfig`.
     #[test]
     fn auto_config_dispatches_bert() {
@@ -590,7 +590,7 @@ mod tests {
         }
     }
 
-    /// `roberta-base`-style config.json dispatches to
+    /// `FacebookAI/roberta-base`-style config.json dispatches to
     /// `AutoConfig::Roberta`.
     #[test]
     fn auto_config_dispatches_roberta() {
@@ -616,7 +616,7 @@ mod tests {
         }
     }
 
-    /// `distilbert-base-uncased`-style config.json dispatches to
+    /// `distilbert/distilbert-base-uncased`-style config.json dispatches to
     /// `AutoConfig::DistilBert` (note the DistilBERT-specific field
     /// names: `dim`, `n_layers`, etc.).
     #[test]
@@ -642,7 +642,7 @@ mod tests {
         }
     }
 
-    /// `xlm-roberta-base`-style config.json dispatches to
+    /// `FacebookAI/xlm-roberta-base`-style config.json dispatches to
     /// `AutoConfig::XlmRoberta`. Field layout is identical to RoBERTa;
     /// the multilingual vocabulary (250k) is the only distinguishing
     /// numeric field.
@@ -731,7 +731,7 @@ mod tests {
         }
     }
 
-    /// `albert-base-v2`-style config.json dispatches to
+    /// `albert/albert-base-v2`-style config.json dispatches to
     /// `AutoConfig::Albert`. Distinguishing fields: `embedding_size`
     /// (factorised embeddings) and the default
     /// `num_hidden_groups=1`, `inner_group_num=1` layout.

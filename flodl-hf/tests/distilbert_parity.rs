@@ -10,7 +10,7 @@
 //! `attention_mask`. No `token_type_ids` (DistilBERT is single-segment)
 //! and no `position_ids` (sequential 0..S, computed internally).
 //!
-//! `_live` — pulls the real `distilbert-base-uncased` weights from the
+//! `_live` — pulls the real `distilbert/distilbert-base-uncased` weights from the
 //! Hub. Run with `fdl test-live`.
 
 use std::path::Path;
@@ -69,7 +69,7 @@ fn distilbert_parity_vs_pytorch_live() {
     let actual = out.data().to_f32_vec().unwrap();
     let diff = max_abs_diff(&actual, &hidden_ref_data);
     eprintln!(
-        "distilbert-base-uncased last_hidden_state max_abs_diff = {diff:.3e} (tol {HIDDEN_TOL:.0e})"
+        "distilbert/distilbert-base-uncased last_hidden_state max_abs_diff = {diff:.3e} (tol {HIDDEN_TOL:.0e})"
     );
     assert!(
         diff <= HIDDEN_TOL,

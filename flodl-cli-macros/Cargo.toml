@@ -15,6 +15,6 @@ categories = ["command-line-interface", "development-tools::procedural-macro-hel
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true

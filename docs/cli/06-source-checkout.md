@@ -100,7 +100,7 @@ fdl flodl-hf example distilbert-embed # + distilbert-classify / -ner / -qa
 fdl flodl-hf example distilbert-finetune  # fine-tune walkthrough (loss curve + export recipe)
 
 # Round-trip export to the HF ecosystem (any supported family/head)
-fdl flodl-hf export --hub bert-base-uncased --out /tmp/bert-export
+fdl flodl-hf export --hub google-bert/bert-base-uncased --out /tmp/bert-export
 fdl flodl-hf export --checkpoint ./my.fdl  --out /tmp/my-export
 fdl flodl-hf verify-export /tmp/bert-export             # auto-detects Hub source from stamped config
 fdl flodl-hf verify-export /tmp/my-export --no-hub-source
@@ -112,7 +112,7 @@ fdl flodl-hf verify-matrix -- --families bert,albert --heads base,seqcls
 # Parity-fixture regeneration (contributors; 29 per-head commands plus `parity all`)
 fdl flodl-hf parity                       # list parity targets
 fdl flodl-hf parity all                   # run every fixture in sequence (PASS/FAIL grid)
-fdl flodl-hf parity bert                  # bert-base-uncased backbone fixture
+fdl flodl-hf parity bert                  # google-bert/bert-base-uncased backbone fixture
 fdl flodl-hf parity bert-seqcls           # per-head fixtures
 fdl flodl-hf parity albert-mlm            # ALBERT family masked-LM fixture
 fdl flodl-hf parity deberta-v2-qa         # DeBERTa-v2 QA fixture

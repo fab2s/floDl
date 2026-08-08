@@ -27,27 +27,19 @@ rocm = ["gpu", "flodl-sys/rocm"]
 rng = ["rand"]
 
 [dependencies]
-flodl-sys = { version = "0.7.0", path = "../flodl-sys" }
-flodl-hw = { version = "0.7.0", path = "../flodl-hw" }
-indexmap = "2"
-flate2 = "1"
-hmac-sha256 = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# bincode's successor, and the reason is not a version bump: bincode 2 is
-# unmaintained (RUSTSEC-2025-0141) and its `3.0.0` on crates.io is a
-# TOMBSTONE -- a README plus a lib.rs containing only a compiler error,
-# published because crates.io cannot archive a crate. bincode-next is the
-# continuation, and the swap is safe in the way that matters here: same
-# API, and a BYTE-IDENTICAL wire encoding, each decoding the other's
-# output (verified 2026-08-08 across u32/String/Vec<i64>/Option<f32>).
-# So no CONTROL_PROTOCOL_VERSION bump. It is what sets the workspace MSRV.
-bincode-next = { version = "3.1.1", features = ["serde"] }
-rand = { version = "0.10", optional = true }
+flodl-sys.workspace = true
+flodl-hw.workspace = true
+indexmap.workspace = true
+flate2.workspace = true
+hmac-sha256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode-next.workspace = true
+rand = { workspace = true, optional = true }
 # `_exit` for cluster roles that finish and must terminate without running
 # libtorch's C++ static destructors (which GP-fault when the launcher force-
 # exits deep in the call stack — see `clean_process_exit`).
-libc = "0.2"
+libc.workspace = true
 
 [package.metadata.docs.rs]
 # docs.rs has no libtorch — flodl-sys/build.rs gates on env::var("DOCS_RS")
@@ -121,5 +113,3 @@ doc-scrape-examples = false
 name = "dna_autoencoder"
 path = "examples/bio/dna_autoencoder/main.rs"
 doc-scrape-examples = false
-
-[dev-dependencies]

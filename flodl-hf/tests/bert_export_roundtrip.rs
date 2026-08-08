@@ -16,7 +16,7 @@ use flodl_hf::models::bert::{BertConfig, BertModel};
 #[test]
 #[ignore = "live: HF export roundtrip; requires network + hf-hub cache"]
 fn bert_export_roundtrip_live() {
-    let repo = "bert-base-uncased";
+    let repo = "google-bert/bert-base-uncased";
     let graph = BertModel::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();

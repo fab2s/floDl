@@ -1,4 +1,4 @@
-//! ALBERT encoder, compatible with HuggingFace `albert-base-v2`
+//! ALBERT encoder, compatible with HuggingFace `albert/albert-base-v2`
 //! checkpoints.
 //!
 //! ALBERT differs from the BERT/RoBERTa/DistilBERT family in two
@@ -6,7 +6,7 @@
 //!
 //! 1. **Factorised embeddings.** The token / position / token-type
 //!    embeddings live in a smaller `embedding_size` space (128 for
-//!    `albert-base-v2`), and a single `embedding_hidden_mapping_in`
+//!    `albert/albert-base-v2`), and a single `embedding_hidden_mapping_in`
 //!    linear projection lifts them into the `hidden_size` space the
 //!    transformer block expects. The embedding LayerNorm operates in
 //!    embedding space, before the projection. The MLM decoder
@@ -41,7 +41,7 @@
 //!
 //! ## Activation note
 //!
-//! Both `albert-base-v1` and `albert-base-v2` ship
+//! Both `albert-base-v1` and `albert/albert-base-v2` ship
 //! `hidden_act: "gelu_new"` — the tanh-approximation form
 //! (`0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`).
 //! [`AlbertConfig::from_json_str`] parses `hidden_act` into a
@@ -74,7 +74,7 @@ pub struct AlbertConfig {
     pub vocab_size: i64,
     /// Factorised embedding dimension. Must divide `hidden_size`
     /// implicitly — both are independent config knobs; HF defaults
-    /// are 128 (embedding) and 768 (hidden) for `albert-base-v2`.
+    /// are 128 (embedding) and 768 (hidden) for `albert/albert-base-v2`.
     pub embedding_size: i64,
     pub hidden_size: i64,
     /// Total number of transformer-block applications. With
@@ -91,7 +91,7 @@ pub struct AlbertConfig {
     pub attention_probs_dropout_prob: f64,
     /// FFN activation form (parsed from HF `hidden_act`). Default
     /// [`GeluApprox::Tanh`] matches both `albert-base-v1` and
-    /// `albert-base-v2` — both ship `hidden_act: "gelu_new"`.
+    /// `albert/albert-base-v2` — both ship `hidden_act: "gelu_new"`.
     pub hidden_act: GeluApprox,
     /// See [`crate::models::bert::BertConfig::num_labels`].
     pub num_labels: Option<i64>,
@@ -102,7 +102,7 @@ pub struct AlbertConfig {
 }
 
 impl AlbertConfig {
-    /// Preset matching `albert-base-v2` on the HuggingFace Hub.
+    /// Preset matching `albert/albert-base-v2` on the HuggingFace Hub.
     pub fn albert_base_v2() -> Self {
         AlbertConfig {
             vocab_size: 30000,
@@ -750,7 +750,7 @@ impl Module for AlbertMLMHeadTransform {
 /// top-level key tied to `decoder.bias`; the safetensors loader
 /// silently ignores that extra key.
 ///
-/// Canonical checkpoints: `albert-base-v2`, `albert-large-v2`.
+/// Canonical checkpoints: `albert/albert-base-v2`, `albert-large-v2`.
 pub type AlbertForMaskedLM = MaskedLmHead<AlbertConfig>;
 
 impl MaskedLmHead<AlbertConfig> {
