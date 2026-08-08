@@ -1671,8 +1671,8 @@ every worker, pre-builds, and fans out.
   five modes with one line. PyTorch has no equivalent mechanism.
 - **No CUDA before `Trainer::run`** invariant: user binaries must not
   instantiate CUDA tensors in `main()`. Use
-  `flodl::sys::detect_gpus()` (CUDA-free, via `nvidia-smi`) for any
-  pre-run GPU query.
+  `flodl::sys::detect_gpus()` (loads no GPU runtime; reads `nvidia-smi`
+  on NVIDIA, the KFD topology on AMD) for any pre-run GPU query.
 
 See the [DDP Reference](ddp/01-reference.md) for complete API documentation.
 

@@ -269,8 +269,9 @@ impl ClusterBuilder {
     /// Synthesize a single-host cluster from [`crate::sys::detect_gpus`].
     ///
     /// The ergonomic one-liner for the common "single machine,
-    /// multi-GPU" case. Reads visible GPUs via `nvidia-smi` (filtered
-    /// by `CUDA_VISIBLE_DEVICES`), builds a one-host topology with
+    /// multi-GPU" case. Reads visible GPUs through the build's own vendor
+    /// probe (`nvidia-smi`, or the KFD topology on ROCm), filtered by
+    /// that vendor's visibility mask, builds a one-host topology with
     /// `world_size = num_visible_gpus`, defaults master to `localhost`,
     /// nccl_socket_ifname to `lo`.
     ///

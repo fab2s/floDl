@@ -1,8 +1,167 @@
 # Upgrading floDl
 
-Three upgrades are documented here, newest first: the 0.7.0 monitor
-record surface, the 0.6.0 process-model distributed rewrite, then the
-0.5.0 CLI maturity pass.
+Four upgrades are documented here, newest first: the 0.8.0 multi-vendor
+GPU pass, the 0.7.0 monitor record surface, the 0.6.0 process-model
+distributed rewrite, then the 0.5.0 CLI maturity pass.
+
+---
+
+## Upgrading to floDl 0.8.0 (multi-vendor GPU)
+
+0.8.0 adds AMD (ROCm) as a second GPU backend, and the API stopped
+saying CUDA where it meant "the GPU". Most of the surface moved by
+rename with a deprecated alias left behind, so **existing code keeps
+compiling and starts warning**. Two changes do not warn, and they are
+the two to read: the Rust floor, and Hub repo ids.
+
+### TL;DR
+
+| Change | What it costs you |
+|---|---|
+| `cuda_*` → `gpu_*`, `Cuda*` → `Gpu*` | Nothing now: 33 deprecated aliases ship. Deprecation warnings until you rename. |
+| `fdl cuda-test` → `fdl gpu-test` (and friends) | CI configs and scripts need the new spelling. The old names are gone. |
+| MSRV is **1.91** | `rustup update`. Nothing else. |
+| flodl-hf: bare Hub repo ids stop resolving | **Silent breakage of working code.** Owner-qualify every repo id. |
+| `bincode` → `bincode-next` | Nothing. Byte-identical wire, same API. |
+| Cluster wire versions bumped | Every box in one cohort must run the same flodl. |
+
+### The GPU API is vendor-neutral
+
+libtorch ships one GPU backend per build, and ROCm masquerades as CUDA
+all the way down to its dispatcher, so the vendor is a build-time
+property rather than something the API should name. `cuda_*` became
+`gpu_*`, `Cuda*` became `Gpu*`, and the C ABI `flodl_cuda_*` became
+`flodl_gpu_*`.
+
+```rust
+// before
+use flodl::tensor::{cuda_available, cuda_device_count, CudaStream};
+
+// now
+use flodl::tensor::{gpu_available, gpu_device_count, GpuStream};
+```
+
+Deprecated aliases for all 33 renamed items live in `flodl::compat` and
+are re-exported from the crate root and from `tensor` / `nn`, so every
+old path still resolves. They are one unit of removal: expect them to go
+in a later major, and let the deprecation warnings drive the rename.
+
+Three names stayed CUDA-spelled **on purpose**, so do not "finish" the
+rename in your own code:
+
+- `flodl_nccl_*` — RCCL exports the `ncclXxx` names verbatim, and
+  PyTorch keeps `backend="nccl"` on ROCm. Renaming costs parity and buys
+  nothing.
+- `set_cudnn_benchmark` — upstream routes it to MIOpen on ROCm.
+- `cuda_compute_capability` — compute capability is an NVIDIA concept. A
+  neutral name would compile on ROCm and hand back a gfx arch dressed as
+  an `sm_` pair, so it errors there instead.
+
+### Feature flags name the axis they select
+
+`gpu` is the vendor-neutral gate; `cuda` and `rocm` select a backend and
+imply it. **`--features cuda` behaves exactly as before.** `build.rs`
+refuses both vendors at once, and refuses `gpu` without one.
+
+```toml
+flodl = { version = "0.8", features = ["cuda"] }   # unchanged
+flodl = { version = "0.8", features = ["rocm"] }   # new
+```
+
+### The `fdl cuda-*` commands are `gpu-*`
+
+`fdl gpu-test`, `gpu-test-all`, `gpu-test-nccl`, `gpu-test-serial`,
+`gpu-build`, `gpu-clippy`, `gpu-shell`. The cargo feature they pass is
+derived from the **active libtorch variant** (`cu…` / `sm…` builds
+`--features cuda`; `rocm…` / `gfx…` builds `--features rocm`) and
+exported as `$FDL_GPU_FEATURE`, so one command line covers either
+vendor. Anything calling the old names — CI, scripts, muscle memory —
+needs updating; they were renamed, not aliased.
+
+If your own `fdl.yml` hardcodes `--features cuda`, `--features
+"$FDL_GPU_FEATURE"` is the portable form. It expands empty on a CPU
+variant, so one line serves a CPU build and both vendors.
+
+### Minimum Rust is 1.91
+
+Three floors stack: let-chains in our own source (1.88), `bincode-next`
+(1.90), and `xet-core-structures` (1.91), the last reached through
+`hf-hub` 1.0's mandatory `hf-xet` dependency. With no committed
+lockfile, consumers resolve fresh, so this floor tracks the ecosystem
+and will move again.
+
+### flodl-hf: owner-qualify your Hub repo ids
+
+This is the one that breaks working code with no compiler warning. The
+HuggingFace stack moved to `hf-hub` 1.0, `safetensors` 0.8 and
+`tokenizers` 0.23. The Hub answers a bare pre-2024 repo name with a 307
+redirect to its owner-qualified home; `hf-hub` 0.4's transport followed
+that redirect and 1.0 does not, so a bare name now fails with
+`Repository not found`.
+
+```rust
+// before -- worked through the redirect
+let model = BertModel::from_pretrained("bert-base-uncased")?;
+
+// now -- owner-qualified, which is also what the Hub documents
+let model = BertModel::from_pretrained("google-bert/bert-base-uncased")?;
+```
+
+The five common ones: `google-bert/bert-base-uncased`,
+`FacebookAI/roberta-base`, `FacebookAI/xlm-roberta-base`,
+`distilbert/distilbert-base-uncased`, `albert/albert-base-v2`. Repo ids
+that already carry an owner (every fine-tune, every `org/model`) are
+unaffected.
+
+### No action needed, but worth knowing
+
+- **`bincode` → `bincode-next`.** bincode 2 is unmaintained
+  (RUSTSEC-2025-0141) and its `3.0.0` on crates.io is a tombstone. The
+  successor has the same API and a byte-identical wire encoding, each
+  decoding the other's output, so nothing on the wire or on disk
+  changed.
+- **`flodl-hw` is a new workspace crate**, dependency-free hardware
+  detection shared by `flodl` and `flodl-cli`. `flodl::sys` is a facade
+  over it, so existing `flodl::sys::detect_gpus()` callers are
+  untouched. Depend on `flodl-hw` directly only if you want GPU/RAM
+  detection without libtorch.
+- **`detect_gpus()` now returns only devices the running build can
+  address**, filtered by the build's vendor. That is what keeps a CUDA
+  build from spawning a rank on an AMD card it cannot reach. Its sibling
+  `detect_gpus_physical()` ignores the filter and answers the
+  provisioning question instead ("which libtorch variant covers this
+  box"). If you were using `detect_gpus()` for the second question, move
+  to the sibling.
+- **Integrated GPUs no longer double-count memory.** An APU's aperture
+  is carved out of host RAM, so the data plane reserves it once.
+  `gpu_ram_share` on `DataLoaderBuilder` / `TrainerConfig` /
+  `DdpRunConfig` overrides the fraction, and is **required** on a
+  multi-socket APU: each package carries its own aperture while
+  `/proc/meminfo` is system-wide, so that case is refused as an ordinary
+  error from `DataLoaderBuilder::build` rather than guessed at.
+
+### Cluster cohorts must be same-version
+
+The control wire went `CONTROL_PROTOCOL_VERSION` 2 → 4 (the join hello
+grew the vendor label, run identity, NCCL version and model signature)
+and the CPU averaging plane 2 → 3 (structural-zero elision). Both bumps
+are deliberate: bincode is not self-describing, so without them a mixed
+cohort would fail somewhere deep and opaque. With them it fails at the
+handshake, named.
+
+**Upgrade every box in a cohort together.** A rolling upgrade of a
+standing fleet is not supported.
+
+Checkpoint metadata went schema 4 → 5 (`CoverageBlock.epoch_splits`).
+Old checkpoints still load; a resume whose epoch slicing changed is now
+refused up front rather than silently re-slicing coverage.
+
+### Doc links moved
+
+`docs/cli.md` split into `docs/cli/01-install.md` … `06-source-checkout.md`,
+and `docs/ddp.md` into `docs/ddp/01-reference.md` plus a cluster guide,
+an internals chapter and a troubleshooting chapter. `docs/README.md` is
+the index. Site permalinks on flodl.dev are unchanged.
 
 ---
 

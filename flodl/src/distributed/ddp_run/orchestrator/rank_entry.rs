@@ -509,6 +509,15 @@ impl DdpHandle {
             AverageBackend::Nccl => None,
         };
         let session_salt = cluster.salt;
+        // All-zeros is the "no signature configured" convention, and it is
+        // what every rank sends: nothing in flodl computes a dataset
+        // signature yet. Both verifiers exist and work (the membership
+        // ledger and the rendezvous each seed from their first member and
+        // refuse a mismatch by name), so wiring a real value here is what
+        // turns them on. What to hash is the open question: `BatchDataSet`
+        // exposes only `len` and `get_batch`, and a signature that differs
+        // for benign reasons refuses a correct cohort, which is worse than
+        // this honest no-op.
         let dataset_sig = [0u8; 32];
 
         // Backend bootstrap (the one divergence): NCCL inits the comm on this

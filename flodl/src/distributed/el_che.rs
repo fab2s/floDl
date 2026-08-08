@@ -1594,7 +1594,8 @@ mod spec_prior {
     /// Ordinal "spec score" for a CUDA device. Higher = better spec.
     /// Returns `None` when device-property queries fail (e.g. CUDA absent).
     ///
-    /// Uses [`crate::sys::detect_gpus`] (nvidia-smi based) instead of
+    /// Uses [`crate::sys::detect_gpus`] (an out-of-process vendor probe:
+    /// `nvidia-smi`, or the KFD topology on ROCm) instead of
     /// libtorch's `cuda_compute_capability` / `gpu_memory_info_idx` so
     /// this can run on the controller's main thread without violating
     /// the "no CUDA touch before fan-out" invariant.

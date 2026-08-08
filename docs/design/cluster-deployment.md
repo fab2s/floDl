@@ -13,6 +13,12 @@ constrain it, and the future slices that implement what's currently
 design-only. It does not cover communication algorithms (see
 [cloud-ddp.md](./cloud-ddp.md)) or training-loop semantics.
 
+> **Status lines here are dated, the code is not.** Every "today" and
+> "future" claim below was last reconciled against the tree on
+> **2026-08-08**. For what a command actually does now, `fdl <cmd> -h`
+> and [the CLI reference](../cli/03-cluster-commands.md) are
+> authoritative over this file.
+
 ## The three layers
 
 ### Storage
@@ -273,16 +279,22 @@ Status: **design-only**. Easy slice to land.
 
 In rough sequencing order:
 
+`fdl probe` **shipped** and is no longer on this list: it SSHes each
+host, aggregates arch, libtorch variant, NCCL version, shared-data path
+and prerequisites, and is loud on mismatch with `--json` for machine
+use. It grew past the sketch below, notably the loader-compatibility
+check that names a variant this host's glibc cannot load.
+
 | Slice | Scope | LOC est |
 |-------|-------|---------|
-| `fdl probe <env>` | SSH each host, return arch + libtorch variants + libnccl version per host. Idempotent, no side effects. Loud on mismatch, structured output. | ~150 |
 | `fdl deploy <env>` | Calls probe internally, ships binary via shared storage layer or rsync, runs. Hot-swap libtorch variant when probed arch ≠ declared but a local variant covers. `--strict` flag escalates any mismatch to error. | ~250 |
 | `fdl libtorch build --portable` | Manylinux2014-base container build, broad arch list, bundled cudnn/cufile. | ~80 + Dockerfile |
 | Controller/averager separation | Make `ClusterCoordinator` runnable as standalone process; same for `ClusterController`. yml gains optional separate addressing; launcher spawns them independently or talks to existing instances. | ~300 |
 
-None of these are blocking for current production users; flodl runs
-single-host today. They're the staircase from "one-machine training" 
-to "datacenter-grade deployment" without rewriting the foundation.
+None of these are blocking: single-host and multi-host both work today,
+by fan-out and by dial-in. They're the remaining steps from "runs on
+the hosts you name" to "datacenter-grade deployment" without rewriting
+the foundation.
 
 ## Today's state
 
@@ -292,11 +304,15 @@ visible GPUs, the controller + averager run in-process, NCCL elastic
 membership survives rank death, ShutdownWithSave persists state on
 unrecoverable failure.
 
-Multi-host production user with `fdl @cluster <cmd>`: **works**, with
-manual libtorch provisioning per host (`fdl libtorch download`
-on each, separately). No auto-probe, no auto-deploy, no
-controller/averager separation, no shared-storage abstraction in
-the cluster topology - these are deferred.
+Multi-host production user with `fdl @cluster <cmd>`: **works**.
+libtorch provisioning is still per host (`fdl libtorch download` on
+each, separately), but `fdl probe` now answers whether that provisioning
+is coherent before a run spends a window on finding out. Self-deployed
+workers arrived too: a box can dial in with `fdl join` rather than being
+fanned out to, `fdl publish` makes the controller the authority for what
+a run is, and `fdl join-config` scaffolds the whole farm. Still deferred:
+auto-deploy, controller/averager separation, and a shared-storage
+abstraction in the cluster topology.
 
 Test rig with `fdl @cluster-test <cmd>`: **works** with virtiofs or
 sshfs shared mount. The end-to-end NCCL via-coord smoke test passed

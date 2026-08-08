@@ -119,6 +119,26 @@ binary against its own libtorch, and the averaging plane is
 vendor-blind - so under those modes mixing is allowed, and it is one of
 the reasons the CPU plane exists.
 
+> **The dataset signature is inert today, on every path.** The hello
+> carries a 32-byte `dataset_sig` and both verifiers are built and
+> working (the membership ledger seeds from the first member and refuses
+> a mismatch by name; the NCCL rendezvous does the same independently).
+> Nothing computes one. The trainer passes all-zeros, and `fdl join`
+> sends none, which is the same all-zeros by convention. Every member
+> therefore presents the same value, they agree trivially, and no
+> comparison happens: **a cohort can read as coherent on dataset while
+> nothing was compared.**
+>
+> What *does* bind a cohort: the vendor label above, run identity, NCCL
+> version, and the model signature. The model signature is the one that
+> catches the realistic version of this failure, since a stale tree or a
+> wrong `bin:` usually changes the model too.
+>
+> Treat "every box sees the same data" as your own precondition, not
+> something admission enforces. The one place you can supply a real
+> signature today is `Cluster::rendezvous(sig)`, if you drive ranks
+> manually via `Ddp::wrap` rather than through `Trainer`.
+
 `fdl @cluster <cmd>` fan-out is sugar over this protocol: it starts
 one worker agent per host over SSH, and those agents dial back in like
 any worker would. The defaults make fan-out behave exactly like a
