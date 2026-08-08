@@ -474,8 +474,8 @@ impl Trainer {
     /// call. That means: no [`crate::tensor::gpu_device_count`] /
     /// [`crate::tensor::gpu_devices`] / `Tensor` construction on a
     /// CUDA device / `Module::on_device(Device::CUDA(_))`. Pre-run GPU
-    /// queries must go through [`crate::sys::detect_gpus`] (which uses
-    /// `nvidia-smi` and does NOT init libtorch).
+    /// queries must go through [`crate::sys::detect_gpus`] (an
+    /// out-of-process vendor probe that does NOT init libtorch).
     ///
     /// Why: on cluster fan-out the parent (launcher) process exits
     /// without running training, and on heterogeneous GPUs touching

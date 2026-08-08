@@ -19,7 +19,8 @@
 //! controller [`JoinMsgWire::Abort`].
 //!
 //! The agent touches no CUDA: GPU inventory comes from
-//! [`crate::sys::detect_gpus`] (nvidia-smi), honoring the "no CUDA
+//! [`crate::sys::detect_gpus`] (an out-of-process vendor probe),
+//! honoring the "no CUDA
 //! before `Trainer::run`" invariant — the agent process never trains.
 
 use std::net::TcpStream;
@@ -74,8 +75,8 @@ pub struct AgentSpec {
     #[serde(default)]
     pub salt_hex: Option<String>,
     /// Physical CUDA device ids to run, one rank each. `None` means all
-    /// GPUs visible on this host (resolved at agent start via
-    /// `nvidia-smi`, never libtorch).
+    /// GPUs visible on this host (resolved at agent start by the
+    /// vendor probe, never libtorch).
     #[serde(default)]
     pub local_devices: Option<Vec<u8>>,
     /// libtorch variant label for the hello (informational).

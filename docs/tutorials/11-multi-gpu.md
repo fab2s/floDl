@@ -63,8 +63,10 @@ When `Trainer::builder(...).run()` (or `Trainer::run`) fires on a host
 where `flodl::sys::detect_gpus() >= 2` and **no cluster overlay is
 active**, the framework:
 
-1. Probes visible CUDA devices via `nvidia-smi` (no libtorch context
-   touched).
+1. Probes visible GPUs without touching a libtorch context. Detection is
+   per vendor: `nvidia-smi` for NVIDIA, the kernel's KFD topology for
+   AMD. A build targeting one vendor counts only that vendor's devices,
+   since libtorch addresses one GPU backend per process.
 2. Synthesizes a single-host cluster topology covering every visible
    device.
 3. Turns the calling binary process into the **launcher** - it forks
@@ -93,7 +95,8 @@ CUDA tensors it instantiated would corrupt the spawned children's
 contexts on heterogeneous-GPU rigs.
 
 For any pre-`Trainer::run` GPU query, use `flodl::sys::detect_gpus()`,
-which shells out to `nvidia-smi` and does **not** load libtorch:
+which reads the vendor's own out-of-process source (`nvidia-smi`, or the
+KFD topology on AMD) and does **not** load libtorch:
 
 ```rust
 use flodl::sys::detect_gpus;

@@ -25,6 +25,40 @@ fdl probe                     # check NCCL availability + libtorch wiring
 Falls back to shared memory transport if peer-to-peer is unavailable.
 Or switch to a `Cpu*` mode in `ElCheConfig` to bypass NCCL entirely.
 
+### NCCL hangs on a cloud rig that formed fine
+
+The most misattributed cluster failure, because the two planes have
+different network shapes and only one of them is exercised before the
+hang.
+
+The **control plane is hub-and-spoke**: every worker talks to the
+controller and to nobody else. So a cohort forms, `fdl status` looks
+healthy, and admission passes with every worker reachable through a
+single open port (or a single ssh forward).
+
+The **NCCL data plane is a full mesh**. Every rank opens TCP to every
+other rank on ephemeral ports, so an N-host run needs **all-to-all**
+reachability among the workers, not just worker-to-controller. On a
+default cloud security group, or any topology where workers reach the
+controller but not each other, formation succeeds and then the first
+collective blocks forever with no error: NCCL waits rather than
+failing.
+
+Three ways out:
+
+- Open all-to-all TCP between workers in the security group / firewall.
+- Use a `Cpu*` `ElCheMode`. CPU averaging routes through the controller,
+  so it needs only the hub-and-spoke shape it already has, and it is the
+  supported answer for tunneled workers and topologies where a mesh is
+  not achievable.
+- Confirm before blaming NCCL: if the same run completes under
+  `ElCheConfig::cpu_async()` and hangs under an `Nccl*` mode, the
+  difference is reachability, not the model or the data.
+
+Tunneled workers (`--ssh`, `join.tunnel_only`) are CPU-mode only for
+exactly this reason: a port forward carries the hub-and-spoke plane and
+cannot carry a mesh.
+
 ### NCCL version skew across hosts
 
 If one host has libtorch shipping NCCL 2.27 and another has 2.26, the
