@@ -101,7 +101,7 @@ rung_1() {
         return
     fi
     local log="$LOGDIR/rung1.log"
-    "$FDL" @cluster-test cuda-test-nccl > "$log" 2>&1
+    "$FDL" @cluster-test gpu-test-nccl > "$log" 2>&1
     verify "rung 1 (single-host process-per-rank)" "$?" "$log"
 }
 

@@ -63,10 +63,19 @@ commands:
     # counters that count as growth. Without it, test_gaussian_blur_no_ram
     # _leak_leakcheck fails on the instrumentation rather than on a leak.
     #
-    # Needs: rustup component add llvm-tools-preview
-    #        cargo install cargo-llvm-cov --locked
+    # CPU only, and therefore a FLOOR rather than a measurement: it
+    # scores every GPU-reachable region as missed. `fdl coverage-all`
+    # runs the GPU suites too and says which ones it could not.
     run: cargo llvm-cov --workspace --summary-only -- --skip leakcheck
     docker: dev
+  coverage-all:
+    description: Coverage across every suite this box can run, with an honest skip list
+    # No `docker:` line ON PURPOSE. The phases run in DIFFERENT
+    # containers (CPU in dev, GPU in cuda/rocm) and an fdl command names
+    # exactly one service, so the script drives compose itself. Running
+    # natively still gets FDL_GPU_FEATURE: `libtorch_env` fills it for
+    # native commands as well as docker ones.
+    run: bash ci/coverage.sh
   ci:
     description: Run the full CI CPU job locally (build + test + clippy + doc)
     run: cargo build && cargo test -- --nocapture --skip leakcheck && cargo test leakcheck -- --test-threads=1 --nocapture && cargo clippy --all-targets -- -W clippy::all && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items && test -f target/doc/flodl/index.html
