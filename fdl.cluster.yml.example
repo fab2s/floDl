@@ -45,6 +45,26 @@
 #       identity_file: maps to `ssh -i <path>`
 #       options:       list of `-o Key=Value` directives, e.g.
 #                      `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`
+#     WATCH THE FRAME OF REFERENCE, and note it is not one frame.
+#     `identity_file:` is read by whichever process opens the ssh
+#     connection, and on a rig with a containerised training vehicle that
+#     is TWO different filesystem namespaces:
+#       - `fdl probe`, the cluster pre-flight build and the GPU-count
+#         query are `flodl-cli` (a host binary), so they resolve it on
+#         the HOST.
+#       - `fdl @cluster <cmd>` where the command declares `docker:` runs
+#         the training binary IN that container, and the launcher's own
+#         rank fan-out opens ssh from THERE, so it resolves it inside
+#         the container.
+#     No single value satisfies both. Pick the one the TRAINING path
+#     needs (a broken dispatch kills runs; a red probe only misreports),
+#     and expect `fdl @cluster probe` to fail on that host with
+#     `Identity file ... not accessible` + `Permission denied
+#     (publickey)`. Do not "fix" that by switching to the host path
+#     unless your vehicle has no `docker:` line -- you would trade a
+#     cosmetic probe failure for a broken run.
+#     Everything else in a worker entry (`path:`, anything in `env:`) is
+#     resolved on the WORKER, which is a third frame again.
 #   - `tunnel:` (optional, default false) routes this worker's training
 #     traffic through its fan-out SSH session instead of a direct TCP
 #     connection: the launcher adds a remote forward
@@ -225,7 +245,7 @@ cluster:
         target: node-b                # ssh target; defaults to host: if omitted
         # port: 2222
         # user: ubuntu
-        # identity_file: /home/ubuntu/.ssh/cluster_key
+        # identity_file: /home/ubuntu/.ssh/cluster_key   # path on THIS box, not node-b
         # options:
         #   - ProxyJump=bastion
         #   - StrictHostKeyChecking=no
