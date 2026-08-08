@@ -61,10 +61,19 @@ fi
 # `/home/me/` is the documented placeholder convention (docs, examples)
 # and `/home/ubuntu/` is the container-internal user (Dockerfile.cuda,
 # docker-compose ssh rank setup) — both are deliberate, not leaks.
+#
+# `/home/op/` is the third, and it is the OPERATOR placeholder used
+# throughout the cluster / join / publish surface (`op` reads as the
+# person running the rig, which `me` does not). It arrived with that
+# surface and outnumbers `/home/me/` 30 to 14, but was never added here,
+# so this check has been failing on a clean tree. Allow-listed rather
+# than rewritten: it is the more descriptive name in the context that
+# uses it, and rewriting 30 sites to satisfy a stale allow-list is the
+# wrong direction of fix.
 HARDCODED=$(git grep -nE '/home/[a-z][a-zA-Z0-9_-]+/|/Users/[a-zA-Z][a-zA-Z0-9_-]+/|C:\\\\Users\\\\[a-zA-Z][a-zA-Z0-9_-]+' \
     -- ':!ci/release' ':!CHANGELOG.md' ':!Cargo.lock' \
        ':!site/_site' ':!site/.jekyll-cache' \
-    2>/dev/null | grep -vE '/home/(me|ubuntu)/' || true)
+    2>/dev/null | grep -vE '/home/(me|ubuntu|op)/' || true)
 
 if [ -n "$HARDCODED" ]; then
     echo "FAIL: hardcoded user-specific paths:"
