@@ -10,17 +10,27 @@ edition = "2024"
 # exactly this toolchain, so a wrong value here is a failing build rather
 # than a promise nobody tests.
 #
-# Two floors stack here, and the higher one wins:
+# Three floors stack here, and the highest one wins:
 #   1.88  our own source -- let-chains, used across graph/, monitor/ and
 #         distributed/ (rewriting them to go lower would be a large and
 #         gratuitous refactor)
 #   1.90  `bincode-next`, taken to replace the unmaintained bincode 2
+#   1.91  `xet-core-structures`, reached through hf-hub 1.0's MANDATORY
+#         `hf-xet` dependency (no feature gates it). It calls
+#         `str::floor_char_boundary`, stable only from 1.91 -- verified
+#         by compiling a one-line probe on both 1.90.0 and 1.91.0.
+#
+# That third floor is worth reading twice, because nothing warned about
+# it: `xet-core-structures` declares NO `rust-version` of its own, so
+# cargo cannot report the conflict and MSRV-aware resolution has nothing
+# to act on. It simply fails to compile, in a transitive crate, on the
+# declared floor. The msrv job is what caught it.
 #
 # With no committed Cargo.lock this also tracks the ECOSYSTEM: consumers
 # resolve fresh, so a transitive dep raising its own rust-version raises
 # ours, and pinning it back in a lockfile nobody ships would not help.
-# Expect to bump it; the job says when.
-rust-version = "1.90"
+# Expect to bump it; the job says when — this is the job having said so.
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/flodl-labs/flodl"
 homepage = "https://flodl.dev"
