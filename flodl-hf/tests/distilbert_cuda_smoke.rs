@@ -20,8 +20,8 @@ use flodl_hf::task_heads::{
 };
 
 use common::{
-    assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels, qa_positions,
-    seqcls_labels, tokcls_labels, BATCH, CUDA, SEQ,
+    BATCH, CUDA, SEQ, assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels,
+    qa_positions, seqcls_labels, tokcls_labels,
 };
 
 const NUM_LABELS: i64 = 3;
@@ -40,7 +40,10 @@ fn distilbert_seqcls_cuda_smoke() {
     let cfg = DistilBertConfig::distilbert_base_uncased();
     let head = DistilBertForSequenceClassification::on_device(&cfg, NUM_LABELS, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&distilbert_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&distilbert_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, NUM_LABELS]);
 
     let labels = seqcls_labels(BATCH, NUM_LABELS);
@@ -56,7 +59,10 @@ fn distilbert_tokcls_cuda_smoke() {
     let cfg = DistilBertConfig::distilbert_base_uncased();
     let head = DistilBertForTokenClassification::on_device(&cfg, NUM_LABELS, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&distilbert_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&distilbert_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, NUM_LABELS]);
 
     let labels = tokcls_labels(BATCH, SEQ, NUM_LABELS);
@@ -72,7 +78,10 @@ fn distilbert_qa_cuda_smoke() {
     let cfg = DistilBertConfig::distilbert_base_uncased();
     let head = DistilBertForQuestionAnswering::on_device(&cfg, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&distilbert_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&distilbert_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, 2]);
 
     let (starts, ends) = qa_positions(BATCH, SEQ);
@@ -88,7 +97,10 @@ fn distilbert_mlm_cuda_smoke() {
     let cfg = DistilBertConfig::distilbert_base_uncased();
     let head = DistilBertForMaskedLM::on_device(&cfg, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&distilbert_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&distilbert_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, cfg.vocab_size]);
 
     let labels = mlm_labels(BATCH, SEQ, cfg.vocab_size);

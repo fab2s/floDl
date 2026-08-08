@@ -63,7 +63,9 @@ pub fn parse_ssh_target(rest: &str) -> Result<SshTarget, &'static str> {
             } else {
                 let end = after.find('/').ok_or("no remote path")?;
                 let port_str = after[..end].strip_suffix(':').unwrap_or(&after[..end]);
-                let port = port_str.parse::<u16>().map_err(|_| "port is not a number")?;
+                let port = port_str
+                    .parse::<u16>()
+                    .map_err(|_| "port is not a number")?;
                 (&hostpart[..c], Some(port), &after[end..])
             }
         }
@@ -91,7 +93,10 @@ mod tests {
 
     #[test]
     fn a_scheme_is_only_a_scheme_with_its_separator() {
-        assert_eq!(split_scheme("sshfs://exa/data"), (Some("sshfs"), "exa/data"));
+        assert_eq!(
+            split_scheme("sshfs://exa/data"),
+            (Some("sshfs"), "exa/data")
+        );
         assert_eq!(split_scheme("/flodl/data"), (None, "/flodl/data"));
         // A colon alone is not a scheme: `host:/path` is the scp
         // spelling, and reading it as one would swallow the host.
@@ -102,22 +107,34 @@ mod tests {
     fn an_ssh_target_parses_all_four_spellings() {
         assert_eq!(
             parse_ssh_target("flodl@exa:/flodl/data").unwrap(),
-            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: None },
+            SshTarget {
+                remote: "flodl@exa:/flodl/data".into(),
+                port: None
+            },
         );
         assert_eq!(
             parse_ssh_target("exa/flodl/data").unwrap(),
-            SshTarget { remote: "exa:/flodl/data".into(), port: None },
+            SshTarget {
+                remote: "exa:/flodl/data".into(),
+                port: None
+            },
         );
         assert_eq!(
             parse_ssh_target("flodl@exa:2222/flodl/data").unwrap(),
-            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
+            SshTarget {
+                remote: "flodl@exa:/flodl/data".into(),
+                port: Some(2222)
+            },
         );
         // What the documented grammar `[user@]host[:port]:/abs/path`
         // literally produces with both parts in play — the spelling an
         // operator on a non-standard port will type first.
         assert_eq!(
             parse_ssh_target("flodl@exa:2222:/flodl/data").unwrap(),
-            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
+            SshTarget {
+                remote: "flodl@exa:/flodl/data".into(),
+                port: Some(2222)
+            },
         );
     }
 

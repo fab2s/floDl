@@ -127,11 +127,7 @@ impl<M: Module + 'static> Worker<M> {
     /// Wrap a bare [`GpuWorker`] as a single-device cooperative worker.
     /// No coordinator; epoch plans are synthesized locally over the whole
     /// dataset for `num_epochs`.
-    pub(crate) fn single(
-        worker: GpuWorker<M>,
-        num_epochs: usize,
-        total_samples: usize,
-    ) -> Self {
+    pub(crate) fn single(worker: GpuWorker<M>, num_epochs: usize, total_samples: usize) -> Self {
         Worker {
             inner: WorkerInner::Single {
                 worker,
@@ -145,7 +141,7 @@ impl<M: Module + 'static> Worker<M> {
             active_guard: None,
             shutdown: false,
             finished: false,
-            forensics: None, // single device: no peers to unblock
+            forensics: None,  // single device: no peers to unblock
             metrics_rx: None, // no coordinator aggregates on a single device
             eval_rx: None,    // no controller eval on a single device
         }
@@ -320,9 +316,10 @@ impl<M: Module + 'static> Worker<M> {
         // close it now so its coverage is reported (a well-formed loop drains
         // via `next_batch` returning `None`, which already ran `end_epoch`).
         if let Some(mut st) = self.epoch_state.take()
-            && !st.shutdown() {
-                self.worker_mut().end_epoch(&mut st)?;
-            }
+            && !st.shutdown()
+        {
+            self.worker_mut().end_epoch(&mut st)?;
+        }
         self.pending_plan = None;
         self.compute_start = None;
 
@@ -436,9 +433,7 @@ impl<M: Module + 'static> Worker<M> {
     /// loss average (read via `.item()`; unchanged by the preceding backward).
     pub fn step(&mut self, loss: &Variable) -> Result<StepOutcome> {
         let mut st = self.epoch_state.take().ok_or_else(|| {
-            TensorError::new(
-                "Worker::step called with no batch in flight; call next_batch() first",
-            )
+            TensorError::new("Worker::step called with no batch in flight; call next_batch() first")
         })?;
 
         let loss_val: f64 = loss.data().item()?;
@@ -473,9 +468,10 @@ impl<M: Module + 'static> Worker<M> {
         // Release any lingering per-batch guard before the final accounting.
         self.active_guard = None;
         if let Some(mut st) = self.epoch_state.take()
-            && !st.shutdown() {
-                self.worker_mut().end_epoch(&mut st)?;
-            }
+            && !st.shutdown()
+        {
+            self.worker_mut().end_epoch(&mut st)?;
+        }
 
         // Borrow (never move) self.inner — `Worker` has a Drop impl, so moving
         // a field out is illegal; teardown / snapshot both take `&mut`.
@@ -554,8 +550,7 @@ impl<M: Module> Drop for Worker<M> {
                 f.world_size,
                 reason.clone(),
             );
-            let path =
-                crate::distributed::CheckpointBundle::rank_death_path(stem, f.global_rank);
+            let path = crate::distributed::CheckpointBundle::rank_death_path(stem, f.global_rank);
             match record.write_to_file(&path) {
                 Ok(()) => eprintln!(
                     "flodl cluster rank: wrote death record to {}",

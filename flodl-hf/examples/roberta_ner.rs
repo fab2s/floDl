@@ -19,9 +19,8 @@
 use flodl_hf::models::roberta::RobertaForTokenClassification;
 
 fn main() -> flodl::Result<()> {
-    let ner = RobertaForTokenClassification::from_pretrained(
-        "Jean-Baptiste/roberta-large-ner-english",
-    )?;
+    let ner =
+        RobertaForTokenClassification::from_pretrained("Jean-Baptiste/roberta-large-ner-english")?;
 
     let sentences = &[
         "fab2s writes Rust code in Latent",
@@ -32,8 +31,12 @@ fn main() -> flodl::Result<()> {
     for (sentence, tokens) in sentences.iter().zip(&tagged) {
         println!("{sentence:?}");
         for t in tokens {
-            if !t.attends { continue; }
-            if t.label == "O" { continue; }
+            if !t.attends {
+                continue;
+            }
+            if t.label == "O" {
+                continue;
+            }
             println!("  {:<15} {:<8} ({:.3})", t.token, t.label, t.score);
         }
     }

@@ -1,10 +1,10 @@
 use crate::autograd::Variable;
 use crate::tensor::{Device, Result, Tensor};
 
+use super::Module;
 use super::init;
 use super::parameter::Parameter;
 use super::rope::RotaryEmbedding;
-use super::Module;
 
 /// Multi-head attention mechanism.
 ///
@@ -44,11 +44,17 @@ struct Linear {
 impl Linear {
     fn on_device(in_features: i64, out_features: i64, device: Device) -> Result<Self> {
         let w = init::xavier_uniform(
-            &[out_features, in_features], in_features, out_features, device,
+            &[out_features, in_features],
+            in_features,
+            out_features,
+            device,
         )?;
         let b = Tensor::zeros(
             &[out_features],
-            crate::tensor::TensorOptions { dtype: crate::tensor::DType::Float32, device },
+            crate::tensor::TensorOptions {
+                dtype: crate::tensor::DType::Float32,
+                device,
+            },
         )?;
         Ok(Linear {
             weight: Parameter::new(w, "weight"),
@@ -57,11 +63,7 @@ impl Linear {
     }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        crate::autograd::linear(
-            input,
-            &self.weight.variable,
-            Some(&self.bias.variable),
-        )
+        crate::autograd::linear(input, &self.weight.variable, Some(&self.bias.variable))
     }
 
     fn parameters(&self, prefix: &str) -> Vec<Parameter> {
@@ -156,12 +158,15 @@ impl MultiheadAttention {
         let v = self.v_proj.forward(value)?;
 
         // Reshape to [batch, num_heads, seq, head_dim]
-        let q = q.reshape(&[batch, seq_q, self.num_heads, self.head_dim])?
-                 .transpose(1, 2)?;
-        let k = k.reshape(&[batch, seq_k, self.num_heads, self.head_dim])?
-                 .transpose(1, 2)?;
-        let v = v.reshape(&[batch, seq_k, self.num_heads, self.head_dim])?
-                 .transpose(1, 2)?;
+        let q = q
+            .reshape(&[batch, seq_q, self.num_heads, self.head_dim])?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape(&[batch, seq_k, self.num_heads, self.head_dim])?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape(&[batch, seq_k, self.num_heads, self.head_dim])?
+            .transpose(1, 2)?;
 
         // Rotary positions rotate query/key in place of additive
         // position embeddings.
@@ -200,16 +205,19 @@ impl MultiheadAttention {
         };
         // [batch, heads, seq_q, head_dim]
         let out = crate::autograd::scaled_dot_product_attention(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             add_mask.as_ref(),
-            /*dropout_p=*/0.0,
-            /*is_causal=*/false,
+            /*dropout_p=*/ 0.0,
+            /*is_causal=*/ false,
             Some(self.scale),
         )?;
 
         // Reshape back: [batch, seq_q, embed_dim]
-        let out = out.transpose(1, 2)?
-                     .reshape(&[batch, seq_q, self.num_heads * self.head_dim])?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape(&[batch, seq_q, self.num_heads * self.head_dim])?;
 
         // Output projection
         self.out_proj.forward(&out)
@@ -217,7 +225,9 @@ impl MultiheadAttention {
 }
 
 impl Module for MultiheadAttention {
-    fn name(&self) -> &str { "multihead_attention" }
+    fn name(&self) -> &str {
+        "multihead_attention"
+    }
 
     /// Self-attention forward: query = key = value = input, no mask.
     fn forward(&self, input: &Variable) -> Result<Variable> {
@@ -245,7 +255,9 @@ mod tests {
         // an assert! panic).
         let device = test_device();
         // `.map(|_| ())` because MultiheadAttention isn't Debug (unwrap_err needs it).
-        let err = MultiheadAttention::on_device(10, 3, device).map(|_| ()).unwrap_err();
+        let err = MultiheadAttention::on_device(10, 3, device)
+            .map(|_| ())
+            .unwrap_err();
         assert!(err.to_string().contains("divisible"), "unexpected: {err}");
         // Zero / negative heads also rejected rather than dividing by zero.
         assert!(MultiheadAttention::on_device(8, 0, device).is_err());
@@ -357,23 +369,41 @@ mod tests {
 
         for m in [None, Some(&mask)] {
             let mut scores = q
-                .matmul(&k.transpose(2, 3).unwrap()).unwrap()
-                .mul_scalar(scale).unwrap();
+                .matmul(&k.transpose(2, 3).unwrap())
+                .unwrap()
+                .mul_scalar(scale)
+                .unwrap();
             if let Some(m) = m {
                 scores = scores.masked_fill(m, f64::NEG_INFINITY).unwrap();
             }
             let reference = scores.softmax(-1).unwrap().matmul(&v).unwrap();
 
             let add_mask = m.map(|m| {
-                Tensor::zeros(&m.shape(), opts).unwrap()
-                    .masked_fill(m, f64::NEG_INFINITY).unwrap()
+                Tensor::zeros(&m.shape(), opts)
+                    .unwrap()
+                    .masked_fill(m, f64::NEG_INFINITY)
+                    .unwrap()
             });
             let fused = Tensor::scaled_dot_product_attention(
-                &q, &k, &v, add_mask.as_ref(), 0.0, false, Some(scale),
-            ).unwrap();
+                &q,
+                &k,
+                &v,
+                add_mask.as_ref(),
+                0.0,
+                false,
+                Some(scale),
+            )
+            .unwrap();
 
-            let diff = fused.sub(&reference).unwrap().abs().unwrap()
-                .max().unwrap().item().unwrap();
+            let diff = fused
+                .sub(&reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max()
+                .unwrap()
+                .item()
+                .unwrap();
             assert!(
                 diff < 1e-5,
                 "SDPA diverged from the explicit chain (masked={}): max |Δ| = {diff}",

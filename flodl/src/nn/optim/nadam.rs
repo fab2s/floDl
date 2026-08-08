@@ -6,8 +6,8 @@ use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
-    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    read_f64_le, read_i64_le, read_tensor_state, read_u32_le, write_f64_le, write_i64_le,
+    write_tensor_state, write_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -44,17 +44,27 @@ impl NAdam {
         let n = params.len();
         NAdam {
             params: params.iter().map(|p| p.variable.clone()).collect(),
-            lr, beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay: 0.0,
-            m: vec![None; n], v: vec![None; n], steps: vec![0; n],
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            m: vec![None; n],
+            v: vec![None; n],
+            steps: vec![0; n],
         }
     }
 
     /// Current learning rate.
-    pub fn lr(&self) -> f64 { self.lr }
+    pub fn lr(&self) -> f64 {
+        self.lr
+    }
 }
 
 impl Optimizer for NAdam {
-    fn lr(&self) -> f64 { self.lr }
+    fn lr(&self) -> f64 {
+        self.lr
+    }
     fn step(&mut self) -> Result<()> {
         let b1 = self.beta1;
         let b2 = self.beta2;
@@ -85,11 +95,14 @@ impl Optimizer for NAdam {
                     };
 
                     // Nesterov-corrected first moment
-                    let m_hat = m_new.mul_scalar(b1 / (1.0 - b1t1))?
+                    let m_hat = m_new
+                        .mul_scalar(b1 / (1.0 - b1t1))?
                         .add(&grad.mul_scalar((1.0 - b1) / (1.0 - b1t))?)?;
                     let v_hat = v_new.mul_scalar(1.0 / (1.0 - b2t))?;
 
-                    let update = m_hat.div(&v_hat.sqrt()?.add_scalar(self.eps)?)?.mul_scalar(self.lr)?;
+                    let update = m_hat
+                        .div(&v_hat.sqrt()?.add_scalar(self.eps)?)?
+                        .mul_scalar(self.lr)?;
                     data.sub_(&update)?;
 
                     self.m[i] = Some(m_new);
@@ -115,10 +128,14 @@ impl Optimizer for NAdam {
     }
 
     fn zero_grad(&self) {
-        for p in &self.params { p.zero_grad_set_to_none(); }
+        for p in &self.params {
+            p.zero_grad_set_to_none();
+        }
     }
 
-    fn set_lr(&mut self, lr: f64) { self.lr = lr; }
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
 
     fn save_state_to(&self, path: &str) -> Result<()> {
         <Self as Stateful>::save_state_file(self, path)
@@ -126,7 +143,9 @@ impl Optimizer for NAdam {
 }
 
 impl Stateful for NAdam {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::NAdam }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::NAdam
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
@@ -150,7 +169,9 @@ impl Stateful for NAdam {
         let count = read_u32_le(r)? as usize;
         if count != self.params.len() {
             return Err(crate::tensor::TensorError::new(&format!(
-                "NAdam: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+                "NAdam: param count mismatch: checkpoint={} optimizer={}",
+                count,
+                self.params.len()
             )));
         }
         self.lr = read_f64_le(r)?;
@@ -177,8 +198,8 @@ impl Stateful for NAdam {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{make_param, state_tmp};
+    use super::*;
     use crate::tensor::Tensor;
 
     #[test]
@@ -188,7 +209,8 @@ mod tests {
         let dev = crate::tensor::test_device();
         let p = make_param("w", &[2]);
         let mut opt = NAdam::new(std::slice::from_ref(&p), 0.02);
-        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        p.variable
+            .set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
         opt.step().unwrap();
 
         let path = state_tmp("nadam_roundtrip.optim");
@@ -207,10 +229,14 @@ mod tests {
         let p = make_param("w", &[2]);
         let mut opt = NAdam::new(std::slice::from_ref(&p), 0.01);
         for _ in 0..3 {
-            p.variable.set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
+            p.variable
+                .set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
             opt.step().unwrap();
         }
-        assert!(opt.steps.iter().any(|&s| s > 0), "warm-up should advance steps");
+        assert!(
+            opt.steps.iter().any(|&s| s > 0),
+            "warm-up should advance steps"
+        );
         opt.reset_state();
         assert!(opt.steps.iter().all(|&s| s == 0), "steps must reset to 0");
         assert!(opt.m.iter().all(|s| s.is_none()), "m must be cleared");
@@ -223,13 +249,17 @@ mod tests {
         let before = p.variable.data().item().unwrap();
         let mut opt = NAdam::new(std::slice::from_ref(&p), 0.01);
         let x = Variable::new(
-            Tensor::from_f32(&[2.0], &[1], crate::tensor::test_device()).unwrap(), false,
+            Tensor::from_f32(&[2.0], &[1], crate::tensor::test_device()).unwrap(),
+            false,
         );
         let loss = x.mul(&p.variable).unwrap().sum().unwrap();
         loss.backward().unwrap();
         opt.step().unwrap();
         let after = p.variable.data().item().unwrap();
-        assert!((after - before).abs() > 1e-6, "NAdam step should change parameter");
+        assert!(
+            (after - before).abs() > 1e-6,
+            "NAdam step should change parameter"
+        );
     }
 
     #[test]
@@ -242,12 +272,13 @@ mod tests {
 
         let x = Variable::new(
             Tensor::from_f32(
-                &[1.0, 0.0, 0.0, 0.0,
-                  0.0, 1.0, 0.0, 0.0,
-                  0.0, 0.0, 1.0, 0.0,
-                  0.0, 0.0, 0.0, 1.0],
-                &[4, 4], dev,
-            ).unwrap(),
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                &[4, 4],
+                dev,
+            )
+            .unwrap(),
             false,
         );
         let target = Variable::new(
@@ -271,7 +302,11 @@ mod tests {
 
         let pred = model.forward(&x).unwrap();
         let final_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
-        assert!(final_loss < first_loss * 0.5,
-            "NAdam should converge: first={}, final={}", first_loss, final_loss);
+        assert!(
+            final_loss < first_loss * 0.5,
+            "NAdam should converge: first={}, final={}",
+            first_loss,
+            final_loss
+        );
     }
 }

@@ -142,9 +142,8 @@ const DEFAULT_CONTAINER_PROJECT_ROOT: &str = "/workspace";
 /// user-edited and version-controlled, so re-parsing once per
 /// invocation is cheap — the cache only avoids re-parsing *within* a
 /// single invocation.
-static COMPOSE_MOUNT_CACHE: std::sync::OnceLock<
-    std::collections::HashMap<String, String>,
-> = std::sync::OnceLock::new();
+static COMPOSE_MOUNT_CACHE: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+    std::sync::OnceLock::new();
 
 /// Resolve the absolute container path where the host project root is
 /// mounted inside `service`.
@@ -162,8 +161,7 @@ static COMPOSE_MOUNT_CACHE: std::sync::OnceLock<
 /// would resolve to the non-existent
 /// `/workspace/flodl-hf/flodl-hf/convert`.
 fn container_project_root(project_root: &Path, service: &str) -> String {
-    let cache = COMPOSE_MOUNT_CACHE
-        .get_or_init(|| parse_compose_project_mounts(project_root));
+    let cache = COMPOSE_MOUNT_CACHE.get_or_init(|| parse_compose_project_mounts(project_root));
     cache
         .get(service)
         .cloned()
@@ -178,9 +176,7 @@ fn container_project_root(project_root: &Path, service: &str) -> String {
 /// (`{ type: bind, source: ., target: /workspace }`) volume entries.
 /// Read errors, parse errors, and missing sections all yield an empty
 /// map — callers fall back to the convention.
-fn parse_compose_project_mounts(
-    project_root: &Path,
-) -> std::collections::HashMap<String, String> {
+fn parse_compose_project_mounts(project_root: &Path) -> std::collections::HashMap<String, String> {
     let compose_path = project_root.join("docker-compose.yml");
     let text = match std::fs::read_to_string(&compose_path) {
         Ok(t) => t,
@@ -244,9 +240,10 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
                 .get(serde_yaml_ng::Value::String("target".into()))
                 .and_then(|v| v.as_str());
             if matches!(source, Some(".") | Some("./"))
-                && let Some(t) = target {
-                    return Some(t.to_string());
-                }
+                && let Some(t) = target
+            {
+                return Some(t.to_string());
+            }
         }
     }
     None
@@ -329,10 +326,7 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
         // LD_LIBRARY_PATH already works there, and setting RUSTFLAGS
         // would invalidate every existing cargo cache for no gain.
         if cfg!(target_os = "macos") && std::env::var_os("RUSTFLAGS").is_none() {
-            env.push((
-                "RUSTFLAGS".into(),
-                format!("-C link-arg=-Wl,-rpath,{lib}"),
-            ));
+            env.push(("RUSTFLAGS".into(), format!("-C link-arg=-Wl,-rpath,{lib}")));
         }
 
         // The cargo feature this variant needs, so a `run:` line can say
@@ -357,20 +351,21 @@ fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
 
         // CUDA version from .arch metadata.
         if let Some(cuda) = &info.cuda_version
-            && cuda != "none" {
-                let cuda_version = if cuda.matches('.').count() < 2 {
-                    format!("{cuda}.0")
-                } else {
-                    cuda.clone()
-                };
-                let cuda_tag = cuda_version
-                    .splitn(3, '.')
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                env.push(("CUDA_VERSION".into(), cuda_version));
-                env.push(("CUDA_TAG".into(), cuda_tag));
-            }
+            && cuda != "none"
+        {
+            let cuda_version = if cuda.matches('.').count() < 2 {
+                format!("{cuda}.0")
+            } else {
+                cuda.clone()
+            };
+            let cuda_tag = cuda_version
+                .splitn(3, '.')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(".");
+            env.push(("CUDA_VERSION".into(), cuda_version));
+            env.push(("CUDA_TAG".into(), cuda_tag));
+        }
     }
 
     Ok(env)
@@ -463,11 +458,10 @@ fn resolve_libtorch_from_overlay(
 ///   2. Directory containing `.active` — read its `.active`.
 ///   3. Direct variant dir (has `lib/`) — use as-is, parse `.arch` if
 ///      present.
-pub(crate) fn resolve_libtorch_at(
-    path: &Path,
-) -> Option<(libtorch::detect::LibtorchInfo, String)> {
+pub(crate) fn resolve_libtorch_at(path: &Path) -> Option<(libtorch::detect::LibtorchInfo, String)> {
     if path.is_file()
-        && path.file_name()
+        && path
+            .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(".active"))
     {
@@ -477,18 +471,12 @@ pub(crate) fn resolve_libtorch_at(
         return Some((info, host_path));
     }
     if path.join(".active").exists() {
-        let info = libtorch::detect::read_active_from(
-            &path.join(".active"),
-            path,
-        )?;
+        let info = libtorch::detect::read_active_from(&path.join(".active"), path)?;
         let host_path = path.join(&info.path).display().to_string();
         return Some((info, host_path));
     }
     if path.join("lib").is_dir() {
-        let info = libtorch::detect::libtorch_info_from_dir(
-            path.display().to_string(),
-            path,
-        );
+        let info = libtorch::detect::libtorch_info_from_dir(path.display().to_string(), path);
         let host_path = path.display().to_string();
         return Some((info, host_path));
     }
@@ -516,10 +504,7 @@ fn spawn_docker_shell(command: &str, project_root: &Path) -> ExitCode {
         // interpolation resolves to the host's hostname. bash sets
         // HOSTNAME as a shell built-in but doesn't export it; docker
         // compose only reads exported env vars.
-        .env(
-            "HOSTNAME",
-            crate::cluster::resolve_local_hostname(),
-        )
+        .env("HOSTNAME", crate::cluster::resolve_local_hostname())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .stdin(Stdio::inherit());
@@ -597,11 +582,7 @@ fn split_user_args_dashdash(args: &[String]) -> (&[String], Option<&[String]>) {
 /// User args go after append on each side: `append` seeds defaults,
 /// and last-wins for cargo-style flags lets the user override without
 /// ceremony (e.g. `append: --no-ansi` + CLI `--ansi`).
-pub(crate) fn compose_run_command(
-    run: &str,
-    user_args: &[String],
-    append: Option<&str>,
-) -> String {
+pub(crate) fn compose_run_command(run: &str, user_args: &[String], append: Option<&str>) -> String {
     let suffix = append.map(str::trim).filter(|s| !s.is_empty());
     let (append_pre, append_post, append_has_dashdash) = match suffix {
         Some(s) => {
@@ -610,10 +591,7 @@ pub(crate) fn compose_run_command(
             // with empty pre, non-empty post) from "append had no `--`"
             // (post defaults empty). Without this we'd swallow the
             // separator on legacy yml.
-            let has = s == "--"
-                || s.starts_with("-- ")
-                || s.ends_with(" --")
-                || s.contains(" -- ");
+            let has = s == "--" || s.starts_with("-- ") || s.ends_with(" --") || s.contains(" -- ");
             (pre, post, has)
         }
         None => (String::new(), String::new(), false),
@@ -695,8 +673,7 @@ fn testing_cluster_env_arg() -> String {
 /// one. Names are literals here because flodl-cli is decoupled from the
 /// flodl library crate by policy; `flodl-hw` is a dependency, so the GPU
 /// one is asserted against its constant in the tests below.
-const TESTING_ENV_VARS: &[&str] =
-    &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
+const TESTING_ENV_VARS: &[&str] = &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
 
 /// The logical `docker:` value meaning "whichever GPU container matches
 /// the active libtorch variant".
@@ -871,10 +848,11 @@ pub fn exec_command(
     // blocks) are intentionally skipped — those are the binary's
     // surface, not the user's.
     if let Some(schema) = &cmd_config.schema
-        && let Err(e) = config::validate_tail(extra_args, schema) {
-            cli_error!("{e}");
-            return ExitCode::FAILURE;
-        }
+        && let Err(e) = config::validate_tail(extra_args, schema)
+    {
+        cli_error!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     // Resolve config: preset overrides merged with root defaults.
     let resolved = match preset_name {
@@ -884,10 +862,11 @@ pub fn exec_command(
                 // Whole-map validation is deferred so a broken sibling
                 // preset doesn't block a correct one from running.
                 if let Some(schema) = &cmd_config.schema
-                    && let Err(e) = config::validate_preset_for_exec(name, preset, schema) {
-                        cli_error!("{e}");
-                        return ExitCode::FAILURE;
-                    }
+                    && let Err(e) = config::validate_preset_for_exec(name, preset, schema)
+                {
+                    cli_error!("{e}");
+                    return ExitCode::FAILURE;
+                }
                 config::merge_preset(cmd_config, preset)
             }
             None => {
@@ -910,10 +889,7 @@ pub fn exec_command(
     let use_docker = cmd_config.docker.is_some() && !inside_docker();
 
     if use_docker {
-        let service = resolve_docker_service(
-            cmd_config.docker.as_deref().unwrap(),
-            project_root,
-        );
+        let service = resolve_docker_service(cmd_config.docker.as_deref().unwrap(), project_root);
         let workdir = cmd_dir
             .strip_prefix(project_root)
             .unwrap_or(cmd_dir)
@@ -1253,10 +1229,7 @@ fn print_entry_section(cmd_config: &CommandConfig) {
     eprintln!("{}:", style::yellow("Entry"));
     eprintln!("    {entry}");
     if let Some(service) = &cmd_config.docker {
-        eprintln!(
-            "     {}",
-            style::dim(&format!("[docker: {service}]"))
-        );
+        eprintln!("     {}", style::dim(&format!("[docker: {service}]")));
     }
     eprintln!();
     eprintln!(
@@ -1276,7 +1249,11 @@ fn print_defaults_section(cmd_config: &CommandConfig) {
             eprintln!("    {}  {mode}", style::dim("ddp.mode"));
         }
         if let Some(anchor) = &d.anchor {
-            eprintln!("    {}  {}", style::dim("ddp.anchor"), value_to_string(anchor));
+            eprintln!(
+                "    {}  {}",
+                style::dim("ddp.anchor"),
+                value_to_string(anchor)
+            );
         }
     }
     if let Some(t) = &cmd_config.training {
@@ -1373,7 +1350,7 @@ pub fn print_preset_help(cmd_config: &CommandConfig, cmd_name: &str, preset_name
         let docker_info = cmd_config
             .docker
             .as_ref()
-            .map(|s| format!("[{s}] ", ))
+            .map(|s| format!("[{s}] ",))
             .unwrap_or_default();
 
         eprintln!();
@@ -1405,9 +1382,10 @@ fn print_config_field<T: std::fmt::Display>(label: &str, val: &Option<T>) {
 
 fn print_config_value(label: &str, val: &Option<serde_json::Value>) {
     if let Some(v) = val
-        && !v.is_null() {
-            eprintln!("    {}  {}", style::dim(label), value_to_string(v));
-        }
+        && !v.is_null()
+    {
+        eprintln!("    {}  {}", style::dim(label), value_to_string(v));
+    }
 }
 
 /// Print the project help with scripts and commands.
@@ -1513,10 +1491,7 @@ pub fn print_project_help(
                             .and_then(|c| c.description)
                             .unwrap_or_else(|| "(sub-command)".into())
                     } else {
-                        spec.run
-                            .as_deref()
-                            .unwrap_or("(command)")
-                            .to_string()
+                        spec.run.as_deref().unwrap_or("(command)").to_string()
                     }
                 }
             };
@@ -1657,7 +1632,12 @@ fn format_option(long: &str, spec: &OptionSpec, avail_width: usize) -> Vec<Strin
             flag.chars().count() + 1 + placeholder.chars().count(),
         )
     };
-    let segs = desc_segments(spec.description.as_deref(), &spec.default, &spec.choices, &spec.ty);
+    let segs = desc_segments(
+        spec.description.as_deref(),
+        &spec.default,
+        &spec.choices,
+        &spec.ty,
+    );
     let mut out = format_row(&left, visible, OPT_COL, &segs, avail_width);
     if let Some(env) = &spec.env {
         out.push(format!(
@@ -1679,10 +1659,16 @@ struct Seg {
 
 impl Seg {
     fn plain(s: &str) -> Seg {
-        Seg { text: s.to_string(), styled: s.to_string() }
+        Seg {
+            text: s.to_string(),
+            styled: s.to_string(),
+        }
     }
     fn dim(s: &str) -> Seg {
-        Seg { text: s.to_string(), styled: style::dim(s) }
+        Seg {
+            text: s.to_string(),
+            styled: style::dim(s),
+        }
     }
 }
 
@@ -1710,10 +1696,15 @@ fn desc_segments(
         }
     }
     if let Some(choices) = choices
-        && !choices.is_empty() {
-            let list = choices.iter().map(format_value).collect::<Vec<_>>().join(", ");
-            segs.push(Seg::dim(&format!("[possible: {list}]")));
-        }
+        && !choices.is_empty()
+    {
+        let list = choices
+            .iter()
+            .map(format_value)
+            .collect::<Vec<_>>()
+            .join(", ");
+        segs.push(Seg::dim(&format!("[possible: {list}]")));
+    }
     // Annotate list types so users know about repeat/comma semantics.
     if ty.starts_with("list[") {
         segs.push(Seg::dim("(repeat or comma-separate)"));
@@ -1866,9 +1857,18 @@ fn term_cols() -> Option<usize> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
     unsafe extern "C" {
-        fn ioctl(fd: std::os::raw::c_int, request: std::os::raw::c_ulong, ...) -> std::os::raw::c_int;
+        fn ioctl(
+            fd: std::os::raw::c_int,
+            request: std::os::raw::c_ulong,
+            ...
+        ) -> std::os::raw::c_int;
     }
-    let mut ws = Winsize { row: 0, col: 0, xpixel: 0, ypixel: 0 };
+    let mut ws = Winsize {
+        row: 0,
+        col: 0,
+        xpixel: 0,
+        ypixel: 0,
+    };
     // SAFETY: `ioctl(TIOCGWINSZ, &Winsize)` writes the window size into the
     // struct; the fd is stderr, verified above to be a terminal.
     let rc = unsafe { ioctl(stderr.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
@@ -2157,15 +2157,8 @@ mod tests {
             "--".to_string(),
             "--ignored".to_string(),
         ];
-        let out = compose_run_command(
-            "cargo test",
-            &user,
-            Some("--release -- --nocapture"),
-        );
-        assert_eq!(
-            out,
-            "cargo test --release -p foo -- --nocapture --ignored"
-        );
+        let out = compose_run_command("cargo test", &user, Some("--release -- --nocapture"));
+        assert_eq!(out, "cargo test --release -p foo -- --nocapture --ignored");
     }
 
     #[test]
@@ -2182,18 +2175,12 @@ mod tests {
             split_append_dashdash("--foo --"),
             ("--foo".to_string(), String::new())
         );
-        assert_eq!(
-            split_append_dashdash("--"),
-            (String::new(), String::new())
-        );
+        assert_eq!(split_append_dashdash("--"), (String::new(), String::new()));
         assert_eq!(
             split_append_dashdash("--foo"),
             ("--foo".to_string(), String::new())
         );
-        assert_eq!(
-            split_append_dashdash(""),
-            (String::new(), String::new())
-        );
+        assert_eq!(split_append_dashdash(""), (String::new(), String::new()));
     }
 
     // ── resolve_libtorch_at: 3-shape libtorch variant resolution ────────
@@ -2212,15 +2199,18 @@ mod tests {
     struct Scratch(std::path::PathBuf);
     impl Scratch {
         fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("fdl-resolve-libtorch-{}-{}", nanos, seq));
+            let dir = std::env::temp_dir().join(format!("fdl-resolve-libtorch-{}-{}", nanos, seq));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
-        fn path(&self) -> &std::path::Path { &self.0 }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -2238,7 +2228,8 @@ mod tests {
             std::fs::write(
                 d.join(".arch"),
                 format!("torch={torch}\ncuda=1.0\narchs={archs}\nsource=test\n"),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
 
@@ -2250,8 +2241,7 @@ mod tests {
         let pointer = lt.join(".active.alt");
         std::fs::write(&pointer, "precompiled/v1\n").unwrap();
 
-        let (info, host_path) = resolve_libtorch_at(&pointer)
-            .expect("pointer file resolves");
+        let (info, host_path) = resolve_libtorch_at(&pointer).expect("pointer file resolves");
         assert_eq!(info.path, "precompiled/v1");
         assert_eq!(info.torch_version.as_deref(), Some("1.0"));
         assert_eq!(host_path, lt.join("precompiled/v1").display().to_string());
@@ -2264,8 +2254,7 @@ mod tests {
         populate_lt_root(&lt);
         std::fs::write(lt.join(".active"), "builds/v2\n").unwrap();
 
-        let (info, host_path) = resolve_libtorch_at(&lt)
-            .expect("libtorch-root dir resolves");
+        let (info, host_path) = resolve_libtorch_at(&lt).expect("libtorch-root dir resolves");
         assert_eq!(info.path, "builds/v2");
         assert_eq!(info.torch_version.as_deref(), Some("2.0"));
         assert_eq!(host_path, lt.join("builds/v2").display().to_string());
@@ -2279,10 +2268,10 @@ mod tests {
         std::fs::write(
             variant.join(".arch"),
             "torch=3.0\ncuda=2.0\narchs=1.0\nsource=test\n",
-        ).unwrap();
+        )
+        .unwrap();
 
-        let (info, host_path) = resolve_libtorch_at(&variant)
-            .expect("direct variant dir resolves");
+        let (info, host_path) = resolve_libtorch_at(&variant).expect("direct variant dir resolves");
         assert_eq!(info.path, variant.display().to_string());
         assert_eq!(info.torch_version.as_deref(), Some("3.0"));
         assert_eq!(host_path, variant.display().to_string());
@@ -2293,8 +2282,10 @@ mod tests {
         let s = Scratch::new();
         let bogus = s.path().join("no-lib-no-active-no-pointer");
         std::fs::create_dir_all(&bogus).unwrap();
-        assert!(resolve_libtorch_at(&bogus).is_none(),
-            "dir without lib/, .active, or pointer-shape filename → None");
+        assert!(
+            resolve_libtorch_at(&bogus).is_none(),
+            "dir without lib/, .active, or pointer-shape filename → None"
+        );
     }
 
     #[test]

@@ -43,8 +43,8 @@ use std::path::Path;
 use flodl::{Device, Graph, Result, TensorError};
 
 use crate::models::albert::{
-    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering,
-    AlbertForSequenceClassification, AlbertForTokenClassification, AlbertModel,
+    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering, AlbertForSequenceClassification,
+    AlbertForTokenClassification, AlbertModel,
 };
 use crate::models::auto::AutoConfig;
 use crate::models::bert::{
@@ -207,11 +207,7 @@ fn classify_architecture(arch: &str) -> Result<HeadKind> {
 /// [`flodl::Graph::load_checkpoint`]. For Hub-fetch flows reach for
 /// [`crate::models::auto::AutoModel::from_pretrained_for_export`]
 /// directly — it builds, fetches, and loads in one call.
-pub fn build_for_export(
-    config: &AutoConfig,
-    has_pooler: bool,
-    device: Device,
-) -> Result<Graph> {
+pub fn build_for_export(config: &AutoConfig, has_pooler: bool, device: Device) -> Result<Graph> {
     let head = match config.architectures().and_then(|arr| arr.first()) {
         Some(name) => classify_architecture(name)?,
         None => HeadKind::Base,
@@ -485,10 +481,7 @@ mod tests {
 
     #[test]
     fn classify_architecture_suffix_match() {
-        assert_eq!(
-            classify_architecture("BertModel").unwrap(),
-            HeadKind::Base,
-        );
+        assert_eq!(classify_architecture("BertModel").unwrap(), HeadKind::Base,);
         assert_eq!(
             classify_architecture("BertForSequenceClassification").unwrap(),
             HeadKind::SeqCls,
@@ -557,8 +550,7 @@ mod tests {
         // Compare against the same base config without the head hint.
         let mut base_cfg = cfg.clone();
         base_cfg.architectures = None;
-        let base_graph =
-            build_for_export(&AutoConfig::Bert(base_cfg), true, Device::CPU).unwrap();
+        let base_graph = build_for_export(&AutoConfig::Bert(base_cfg), true, Device::CPU).unwrap();
 
         assert_ne!(
             head_graph.structural_hash(),

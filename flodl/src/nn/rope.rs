@@ -226,8 +226,16 @@ mod tests {
         assert!((out[1] - 2.0).abs() < 1e-5);
         // Position 1: rotation by 1 radian.
         let (s, c) = 1f32.sin_cos();
-        assert!((out[2] - (3.0 * c - 4.0 * s)).abs() < 1e-5, "got {}", out[2]);
-        assert!((out[3] - (4.0 * c + 3.0 * s)).abs() < 1e-5, "got {}", out[3]);
+        assert!(
+            (out[2] - (3.0 * c - 4.0 * s)).abs() < 1e-5,
+            "got {}",
+            out[2]
+        );
+        assert!(
+            (out[3] - (4.0 * c + 3.0 * s)).abs() < 1e-5,
+            "got {}",
+            out[3]
+        );
     }
 
     #[test]

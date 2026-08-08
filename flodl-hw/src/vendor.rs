@@ -177,10 +177,7 @@ impl GpuArch {
                 minor: min.trim().parse().ok()?,
             });
         }
-        let digits = t
-            .trim_start_matches("sm_")
-            .trim_start_matches("sm")
-            .trim();
+        let digits = t.trim_start_matches("sm_").trim_start_matches("sm").trim();
         if digits.len() < 2 || !digits.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
@@ -352,7 +349,11 @@ mod tests {
     fn parses_nvidia_capability_forms() {
         let expect = GpuArch::Sm { major: 8, minor: 6 };
         for form in ["8.6", "sm_86", "sm86", " 8.6 "] {
-            assert_eq!(GpuArch::parse(GpuVendor::Nvidia, form).unwrap(), expect, "{form}");
+            assert_eq!(
+                GpuArch::parse(GpuVendor::Nvidia, form).unwrap(),
+                expect,
+                "{form}"
+            );
         }
     }
 
@@ -363,7 +364,10 @@ mod tests {
         // every current card.
         assert_eq!(
             GpuArch::parse(GpuVendor::Nvidia, "sm_120").unwrap(),
-            GpuArch::Sm { major: 12, minor: 0 }
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
         );
         assert_eq!(
             GpuArch::parse(GpuVendor::Nvidia, "sm_61").unwrap(),
@@ -401,14 +405,24 @@ mod tests {
 
     #[test]
     fn displays_in_vendor_form() {
-        assert_eq!(GpuArch::Sm { major: 12, minor: 0 }.to_string(), "sm_120");
+        assert_eq!(
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
+            .to_string(),
+            "sm_120"
+        );
         assert_eq!(GpuArch::Gfx("gfx1100".into()).to_string(), "gfx1100");
     }
 
     #[test]
     fn archs_token_differs_from_display_on_nvidia_only() {
         // `.arch` archs= carries the CMake TORCH_CUDA_ARCH_LIST form.
-        let sm = GpuArch::Sm { major: 12, minor: 0 };
+        let sm = GpuArch::Sm {
+            major: 12,
+            minor: 0,
+        };
         assert_eq!(sm.archs_token(), "12.0");
         assert_ne!(sm.archs_token(), sm.to_string());
         let gfx = GpuArch::Gfx("gfx1100".into());
@@ -421,11 +435,17 @@ mod tests {
         // whatever we write into `archs=` must match back.
         for a in [
             GpuArch::Sm { major: 6, minor: 1 },
-            GpuArch::Sm { major: 12, minor: 0 },
+            GpuArch::Sm {
+                major: 12,
+                minor: 0,
+            },
             GpuArch::Gfx("gfx1030".into()),
         ] {
             assert!(a.covered_by(&a.archs_token()), "{a}");
-            assert!(a.covered_by(&format!("gfx900;{};8.9", a.archs_token())), "{a}");
+            assert!(
+                a.covered_by(&format!("gfx900;{};8.9", a.archs_token())),
+                "{a}"
+            );
         }
     }
 
@@ -433,7 +453,10 @@ mod tests {
     fn nvidia_coverage_falls_back_to_major() {
         let sm86 = GpuArch::Sm { major: 8, minor: 6 };
         assert!(sm86.covered_by("6.1;8.6"));
-        assert!(sm86.covered_by("8.0"), "same major is forward-compatible via PTX");
+        assert!(
+            sm86.covered_by("8.0"),
+            "same major is forward-compatible via PTX"
+        );
         assert!(!sm86.covered_by("6.1;12.0"));
     }
 
@@ -444,7 +467,10 @@ mod tests {
         // first kernel launch failed with "no kernel image".
         let cu128 = "7.0 7.5 8.0 8.6 8.9 9.0 12.0";
         for (maj, min) in [(5u32, 0u32), (5, 2)] {
-            let dev = GpuArch::Sm { major: maj, minor: min };
+            let dev = GpuArch::Sm {
+                major: maj,
+                minor: min,
+            };
             assert!(
                 !dev.covered_by(cu128),
                 "sm_{maj}{min} matched the 5 inside 7.5",
@@ -453,7 +479,13 @@ mod tests {
         // The mirror: a major that is a substring of a two-digit major.
         assert!(!GpuArch::Sm { major: 2, minor: 0 }.covered_by("12.0"));
         // ...while the two-digit major itself still matches.
-        assert!(GpuArch::Sm { major: 12, minor: 0 }.covered_by(cu128));
+        assert!(
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
+            .covered_by(cu128)
+        );
         // Real coverage of the rig's own cards is unchanged.
         assert!(GpuArch::Sm { major: 6, minor: 1 }.covered_by("5.0 5.2 6.0 6.1 7.0"));
         assert!(!GpuArch::Sm { major: 6, minor: 1 }.covered_by(cu128));
@@ -465,10 +497,7 @@ mod tests {
         // writes the list through verbatim.
         let sm86 = GpuArch::Sm { major: 8, minor: 6 };
         assert!(sm86.covered_by("6.1;8.6+PTX"));
-        assert_eq!(
-            GpuArch::parse(GpuVendor::Nvidia, "8.6+PTX").unwrap(),
-            sm86,
-        );
+        assert_eq!(GpuArch::parse(GpuVendor::Nvidia, "8.6+PTX").unwrap(), sm86,);
     }
 
     #[test]
@@ -492,7 +521,10 @@ mod tests {
 
     #[test]
     fn arch_knows_its_own_vendor() {
-        assert_eq!(GpuArch::Sm { major: 8, minor: 6 }.vendor(), GpuVendor::Nvidia);
+        assert_eq!(
+            GpuArch::Sm { major: 8, minor: 6 }.vendor(),
+            GpuVendor::Nvidia
+        );
         assert_eq!(GpuArch::Gfx("gfx942".into()).vendor(), GpuVendor::Amd);
         assert_eq!(GpuArch::Gfx("gfx942".into()).sm_major(), None);
     }

@@ -26,7 +26,9 @@ impl Reshape {
 }
 
 impl Module for Reshape {
-    fn name(&self) -> &str { "reshape" }
+    fn name(&self) -> &str {
+        "reshape"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.reshape(&self.shape)

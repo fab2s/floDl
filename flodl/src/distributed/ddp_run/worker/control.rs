@@ -1,12 +1,9 @@
 //! Control-message dispatch: `handle_control` (non-blocking drain), `drain_until_shutdown`, and the central `dispatch_control` state machine.
 
-
 use crate::nn::Module;
 use crate::tensor::{Result, TensorError};
 
-use super::super::{
-    ControlMsg, TimingMsg, make_partition, pick_space,
-};
+use super::super::{ControlMsg, TimingMsg, make_partition, pick_space};
 use super::GpuWorker;
 
 impl<M: Module> GpuWorker<M> {
@@ -81,8 +78,7 @@ impl<M: Module> GpuWorker<M> {
                 // the snapshot (cpu-async overshoot) survive the EASGD blend
                 // in `load_averaged` and must ride the next frame's mass.
                 // Marker reset so a spurious second Update subtracts 0.
-                self.steps_since_avg =
-                    self.steps_since_avg.saturating_sub(self.steps_at_snapshot);
+                self.steps_since_avg = self.steps_since_avg.saturating_sub(self.steps_at_snapshot);
                 self.steps_at_snapshot = 0;
             }
             ControlMsg::StageAdvisory { counts, segments } => {
@@ -94,7 +90,12 @@ impl<M: Module> GpuWorker<M> {
                 }
             }
             ControlMsg::SyncNow => {
-                crate::debug!("  ddp-worker: rank {} SyncNow (step={}, epoch={})", self.rank, self.local_step, self.current_epoch);
+                crate::debug!(
+                    "  ddp-worker: rank {} SyncNow (step={}, epoch={})",
+                    self.rank,
+                    self.local_step,
+                    self.current_epoch
+                );
                 let (divergence, post_norm, pre_norm) = self.sync_now_nccl()?;
                 crate::debug!("  ddp-worker: rank {} SyncNow done", self.rank);
                 // NCCL sync is synchronous — nothing can step between the
@@ -136,19 +137,18 @@ impl<M: Module> GpuWorker<M> {
                          (old epoch {} offset {} size {}; new epoch {} offset {} size {}) \
                          — one-chunk-in-flight violated, a chunk was dropped",
                         self.rank,
-                        old.epoch, old.partition_offset, old.partition_size,
-                        plan.epoch, plan.partition_offset, plan.partition_size,
+                        old.epoch,
+                        old.partition_offset,
+                        old.partition_size,
+                        plan.epoch,
+                        plan.partition_offset,
+                        plan.partition_size,
                     );
-                    debug_assert!(
-                        false,
-                        "StartEpoch overwrote an unconsumed pending_plan"
-                    );
+                    debug_assert!(false, "StartEpoch overwrote an unconsumed pending_plan");
                 }
                 self.pending_plan = Some(plan);
             }
-            ControlMsg::DeclareDead
-            | ControlMsg::NewNcclSession
-            | ControlMsg::RequestNewNcclId => {
+            ControlMsg::DeclareDead | ControlMsg::NewNcclSession | ControlMsg::RequestNewNcclId => {
                 // Cluster-mode elastic-membership signals. The
                 // cluster_worker layer intercepts these in its
                 // inbound bridge (updates a local DeadRanks ledger,
@@ -228,9 +228,7 @@ impl<M: Module> GpuWorker<M> {
                         Ok(msg) => {
                             let releases = matches!(
                                 &msg,
-                                ControlMsg::SyncNow
-                                    | ControlMsg::Update(_)
-                                    | ControlMsg::Shutdown
+                                ControlMsg::SyncNow | ControlMsg::Update(_) | ControlMsg::Shutdown
                             );
                             let shutdown = self.dispatch_control(msg)?;
                             if shutdown || releases {
@@ -244,7 +242,10 @@ impl<M: Module> GpuWorker<M> {
             ControlMsg::SetGlobalStep(step) => {
                 self.global_step = step;
             }
-            ControlMsg::Checkpoint { version, target_rank } => {
+            ControlMsg::Checkpoint {
+                version,
+                target_rank,
+            } => {
                 // Targeted: only the rank named by the coord runs.
                 // Other ranks silently ignore the frame (in cluster
                 // mode the broadcast is already targeted by the
@@ -273,7 +274,11 @@ impl<M: Module> GpuWorker<M> {
                     error: err,
                 });
             }
-            ControlMsg::ExecuteEvalCallback { schedule_id, epoch, target_rank } => {
+            ControlMsg::ExecuteEvalCallback {
+                schedule_id,
+                epoch,
+                target_rank,
+            } => {
                 // Targeted: only the rank named by the coord runs.
                 // Mirrors the `Checkpoint` arm; worker never decides
                 // whether it is the evaluator. Every rank has

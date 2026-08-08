@@ -51,7 +51,7 @@ use std::io::{ErrorKind, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::distributed::wire::{hmac_sha256_64, SessionSalt};
+use crate::distributed::wire::{SessionSalt, hmac_sha256_64};
 use crate::tensor::{Result, TensorError};
 
 // ---------------------------------------------------------------------------
@@ -215,9 +215,7 @@ impl MuxRecord {
             MuxRecord::Data { rank, payload } => {
                 Ok((REC_DATA, *rank, std::borrow::Cow::Borrowed(payload)))
             }
-            MuxRecord::Control(msg) => {
-                Ok((REC_CONTROL, 0, std::borrow::Cow::Owned(encode(msg)?)))
-            }
+            MuxRecord::Control(msg) => Ok((REC_CONTROL, 0, std::borrow::Cow::Owned(encode(msg)?))),
             MuxRecord::HostFrame { payload } => {
                 Ok((REC_HOST_FRAME, 0, std::borrow::Cow::Borrowed(payload)))
             }
@@ -334,7 +332,11 @@ impl MuxRecord {
         Self::finish_read(hdr, r, salt).map(MuxRead::Record)
     }
 
-    fn finish_read<R: Read>(hdr: [u8; MUX_HEADER_LEN], r: &mut R, salt: &SessionSalt) -> Result<Self> {
+    fn finish_read<R: Read>(
+        hdr: [u8; MUX_HEADER_LEN],
+        r: &mut R,
+        salt: &SessionSalt,
+    ) -> Result<Self> {
         let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         if magic != MUX_RECORD_MAGIC {
             return Err(TensorError::new(&format!(
@@ -588,9 +590,7 @@ fn read_idle_gate<R: Read>(r: &mut R) -> Result<IdleGate> {
             Ok(0) => return Ok(IdleGate::Eof),
             Ok(_) => return Ok(IdleGate::Byte(b[0])),
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e)
-                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 return Ok(IdleGate::Idle);
             }
             Err(e)
@@ -676,8 +676,7 @@ fn fill_committed<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
 fn fill_committed_incremental<R: Read>(r: &mut R, len: usize) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < len {
-        let chunk = (len - buf.len())
-            .min(crate::distributed::wire::READ_CHUNK);
+        let chunk = (len - buf.len()).min(crate::distributed::wire::READ_CHUNK);
         let old_len = buf.len();
         buf.resize(old_len + chunk, 0);
         fill_committed(r, &mut buf[old_len..])?;

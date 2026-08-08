@@ -5,8 +5,8 @@ use crate::autograd::Variable;
 use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 
-use super::node::*;
 use super::FlowBuilder;
+use super::node::*;
 
 /// Wire a Switch node into the flow.
 pub(super) fn wire_switch(
@@ -99,9 +99,7 @@ fn branch_index(value: f64, n_branches: usize, row: Option<usize>) -> Result<usi
     if idx >= n_branches {
         return Err(TensorError::new(&format!(
             "switch: router selected branch {}{} but only {} branches exist",
-            idx,
-            at,
-            n_branches
+            idx, at, n_branches
         )));
     }
     Ok(idx)
@@ -233,10 +231,7 @@ fn switch_route(
     grouped.index_select(0, &Tensor::from_i64(&inverse, &[rows], device)?)
 }
 
-fn make_switch_func(
-    router: Rc<dyn Module>,
-    branches: Vec<Rc<dyn Module>>,
-) -> NodeFn {
+fn make_switch_func(router: Rc<dyn Module>, branches: Vec<Rc<dyn Module>>) -> NodeFn {
     Box::new(move |inputs: &[Variable]| {
         let empty = HashMap::new();
         let output = switch_route(&router, &inputs[0], &empty, &branches)?;
@@ -244,15 +239,11 @@ fn make_switch_func(
     })
 }
 
-fn make_switch_ref_forward(
-    router: Rc<dyn Module>,
-    branches: Vec<Rc<dyn Module>>,
-) -> RefForwardFn {
+fn make_switch_ref_forward(router: Rc<dyn Module>, branches: Vec<Rc<dyn Module>>) -> RefForwardFn {
     Rc::new(move |stream: &Variable, refs: &HashMap<String, Variable>| {
         switch_route(&router, stream, refs, &branches)
     })
 }
-
 
 /// Bundles router + branches for parameter collection.
 struct SwitchComposite {

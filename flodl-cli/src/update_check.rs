@@ -157,9 +157,7 @@ fn run_silent() {
     if !cfg.update_check.first_run_seen {
         eprintln!();
         eprintln!("fdl checks for updates once a day.");
-        eprintln!(
-            "  Opt out: set `FDL_NO_UPDATE_CHECK=1` or edit `update_check.enabled`"
-        );
+        eprintln!("  Opt out: set `FDL_NO_UPDATE_CHECK=1` or edit `update_check.enabled`");
         eprintln!("           in {}", cfg_path.display());
         cfg.update_check.first_run_seen = true;
         printed_anything = true;
@@ -201,8 +199,7 @@ fn config_path() -> Option<PathBuf> {
 /// `config_dir()` so we don't pull in an external crate for it.
 fn config_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
-        env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+        env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
     } else if cfg!(target_os = "windows") {
         env::var_os("APPDATA").map(PathBuf::from)
     } else {
@@ -266,9 +263,10 @@ fn detect_project_crates() -> BTreeMap<String, String> {
         let line = line.trim();
         if line == "[[package]]" {
             if let (Some(name), Some(version)) = (current_name.take(), current_version.take())
-                && FRAMEWORK_CRATES.contains(&name.as_str()) {
-                    out.insert(name, version);
-                }
+                && FRAMEWORK_CRATES.contains(&name.as_str())
+            {
+                out.insert(name, version);
+            }
         } else if let Some(rest) = line.strip_prefix("name = ") {
             current_name = unquote(rest);
         } else if let Some(rest) = line.strip_prefix("version = ") {
@@ -277,9 +275,10 @@ fn detect_project_crates() -> BTreeMap<String, String> {
     }
     // Trailing block.
     if let (Some(name), Some(version)) = (current_name, current_version)
-        && FRAMEWORK_CRATES.contains(&name.as_str()) {
-            out.insert(name, version);
-        }
+        && FRAMEWORK_CRATES.contains(&name.as_str())
+    {
+        out.insert(name, version);
+    }
 
     out
 }
@@ -340,7 +339,11 @@ pub(crate) fn probe_crates_io(crate_name: &str) -> Option<String> {
     }
 
     let resp: CratesIoResponse = serde_json::from_slice(&output.stdout).ok()?;
-    Some(resp.krate.max_stable_version.unwrap_or(resp.krate.max_version))
+    Some(
+        resp.krate
+            .max_stable_version
+            .unwrap_or(resp.krate.max_version),
+    )
 }
 
 // ---- Comparison + nudges --------------------------------------------------
@@ -353,19 +356,21 @@ fn collect_nudges(
     let mut out = Vec::new();
 
     if let Some(latest) = latest_known.get("flodl-cli")
-        && semver_lt(self_version, latest) {
-            out.push(format!(
-                "flodl-cli {latest} is available (you have {self_version})"
-            ));
-        }
+        && semver_lt(self_version, latest)
+    {
+        out.push(format!(
+            "flodl-cli {latest} is available (you have {self_version})"
+        ));
+    }
 
     for (name, current) in project_versions {
         if let Some(latest) = latest_known.get(name)
-            && semver_lt(current, latest) {
-                out.push(format!(
-                    "{name} {latest} is available (your project pins {current})"
-                ));
-            }
+            && semver_lt(current, latest)
+        {
+            out.push(format!(
+                "{name} {latest} is available (your project pins {current})"
+            ));
+        }
     }
 
     out

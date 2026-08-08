@@ -21,8 +21,7 @@
 
 use crate::cluster::resolve_local_hostname;
 use crate::config::{
-    ClusterConfig, ClusterController, ClusterWorker, LocalDevices,
-    DEFAULT_CONTROLLER_PORT,
+    ClusterConfig, ClusterController, ClusterWorker, DEFAULT_CONTROLLER_PORT, LocalDevices,
 };
 
 /// Parsed `--gpus` argument value.
@@ -45,9 +44,7 @@ impl GpusSpec {
     pub fn parse(raw: &str) -> Result<Self, String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(
-                "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)".to_string(),
-            );
+            return Err("--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)".to_string());
         }
         if trimmed.eq_ignore_ascii_case("all") {
             return Ok(GpusSpec::All);
@@ -58,9 +55,9 @@ impl GpusSpec {
             if p.is_empty() {
                 return Err(format!("--gpus: empty entry in {trimmed:?}"));
             }
-            let idx: u8 = p.parse().map_err(|e| {
-                format!("--gpus: cannot parse {p:?} as device index: {e}")
-            })?;
+            let idx: u8 = p
+                .parse()
+                .map_err(|e| format!("--gpus: cannot parse {p:?} as device index: {e}"))?;
             out.push(idx);
         }
         let mut sorted = out.clone();
@@ -90,8 +87,7 @@ impl GpusSpec {
                 // enumerate, hardware present without its stack
                 // installed, or genuinely no GPU. An explicit `--gpus
                 // all` must fail loudly rather than resolve to zero.
-                let devices = local_gpu_count()
-                    .map_err(|e| format!("--gpus all: {e}"))?;
+                let devices = local_gpu_count().map_err(|e| format!("--gpus all: {e}"))?;
                 if devices > u8::MAX as usize {
                     return Err(format!(
                         "--gpus all: {devices} GPUs detected, which exceeds \
@@ -139,9 +135,7 @@ pub fn synthesize_local_cluster(devices: &[u8]) -> Result<ClusterConfig, String>
     let hostname = resolve_local_hostname();
     let path = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| {
-            format!("synthesize_local_cluster: cannot read current_dir: {e}")
-        })?;
+        .map_err(|e| format!("synthesize_local_cluster: cannot read current_dir: {e}"))?;
     let port = std::env::var("FLODL_CONTROLLER_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
@@ -303,7 +297,8 @@ mod tests {
         // The synthesized config must pass ClusterConfig::validate (so the
         // launcher accepts it without special-casing).
         let c = synthesize_local_cluster(&[0, 1]).unwrap();
-        c.validate().expect("synthesized cluster must pass validate");
+        c.validate()
+            .expect("synthesized cluster must pass validate");
     }
 
     #[test]
@@ -311,7 +306,8 @@ mod tests {
         // N=1 is structurally valid (validate enforces 0..world_size with
         // ranks=[0], devices=[0]). Caller decides whether to use it.
         let c = synthesize_local_cluster(&[2]).unwrap();
-        c.validate().expect("single-device synthesized config validates");
+        c.validate()
+            .expect("single-device synthesized config validates");
         assert_eq!(c.workers[0].ranks, vec![0]);
         assert_eq!(c.workers[0].local_devices, LocalDevices::Explicit(vec![2]));
     }

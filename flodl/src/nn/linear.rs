@@ -1,9 +1,9 @@
 use crate::autograd::{self, Variable};
 use crate::tensor::{Device, Result};
 
+use super::Module;
 use super::init;
 use super::parameter::Parameter;
-use super::Module;
 
 /// Fully connected layer: `y = x @ W^T + b`.
 ///
@@ -32,7 +32,12 @@ impl Linear {
 
     /// Create a linear layer on a specific device with bias.
     pub fn on_device(in_features: i64, out_features: i64, device: Device) -> Result<Self> {
-        let w = init::kaiming_uniform(&[out_features, in_features], in_features, 5.0_f64.sqrt(), device)?;
+        let w = init::kaiming_uniform(
+            &[out_features, in_features],
+            in_features,
+            5.0_f64.sqrt(),
+            device,
+        )?;
         let b = init::uniform_bias(in_features, &[out_features], device)?;
         Ok(Linear {
             weight: Parameter::new(w, "weight"),
@@ -47,7 +52,12 @@ impl Linear {
 
     /// Create a linear layer without bias on a specific device.
     pub fn no_bias_on_device(in_features: i64, out_features: i64, device: Device) -> Result<Self> {
-        let w = init::kaiming_uniform(&[out_features, in_features], in_features, 5.0_f64.sqrt(), device)?;
+        let w = init::kaiming_uniform(
+            &[out_features, in_features],
+            in_features,
+            5.0_f64.sqrt(),
+            device,
+        )?;
         Ok(Linear {
             weight: Parameter::new(w, "weight"),
             bias: None,
@@ -93,7 +103,9 @@ impl Linear {
 }
 
 impl Module for Linear {
-    fn name(&self) -> &str { "linear" }
+    fn name(&self) -> &str {
+        "linear"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::linear(
@@ -132,7 +144,7 @@ mod tests {
         let params = layer.parameters();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].variable.shape(), vec![2, 4]); // weight
-        assert_eq!(params[1].variable.shape(), vec![2]);     // bias
+        assert_eq!(params[1].variable.shape(), vec![2]); // bias
     }
 
     #[test]
@@ -157,8 +169,14 @@ mod tests {
         loss.backward().unwrap();
 
         let params = layer.parameters();
-        assert!(params[0].variable.grad().is_some(), "weight should have gradient");
-        assert!(params[1].variable.grad().is_some(), "bias should have gradient");
+        assert!(
+            params[0].variable.grad().is_some(),
+            "weight should have gradient"
+        );
+        assert!(
+            params[1].variable.grad().is_some(),
+            "bias should have gradient"
+        );
     }
 
     #[test]
@@ -187,17 +205,20 @@ mod tests {
         use std::rc::Rc;
 
         // Shared weight: [out=2, in=3].
-        let shared = Parameter::new(
-            Tensor::randn(&[2, 3], test_opts()).unwrap(),
-            "weight",
-        );
+        let shared = Parameter::new(Tensor::randn(&[2, 3], test_opts()).unwrap(), "weight");
 
         let layer_a = Linear::from_shared_weight(shared.clone(), None);
         let layer_b = Linear::from_shared_weight(shared.clone(), None);
 
         // Rc pointer identity across both layers and the original handle.
-        assert!(Rc::ptr_eq(&layer_a.weight.variable.inner, &layer_b.weight.variable.inner));
-        assert!(Rc::ptr_eq(&shared.variable.inner,        &layer_a.weight.variable.inner));
+        assert!(Rc::ptr_eq(
+            &layer_a.weight.variable.inner,
+            &layer_b.weight.variable.inner
+        ));
+        assert!(Rc::ptr_eq(
+            &shared.variable.inner,
+            &layer_a.weight.variable.inner
+        ));
 
         // Two distinct inputs, two forward paths, single scalar loss.
         let x1 = Variable::new(Tensor::randn(&[4, 3], test_opts()).unwrap(), false);
@@ -209,21 +230,32 @@ mod tests {
 
         // The one leaf accumulates gradient from both paths; either
         // handle sees it.
-        let g_a = layer_a.weight.variable.grad().expect("layer_a sees gradient");
-        let g_b = layer_b.weight.variable.grad().expect("layer_b sees gradient");
+        let g_a = layer_a
+            .weight
+            .variable
+            .grad()
+            .expect("layer_a sees gradient");
+        let g_b = layer_b
+            .weight
+            .variable
+            .grad()
+            .expect("layer_b sees gradient");
         assert_eq!(g_a.shape(), vec![2, 3]);
         assert_eq!(g_b.shape(), vec![2, 3]);
 
         // Gradient value should equal sum over batch rows of each input
         // (since d/dW sum(x @ W^T) = sum_rows(x) broadcast to out axis).
         let expected = {
-            let s1 = x1.data().sum_dim(0, false).unwrap();  // [3]
-            let s2 = x2.data().sum_dim(0, false).unwrap();  // [3]
-            let row = s1.add(&s2).unwrap();                    // [3]
+            let s1 = x1.data().sum_dim(0, false).unwrap(); // [3]
+            let s2 = x2.data().sum_dim(0, false).unwrap(); // [3]
+            let row = s1.add(&s2).unwrap(); // [3]
             // Broadcast to [2, 3] by stacking the same row twice.
-            row.unsqueeze(0).unwrap()
-                .expand(&[2, 3]).unwrap()
-                .contiguous().unwrap()
+            row.unsqueeze(0)
+                .unwrap()
+                .expand(&[2, 3])
+                .unwrap()
+                .contiguous()
+                .unwrap()
         };
         let got = g_a.to_f32_vec().unwrap();
         let want = expected.to_f32_vec().unwrap();
@@ -240,10 +272,7 @@ mod tests {
     fn test_from_shared_weight_dedups_in_graph_named_parameters() {
         use crate::graph::FlowBuilder;
 
-        let shared = Parameter::new(
-            Tensor::randn(&[3, 4], test_opts()).unwrap(),
-            "weight",
-        );
+        let shared = Parameter::new(Tensor::randn(&[3, 4], test_opts()).unwrap(), "weight");
         let layer_a = Linear::from_shared_weight(shared.clone(), None);
         let layer_b = Linear::from_shared_weight(shared.clone(), None);
 

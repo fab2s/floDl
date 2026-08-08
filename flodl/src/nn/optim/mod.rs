@@ -9,19 +9,19 @@ use std::io::{Read, Write};
 
 use crate::tensor::Result;
 
-mod sgd;
-mod adam;
-mod rmsprop;
 mod adagrad;
-mod radam;
+mod adam;
 mod nadam;
+mod radam;
+mod rmsprop;
+mod sgd;
 
-pub use sgd::{SGD, SGDBuilder};
-pub use adam::{Adam, AdamBuilder, AdamW, AdamWBuilder};
-pub use rmsprop::{RMSprop, RMSpropBuilder};
 pub use adagrad::{Adagrad, AdagradBuilder};
-pub use radam::RAdam;
+pub use adam::{Adam, AdamBuilder, AdamW, AdamWBuilder};
 pub use nadam::NAdam;
+pub use radam::RAdam;
+pub use rmsprop::{RMSprop, RMSpropBuilder};
+pub use sgd::{SGD, SGDBuilder};
 
 /// Optimizer trait: step, zero gradients, and adjust learning rate.
 pub trait Optimizer {
@@ -211,9 +211,8 @@ pub(crate) const STATE_VERSION: u32 = 1;
 /// Write the state-file header for `kind`.
 fn write_state_header<W: Write>(w: &mut W, kind: StateKind) -> Result<()> {
     use crate::nn::checkpoint::write_u32_le;
-    w.write_all(&STATE_MAGIC).map_err(|e| {
-        crate::tensor::TensorError::new(&format!("io: {}", e))
-    })?;
+    w.write_all(&STATE_MAGIC)
+        .map_err(|e| crate::tensor::TensorError::new(&format!("io: {}", e)))?;
     write_u32_le(w, STATE_VERSION)?;
     write_u32_le(w, kind.tag())?;
     Ok(())
@@ -223,9 +222,8 @@ fn write_state_header<W: Write>(w: &mut W, kind: StateKind) -> Result<()> {
 fn read_state_header<R: Read>(r: &mut R, expected: StateKind, path: &str) -> Result<()> {
     use crate::nn::checkpoint::read_u32_le;
     let mut magic = [0u8; 4];
-    r.read_exact(&mut magic).map_err(|e| {
-        crate::tensor::TensorError::new(&format!("{path}: io: {}", e))
-    })?;
+    r.read_exact(&mut magic)
+        .map_err(|e| crate::tensor::TensorError::new(&format!("{path}: io: {}", e)))?;
     if magic != STATE_MAGIC {
         return Err(crate::tensor::TensorError::new(&format!(
             "{path}: not a current flodl optimizer state file (missing FDLO \
@@ -253,7 +251,8 @@ fn read_state_header<R: Read>(r: &mut R, expected: StateKind, path: &str) -> Res
     if found != expected {
         return Err(crate::tensor::TensorError::new(&format!(
             "{path}: state file was written by {} but is being loaded into {}",
-            found.name(), expected.name()
+            found.name(),
+            expected.name()
         )));
     }
     Ok(())
@@ -304,9 +303,8 @@ pub trait Stateful {
     /// [`migrate_optim_state_file`], and files written by a different
     /// optimizer are rejected by kind.
     fn load_state_file(&mut self, path: &str) -> Result<()> {
-        let f = std::fs::File::open(path).map_err(|e| {
-            crate::tensor::TensorError::new(&format!("io: {}", e))
-        })?;
+        let f = std::fs::File::open(path)
+            .map_err(|e| crate::tensor::TensorError::new(&format!("io: {}", e)))?;
         let expected = self.state_kind();
         if path.ends_with(".gz") {
             let mut r = flate2::read::GzDecoder::new(f);
@@ -339,7 +337,10 @@ pub trait Stateful {
 pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result<()> {
     use crate::nn::checkpoint::{read_u32_le, write_f64_le};
 
-    if matches!(kind, StateKind::Adagrad | StateKind::RAdam | StateKind::NAdam) {
+    if matches!(
+        kind,
+        StateKind::Adagrad | StateKind::RAdam | StateKind::NAdam
+    ) {
         return Err(crate::tensor::TensorError::new(&format!(
             "migrate_optim_state_file: {} had no serialized state format \
              before the FDLO header — nothing to migrate",
@@ -347,9 +348,8 @@ pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result
         )));
     }
 
-    let f = std::fs::File::open(src).map_err(|e| {
-        crate::tensor::TensorError::new(&format!("{src}: io: {}", e))
-    })?;
+    let f = std::fs::File::open(src)
+        .map_err(|e| crate::tensor::TensorError::new(&format!("{src}: io: {}", e)))?;
     let mut r: Box<dyn Read> = if src.ends_with(".gz") {
         Box::new(flate2::read::GzDecoder::new(f))
     } else {
@@ -361,9 +361,8 @@ pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result
     // of a weight-decay f64 (AdamW) or of a power-of-two scale (GradScaler)
     // — none of which collide with `FDLO`.
     let mut first = [0u8; 4];
-    r.read_exact(&mut first).map_err(|e| {
-        crate::tensor::TensorError::new(&format!("{src}: io: {}", e))
-    })?;
+    r.read_exact(&mut first)
+        .map_err(|e| crate::tensor::TensorError::new(&format!("{src}: io: {}", e)))?;
     if first == STATE_MAGIC {
         return Err(crate::tensor::TensorError::new(&format!(
             "migrate_optim_state_file: {src} already has the current FDLO \
@@ -371,20 +370,16 @@ pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result
         )));
     }
 
-    let io_err = |e: std::io::Error| {
-        crate::tensor::TensorError::new(&format!("io: {}", e))
-    };
+    let io_err = |e: std::io::Error| crate::tensor::TensorError::new(&format!("io: {}", e));
 
     // Transform the old Adam payload (count | lr | t | (m,v)* | groups)
     // into the current one (count | lr | (m,v,step)* | groups), expanding
     // the global t into per-param steps. `count` was already consumed by
     // the magic sniff.
-    fn migrate_adam_payload<R: Read, W: Write>(
-        r: &mut R, w: &mut W, count: u32,
-    ) -> Result<()> {
+    fn migrate_adam_payload<R: Read, W: Write>(r: &mut R, w: &mut W, count: u32) -> Result<()> {
         use crate::nn::checkpoint::{
-            read_f64_le, read_i64_le, read_tensor_state,
-            write_f64_le, write_i64_le, write_u32_le, write_tensor_state,
+            read_f64_le, read_i64_le, read_tensor_state, write_f64_le, write_i64_le,
+            write_tensor_state, write_u32_le,
         };
         write_u32_le(w, count)?;
         let lr = read_f64_le(r)?;
@@ -397,9 +392,7 @@ pub fn migrate_optim_state_file(src: &str, dst: &str, kind: StateKind) -> Result
             write_tensor_state(w, v.as_ref())?;
             write_i64_le(w, t)?;
         }
-        std::io::copy(r, w).map_err(|e| {
-            crate::tensor::TensorError::new(&format!("io: {}", e))
-        })?;
+        std::io::copy(r, w).map_err(|e| crate::tensor::TensorError::new(&format!("io: {}", e)))?;
         Ok(())
     }
 
@@ -438,10 +431,14 @@ mod test_helpers {
     use crate::tensor::{Tensor, TensorOptions};
 
     pub(super) fn make_param(name: &str, shape: &[i64]) -> Parameter {
-        let t = Tensor::randn(shape, TensorOptions {
-            dtype: crate::tensor::DType::Float32,
-            device: crate::tensor::test_device(),
-        }).unwrap();
+        let t = Tensor::randn(
+            shape,
+            TensorOptions {
+                dtype: crate::tensor::DType::Float32,
+                device: crate::tensor::test_device(),
+            },
+        )
+        .unwrap();
         Parameter::new(t, name)
     }
 
@@ -456,8 +453,8 @@ mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_helpers::make_param;
+    use super::*;
     use crate::nn::parameter::Parameter;
 
     #[test]
@@ -507,7 +504,12 @@ mod tests {
 
         let vals = p.variable.data().to_f32_vec().unwrap();
         for (i, &v) in vals.iter().enumerate() {
-            assert!(v.is_finite(), "param[{}] should be finite after step-without-backward: {}", i, v);
+            assert!(
+                v.is_finite(),
+                "param[{}] should be finite after step-without-backward: {}",
+                i,
+                v
+            );
         }
     }
 

@@ -75,7 +75,11 @@ fn xlm_roberta_parity_vs_pytorch_live() {
     let out = graph
         .forward_multi(&[input_ids, token_type_ids, attention_mask])
         .unwrap();
-    assert_eq!(out.shape(), pooler_ref_shape, "pooler_output shape mismatch");
+    assert_eq!(
+        out.shape(),
+        pooler_ref_shape,
+        "pooler_output shape mismatch"
+    );
 
     let actual = out.data().to_f32_vec().unwrap();
     let diff = max_abs_diff(&actual, &pooler_ref_data);

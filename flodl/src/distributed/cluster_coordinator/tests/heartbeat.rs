@@ -70,7 +70,8 @@ fn heartbeat_stale_declares_rank_dead_and_unblocks_should_average() {
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0, data_ms: 0.0,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 0.5,
@@ -189,7 +190,14 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
                 // frame only arrives after rank 2 is detected dead (~1s),
                 // well past the 1s heartbeat timeout. (send errors mean the
                 // peer is already gone; the recv below surfaces the EOF.)
-                let _ = send_timing(s, salt, TimingMsgWire::Heartbeat { rank, step_count: 1 });
+                let _ = send_timing(
+                    s,
+                    salt,
+                    TimingMsgWire::Heartbeat {
+                        rank,
+                        step_count: 1,
+                    },
+                );
                 s.set_read_timeout(Some(Duration::from_millis(200))).ok();
                 match recv_frame(s, salt) {
                     Ok(Some(frame)) => match frame.decode::<ControlMsgWire>() {
@@ -200,7 +208,8 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
                                 salt,
                                 TimingMsgWire::Batch {
                                     rank,
-                                    batch_ms: 5.0, data_ms: 0.0,
+                                    batch_ms: 5.0,
+                                    data_ms: 0.0,
                                     step_count: 1,
                                     param_norm: None,
                                     batch_loss: 0.1,
@@ -208,10 +217,7 @@ fn dead_rank_remainder_redistributed_via_extend_partition() {
                                 },
                             )?;
                         }
-                        Ok(ControlMsgWire::ExtendPartition {
-                            partition_size,
-                            ..
-                        }) => {
+                        Ok(ControlMsgWire::ExtendPartition { partition_size, .. }) => {
                             acc.fetch_add(partition_size, Ordering::SeqCst);
                         }
                         Ok(_other) => {
@@ -332,17 +338,14 @@ fn observe_meta_runs_during_averaging_cycle_no_anchor_change_in_probe() {
     let body = |rank: u32| {
         let rank = rank as u64;
         move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
-            send_timing(
-                s,
-                salt,
-                TimingMsgWire::LrUpdate { rank, lr: 0.01 },
-            )?;
+            send_timing(s, salt, TimingMsgWire::LrUpdate { rank, lr: 0.01 })?;
             send_timing(
                 s,
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0, data_ms: 0.0,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 1.0,
@@ -370,7 +373,10 @@ fn observe_meta_runs_during_averaging_cycle_no_anchor_change_in_probe() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
     r0.join().unwrap().expect("rank 0 path");
     r1.join().unwrap().expect("rank 1 path");
-    coord_handle.join().unwrap().expect("coord cycle 1 with meta on");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord cycle 1 with meta on");
 }
 
 #[test]
@@ -381,8 +387,7 @@ fn max_failure_threshold_breach_dispatches_shutdown_with_save() {
     // coord broadcasts ShutdownWithSave to every rank, and the
     // dispatched flag flips.
     let world_size = 3;
-    let dead_ranks =
-        crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
     let dead_for_coord = Arc::clone(&dead_ranks);
     let (port, coord_handle) = spawn_coord(
         world_size,
@@ -396,9 +401,7 @@ fn max_failure_threshold_breach_dispatches_shutdown_with_save() {
             .no_divergence_guard()
             .dead_ranks(dead_for_coord)
             .heartbeat_timeout_secs(1)
-            .max_failure(
-                crate::distributed::max_failure::MaxFailureThreshold::Absolute(1),
-            )
+            .max_failure(crate::distributed::max_failure::MaxFailureThreshold::Absolute(1))
         },
         |coord| {
             let start = Instant::now();
@@ -415,10 +418,7 @@ fn max_failure_threshold_breach_dispatches_shutdown_with_save() {
         },
     );
 
-    fn drain_shutdown_with_save(
-        s: &mut TcpStream,
-        salt: &SessionSalt,
-    ) -> Result<()> {
+    fn drain_shutdown_with_save(s: &mut TcpStream, salt: &SessionSalt) -> Result<()> {
         // Bound the wait — the coord's heartbeat_timeout=1s means
         // dispatch lands ~1.0-1.5s after handshake.
         s.set_read_timeout(Some(Duration::from_secs(5)))
@@ -462,10 +462,19 @@ fn max_failure_threshold_breach_dispatches_shutdown_with_save() {
         TEST_SALT,
         drain_shutdown_with_save,
     );
-    r0.join().unwrap().expect("rank 0 receives ShutdownWithSave");
-    r1.join().unwrap().expect("rank 1 receives ShutdownWithSave");
-    r2.join().unwrap().expect("rank 2 receives ShutdownWithSave");
-    coord_handle.join().unwrap().expect("coord dispatched broadcast");
+    r0.join()
+        .unwrap()
+        .expect("rank 0 receives ShutdownWithSave");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 receives ShutdownWithSave");
+    r2.join()
+        .unwrap()
+        .expect("rank 2 receives ShutdownWithSave");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord dispatched broadcast");
 }
 
 #[test]
@@ -479,16 +488,12 @@ fn controller_writes_meta_json_on_shutdown_with_save() {
     // the worker-side `shutdown_with_save_writes_model_and_optim_*`
     // test) — only `.meta.json` is asserted here.
     let world_size = 3;
-    let dir = std::env::temp_dir().join(format!(
-        "flodl_coord_meta_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("flodl_coord_meta_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("coord_ckpt");
     let stem_str = stem.to_str().unwrap().to_string();
 
-    let dead_ranks =
-        crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
     let dead_for_coord = Arc::clone(&dead_ranks);
     let stem_for_coord = stem_str.clone();
     let (port, coord_handle) = spawn_coord(
@@ -503,9 +508,7 @@ fn controller_writes_meta_json_on_shutdown_with_save() {
             .no_divergence_guard()
             .dead_ranks(dead_for_coord)
             .heartbeat_timeout_secs(1)
-            .max_failure(
-                crate::distributed::max_failure::MaxFailureThreshold::Absolute(1),
-            )
+            .max_failure(crate::distributed::max_failure::MaxFailureThreshold::Absolute(1))
             .save_path(stem_for_coord.clone())
         },
         |coord| {
@@ -564,16 +567,14 @@ fn controller_writes_meta_json_on_shutdown_with_save() {
     r2.join().unwrap().expect("rank 2 path");
     coord_handle.join().unwrap().expect("coord dispatched");
 
-    let meta_path =
-        crate::distributed::CheckpointBundle::meta_path(&stem_str);
+    let meta_path = crate::distributed::CheckpointBundle::meta_path(&stem_str);
     assert!(
         meta_path.exists(),
         "controller meta.json missing at {}",
         meta_path.display(),
     );
-    let meta =
-        crate::distributed::CheckpointMeta::read_from_file(&meta_path)
-            .expect("controller-written meta parses");
+    let meta = crate::distributed::CheckpointMeta::read_from_file(&meta_path)
+        .expect("controller-written meta parses");
     assert_eq!(meta.world_size_at_save, world_size);
     assert_eq!(
         meta.save_reason,
@@ -648,7 +649,9 @@ fn rendezvous_retry_picks_next_survivor_on_generator_death() {
     let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
 
     r0.join().unwrap().expect("rank 0 handshake");
-    r1.join().unwrap().expect("rank 1 receives RequestNewNcclId");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 receives RequestNewNcclId");
     r2.join().unwrap().expect("rank 2 handshake");
     coord_handle.join().unwrap().expect("coord drives clean");
 }
@@ -699,7 +702,9 @@ fn rendezvous_retry_fires_on_timeout_without_death() {
     let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, |_s, _salt| Ok(()));
 
     r0.join().unwrap().expect("rank 0 handshake");
-    r1.join().unwrap().expect("rank 1 receives RequestNewNcclId on timeout");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 receives RequestNewNcclId on timeout");
     r2.join().unwrap().expect("rank 2 handshake");
     coord_handle.join().unwrap().expect("coord drives clean");
 }
@@ -714,10 +719,7 @@ fn rendezvous_retry_fires_on_timeout_without_death() {
 fn rendezvous_exhaustion_dispatches_shutdown_with_save() {
     let world_size = 3;
 
-    let dir = std::env::temp_dir().join(format!(
-        "flodl_rdv_exhaust_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("flodl_rdv_exhaust_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("ckpt").to_string_lossy().into_owned();
 
@@ -732,11 +734,7 @@ fn rendezvous_exhaustion_dispatches_shutdown_with_save() {
         move |coord| {
             // initiated 10s ago → timed_out=true; empty survivor
             // pool → no next candidate → exhaustion branch fires.
-            coord.test_seed_rendezvous_pending(
-                0,
-                Vec::new(),
-                10,
-            );
+            coord.test_seed_rendezvous_pending(0, Vec::new(), 10);
             coord.tick()?;
             assert!(
                 coord.rendezvous_pending_generator().is_none(),
@@ -765,9 +763,15 @@ fn rendezvous_exhaustion_dispatches_shutdown_with_save() {
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, drain_shutdown);
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, drain_shutdown);
     let r2 = fake_rank(port, 2, world_size as u32, TEST_SALT, drain_shutdown);
-    r0.join().unwrap().expect("rank 0 receives ShutdownWithSave");
-    r1.join().unwrap().expect("rank 1 receives ShutdownWithSave");
-    r2.join().unwrap().expect("rank 2 receives ShutdownWithSave");
+    r0.join()
+        .unwrap()
+        .expect("rank 0 receives ShutdownWithSave");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 receives ShutdownWithSave");
+    r2.join()
+        .unwrap()
+        .expect("rank 2 receives ShutdownWithSave");
     coord_handle.join().unwrap().expect("coord drives clean");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -784,10 +788,12 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
     let num_epochs = 2;
     let (port, coord_handle) = spawn_coord(
         world_size,
-        move || cfg_sync_cpu(world_size)
-            .total_samples(8)
-            .batch_size(4)
-            .num_epochs(num_epochs),
+        move || {
+            cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(num_epochs)
+        },
         move |coord| {
             coord.dispatch_epoch(0)?;
             let start = Instant::now();
@@ -798,9 +804,7 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
             // when ranks exit, `is_finished()` flips, alive=false.
             loop {
                 if start.elapsed() > Duration::from_secs(10) {
-                    return Err(TensorError::new(
-                        "coord did not drain within 10s",
-                    ));
+                    return Err(TensorError::new("coord did not drain within 10s"));
                 }
                 if !coord.tick()? {
                     break;
@@ -827,23 +831,26 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
                 let msg = recv_control(s, salt)?;
                 match msg {
                     ControlMsgWire::StartEpoch(plan) => {
-                        send_metrics(s, salt, MetricsMsgWire {
-                            rank,
-                            epoch: plan.epoch,
-                            avg_loss: 0.5,
-                            batches_processed: 2,
-                            epoch_ms: 50.0,
-                            samples_processed: 4,
-                            share_complete_ms: 0.0,
-                            compute_only_ms: 50.0,
-                            data_starve_ms: 0.0,
-                            scalars: std::collections::HashMap::new(),
-                            resources: None,
-                        })?;
+                        send_metrics(
+                            s,
+                            salt,
+                            MetricsMsgWire {
+                                rank,
+                                epoch: plan.epoch,
+                                avg_loss: 0.5,
+                                batches_processed: 2,
+                                epoch_ms: 50.0,
+                                samples_processed: 4,
+                                share_complete_ms: 0.0,
+                                compute_only_ms: 50.0,
+                                data_starve_ms: 0.0,
+                                scalars: std::collections::HashMap::new(),
+                                resources: None,
+                            },
+                        )?;
                         completed += 1;
                     }
-                    ControlMsgWire::Shutdown
-                    | ControlMsgWire::ShutdownWithSave { .. } => {
+                    ControlMsgWire::Shutdown | ControlMsgWire::ShutdownWithSave { .. } => {
                         saw_shutdown = true;
                     }
                     // SetEpochCallbackRole / EpochAggregated / any
@@ -861,13 +868,26 @@ fn epoch_transition_dispatches_next_then_shutdowns_at_horizon() {
             Ok(())
         }
     }
-    let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT,
-        rank_body(0, num_epochs));
-    let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT,
-        rank_body(1, num_epochs));
+    let r0 = fake_rank(
+        port,
+        0,
+        world_size as u32,
+        TEST_SALT,
+        rank_body(0, num_epochs),
+    );
+    let r1 = fake_rank(
+        port,
+        1,
+        world_size as u32,
+        TEST_SALT,
+        rank_body(1, num_epochs),
+    );
     r0.join().unwrap().expect("rank 0 completed all epochs");
     r1.join().unwrap().expect("rank 1 completed all epochs");
-    coord_handle.join().unwrap().expect("coord finishes cleanly");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord finishes cleanly");
 }
 
 /// Externally-reported death (launcher child supervision) takes the
@@ -905,9 +925,7 @@ fn reported_death_declared_via_drain_and_cycle_completes() {
             let start = Instant::now();
             while coord.avg_count() == 0 {
                 if start.elapsed() > Duration::from_secs(10) {
-                    return Err(TensorError::new(
-                        "reported_death: avg_count never advanced",
-                    ));
+                    return Err(TensorError::new("reported_death: avg_count never advanced"));
                 }
                 coord.tick()?;
                 thread::sleep(Duration::from_millis(20));
@@ -941,7 +959,8 @@ fn reported_death_declared_via_drain_and_cycle_completes() {
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0, data_ms: 0.0,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 0.5,
@@ -1074,7 +1093,8 @@ fn exiting_latch_suppresses_late_death_report_exactly_once() {
                 salt,
                 TimingMsgWire::Batch {
                     rank,
-                    batch_ms: 10.0, data_ms: 0.0,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
                     step_count: 1,
                     param_norm: None,
                     batch_loss: 0.5,

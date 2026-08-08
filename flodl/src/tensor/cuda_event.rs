@@ -24,7 +24,7 @@ use std::ptr;
 
 use flodl_sys as ffi;
 
-use crate::tensor::{check_err, Result};
+use crate::tensor::{Result, check_err};
 
 /// Flags controlling CUDA event behavior.
 #[derive(Clone, Copy, Debug)]
@@ -63,9 +63,7 @@ impl GpuEvent {
 
     /// Record this event on a specific CUDA stream.
     pub fn record_on(&self, stream: &super::cuda_stream::GpuStream) -> Result<()> {
-        let err = unsafe {
-            ffi::flodl_gpu_event_record_on_stream(self.ptr, stream.as_ptr())
-        };
+        let err = unsafe { ffi::flodl_gpu_event_record_on_stream(self.ptr, stream.as_ptr()) };
         check_err(err)
     }
 
@@ -86,9 +84,7 @@ impl GpuEvent {
     /// (timing enabled) and both must have been recorded and completed.
     pub fn elapsed_time(start: &GpuEvent, end: &GpuEvent) -> Result<f32> {
         let mut ms: f32 = 0.0;
-        let err = unsafe {
-            ffi::flodl_gpu_event_elapsed_time(start.ptr, end.ptr, &mut ms)
-        };
+        let err = unsafe { ffi::flodl_gpu_event_elapsed_time(start.ptr, end.ptr, &mut ms) };
         check_err(err)?;
         Ok(ms)
     }
@@ -122,7 +118,10 @@ mod tests {
             assert!(GpuEvent::new(GpuEventFlags::Default).is_ok());
         } else {
             let result = GpuEvent::new(GpuEventFlags::Default);
-            assert!(result.is_err(), "GpuEvent::new() should fail on a CPU build");
+            assert!(
+                result.is_err(),
+                "GpuEvent::new() should fail on a CPU build"
+            );
         }
     }
 
@@ -144,7 +143,10 @@ mod tests {
 
         event.record().unwrap();
         event.synchronize().unwrap();
-        assert!(event.is_complete(), "event should be complete after synchronize");
+        assert!(
+            event.is_complete(),
+            "event should be complete after synchronize"
+        );
     }
 
     #[test]
@@ -187,6 +189,9 @@ mod tests {
         end.synchronize().unwrap();
 
         let result = GpuEvent::elapsed_time(&start, &end);
-        assert!(result.is_err(), "elapsed_time should fail with DisableTiming events");
+        assert!(
+            result.is_err(),
+            "elapsed_time should fail with DisableTiming events"
+        );
     }
 }

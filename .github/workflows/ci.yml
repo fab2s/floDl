@@ -120,7 +120,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      # Formatting is rustfmt's from 2026-08-08, and this keeps it that
+      # way. Adopted for a concrete reason rather than conformity:
+      # `cargo clippy --fix` applies span-based text edits and leaves
+      # layout to rustfmt by design, so on a hand-formatted tree it
+      # produces correct code at the wrong indentation and every
+      # mechanical fix needs a manual pass afterwards. With rustfmt in the
+      # loop those tools work end to end. Runs before the libtorch
+      # download, so a formatting failure costs seconds.
+      - name: Formatting
+        run: cargo fmt --all --check
 
       - name: Cache cargo registry + build artifacts
         uses: actions/cache@v4

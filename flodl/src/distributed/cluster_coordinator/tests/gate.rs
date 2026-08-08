@@ -287,9 +287,10 @@ fn slot_zero_final_window_rank_does_not_block_the_gate() {
     let sizes: Vec<usize> = (0..world_size)
         .map(|r| coord.compute_chunk_batches_for_test(r, 0))
         .collect();
-    let zero = sizes.iter().position(|&n| n == 0).expect(
-        "precondition: the plan consolidates a lone-1 into a 0-slot sit-out",
-    );
+    let zero = sizes
+        .iter()
+        .position(|&n| n == 0)
+        .expect("precondition: the plan consolidates a lone-1 into a 0-slot sit-out");
     let mover = 1 - zero;
     let counts = coord.el_che_for_test().batch_counts().to_vec();
 
@@ -342,7 +343,11 @@ fn stale_final_window_plan_repins_when_counts_change() {
     let before: Vec<usize> = (0..world_size)
         .map(|r| coord.compute_chunk_batches_for_test(r, 0))
         .collect();
-    assert_eq!(before.iter().sum::<usize>(), 4, "coverage exact: {before:?}");
+    assert_eq!(
+        before.iter().sum::<usize>(),
+        4,
+        "coverage exact: {before:?}"
+    );
 
     // The schedule changes underneath the pin (what a mid-epoch anchor
     // commit does): rank 0 measures far faster, recompute skews counts.

@@ -1,8 +1,8 @@
 use crate::autograd::{Variable, layer_norm};
-use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
+use crate::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
-use super::parameter::Parameter;
 use super::Module;
+use super::parameter::Parameter;
 
 /// Layer normalization over the last dimension.
 ///
@@ -42,7 +42,10 @@ impl LayerNorm {
 
     /// Create a LayerNorm on a specific device with a custom epsilon.
     pub fn on_device_with_eps(size: i64, eps: f64, device: Device) -> Result<Self> {
-        let opts = TensorOptions { dtype: DType::Float32, device };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device,
+        };
         let weight = Variable::new(Tensor::ones(&[size], opts)?, true);
         let bias = Variable::new(Tensor::zeros(&[size], opts)?, true);
 
@@ -62,10 +65,18 @@ impl LayerNorm {
 }
 
 impl Module for LayerNorm {
-    fn name(&self) -> &str { "layernorm" }
+    fn name(&self) -> &str {
+        "layernorm"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        layer_norm(input, &self.weight.variable, &self.bias.variable, self.size, self.eps)
+        layer_norm(
+            input,
+            &self.weight.variable,
+            &self.bias.variable,
+            self.size,
+            self.eps,
+        )
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -81,9 +92,7 @@ mod tests {
     #[test]
     fn test_layernorm_forward_shape() {
         let ln = LayerNorm::on_device(8, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[2, 8], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 8], test_opts()).unwrap(), false);
         let y = ln.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 8]);
     }
@@ -105,9 +114,7 @@ mod tests {
     #[test]
     fn test_layernorm_3d_input() {
         let ln = LayerNorm::on_device(16, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[2, 5, 16], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 5, 16], test_opts()).unwrap(), false);
         let y = ln.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 5, 16]);
     }
@@ -115,9 +122,7 @@ mod tests {
     #[test]
     fn test_layernorm_gradient() {
         let ln = LayerNorm::on_device(8, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[4, 8], test_opts()).unwrap(), true,
-        );
+        let x = Variable::new(Tensor::randn(&[4, 8], test_opts()).unwrap(), true);
         let y = ln.forward(&x).unwrap().sum().unwrap();
         y.backward().unwrap();
         assert!(x.grad().is_some());
@@ -141,18 +146,22 @@ mod tests {
         let y_def = ln_def.forward(&x).unwrap().data().to_f32_vec().unwrap();
         // Default eps gives a properly normalized output (std ~= 1).
         let std_def = (y_def.iter().map(|v| v * v).sum::<f32>() / y_def.len() as f32).sqrt();
-        assert!((std_def - 1.0).abs() < 0.2, "default-eps std ~1, got {std_def}");
+        assert!(
+            (std_def - 1.0).abs() < 0.2,
+            "default-eps std ~1, got {std_def}"
+        );
         // Huge eps collapses the scaling: output magnitude << default.
         let max_huge = y_huge.iter().fold(0.0_f32, |a, &b| a.max(b.abs()));
-        assert!(max_huge < 0.01, "huge-eps output should be tiny, got max {max_huge}");
+        assert!(
+            max_huge < 0.01,
+            "huge-eps output should be tiny, got max {max_huge}"
+        );
     }
 
     #[test]
     fn test_layernorm_bert_eps_constructor() {
         let ln = LayerNorm::on_device_with_eps(8, 1e-12, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[2, 8], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 8], test_opts()).unwrap(), false);
         // Smoke: constructor wires through and forward runs without panic.
         let y = ln.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 8]);
@@ -175,12 +184,14 @@ mod tests {
         let expected = [
             -1.341_640_8_f32,
             -0.447_213_6_f32,
-             0.447_213_6_f32,
-             1.341_640_8_f32,
+            0.447_213_6_f32,
+            1.341_640_8_f32,
         ];
         for (i, (got, exp)) in y.iter().zip(expected.iter()).enumerate() {
-            assert!((got - exp).abs() < 1e-5,
-                "bert-eps layernorm dim {i}: got {got}, expected {exp}");
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "bert-eps layernorm dim {i}: got {got}, expected {exp}"
+            );
         }
     }
 

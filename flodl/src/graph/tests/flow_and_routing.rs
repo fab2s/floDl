@@ -162,7 +162,11 @@ fn test_forward_ref_reset_state() {
     graph.reset_state();
     let y_after = graph.forward(&x).unwrap();
     let d_after = y_after.data().to_f32_vec().unwrap();
-    assert!((d_after[0] - 1.0).abs() < 1e-5, "after reset: got {}", d_after[0]);
+    assert!(
+        (d_after[0] - 1.0).abs() < 1e-5,
+        "after reset: got {}",
+        d_after[0]
+    );
 }
 
 #[test]
@@ -187,7 +191,11 @@ fn test_forward_ref_detach_state() {
     // State should still have values (not reset)
     let y2 = graph.forward(&x).unwrap();
     let d2 = y2.data().to_f32_vec().unwrap();
-    assert!((d2[0] - 2.0).abs() < 1e-5, "detach preserves values: got {}", d2[0]);
+    assert!(
+        (d2[0] - 2.0).abs() < 1e-5,
+        "detach preserves values: got {}",
+        d2[0]
+    );
 }
 
 #[test]
@@ -208,7 +216,11 @@ fn test_forward_ref_backward() {
 
     assert!(x.grad().is_some(), "input should have gradient");
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -258,38 +270,63 @@ fn test_forward_ref_mixed_refs() {
 fn test_switch_selects_branch() {
     // Branch 0: double, Branch 1: triple. Router selects branch 1.
     let graph = FlowBuilder::from(Identity)
-        .switch(FixedSelector::new(1), vec![Box::new(Doubler), Box::new(Tripler)])
+        .switch(
+            FixedSelector::new(1),
+            vec![Box::new(Doubler), Box::new(Tripler)],
+        )
         .build()
         .unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
     let y = graph.forward(&x).unwrap();
     let data = y.data().to_f32_vec().unwrap();
-    assert!((data[0] - 3.0).abs() < 1e-5, "triple [1]=3, got {}", data[0]);
-    assert!((data[1] - 6.0).abs() < 1e-5, "triple [2]=6, got {}", data[1]);
+    assert!(
+        (data[0] - 3.0).abs() < 1e-5,
+        "triple [1]=3, got {}",
+        data[0]
+    );
+    assert!(
+        (data[1] - 6.0).abs() < 1e-5,
+        "triple [2]=6, got {}",
+        data[1]
+    );
 }
 
 #[test]
 fn test_switch_branch0() {
     let graph = FlowBuilder::from(Identity)
-        .switch(FixedSelector::new(0), vec![Box::new(Doubler), Box::new(Tripler)])
+        .switch(
+            FixedSelector::new(0),
+            vec![Box::new(Doubler), Box::new(Tripler)],
+        )
         .build()
         .unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
     let y = graph.forward(&x).unwrap();
     let data = y.data().to_f32_vec().unwrap();
-    assert!((data[0] - 2.0).abs() < 1e-5, "double [1]=2, got {}", data[0]);
-    assert!((data[1] - 4.0).abs() < 1e-5, "double [2]=4, got {}", data[1]);
+    assert!(
+        (data[0] - 2.0).abs() < 1e-5,
+        "double [1]=2, got {}",
+        data[0]
+    );
+    assert!(
+        (data[1] - 4.0).abs() < 1e-5,
+        "double [2]=4, got {}",
+        data[1]
+    );
 }
 
 #[test]
 fn test_switch_backward() {
     let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
-        .switch(FixedSelector::new(0), vec![
-            Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
-            Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
-        ])
+        .switch(
+            FixedSelector::new(0),
+            vec![
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+                Box::new(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap()),
+            ],
+        )
         .build()
         .unwrap();
 
@@ -335,7 +372,9 @@ impl Module for EqualRouter {
             false,
         ))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 #[test]
@@ -379,7 +418,9 @@ impl Module for RowRouter {
         }
         Ok(Variable::new(from_f32(&w, &[rows, 2]), false))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 #[test]
@@ -397,7 +438,11 @@ fn test_gate_weights_are_per_sample() {
     // Swapping the rows' weights would give 2.25x / 2.75x instead.
     let d = y.data().to_f32_vec().unwrap();
     for (i, want) in [2.75, 5.5, 22.5, 45.0].iter().enumerate() {
-        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-4,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -410,11 +455,25 @@ fn test_gate_backward_batched() {
         .unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
-    graph.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+    graph
+        .forward(&x)
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward()
+        .unwrap();
 
-    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    let g = x
+        .grad()
+        .expect("input must receive gradient")
+        .to_f32_vec()
+        .unwrap();
     for (i, want) in [2.75, 2.75, 2.25, 2.25].iter().enumerate() {
-        assert!((g[i] - want).abs() < 1e-4, "elem {i} grad: want {want}, got {}", g[i]);
+        assert!(
+            (g[i] - want).abs() < 1e-4,
+            "elem {i} grad: want {want}, got {}",
+            g[i]
+        );
     }
 }
 
@@ -435,7 +494,11 @@ fn test_threshold_halt_batched_is_whole_batch() {
     let y = graph.forward(&x).unwrap();
     let d = y.data().to_f32_vec().unwrap();
     for (i, want) in [1.0, 2.0, 60.0, 70.0].iter().enumerate() {
-        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-5,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -459,7 +522,11 @@ fn test_gate_backward() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -482,7 +549,6 @@ fn test_gate_parameters() {
 }
 
 // --- Map tests ---
-
 
 #[test]
 fn test_softmax_router_gate() {
@@ -547,7 +613,10 @@ fn test_sigmoid_router_gate() {
 fn test_fixed_selector_switch() {
     // FixedSelector(1) always picks branch 1 (Tripler)
     let graph = FlowBuilder::from(Identity)
-        .switch(FixedSelector::new(1), vec![Box::new(Doubler), Box::new(Tripler)])
+        .switch(
+            FixedSelector::new(1),
+            vec![Box::new(Doubler), Box::new(Tripler)],
+        )
         .build()
         .unwrap();
 
@@ -591,17 +660,23 @@ impl Module for SignSelector {
             .collect();
         Ok(Variable::new(from_f32(&idx, &[rows]), false))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 /// Emits `count` indices regardless of the stream's row count.
-struct BadCountSelector { count: i64 }
+struct BadCountSelector {
+    count: i64,
+}
 impl Module for BadCountSelector {
     fn forward(&self, _input: &Variable) -> Result<Variable> {
         let idx = vec![0.0f32; self.count as usize];
         Ok(Variable::new(from_f32(&idx, &[self.count]), false))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 /// Emits a per-row index that names a branch that does not exist.
@@ -613,7 +688,9 @@ impl Module for OutOfRangeSelector {
         idx[1] = 7.0; // row 1 asks for branch 7
         Ok(Variable::new(from_f32(&idx, &[rows]), false))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 #[test]
@@ -635,9 +712,9 @@ fn test_switch_per_sample_dispatch() {
     let d = y.data().to_f32_vec().unwrap();
     let expect = [
         -2.0, -4.0, // row 0: doubled
-        3.0, 6.0,   // row 1: tripled
+        3.0, 6.0, // row 1: tripled
         -6.0, -8.0, // row 2: doubled
-        9.0, 12.0,  // row 3: tripled
+        9.0, 12.0, // row 3: tripled
     ];
     for (i, want) in expect.iter().enumerate() {
         assert!(
@@ -660,7 +737,11 @@ fn test_switch_per_sample_gradient() {
     let y = graph.forward(&x).unwrap();
     y.sum().unwrap().backward().unwrap();
 
-    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    let g = x
+        .grad()
+        .expect("input must receive gradient")
+        .to_f32_vec()
+        .unwrap();
     // Row 0 went through Doubler (d/dx = 2), row 1 through Tripler (d/dx = 3).
     assert!((g[0] - 2.0).abs() < 1e-5, "row 0 grad: got {}", g[0]);
     assert!((g[1] - 2.0).abs() < 1e-5, "row 0 grad: got {}", g[1]);
@@ -676,8 +757,8 @@ fn test_argmax_selector_emits_one_index_per_sample() {
     let x = Variable::new(
         from_f32(
             &[
-                1.0, 2.0, 3.0, -1.0, -2.0, -3.0, 0.5, 0.0, -0.5, 4.0, -4.0, 1.0, 2.0,
-                2.0, 2.0, -1.0, 3.0, 0.0,
+                1.0, 2.0, 3.0, -1.0, -2.0, -3.0, 0.5, 0.0, -0.5, 4.0, -4.0, 1.0, 2.0, 2.0, 2.0,
+                -1.0, 3.0, 0.0,
             ],
             &[6, 3],
         ),
@@ -685,7 +766,11 @@ fn test_argmax_selector_emits_one_index_per_sample() {
     );
 
     let out = sel.forward(&x).unwrap();
-    assert_eq!(out.data().numel(), 6, "one branch index per row, not one flat index");
+    assert_eq!(
+        out.data().numel(),
+        6,
+        "one branch index per row, not one flat index"
+    );
     for v in out.data().to_f64_vec().unwrap() {
         assert!((0.0..2.0).contains(&v), "branch index {v} outside [0, 2)");
     }
@@ -711,7 +796,11 @@ fn test_argmax_selector_switch_batched() {
         false,
     );
     let y = graph.forward(&x).unwrap();
-    assert_eq!(y.shape(), vec![32, 8], "every input row must yield one output row");
+    assert_eq!(
+        y.shape(),
+        vec![32, 8],
+        "every input row must yield one output row"
+    );
 }
 
 #[test]
@@ -774,7 +863,6 @@ fn test_argmax_selector_accepts_using_refs() {
 
 // --- Halt tests ---
 
-
 #[test]
 fn test_threshold_halt_while() {
     // body = Doubler, halt when max > 10
@@ -790,7 +878,11 @@ fn test_threshold_halt_while() {
     let data = y.data().to_f32_vec().unwrap();
     // Should stop at [8, 16] (max=16 > 10)
     assert!((data[0] - 8.0).abs() < 1e-5, "expected 8, got {}", data[0]);
-    assert!((data[1] - 16.0).abs() < 1e-5, "expected 16, got {}", data[1]);
+    assert!(
+        (data[1] - 16.0).abs() < 1e-5,
+        "expected 16, got {}",
+        data[1]
+    );
 }
 
 #[test]
@@ -810,7 +902,11 @@ fn test_threshold_halt_until() {
     let data = y.data().to_f32_vec().unwrap();
     // Should stop at [8, 16] (max=16 > 10)
     assert!((data[0] - 8.0).abs() < 1e-5, "expected 8, got {}", data[0]);
-    assert!((data[1] - 16.0).abs() < 1e-5, "expected 16, got {}", data[1]);
+    assert!(
+        (data[1] - 16.0).abs() < 1e-5,
+        "expected 16, got {}",
+        data[1]
+    );
 }
 
 #[test]
@@ -834,7 +930,10 @@ fn test_threshold_halt_immediate() {
 fn test_learned_halt_parameters() {
     let graph = FlowBuilder::from(Identity)
         .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
-        .until_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 5)
+        .until_cond(
+            LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(),
+            5,
+        )
         .build()
         .unwrap();
 
@@ -848,9 +947,14 @@ struct PerRowHalt;
 impl Module for PerRowHalt {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let rows = input.shape()[0];
-        Ok(Variable::new(from_f32(&vec![-1.0; rows as usize], &[rows]), false))
+        Ok(Variable::new(
+            from_f32(&vec![-1.0; rows as usize], &[rows]),
+            false,
+        ))
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
 
 #[test]
@@ -872,7 +976,10 @@ fn test_learned_halt_pools_batched_state() {
 fn test_learned_halt_loop_runs_batched() {
     let graph = FlowBuilder::from(Identity)
         .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
-        .while_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 3)
+        .while_cond(
+            LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(),
+            3,
+        )
         .build()
         .unwrap();
 
@@ -920,7 +1027,10 @@ fn test_loop_until_batched_pooled_halt() {
     // The until path with a batched state and a pooling condition.
     let graph = FlowBuilder::from(Identity)
         .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
-        .until_cond(LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(), 3)
+        .until_cond(
+            LearnedHalt::on_device(2, crate::tensor::test_device()).unwrap(),
+            3,
+        )
         .build()
         .unwrap();
 
@@ -928,4 +1038,3 @@ fn test_loop_until_batched_pooled_halt() {
     let y = graph.forward(&x).unwrap();
     assert_eq!(y.shape(), vec![3, 2]);
 }
-

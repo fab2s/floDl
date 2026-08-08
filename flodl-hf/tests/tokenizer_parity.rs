@@ -17,8 +17,8 @@ const FIXTURE: &str = "tests/fixtures/bert_base_uncased_parity.safetensors";
 #[test]
 #[ignore = "network"]
 fn bert_tokenizer_matches_parity_fixture_live() {
-    let bytes = std::fs::read(Path::new(FIXTURE))
-        .unwrap_or_else(|e| panic!("reading {FIXTURE}: {e}"));
+    let bytes =
+        std::fs::read(Path::new(FIXTURE)).unwrap_or_else(|e| panic!("reading {FIXTURE}: {e}"));
     let st = SafeTensors::deserialize(&bytes).expect("parse parity fixture");
 
     let view = st.tensor("inputs.input_ids").unwrap();

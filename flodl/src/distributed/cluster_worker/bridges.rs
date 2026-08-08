@@ -105,9 +105,7 @@ pub(super) fn inbound_loop(
                         return;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "cluster_worker: inbound r{rank} ControlFrame parse: {e}"
-                        );
+                        eprintln!("cluster_worker: inbound r{rank} ControlFrame parse: {e}");
                         if !clean_shutdown_seen {
                             poison_peers();
                         }
@@ -119,128 +117,124 @@ pub(super) fn inbound_loop(
                 // liveness deadline (covers CoordHeartbeat AND real traffic).
                 last_inbound = std::time::Instant::now();
                 match frame.kind {
-                MsgKind::Control => match frame.decode::<ControlMsgWire>() {
-                    Ok(wire) => match wire {
-                        // Pure liveness beacon: absorbed here (the deadline
-                        // was just reset above), never forwarded to the inner.
-                        ControlMsgWire::CoordHeartbeat => {}
-                        // Elastic-membership interception (does NOT
-                        // forward to the inner GpuWorker).
-                        ControlMsgWire::DeclareDead { rank: dead_r } => {
-                            local_dead_ranks.declare_dead(dead_r as usize);
-                        }
-                        ControlMsgWire::NewNcclSession {
-                            uid_bytes,
-                            new_rank,
-                            new_world_size,
-                        } => {
-                            let pending = PendingNcclSession {
-                                uid_bytes,
-                                new_rank: new_rank as usize,
-                                new_world_size: new_world_size as usize,
-                            };
-                            if let Ok(mut slot) = nccl_session_mailbox.lock() {
-                                *slot = Some(pending);
+                    MsgKind::Control => match frame.decode::<ControlMsgWire>() {
+                        Ok(wire) => match wire {
+                            // Pure liveness beacon: absorbed here (the deadline
+                            // was just reset above), never forwarded to the inner.
+                            ControlMsgWire::CoordHeartbeat => {}
+                            // Elastic-membership interception (does NOT
+                            // forward to the inner GpuWorker).
+                            ControlMsgWire::DeclareDead { rank: dead_r } => {
+                                local_dead_ranks.declare_dead(dead_r as usize);
                             }
-                        }
-                        ControlMsgWire::RequestNewNcclId => {
-                            match crate::distributed::nccl::NcclUniqueId::new() {
-                                Ok(uid) => {
-                                    let uid_bytes = uid.as_bytes().to_vec();
-                                    let _ = timing_tx.send(
-                                        TimingMsg::NewNcclIdGenerated {
+                            ControlMsgWire::NewNcclSession {
+                                uid_bytes,
+                                new_rank,
+                                new_world_size,
+                            } => {
+                                let pending = PendingNcclSession {
+                                    uid_bytes,
+                                    new_rank: new_rank as usize,
+                                    new_world_size: new_world_size as usize,
+                                };
+                                if let Ok(mut slot) = nccl_session_mailbox.lock() {
+                                    *slot = Some(pending);
+                                }
+                            }
+                            ControlMsgWire::RequestNewNcclId => {
+                                match crate::distributed::nccl::NcclUniqueId::new() {
+                                    Ok(uid) => {
+                                        let uid_bytes = uid.as_bytes().to_vec();
+                                        let _ = timing_tx.send(TimingMsg::NewNcclIdGenerated {
                                             rank,
                                             uid_bytes,
-                                        },
-                                    );
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "cluster_worker: inbound r{rank} \
+                                         NcclUniqueId::new failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            // atomic-dispatch: the post-reduce Update may
+                            // carry the rank's next reduce-window chunk. The
+                            // wire-Update itself is informational (the param
+                            // bridge synthesises the real
+                            // `ControlMsg::Update(AveragedParams)`); when a
+                            // `next_plan` rides along, synthesise a
+                            // `StartEpoch` so the inner starts the next window
+                            // without a separate coord round-trip. Ordering is
+                            // safe: the param bridge's `Update(avg)` was sent
+                            // (same control channel) before its SyncAck, and
+                            // the coord only emits this frame after that ack,
+                            // so the inner dequeues `Update(avg)` before this
+                            // `StartEpoch` (mpsc FIFO).
+                            ControlMsgWire::Update { next_plan, .. } => {
+                                if let Some(plan) = next_plan {
+                                    let msg = ControlMsg::StartEpoch(EpochPlan {
+                                        epoch: plan.epoch as usize,
+                                        partition_offset: plan.partition_offset as usize,
+                                        partition_size: plan.partition_size as usize,
+                                    });
+                                    if control_tx.send(msg).is_err() {
+                                        // Inner GpuWorker dropped its receiver.
+                                        return;
+                                    }
+                                }
+                            }
+                            // Everything else: existing path through
+                            // control_wire_to_msg → inner control_tx.
+                            other => match control_wire_to_msg(other) {
+                                Ok(Some(msg)) => {
+                                    if matches!(msg, ControlMsg::Shutdown) {
+                                        // Clean teardown announced: the EOF
+                                        // that follows is expected — do not
+                                        // poison the peer ledger for it.
+                                        clean_shutdown_seen = true;
+                                    }
+                                    if control_tx.send(msg).is_err() {
+                                        // Inner GpuWorker dropped its receiver.
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {
+                                    // Wire-side notification with no in-process
+                                    // dispatch (e.g. Update{version} —
+                                    // informational; the param bridge handles
+                                    // the real ControlMsg::Update(AveragedParams).)
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "cluster_worker: inbound r{rank} \
-                                         NcclUniqueId::new failed: {e}"
+                                        "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
                                     );
-                                }
-                            }
-                        }
-                        // atomic-dispatch: the post-reduce Update may
-                        // carry the rank's next reduce-window chunk. The
-                        // wire-Update itself is informational (the param
-                        // bridge synthesises the real
-                        // `ControlMsg::Update(AveragedParams)`); when a
-                        // `next_plan` rides along, synthesise a
-                        // `StartEpoch` so the inner starts the next window
-                        // without a separate coord round-trip. Ordering is
-                        // safe: the param bridge's `Update(avg)` was sent
-                        // (same control channel) before its SyncAck, and
-                        // the coord only emits this frame after that ack,
-                        // so the inner dequeues `Update(avg)` before this
-                        // `StartEpoch` (mpsc FIFO).
-                        ControlMsgWire::Update { next_plan, .. } => {
-                            if let Some(plan) = next_plan {
-                                let msg = ControlMsg::StartEpoch(EpochPlan {
-                                    epoch: plan.epoch as usize,
-                                    partition_offset: plan.partition_offset as usize,
-                                    partition_size: plan.partition_size as usize,
-                                });
-                                if control_tx.send(msg).is_err() {
-                                    // Inner GpuWorker dropped its receiver.
+                                    if !clean_shutdown_seen {
+                                        poison_peers();
+                                    }
+                                    inject_shutdown();
                                     return;
                                 }
-                            }
-                        }
-                        // Everything else: existing path through
-                        // control_wire_to_msg → inner control_tx.
-                        other => match control_wire_to_msg(other) {
-                            Ok(Some(msg)) => {
-                                if matches!(msg, ControlMsg::Shutdown) {
-                                    // Clean teardown announced: the EOF
-                                    // that follows is expected — do not
-                                    // poison the peer ledger for it.
-                                    clean_shutdown_seen = true;
-                                }
-                                if control_tx.send(msg).is_err() {
-                                    // Inner GpuWorker dropped its receiver.
-                                    return;
-                                }
-                            }
-                            Ok(None) => {
-                                // Wire-side notification with no in-process
-                                // dispatch (e.g. Update{version} —
-                                // informational; the param bridge handles
-                                // the real ControlMsg::Update(AveragedParams).)
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "cluster_worker: inbound r{rank} control_wire_to_msg: {e}"
-                                );
-                                if !clean_shutdown_seen {
-                                    poison_peers();
-                                }
-                                inject_shutdown();
-                                return;
-                            }
+                            },
                         },
-                    },
-                    Err(e) => {
-                        eprintln!(
-                            "cluster_worker: inbound r{rank} decode ControlMsgWire: {e}"
-                        );
-                        if !clean_shutdown_seen {
-                            poison_peers();
+                        Err(e) => {
+                            eprintln!("cluster_worker: inbound r{rank} decode ControlMsgWire: {e}");
+                            if !clean_shutdown_seen {
+                                poison_peers();
+                            }
+                            inject_shutdown();
+                            return;
                         }
-                        inject_shutdown();
-                        return;
-                    }
-                },
-                other => {
-                    // The control channel only carries Control frames
-                    // in the coord→rank direction. Drop everything
-                    // else with a diagnostic.
-                    eprintln!(
-                        "cluster_worker: inbound r{rank} unexpected MsgKind {other:?} \
+                    },
+                    other => {
+                        // The control channel only carries Control frames
+                        // in the coord→rank direction. Drop everything
+                        // else with a diagnostic.
+                        eprintln!(
+                            "cluster_worker: inbound r{rank} unexpected MsgKind {other:?} \
                          on coord→rank channel; dropping"
-                    );
-                }
+                        );
+                    }
                 }
             }
             Ok(LenFramedRead::WouldBlock) => {
@@ -356,10 +350,7 @@ pub(super) fn nccl_watchdog_loop(
                 last_dead_count,
                 now_dead,
             );
-            let handle = abort_slot
-                .lock()
-                .expect("nccl abort slot poisoned")
-                .clone();
+            let handle = abort_slot.lock().expect("nccl abort slot poisoned").clone();
             match handle {
                 Some(h) => {
                     if let Err(e) = h.abort() {
@@ -441,13 +432,11 @@ pub(super) fn outbound_loop(
     // dashboard the user requested via `monitor.serve(port)`, or the
     // controller's timeline persistence requested through the
     // envelope's `rank_resources` flag.
-    let want_resources = pending.port.is_some()
-        || envelope.as_ref().is_some_and(|c| c.rank_resources);
+    let want_resources =
+        pending.port.is_some() || envelope.as_ref().is_some_and(|c| c.rank_resources);
     let resource_sampler: Option<std::sync::Mutex<crate::monitor::ResourceSampler>> =
         if want_resources {
-            Some(std::sync::Mutex::new(
-                crate::monitor::ResourceSampler::new(),
-            ))
+            Some(std::sync::Mutex::new(crate::monitor::ResourceSampler::new()))
         } else {
             None
         };
@@ -471,7 +460,13 @@ pub(super) fn outbound_loop(
                 let _ = write_timing(stream, salt, msg);
             }
             while let Ok(msg) = metrics_rx.try_recv() {
-                let _ = write_metrics(stream, salt, msg, resource_sampler.as_ref(), assigned_device_idx);
+                let _ = write_metrics(
+                    stream,
+                    salt,
+                    msg,
+                    resource_sampler.as_ref(),
+                    assigned_device_idx,
+                );
             }
             return;
         }
@@ -480,10 +475,14 @@ pub(super) fn outbound_loop(
         // (try_recv returns immediately).
         match metrics_rx.try_recv() {
             Ok(msg) => {
-                if let Err(e) = write_metrics(stream, salt, msg, resource_sampler.as_ref(), assigned_device_idx) {
-                    crate::verbose!(
-                        "cluster_worker: outbound r{rank} metrics write error: {e}"
-                    );
+                if let Err(e) = write_metrics(
+                    stream,
+                    salt,
+                    msg,
+                    resource_sampler.as_ref(),
+                    assigned_device_idx,
+                ) {
+                    crate::verbose!("cluster_worker: outbound r{rank} metrics write error: {e}");
                     return;
                 }
                 continue;
@@ -518,9 +517,7 @@ pub(super) fn outbound_loop(
                         sample: sample.into(),
                     },
                 ) {
-                    crate::verbose!(
-                        "cluster_worker: outbound r{rank} resource write error: {e}"
-                    );
+                    crate::verbose!("cluster_worker: outbound r{rank} resource write error: {e}");
                     return;
                 }
             }
@@ -545,11 +542,13 @@ pub(super) fn outbound_loop(
     }
 }
 
-
 /// Serialize a `ControlFrame` and write it length-delimited to the
 /// worker's host relay, which forwards the opaque blob upstream to the
 /// coordinator. Control-channel mirror of the data channel's framing.
-pub(super) fn write_framed_control<W: std::io::Write>(stream: &mut W, frame: &ControlFrame) -> Result<()> {
+pub(super) fn write_framed_control<W: std::io::Write>(
+    stream: &mut W,
+    frame: &ControlFrame,
+) -> Result<()> {
     let mut buf = Vec::new();
     frame.write_to(&mut buf)?;
     write_len_framed(stream, &buf)
@@ -605,9 +604,10 @@ pub(super) fn trim_sample_to_assigned_device(
     assigned_device_idx: Option<u8>,
 ) {
     if sample.gpus.len() > 1
-        && let Some(target) = assigned_device_idx {
-            sample.gpus.retain(|g| g.device_index == target);
-        }
+        && let Some(target) = assigned_device_idx
+    {
+        sample.gpus.retain(|g| g.device_index == target);
+    }
 }
 
 /// Emit the rank-side dashboard setup sequence — `DashboardRegister`
@@ -629,13 +629,14 @@ pub(super) fn emit_dashboard_setup(
     let rank_u64 = rank as u64;
     let mut emit = |msg: TimingMsgWire| {
         if let Err(e) = write_timing_wire(stream, salt, &msg) {
-            crate::verbose!(
-                "cluster_worker: outbound r{rank} dashboard emit failed: {e}",
-            );
+            crate::verbose!("cluster_worker: outbound r{rank} dashboard emit failed: {e}",);
         }
     };
     if let Some(port) = pending.port {
-        emit(TimingMsgWire::DashboardRegister { rank: rank_u64, port });
+        emit(TimingMsgWire::DashboardRegister {
+            rank: rank_u64,
+            port,
+        });
     }
     if let Some(ref svg) = pending.svg {
         emit(TimingMsgWire::DashboardSetSvg {
@@ -672,10 +673,7 @@ pub(super) fn emit_dashboard_setup(
 /// untouched when no assigned device is known (single-process / CPU
 /// builds) or when the segment count doesn't match the expected
 /// `cpu | gpu0 | gpu1 | …` shape (e.g. NVML returned no GPU names).
-pub(super) fn trim_hardware_to_assigned(
-    full: &str,
-    assigned_device_idx: Option<u8>,
-) -> String {
+pub(super) fn trim_hardware_to_assigned(full: &str, assigned_device_idx: Option<u8>) -> String {
     let Some(target) = assigned_device_idx else {
         return full.to_string();
     };
@@ -707,4 +705,3 @@ pub(super) fn write_timing_wire(
     let frame = ControlFrame::encode(salt, MsgKind::Timing, msg)?;
     write_framed_control(stream, &frame)
 }
-

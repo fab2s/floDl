@@ -38,8 +38,9 @@ use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};
 fn distilbert_mlm_parity_vs_pytorch_live() {
     let dev = Device::CPU;
 
-    let bytes = std::fs::read(Path::new(FIXTURE))
-        .unwrap_or_else(|e| panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity distilbert-mlm` to regenerate)"));
+    let bytes = std::fs::read(Path::new(FIXTURE)).unwrap_or_else(|e| {
+        panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity distilbert-mlm` to regenerate)")
+    });
     let st = SafeTensors::deserialize(&bytes).expect("parse parity fixture");
 
     let ids = st.tensor("inputs.input_ids").unwrap();
@@ -47,7 +48,8 @@ fn distilbert_mlm_parity_vs_pytorch_live() {
     let ref_logits = st.tensor("outputs.logits").unwrap();
 
     let input_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(), false,
+        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(),
+        false,
     );
     let mask_flat_f32: Vec<f32> = parse_i64(&mk).iter().map(|&x| x as f32).collect();
     let mask_flat = Tensor::from_f32(&mask_flat_f32, &shape_i64(&mk), dev).unwrap();
@@ -59,7 +61,10 @@ fn distilbert_mlm_parity_vs_pytorch_live() {
     let head = DistilBertForMaskedLM::from_pretrained(MODEL_ID).unwrap();
     head.graph().eval();
 
-    let out = head.graph().forward_multi(&[input_ids, attention_mask]).unwrap();
+    let out = head
+        .graph()
+        .forward_multi(&[input_ids, attention_mask])
+        .unwrap();
     assert_eq!(out.shape(), ref_shape, "logits shape mismatch");
 
     let actual = out.data().to_f32_vec().unwrap();

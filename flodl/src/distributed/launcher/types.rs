@@ -6,7 +6,6 @@
 
 use std::env;
 
-
 use crate::tensor::{Result, TensorError};
 
 use super::ENV_FULL_CLUSTER_JSON;
@@ -291,15 +290,11 @@ impl FullCluster {
         let controller_val = obj
             .get("controller")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                TensorError::new("cluster launcher: controller (object) required")
-            })?;
+            .ok_or_else(|| TensorError::new("cluster launcher: controller (object) required"))?;
         let controller_host = controller_val
             .get("host")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TensorError::new("cluster launcher: controller.host (string) required")
-            })?
+            .ok_or_else(|| TensorError::new("cluster launcher: controller.host (string) required"))?
             .to_string();
         if controller_host.trim().is_empty() {
             return Err(TensorError::new(
@@ -309,9 +304,7 @@ impl FullCluster {
         let controller_port_u64 = controller_val
             .get("port")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                TensorError::new("cluster launcher: controller.port (u16) required")
-            })?;
+            .ok_or_else(|| TensorError::new("cluster launcher: controller.port (u16) required"))?;
         let controller_port = u16::try_from(controller_port_u64).map_err(|_| {
             TensorError::new(&format!(
                 "cluster launcher: controller.port must fit in u16 (got {controller_port_u64})"
@@ -320,9 +313,7 @@ impl FullCluster {
         let controller_path = controller_val
             .get("path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TensorError::new("cluster launcher: controller.path (string) required")
-            })?
+            .ok_or_else(|| TensorError::new("cluster launcher: controller.path (string) required"))?
             .to_string();
         let controller_docker = controller_val
             .get("docker")
@@ -359,7 +350,10 @@ impl FullCluster {
             .collect::<Result<_>>()?;
 
         // Cross-worker rank check: union must be exactly 0..world_size.
-        let mut all: Vec<usize> = workers.iter().flat_map(|w| w.ranks.iter().copied()).collect();
+        let mut all: Vec<usize> = workers
+            .iter()
+            .flat_map(|w| w.ranks.iter().copied())
+            .collect();
         let ws = all.len();
         all.sort_unstable();
         let expected: Vec<usize> = (0..ws).collect();
@@ -374,8 +368,7 @@ impl FullCluster {
         // exported into every rank child. Missing → empty map.
         let env = parse_env_block(obj.get("env"), "cluster.env")?;
 
-        let gpu_ram_share =
-            parse_gpu_ram_share(obj.get("gpu_ram_share"), "cluster.gpu_ram_share")?;
+        let gpu_ram_share = parse_gpu_ram_share(obj.get("gpu_ram_share"), "cluster.gpu_ram_share")?;
 
         Ok(FullCluster {
             controller: FullController {
@@ -424,7 +417,10 @@ impl FullCluster {
                 o.insert(
                     "ranks".into(),
                     serde_json::Value::Array(
-                        h.ranks.iter().map(|r| serde_json::Value::from(*r)).collect(),
+                        h.ranks
+                            .iter()
+                            .map(|r| serde_json::Value::from(*r))
+                            .collect(),
                     ),
                 );
                 let ld = match &h.local_devices {
@@ -460,10 +456,8 @@ impl FullCluster {
                         ssh_obj.insert("user".into(), serde_json::Value::String(u.clone()));
                     }
                     if let Some(i) = &s.identity_file {
-                        ssh_obj.insert(
-                            "identity_file".into(),
-                            serde_json::Value::String(i.clone()),
-                        );
+                        ssh_obj
+                            .insert("identity_file".into(), serde_json::Value::String(i.clone()));
                     }
                     if !s.options.is_empty() {
                         ssh_obj.insert(
@@ -497,10 +491,7 @@ impl FullCluster {
             "host".into(),
             serde_json::Value::String(self.controller.host.clone()),
         );
-        controller_obj.insert(
-            "port".into(),
-            serde_json::Value::from(self.controller.port),
-        );
+        controller_obj.insert("port".into(), serde_json::Value::from(self.controller.port));
         controller_obj.insert(
             "path".into(),
             serde_json::Value::String(self.controller.path.clone()),
@@ -553,7 +544,10 @@ impl FullCluster {
                 controller_obj.insert("join".into(), serde_json::Value::Object(join_obj));
             }
         }
-        top.insert("controller".into(), serde_json::Value::Object(controller_obj));
+        top.insert(
+            "controller".into(),
+            serde_json::Value::Object(controller_obj),
+        );
         top.insert("workers".into(), serde_json::Value::Array(workers));
         if let Some(g) = self.gpu_ram_share {
             top.insert("gpu_ram_share".into(), serde_json::Value::from(g));
@@ -568,7 +562,6 @@ impl FullCluster {
         serde_json::Value::Object(top)
     }
 }
-
 
 fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
     let obj = v.as_object().ok_or_else(|| {
@@ -591,14 +584,11 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
     }
     let name = host;
 
-    let ranks_arr = obj
-        .get("ranks")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            TensorError::new(&format!(
-                "cluster launcher: workers[{i}] ({name:?}): ranks (array) required"
-            ))
-        })?;
+    let ranks_arr = obj.get("ranks").and_then(|v| v.as_array()).ok_or_else(|| {
+        TensorError::new(&format!(
+            "cluster launcher: workers[{i}] ({name:?}): ranks (array) required"
+        ))
+    })?;
     // Empty ranks: orchestrator-only host entry. Declared in cluster.yml
     // solely so fdl-cli's pre-flight build can read its `docker:` /
     // `arch:` for controller-side build context; the launcher itself
@@ -698,10 +688,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         )));
     }
 
-    let arch = obj
-        .get("arch")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let arch = obj.get("arch").and_then(|v| v.as_str()).map(String::from);
 
     let data_path = obj
         .get("data_path")
@@ -713,10 +700,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         &format!("workers[{i}] ({name:?}).gpu_ram_share"),
     )?;
 
-    let ssh = parse_ssh_block(
-        obj.get("ssh"),
-        &format!("workers[{i}] ({name:?})"),
-    )?;
+    let ssh = parse_ssh_block(obj.get("ssh"), &format!("workers[{i}] ({name:?})"))?;
 
     let tunnel = match obj.get("tunnel") {
         None | Some(serde_json::Value::Null) => false,
@@ -729,10 +713,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
         }
     };
 
-    let env = parse_env_block(
-        obj.get("env"),
-        &format!("workers[{i}] ({name:?}).env"),
-    )?;
+    let env = parse_env_block(obj.get("env"), &format!("workers[{i}] ({name:?}).env"))?;
 
     Ok(FullWorker {
         host: name,
@@ -755,10 +736,7 @@ fn parse_full_worker(v: &serde_json::Value, i: usize) -> Result<FullWorker> {
 /// so the only refusals are a negative, a non-finite, or a non-number
 /// (the same envelope `with_gpu_ram_share`'s `max(0.0)` clamp draws,
 /// made loud because yml is user input).
-fn parse_gpu_ram_share(
-    v: Option<&serde_json::Value>,
-    label: &str,
-) -> Result<Option<f64>> {
+fn parse_gpu_ram_share(v: Option<&serde_json::Value>, label: &str) -> Result<Option<f64>> {
     match v {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => match v.as_f64() {
@@ -878,10 +856,7 @@ fn parse_join_block(v: Option<&serde_json::Value>) -> Result<Option<JoinKnobs>> 
 /// to host name + system ssh defaults"). Loud errors on type
 /// mismatches per field so typos surface immediately rather than
 /// silently dropping a value.
-fn parse_ssh_block(
-    v: Option<&serde_json::Value>,
-    label: &str,
-) -> Result<Option<SshConfig>> {
+fn parse_ssh_block(v: Option<&serde_json::Value>, label: &str) -> Result<Option<SshConfig>> {
     let obj = match v {
         None | Some(serde_json::Value::Null) => return Ok(None),
         Some(serde_json::Value::Object(m)) => m,
@@ -893,10 +868,7 @@ fn parse_ssh_block(
         }
     };
 
-    let target = obj
-        .get("target")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let target = obj.get("target").and_then(|v| v.as_str()).map(String::from);
 
     let port = match obj.get("port") {
         None | Some(serde_json::Value::Null) => None,
@@ -914,10 +886,7 @@ fn parse_ssh_block(
         }
     };
 
-    let user = obj
-        .get("user")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let user = obj.get("user").and_then(|v| v.as_str()).map(String::from);
 
     let identity_file = obj
         .get("identity_file")
@@ -944,7 +913,13 @@ fn parse_ssh_block(
         }
     };
 
-    Ok(Some(SshConfig { target, port, user, identity_file, options }))
+    Ok(Some(SshConfig {
+        target,
+        port,
+        user,
+        identity_file,
+        options,
+    }))
 }
 
 /// Parse an `env:` block from either a launcher-level or host-level
@@ -1013,4 +988,3 @@ fn parse_env_block(
         ))),
     }
 }
-

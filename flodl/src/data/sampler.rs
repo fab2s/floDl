@@ -9,8 +9,6 @@
 //! Custom samplers (weighted, stratified, curriculum learning) implement
 //! the [`Sampler`] trait directly.
 
-
-
 /// Controls the order in which dataset indices are visited each epoch.
 ///
 /// # Implementing a custom sampler
@@ -127,7 +125,11 @@ impl SplitSampler {
     ///
     /// `splits` is clamped to at least 1.
     pub fn new(n: usize, seed: u64, splits: usize) -> Self {
-        SplitSampler { n, seed, splits: splits.max(1) }
+        SplitSampler {
+            n,
+            seed,
+            splits: splits.max(1),
+        }
     }
 
     /// Slices per data pass.

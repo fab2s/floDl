@@ -88,10 +88,19 @@ impl MaxPool2d {
 }
 
 impl Module for MaxPool2d {
-    fn name(&self) -> &str { "maxpool2d" }
+    fn name(&self) -> &str {
+        "maxpool2d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        autograd::max_pool2d(input, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode)
+        autograd::max_pool2d(
+            input,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.ceil_mode,
+        )
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -181,12 +190,18 @@ impl AvgPool2d {
 }
 
 impl Module for AvgPool2d {
-    fn name(&self) -> &str { "avgpool2d" }
+    fn name(&self) -> &str {
+        "avgpool2d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::avg_pool2d(
-            input, self.kernel_size, self.stride, self.padding,
-            self.ceil_mode, self.count_include_pad,
+            input,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.ceil_mode,
+            self.count_include_pad,
         )
     }
 
@@ -260,10 +275,19 @@ impl MaxPool1d {
 }
 
 impl Module for MaxPool1d {
-    fn name(&self) -> &str { "maxpool1d" }
+    fn name(&self) -> &str {
+        "maxpool1d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        autograd::max_pool1d(input, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode)
+        autograd::max_pool1d(
+            input,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.ceil_mode,
+        )
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -336,12 +360,18 @@ impl AvgPool1d {
 }
 
 impl Module for AvgPool1d {
-    fn name(&self) -> &str { "avgpool1d" }
+    fn name(&self) -> &str {
+        "avgpool1d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::avg_pool1d(
-            input, self.kernel_size, self.stride, self.padding,
-            self.ceil_mode, self.count_include_pad,
+            input,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.ceil_mode,
+            self.count_include_pad,
         )
     }
 
@@ -379,12 +409,16 @@ impl AdaptiveMaxPool2d {
     /// The layer will internally compute kernel size, stride, and padding
     /// to produce exactly `[N, C, output_h, output_w]` for any input size.
     pub fn new(output_h: i64, output_w: i64) -> Self {
-        Self { output_size: [output_h, output_w] }
+        Self {
+            output_size: [output_h, output_w],
+        }
     }
 }
 
 impl Module for AdaptiveMaxPool2d {
-    fn name(&self) -> &str { "adaptive_maxpool2d" }
+    fn name(&self) -> &str {
+        "adaptive_maxpool2d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::adaptive_max_pool2d(input, self.output_size)
@@ -423,7 +457,9 @@ impl AdaptiveAvgPool2d {
 }
 
 impl Module for AdaptiveAvgPool2d {
-    fn name(&self) -> &str { "adaptive_avgpool2d" }
+    fn name(&self) -> &str {
+        "adaptive_avgpool2d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::adaptive_avg_pool2d(input, self.output_size)
@@ -469,7 +505,9 @@ impl PixelShuffle {
 }
 
 impl Module for PixelShuffle {
-    fn name(&self) -> &str { "pixel_shuffle" }
+    fn name(&self) -> &str {
+        "pixel_shuffle"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::pixel_shuffle(input, self.upscale_factor)
@@ -514,7 +552,9 @@ impl PixelUnshuffle {
 }
 
 impl Module for PixelUnshuffle {
-    fn name(&self) -> &str { "pixel_unshuffle" }
+    fn name(&self) -> &str {
+        "pixel_unshuffle"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         autograd::pixel_unshuffle(input, self.downscale_factor)
@@ -579,10 +619,14 @@ impl Upsample {
 }
 
 impl Module for Upsample {
-    fn name(&self) -> &str { "upsample" }
+    fn name(&self) -> &str {
+        "upsample"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        let result = input.data().interpolate(&self.output_size, self.mode, self.align_corners)?;
+        let result = input
+            .data()
+            .interpolate(&self.output_size, self.mode, self.align_corners)?;
         Ok(Variable::wrap(result))
     }
 
@@ -653,18 +697,35 @@ impl Unfold {
     }
 
     /// Set dilation (spacing between kernel elements) as `[dH, dW]`.
-    pub fn dilation(mut self, dilation: [i64; 2]) -> Self { self.dilation = dilation; self }
+    pub fn dilation(mut self, dilation: [i64; 2]) -> Self {
+        self.dilation = dilation;
+        self
+    }
     /// Set zero-padding added to both sides as `[padH, padW]`.
-    pub fn padding(mut self, padding: [i64; 2]) -> Self { self.padding = padding; self }
+    pub fn padding(mut self, padding: [i64; 2]) -> Self {
+        self.padding = padding;
+        self
+    }
     /// Set stride of the sliding blocks as `[strideH, strideW]`.
-    pub fn stride(mut self, stride: [i64; 2]) -> Self { self.stride = stride; self }
+    pub fn stride(mut self, stride: [i64; 2]) -> Self {
+        self.stride = stride;
+        self
+    }
 }
 
 impl Module for Unfold {
-    fn name(&self) -> &str { "unfold" }
+    fn name(&self) -> &str {
+        "unfold"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        autograd::im2col(input, self.kernel_size, self.dilation, self.padding, self.stride)
+        autograd::im2col(
+            input,
+            self.kernel_size,
+            self.dilation,
+            self.padding,
+            self.stride,
+        )
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -733,18 +794,36 @@ impl Fold {
     }
 
     /// Set dilation (spacing between kernel elements) as `[dH, dW]`.
-    pub fn dilation(mut self, dilation: [i64; 2]) -> Self { self.dilation = dilation; self }
+    pub fn dilation(mut self, dilation: [i64; 2]) -> Self {
+        self.dilation = dilation;
+        self
+    }
     /// Set zero-padding as `[padH, padW]` (must match the Unfold that produced the input).
-    pub fn padding(mut self, padding: [i64; 2]) -> Self { self.padding = padding; self }
+    pub fn padding(mut self, padding: [i64; 2]) -> Self {
+        self.padding = padding;
+        self
+    }
     /// Set stride of the sliding blocks as `[strideH, strideW]`.
-    pub fn stride(mut self, stride: [i64; 2]) -> Self { self.stride = stride; self }
+    pub fn stride(mut self, stride: [i64; 2]) -> Self {
+        self.stride = stride;
+        self
+    }
 }
 
 impl Module for Fold {
-    fn name(&self) -> &str { "fold" }
+    fn name(&self) -> &str {
+        "fold"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        autograd::col2im(input, self.output_size, self.kernel_size, self.dilation, self.padding, self.stride)
+        autograd::col2im(
+            input,
+            self.output_size,
+            self.kernel_size,
+            self.dilation,
+            self.padding,
+            self.stride,
+        )
     }
 
     fn parameters(&self) -> Vec<Parameter> {
@@ -761,10 +840,7 @@ mod tests {
     fn test_max_pool2d_basic() {
         let opts = crate::tensor::test_opts();
         // [1, 1, 4, 4] → kernel=2, stride=2 → [1, 1, 2, 2]
-        let x = Variable::new(
-            Tensor::randn(&[1, 1, 4, 4], opts).unwrap(),
-            false,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 1, 4, 4], opts).unwrap(), false);
         let pool = MaxPool2d::new(2);
         let y = pool.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![1, 1, 2, 2]);
@@ -774,10 +850,7 @@ mod tests {
     fn test_max_pool2d_with_padding() {
         let opts = crate::tensor::test_opts();
         // [2, 3, 8, 8] → kernel=3, stride=2, padding=1 → [2, 3, 4, 4]
-        let x = Variable::new(
-            Tensor::randn(&[2, 3, 8, 8], opts).unwrap(),
-            false,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 3, 8, 8], opts).unwrap(), false);
         let pool = MaxPool2d::with_stride(3, 2).padding(1);
         let y = pool.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 3, 4, 4]);
@@ -786,10 +859,7 @@ mod tests {
     #[test]
     fn test_max_pool2d_gradient() {
         let opts = crate::tensor::test_opts();
-        let x = Variable::new(
-            Tensor::randn(&[2, 1, 4, 4], opts).unwrap(),
-            true,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 1, 4, 4], opts).unwrap(), true);
         let pool = MaxPool2d::new(2);
         let y = pool.forward(&x).unwrap();
         let loss = y.sum().unwrap();
@@ -805,10 +875,8 @@ mod tests {
         let device = crate::tensor::test_device();
         // Manual check: 2x2 max pool on a known 4x4 input
         let data = vec![
-            1.0_f32, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
         ];
         let x = Variable::new(
             Tensor::from_f32(&data, &[1, 1, 4, 4], device).unwrap(),
@@ -824,10 +892,7 @@ mod tests {
     #[test]
     fn test_avg_pool2d_basic() {
         let opts = crate::tensor::test_opts();
-        let x = Variable::new(
-            Tensor::randn(&[1, 1, 4, 4], opts).unwrap(),
-            false,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 1, 4, 4], opts).unwrap(), false);
         let pool = AvgPool2d::new(2);
         let y = pool.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![1, 1, 2, 2]);
@@ -837,10 +902,8 @@ mod tests {
     fn test_avg_pool2d_values() {
         let device = crate::tensor::test_device();
         let data = vec![
-            1.0_f32, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
         ];
         let x = Variable::new(
             Tensor::from_f32(&data, &[1, 1, 4, 4], device).unwrap(),
@@ -856,10 +919,7 @@ mod tests {
     #[test]
     fn test_avg_pool2d_gradient() {
         let opts = crate::tensor::test_opts();
-        let x = Variable::new(
-            Tensor::randn(&[2, 1, 4, 4], opts).unwrap(),
-            true,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 1, 4, 4], opts).unwrap(), true);
         let pool = AvgPool2d::new(2);
         let y = pool.forward(&x).unwrap();
         let loss = y.sum().unwrap();

@@ -578,7 +578,9 @@ impl ConvergenceGuard for MsfGuard {
             self.nudge_streak = 0;
             crate::verbose!(
                 "  ddp: msf λ_ema={:.4e} sustained > nudge_threshold {:.4e} | nudging anchor down by {:.2}",
-                lema, self.nudge_threshold, self.nudge_factor,
+                lema,
+                self.nudge_threshold,
+                self.nudge_factor,
             );
             return ConvergenceAction::NudgeDown {
                 factor: self.nudge_factor,
@@ -588,7 +590,8 @@ impl ConvergenceGuard for MsfGuard {
             self.suppress_streak = 0;
             crate::verbose!(
                 "  ddp: msf λ_ema={:.4e} sustained > suppress_threshold {:.4e} | suppressing growth",
-                lema, self.suppress_threshold,
+                lema,
+                self.suppress_threshold,
             );
             return ConvergenceAction::SuppressGrowth;
         }
@@ -993,9 +996,7 @@ mod tests {
 
     #[test]
     fn msf_without_nudge_disables_hard_trigger() {
-        let mut g = MsfGuard::default()
-            .with_suppress(1.0e-3, 3)
-            .without_nudge();
+        let mut g = MsfGuard::default().with_suppress(1.0e-3, 3).without_nudge();
         let mut prev = 1.0e-4;
         let mut nudge_fires = 0;
         for _ in 0..20 {

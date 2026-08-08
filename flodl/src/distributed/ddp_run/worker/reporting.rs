@@ -6,10 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::nn::Module;
 use crate::tensor::{Result, Tensor, TensorError};
 
-use super::super::{
-    ControlMsg, EpochMetrics,
-    MetricsMsg, TimingMsg,
-};
+use super::super::{ControlMsg, EpochMetrics, MetricsMsg, TimingMsg};
 use super::GpuWorker;
 
 impl<M: Module> GpuWorker<M> {
@@ -118,15 +115,18 @@ impl<M: Module> GpuWorker<M> {
         batch_loss: f64,
         sync_divergence: Option<f64>,
     ) -> Result<()> {
-        let res = self.timing_tx.send(TimingMsg::Batch {
-            rank: self.rank,
-            batch_ms,
-            data_ms,
-            step_count: self.local_step,
-            param_norm,
-            batch_loss,
-            sync_divergence,
-        }).map_err(|_| TensorError::new("timing channel disconnected"));
+        let res = self
+            .timing_tx
+            .send(TimingMsg::Batch {
+                rank: self.rank,
+                batch_ms,
+                data_ms,
+                step_count: self.local_step,
+                param_norm,
+                batch_loss,
+                sync_divergence,
+            })
+            .map_err(|_| TensorError::new("timing channel disconnected"));
         // Piggyback the current LR after the primary Batch. Failures are
         // tolerated — the meta layer simply observes a stale value next cycle.
         let _ = self.timing_tx.send(TimingMsg::LrUpdate {
@@ -219,17 +219,19 @@ impl<M: Module> GpuWorker<M> {
         data_starve_ms: f64,
     ) -> Result<()> {
         let scalars = super::super::drain_scalars();
-        self.metrics_tx.send(MetricsMsg {
-            rank: self.rank,
-            epoch: self.current_epoch,
-            avg_loss,
-            batches_processed: batches,
-            epoch_ms,
-            samples_processed: batches * self.batch_size,
-            share_complete_ms,
-            compute_only_ms,
-            data_starve_ms,
-            scalars,
-        }).map_err(|_| TensorError::new("metrics channel disconnected"))
+        self.metrics_tx
+            .send(MetricsMsg {
+                rank: self.rank,
+                epoch: self.current_epoch,
+                avg_loss,
+                batches_processed: batches,
+                epoch_ms,
+                samples_processed: batches * self.batch_size,
+                share_complete_ms,
+                compute_only_ms,
+                data_starve_ms,
+                scalars,
+            })
+            .map_err(|_| TensorError::new("metrics channel disconnected"))
     }
 }

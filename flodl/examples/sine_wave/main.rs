@@ -6,8 +6,8 @@
 //!
 //! Run: `cargo run --example sine_wave`
 
-use flodl::*;
 use flodl::Monitor;
+use flodl::*;
 
 fn main() -> Result<()> {
     manual_seed(42);
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let model = FlowBuilder::from(Linear::new(1, 32)?)
         .through(GELU)
         .through(LayerNorm::new(32)?)
-        .also(Linear::new(32, 32)?)   // residual connection
+        .also(Linear::new(32, 32)?) // residual connection
         .through(Linear::new(32, 1)?)
         .build()?;
 
@@ -75,7 +75,10 @@ fn main() -> Result<()> {
 
     // --- Evaluation ---
     model.eval();
-    println!("\n{:>8}  {:>10}  {:>10}  {:>8}", "x", "actual", "predicted", "error");
+    println!(
+        "\n{:>8}  {:>10}  {:>10}  {:>8}",
+        "x", "actual", "predicted", "error"
+    );
     println!("{}", "-".repeat(42));
 
     // Test on 10 evenly spaced points.

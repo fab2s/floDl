@@ -18,7 +18,7 @@
 
 use flodl::nn::Module;
 use flodl::{DType, Variable};
-use flodl_hf::models::bert::{build_extended_attention_mask, BertModel};
+use flodl_hf::models::bert::{BertModel, build_extended_attention_mask};
 use flodl_hf::tokenizer::HfTokenizer;
 
 fn main() -> flodl::Result<()> {
@@ -33,12 +33,8 @@ fn main() -> flodl::Result<()> {
     let mask_f32 = enc.attention_mask.data().to_dtype(DType::Float32)?;
     let mask = Variable::new(build_extended_attention_mask(&mask_f32)?, false);
 
-    let pooled = graph.forward_multi(&[
-        enc.input_ids,
-        enc.position_ids,
-        enc.token_type_ids,
-        mask,
-    ])?;
+    let pooled =
+        graph.forward_multi(&[enc.input_ids, enc.position_ids, enc.token_type_ids, mask])?;
 
     let shape = pooled.shape();
     let hidden = shape[1] as usize;

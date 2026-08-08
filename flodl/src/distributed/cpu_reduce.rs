@@ -167,7 +167,6 @@ pub struct CpuReduceClient {
     decode_dst_fallback_logged: bool,
 }
 
-
 impl CpuReduceClient {
     /// Connect to the controller and complete the handshake.
     ///
@@ -194,9 +193,7 @@ impl CpuReduceClient {
         salt: SessionSalt,
     ) -> Result<Self> {
         if world_size == 0 {
-            return Err(TensorError::new(
-                "cpu_reduce: world_size must be > 0",
-            ));
+            return Err(TensorError::new("cpu_reduce: world_size must be > 0"));
         }
         if rank_id >= world_size {
             return Err(TensorError::new(&format!(
@@ -206,10 +203,7 @@ impl CpuReduceClient {
         // Ranks dial their host-local relay's loopback. The relay process
         // may bind a beat after the rank starts (launcher spawns both),
         // so retry briefly rather than fail on the first refusal.
-        let stream = crate::distributed::wire::connect_with_retry(
-            controller_addr,
-            "cpu_reduce",
-        )?;
+        let stream = crate::distributed::wire::connect_with_retry(controller_addr, "cpu_reduce")?;
         // Disable Nagle: the reduce is a small-frame write→blocking-read
         // ping-pong, which deadlocks Nagle against delayed-ACK for ~40ms
         // per round-trip. With the cross-host reduce being 97-99% of the
@@ -254,9 +248,7 @@ impl CpuReduceClient {
             .set_read_timeout(Some(Duration::from_secs(
                 crate::distributed::wire::scaled_deadline_secs(REDUCE_READ_DEADLINE_SECS),
             )))
-            .map_err(|e| {
-                TensorError::new(&format!("cpu_reduce: set reduce read deadline: {e}"))
-            })?;
+            .map_err(|e| TensorError::new(&format!("cpu_reduce: set reduce read deadline: {e}")))?;
         Ok(client)
     }
 
@@ -266,12 +258,12 @@ impl CpuReduceClient {
         buf[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&self.rank_id.to_le_bytes());
         buf[12..16].copy_from_slice(&self.world_size.to_le_bytes());
-        self.stream.write_all(&buf).map_err(|e| {
-            TensorError::new(&format!("cpu_reduce: handshake write failed: {e}"))
-        })?;
-        self.stream.flush().map_err(|e| {
-            TensorError::new(&format!("cpu_reduce: handshake flush failed: {e}"))
-        })?;
+        self.stream
+            .write_all(&buf)
+            .map_err(|e| TensorError::new(&format!("cpu_reduce: handshake write failed: {e}")))?;
+        self.stream
+            .flush()
+            .map_err(|e| TensorError::new(&format!("cpu_reduce: handshake flush failed: {e}")))?;
         Ok(())
     }
 
@@ -595,9 +587,7 @@ impl CpuReduceClient {
     /// on a frame that then fails MAC and tears the round down; no
     /// snapshot path ever reads stale staging content).
     fn read_reduced_tensors(&mut self) -> Result<(Vec<Tensor>, f64, u128)> {
-        let Some(len) =
-            crate::distributed::relay::mux::read_len_prefix(&mut self.stream)?
-        else {
+        let Some(len) = crate::distributed::relay::mux::read_len_prefix(&mut self.stream)? else {
             return Err(TensorError::new(
                 "cpu_reduce: controller closed connection before sending averaged \
                  frame back (controller crashed, or another rank disconnected and \
@@ -616,8 +606,7 @@ impl CpuReduceClient {
         // closures both capture it). NAN until the header parses, and
         // `is_realized(NAN)` is false — fail-safe to the fresh path.
         let hdr_weight = std::cell::Cell::new(f64::NAN);
-        let mut on_header =
-            |_k: controller::RoundKind, w: f64| hdr_weight.set(w);
+        let mut on_header = |_k: controller::RoundKind, w: f64| hdr_weight.set(w);
         let mut body = (&mut self.stream).take(len as u64);
         let hdr = controller::read_round_frame_streamed(
             &mut body,
@@ -625,9 +614,7 @@ impl CpuReduceClient {
             Some(&mut on_header),
             &mut |i, payload| {
                 let tp = Instant::now();
-                let realized = crate::distributed::realized_work::is_realized(
-                    hdr_weight.get(),
-                );
+                let realized = crate::distributed::realized_work::is_realized(hdr_weight.get());
                 let t = match armed_dsts.as_deref() {
                     Some(dsts) if realized => {
                         decode_into_dst(i, &payload, dsts, &mut dst_fallback)?
@@ -678,9 +665,7 @@ impl CpuReduceClient {
     /// drives through the RoundFrame reduce path.
     #[allow(dead_code)]
     pub fn all_reduce_tensors(&mut self, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
-        Ok(self
-            .all_reduce_weighted(tensors, RoundKind::Model, 1.0)?
-            .0)
+        Ok(self.all_reduce_weighted(tensors, RoundKind::Model, 1.0)?.0)
     }
 
     /// Emit a one-line per-rank summary of the accumulated reduce
@@ -701,7 +686,11 @@ impl CpuReduceClient {
         // Wire carries the frame up and a same-sized averaged frame
         // down, so ~2× bytes traverse the link per reduce.
         let wire_s = self.prof_wire_ns as f64 / 1e9;
-        let mbps = if wire_s > 0.0 { (mb * 2.0) / wire_s } else { 0.0 };
+        let mbps = if wire_s > 0.0 {
+            (mb * 2.0) / wire_s
+        } else {
+            0.0
+        };
         eprintln!(
             "[cpu-reduce-prof] rank={} reduces={} | serialize={:.0}ms ({:.0}%) \
              wire={:.0}ms ({:.0}%) deserialize={:.0}ms ({:.0}%) | per-reduce \
@@ -738,11 +727,7 @@ impl CpuReduceClient {
     /// broadcast is byte-exact f32 regardless of the model wire dtype
     /// (every rank must start from IDENTICAL state). All ranks must
     /// call concurrently.
-    pub fn broadcast_from_root(
-        &mut self,
-        tensors: &[&Tensor],
-        root: u32,
-    ) -> Result<Vec<Tensor>> {
+    pub fn broadcast_from_root(&mut self, tensors: &[&Tensor], root: u32) -> Result<Vec<Tensor>> {
         if root >= self.world_size {
             return Err(TensorError::new(&format!(
                 "cpu_reduce: broadcast root {root} >= world_size {}",
@@ -856,11 +841,7 @@ impl CpuReduceClient {
             )));
         }
         let vals: Vec<f32> = local.iter().map(|v| *v as f32).collect();
-        let tensor = Tensor::from_f32(
-            &vals,
-            &[world_size as i64],
-            Device::CPU,
-        )?;
+        let tensor = Tensor::from_f32(&vals, &[world_size as i64], Device::CPU)?;
         // Bookkeeping reduce: tag it `Control` so the consensus-checkpoint
         // forge never mistakes this count vector for a slice of the model
         // (and so it rides f32 regardless of the model wire dtype — bf16
@@ -878,7 +859,6 @@ impl CpuReduceClient {
         }
         Ok(())
     }
-
 }
 // NOTE: an `AsyncCpuReduceClient` (split read/write, background reader
 // thread) used to live here. It had zero production users — cpu-async
@@ -1160,8 +1140,7 @@ fn decode_into_dst(
         )));
     };
     let dst_ok = dst.device() == Device::CPU
-        && (dst.dtype() == dtype
-            || (dst.dtype() == DType::Float32 && dtype == DType::BFloat16));
+        && (dst.dtype() == dtype || (dst.dtype() == DType::Float32 && dtype == DType::BFloat16));
     if !dst_ok {
         if fallback.is_none() {
             *fallback = Some(format!(

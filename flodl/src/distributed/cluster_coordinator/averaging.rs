@@ -10,8 +10,8 @@
 use std::time::Instant;
 
 use crate::distributed::ddp_run::convergence::ConvergenceAction;
-use crate::distributed::el_che::{AnchorVerdict, WindowReport};
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+use crate::distributed::el_che::{AnchorVerdict, WindowReport};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::Result;
 
@@ -163,8 +163,7 @@ impl ClusterCoordinator {
             fill_ms: (0..self.world_size)
                 .map(|r| self.window.fill_excess_ms(r))
                 .collect(),
-            delivered_coherent: self.delivered_capable()
-                && self.movers_delivered_complete(),
+            delivered_coherent: self.delivered_capable() && self.movers_delivered_complete(),
             sync_ms,
         }
     }
@@ -177,14 +176,10 @@ impl ClusterCoordinator {
     /// `batch_counts`. Call BEFORE the per-cycle counter resets. No-op
     /// unless `-vvv`.
     fn dump_delivered_timing(&self, reduce_ms: f64) {
-        if !self.prof_enabled
-            || !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async)
-        {
+        if !self.prof_enabled || !matches!(self.policy, ApplyPolicy::Cadence | ApplyPolicy::Async) {
             return;
         }
-        let r1 = |v: &[f64]| -> Vec<f64> {
-            v.iter().map(|m| (m * 10.0).round() / 10.0).collect()
-        };
+        let r1 = |v: &[f64]| -> Vec<f64> { v.iter().map(|m| (m * 10.0).round() / 10.0).collect() };
         let compute_per_batch: Vec<f64> = (0..self.world_size)
             .map(|r| {
                 let n = self.window.steps(r).max(1);
@@ -215,9 +210,7 @@ impl ClusterCoordinator {
         };
         let missing: Vec<usize> = (0..self.world_size)
             .filter(|&r| {
-                !self.is_dead(r)
-                    && self.window.steps(r) > 0
-                    && !self.window.has_delivered_sample(r)
+                !self.is_dead(r) && self.window.steps(r) > 0 && !self.window.has_delivered_sample(r)
             })
             .collect();
         eprintln!(
@@ -325,19 +318,18 @@ impl ClusterCoordinator {
         match action {
             ConvergenceAction::Stable => {
                 self.el_che.apply_verdict(AnchorVerdict::Stable {
-                    relax_up: self.policy == ApplyPolicy::Async
-                        && self.elche_relax_up,
+                    relax_up: self.policy == ApplyPolicy::Async && self.elche_relax_up,
                 });
                 if self.policy == ApplyPolicy::Async && self.overshoot_auto {
-                    self.max_overshoot =
-                        (self.max_overshoot + 1).min(self.overshoot_ceiling);
+                    self.max_overshoot = (self.max_overshoot + 1).min(self.overshoot_ceiling);
                 }
             }
             ConvergenceAction::SuppressGrowth => {
                 self.el_che.apply_verdict(AnchorVerdict::SuppressGrowth);
             }
             ConvergenceAction::NudgeDown { factor } => {
-                self.el_che.apply_verdict(AnchorVerdict::NudgeDown { factor });
+                self.el_che
+                    .apply_verdict(AnchorVerdict::NudgeDown { factor });
                 if self.overshoot_auto && self.policy == ApplyPolicy::Async {
                     self.max_overshoot = self.overshoot_initial;
                 }
@@ -357,8 +349,7 @@ impl ClusterCoordinator {
         // λ̂ from observables now that the guard pipeline is plural.
         let d_raw = report.max_relative_delta();
         self.update_epoch_d_aggregator(d_raw, k_max);
-        let in_flight_epoch =
-            in_flight_epoch(self.last_aggregated_epoch, self.num_epochs);
+        let in_flight_epoch = in_flight_epoch(self.last_aggregated_epoch, self.num_epochs);
 
         // `drift` alert. The trigger is the guard's own `NudgeDown` verdict,
         // not a raw `d_raw` threshold invented here: the configured guard IS
@@ -528,10 +519,11 @@ impl ClusterCoordinator {
     /// `finish_averaging_cpu`.
     pub(super) fn emit_sync_end(&mut self) {
         if let Some(start) = self.sync_start.take()
-            && let Some(ref tl) = self.timeline {
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
-            }
+            && let Some(ref tl) = self.timeline
+        {
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
+        }
     }
 
     /// ARM a one-shot coverage-granular checkpoint at the START of a reduce
@@ -558,8 +550,8 @@ impl ClusterCoordinator {
         };
         // Fire at the first reduce where any live rank has reached the target
         // epoch (typically mid-epoch, so the coverage block is non-trivial).
-        let reached = (0..self.world_size)
-            .any(|r| !self.is_dead(r) && self.rank_epoch[r] >= target_epoch);
+        let reached =
+            (0..self.world_size).any(|r| !self.is_dead(r) && self.rank_epoch[r] >= target_epoch);
         if !reached {
             return;
         }
@@ -572,8 +564,7 @@ impl ClusterCoordinator {
                 if let (Some(stem), Some(forge)) =
                     (self.save_path.as_ref(), self.checkpoint_forge.as_ref())
                 {
-                    let model_path =
-                        crate::distributed::CheckpointBundle::model_path(stem);
+                    let model_path = crate::distributed::CheckpointBundle::model_path(stem);
                     if forge.can_write_model() {
                         forge.arm(model_path);
                     } else {

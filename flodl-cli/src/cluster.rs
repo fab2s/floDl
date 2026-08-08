@@ -227,8 +227,7 @@ pub fn prepare_cluster_env(
     // original string and let the remote try its own NSS as a last
     // resort.
     let mut shippable = cluster.clone();
-    let (controller_ip, controller_warning) =
-        resolve_host_to_ip(&shippable.controller.host);
+    let (controller_ip, controller_warning) = resolve_host_to_ip(&shippable.controller.host);
     if let Some(ip) = controller_ip {
         shippable.controller.host = ip;
     }
@@ -276,9 +275,10 @@ pub fn prepare_cluster_env(
             std::env::set_var(ENV_CLUSTER_EXTRA_HOSTS, extra_hosts.join(" "));
         }
         if let Some(e) = overlay_env
-            && !e.trim().is_empty() {
-                std::env::set_var(ENV_FDL_ENV, e);
-            }
+            && !e.trim().is_empty()
+        {
+            std::env::set_var(ENV_FDL_ENV, e);
+        }
     }
     Ok(warnings)
 }
@@ -307,15 +307,13 @@ fn probe_local_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Stri
             config::LocalDevices::Explicit(v) => v.len(),
             config::LocalDevices::All => {
                 if cached_local.is_none() {
-                    cached_local = Some(
-                        crate::gpus::local_gpu_count().map_err(|e| {
-                            format!(
-                                "cluster.workers[{i}] ({:?}): local GPU probe \
+                    cached_local = Some(crate::gpus::local_gpu_count().map_err(|e| {
+                        format!(
+                            "cluster.workers[{i}] ({:?}): local GPU probe \
                                  failed: {e}",
-                                w.host,
-                            )
-                        })?,
-                    );
+                            w.host,
+                        )
+                    })?);
                 }
                 cached_local.unwrap()
             }
@@ -371,12 +369,8 @@ fn probe_worker_device_counts(cluster: &ClusterConfig) -> Result<Vec<usize>, Str
     for (i, w) in cluster.workers.iter().enumerate() {
         let count = match &w.local_devices {
             config::LocalDevices::Explicit(v) => v.len(),
-            config::LocalDevices::All => ssh_query_gpu_count(w).map_err(|e| {
-                format!(
-                    "cluster.workers[{i}] ({:?}): probe failed: {e}",
-                    w.host,
-                )
-            })?,
+            config::LocalDevices::All => ssh_query_gpu_count(w)
+                .map_err(|e| format!("cluster.workers[{i}] ({:?}): probe failed: {e}", w.host,))?,
         };
         if count == 0 {
             return Err(format!(
@@ -449,16 +443,16 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
 pub(crate) fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
     opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
-        (k.trim().eq_ignore_ascii_case("BatchMode")
-            && !v.trim().eq_ignore_ascii_case("yes"))
-        .then(|| {
-            format!(
-                "fdl: host {host:?} ssh.options set `{}` — flodl's ssh is \
+        (k.trim().eq_ignore_ascii_case("BatchMode") && !v.trim().eq_ignore_ascii_case("yes")).then(
+            || {
+                format!(
+                    "fdl: host {host:?} ssh.options set `{}` — flodl's ssh is \
                  non-interactive and will hang on any prompt (passphrase, \
                  host-key). Proceeding as requested.",
-                opt.trim()
-            )
-        })
+                    opt.trim()
+                )
+            },
+        )
     })
 }
 
@@ -471,13 +465,7 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
     let mut cmd = Command::new("ssh");
     // User ssh.options first (they win), then flodl's defaults (M17).
     apply_worker_ssh_opts(&mut cmd, worker);
-    cmd.args([
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ConnectTimeout=5",
-    ]);
+    cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     cmd.arg(target);
     // Both vendors in one round trip, because "how many GPUs" is not an
     // NVIDIA question: counting only nvidia-smi made an AMD worker probe
@@ -493,9 +481,7 @@ fn ssh_query_gpu_count(worker: &config::ClusterWorker) -> Result<usize, String> 
          2>/dev/null | wc -l); echo \"$n $a\"",
     );
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    let output = cmd.output().map_err(|e| format!("ssh spawn failed: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
@@ -579,11 +565,7 @@ fn resolve_cluster_extra_hosts(cluster: &ClusterConfig) -> (Vec<String>, Vec<Str
         // ~/.ssh/config aliases (e.g. a `node-b` alias mapping to
         // 127.0.0.1:2222) routinely don't resolve via host NSS, and
         // surfacing the warning every run is noise.
-        let has_explicit_ssh_target = w
-            .ssh
-            .as_ref()
-            .and_then(|s| s.target.as_deref())
-            .is_some();
+        let has_explicit_ssh_target = w.ssh.as_ref().and_then(|s| s.target.as_deref()).is_some();
         if let Some(msg) = warning
             && !has_explicit_ssh_target
         {
@@ -839,11 +821,23 @@ mod tests {
         // The bug this guards: the probe counted nvidia-smi only, so an
         // AMD worker with `local_devices: all` probed 0 and aborted the
         // fan-out, quoting a tool that host does not have.
-        assert_eq!(pick_worker_count(0, 8, Some("precompiled/rocm70"), "h"), Ok(8));
-        assert_eq!(pick_worker_count(2, 0, Some("precompiled/cu128"), "h"), Ok(2));
+        assert_eq!(
+            pick_worker_count(0, 8, Some("precompiled/rocm70"), "h"),
+            Ok(8)
+        );
+        assert_eq!(
+            pick_worker_count(2, 0, Some("precompiled/cu128"), "h"),
+            Ok(2)
+        );
         // A declared arch outranks the other vendor's cards being present.
-        assert_eq!(pick_worker_count(2, 8, Some("precompiled/rocm71"), "h"), Ok(8));
-        assert_eq!(pick_worker_count(2, 8, Some("builds/sm61-sm120"), "h"), Ok(2));
+        assert_eq!(
+            pick_worker_count(2, 8, Some("precompiled/rocm71"), "h"),
+            Ok(8)
+        );
+        assert_eq!(
+            pick_worker_count(2, 8, Some("builds/sm61-sm120"), "h"),
+            Ok(2)
+        );
     }
 
     #[test]
@@ -876,13 +870,19 @@ mod tests {
     fn resolve_user_never_fabricates() {
         // Pure core — no env mutation needed.
         assert_eq!(resolve_user_from(Some("fab"), None).as_deref(), Some("fab"));
-        assert_eq!(resolve_user_from(Some(" fab \n"), None).as_deref(), Some("fab"));
+        assert_eq!(
+            resolve_user_from(Some(" fab \n"), None).as_deref(),
+            Some("fab")
+        );
         // Empty USER falls through to whoami.
         assert_eq!(
             resolve_user_from(Some(""), Some("who\n".into())).as_deref(),
             Some("who"),
         );
-        assert_eq!(resolve_user_from(None, Some("who".into())).as_deref(), Some("who"));
+        assert_eq!(
+            resolve_user_from(None, Some("who".into())).as_deref(),
+            Some("who")
+        );
         // Double failure -> None (never a fabricated "unknown-user").
         assert_eq!(resolve_user_from(None, None), None);
         assert_eq!(resolve_user_from(Some("  "), Some("  ".into())), None);
@@ -1111,9 +1111,7 @@ commands:
     /// or /etc/hosts content.
     #[test]
     fn resolve_cluster_extra_hosts_suppresses_warning_when_ssh_target_explicit() {
-        use crate::config::{
-            ClusterController, ClusterWorker, LocalDevices, SshConfig,
-        };
+        use crate::config::{ClusterController, ClusterWorker, LocalDevices, SshConfig};
         let cluster = ClusterConfig {
             controller: ClusterController {
                 host: "127.0.0.1".into(),

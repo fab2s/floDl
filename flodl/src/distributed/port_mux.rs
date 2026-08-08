@@ -28,17 +28,17 @@
 //! four bytes are part of the request line it reads.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::tensor::{Result, TensorError};
 
 use super::wire::{
-    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_HTTP_GET,
-    CHANNEL_MAGIC_HTTP_POST, CHANNEL_MAGIC_JOIN, CHANNEL_MAGIC_RENDEZVOUS,
+    CHANNEL_MAGIC_CONTROL, CHANNEL_MAGIC_DATA, CHANNEL_MAGIC_HTTP_GET, CHANNEL_MAGIC_HTTP_POST,
+    CHANNEL_MAGIC_JOIN, CHANNEL_MAGIC_RENDEZVOUS,
 };
 
 /// Poll cadence of the dispatcher's non-blocking accept loop.
@@ -83,19 +83,14 @@ impl PortMux {
     /// binding and its double-run/bind-failure diagnostics). `abort` is
     /// the launcher's failure flag: the accept loop re-checks it every
     /// poll so the failure path can join this thread promptly.
-    pub fn start(
-        listener: TcpListener,
-        abort: Arc<AtomicBool>,
-    ) -> Result<(Self, MuxAccept)> {
+    pub fn start(listener: TcpListener, abort: Arc<AtomicBool>) -> Result<(Self, MuxAccept)> {
         let bound_port = listener
             .local_addr()
-            .map_err(|e| {
-                TensorError::new(&format!("port_mux: local_addr() failed: {e}"))
-            })?
+            .map_err(|e| TensorError::new(&format!("port_mux: local_addr() failed: {e}")))?
             .port();
-        listener.set_nonblocking(true).map_err(|e| {
-            TensorError::new(&format!("port_mux: set_nonblocking failed: {e}"))
-        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| TensorError::new(&format!("port_mux: set_nonblocking failed: {e}")))?;
 
         let (rdv_tx, rdv_rx) = channel();
         let (data_tx, data_rx) = channel();
@@ -109,16 +104,17 @@ impl PortMux {
             .name(format!("flodl-port-mux:{bound_port}"))
             .spawn(move || {
                 dispatch_loop(
-                    listener, rdv_tx, data_tx, ctrl_tx, join_tx, status_tx,
-                    shutdown_c, abort,
+                    listener, rdv_tx, data_tx, ctrl_tx, join_tx, status_tx, shutdown_c, abort,
                 );
             })
-            .map_err(|e| {
-                TensorError::new(&format!("port_mux: spawn dispatcher failed: {e}"))
-            })?;
+            .map_err(|e| TensorError::new(&format!("port_mux: spawn dispatcher failed: {e}")))?;
 
         Ok((
-            PortMux { shutdown, handle: Some(handle), bound_port },
+            PortMux {
+                shutdown,
+                handle: Some(handle),
+                bound_port,
+            },
             MuxAccept {
                 rendezvous: rdv_rx,
                 data: data_rx,
@@ -200,8 +196,7 @@ fn dispatch_one(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let deadline_secs =
-        crate::distributed::wire::scaled_deadline_secs(PEEK_TIMEOUT_SECS);
+    let deadline_secs = crate::distributed::wire::scaled_deadline_secs(PEEK_TIMEOUT_SECS);
     if stream
         .set_read_timeout(Some(Duration::from_secs(deadline_secs)))
         .is_err()
@@ -255,10 +250,7 @@ fn dispatch_one(
 /// hangs up, or `deadline` elapses. The blocking `peek` returns as soon
 /// as ≥1 byte is readable, so a magic split across TCP segments loops
 /// here rather than failing.
-fn peek_magic(
-    stream: &TcpStream,
-    deadline: Duration,
-) -> std::result::Result<u32, String> {
+fn peek_magic(stream: &TcpStream, deadline: Duration) -> std::result::Result<u32, String> {
     let start = Instant::now();
     let mut buf = [0u8; 4];
     loop {
@@ -299,9 +291,9 @@ impl StreamSource {
     /// Wrap a directly bound listener (flips it non-blocking so
     /// [`Self::try_accept`] can poll).
     pub fn from_listener(listener: TcpListener, what: &str) -> Result<Self> {
-        listener.set_nonblocking(true).map_err(|e| {
-            TensorError::new(&format!("{what}: set_nonblocking failed: {e}"))
-        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| TensorError::new(&format!("{what}: set_nonblocking failed: {e}")))?;
         Ok(StreamSource::Listener(listener))
     }
 
@@ -315,16 +307,12 @@ impl StreamSource {
                     // Accepted socket may inherit non-blocking; flip it
                     // back so per-stream read/write timeouts are honored.
                     stream.set_nonblocking(false).map_err(|e| {
-                        TensorError::new(&format!(
-                            "{what}: set_nonblocking(false) failed: {e}"
-                        ))
+                        TensorError::new(&format!("{what}: set_nonblocking(false) failed: {e}"))
                     })?;
                     Ok(Some(stream))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                Err(e) => Err(TensorError::new(&format!(
-                    "{what}: accept failed: {e}"
-                ))),
+                Err(e) => Err(TensorError::new(&format!("{what}: accept failed: {e}"))),
             },
             StreamSource::Mux(rx) => match rx.try_recv() {
                 Ok(stream) => Ok(Some(stream)),

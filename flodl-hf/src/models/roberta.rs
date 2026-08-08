@@ -31,13 +31,15 @@
 
 use std::collections::HashMap;
 
-use flodl::nn::{Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter};
+use flodl::nn::{
+    Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter,
+};
 use flodl::{
     DType, Device, FlowBuilder, Graph, Result, Tensor, TensorError, TensorOptions, Variable,
 };
 
 use crate::models::transformer_layer::{LayerNaming, TransformerLayer, TransformerLayerConfig};
-use crate::path::{prefix_params, HfPath};
+use crate::path::{HfPath, prefix_params};
 
 /// RoBERTa hyperparameters. Matches the fields of a HuggingFace
 /// `RobertaConfig` JSON file that affect model shape.
@@ -118,16 +120,16 @@ impl RobertaConfig {
         let num_labels = parse_num_labels(&v, id2label.as_deref());
         let architectures = parse_architectures(&v);
         Ok(RobertaConfig {
-            vocab_size:              required_i64(&v, "vocab_size")?,
-            hidden_size:             required_i64(&v, "hidden_size")?,
-            num_hidden_layers:       required_i64(&v, "num_hidden_layers")?,
-            num_attention_heads:     required_i64(&v, "num_attention_heads")?,
-            intermediate_size:       required_i64(&v, "intermediate_size")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
+            hidden_size: required_i64(&v, "hidden_size")?,
+            num_hidden_layers: required_i64(&v, "num_hidden_layers")?,
+            num_attention_heads: required_i64(&v, "num_attention_heads")?,
+            intermediate_size: required_i64(&v, "intermediate_size")?,
             max_position_embeddings: required_i64(&v, "max_position_embeddings")?,
-            type_vocab_size:         optional_i64(&v, "type_vocab_size", 1),
-            pad_token_id:            optional_i64(&v, "pad_token_id", 1),
-            layer_norm_eps:               optional_f64(&v, "layer_norm_eps", 1e-5),
-            hidden_dropout_prob:          optional_f64(&v, "hidden_dropout_prob", 0.1),
+            type_vocab_size: optional_i64(&v, "type_vocab_size", 1),
+            pad_token_id: optional_i64(&v, "pad_token_id", 1),
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-5),
+            hidden_dropout_prob: optional_f64(&v, "hidden_dropout_prob", 0.1),
             attention_probs_dropout_prob: optional_f64(&v, "attention_probs_dropout_prob", 0.1),
             hidden_act: optional_hidden_act(&v, "hidden_act", "gelu")?,
             num_labels,
@@ -161,7 +163,10 @@ impl RobertaConfig {
         m.insert("vocab_size".into(), self.vocab_size.into());
         m.insert("hidden_size".into(), self.hidden_size.into());
         m.insert("num_hidden_layers".into(), self.num_hidden_layers.into());
-        m.insert("num_attention_heads".into(), self.num_attention_heads.into());
+        m.insert(
+            "num_attention_heads".into(),
+            self.num_attention_heads.into(),
+        );
         m.insert("intermediate_size".into(), self.intermediate_size.into());
         m.insert(
             "max_position_embeddings".into(),
@@ -170,7 +175,10 @@ impl RobertaConfig {
         m.insert("type_vocab_size".into(), self.type_vocab_size.into());
         m.insert("pad_token_id".into(), self.pad_token_id.into());
         m.insert("layer_norm_eps".into(), self.layer_norm_eps.into());
-        m.insert("hidden_dropout_prob".into(), self.hidden_dropout_prob.into());
+        m.insert(
+            "hidden_dropout_prob".into(),
+            self.hidden_dropout_prob.into(),
+        );
         m.insert(
             "attention_probs_dropout_prob".into(),
             self.attention_probs_dropout_prob.into(),
@@ -275,7 +283,9 @@ impl RobertaEmbeddings {
 }
 
 impl Module for RobertaEmbeddings {
-    fn name(&self) -> &str { "roberta_embeddings" }
+    fn name(&self) -> &str {
+        "roberta_embeddings"
+    }
 
     /// Single-input forward: word ids only. Position ids are computed
     /// internally; token-type embedding adds a zero-row contribution
@@ -292,14 +302,25 @@ impl Module for RobertaEmbeddings {
 
     fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("word_embeddings", self.word_embeddings.parameters()));
-        out.extend(prefix_params("position_embeddings", self.position_embeddings.parameters()));
-        out.extend(prefix_params("token_type_embeddings", self.token_type_embeddings.parameters()));
+        out.extend(prefix_params(
+            "word_embeddings",
+            self.word_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "position_embeddings",
+            self.position_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "token_type_embeddings",
+            self.token_type_embeddings.parameters(),
+        ));
         out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.dropout.set_training(training);
@@ -349,7 +370,9 @@ impl RobertaPooler {
 }
 
 impl Module for RobertaPooler {
-    fn name(&self) -> &str { "roberta_pooler" }
+    fn name(&self) -> &str {
+        "roberta_pooler"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let cls = input.select(1, 0)?;
@@ -369,13 +392,13 @@ impl Module for RobertaPooler {
 /// only the embedding and task-head code differs.
 pub(crate) fn roberta_layer_config(config: &RobertaConfig) -> TransformerLayerConfig {
     TransformerLayerConfig {
-        hidden_size:                  config.hidden_size,
-        num_attention_heads:          config.num_attention_heads,
-        intermediate_size:            config.intermediate_size,
-        hidden_dropout_prob:          config.hidden_dropout_prob,
+        hidden_size: config.hidden_size,
+        num_attention_heads: config.num_attention_heads,
+        intermediate_size: config.intermediate_size,
+        hidden_dropout_prob: config.hidden_dropout_prob,
         attention_probs_dropout_prob: config.attention_probs_dropout_prob,
-        layer_norm_eps:               config.layer_norm_eps,
-        hidden_act:                   config.hidden_act,
+        layer_norm_eps: config.layer_norm_eps,
+        hidden_act: config.hidden_act,
     }
 }
 
@@ -409,7 +432,11 @@ pub(crate) fn roberta_backbone_flow(
     for i in 0..config.num_hidden_layers {
         let tag = layer_root.sub(i).to_string();
         fb = fb
-            .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::BERT, device)?)
+            .through(TransformerLayer::on_device(
+                &layer_cfg,
+                LayerNaming::BERT,
+                device,
+            )?)
             .tag(&tag)
             .using(&["attention_mask"]);
     }
@@ -471,10 +498,10 @@ impl RobertaModel {
 
 // ── Task heads ───────────────────────────────────────────────────────────
 
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead,
-};
 pub use crate::task_heads::{Answer, TokenPrediction};
+use crate::task_heads::{
+    ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead, check_num_labels,
+};
 
 /// RoBERTa graphs take three `forward_multi` inputs — `input_ids`,
 /// `token_type_ids`, and an extended attention mask — in that order.
@@ -526,11 +553,7 @@ pub struct RobertaClassificationHead {
 }
 
 impl RobertaClassificationHead {
-    pub fn on_device(
-        config: &RobertaConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &RobertaConfig, num_labels: i64, device: Device) -> Result<Self> {
         Ok(RobertaClassificationHead {
             dropout: Dropout::new(config.hidden_dropout_prob),
             dense: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
@@ -540,11 +563,13 @@ impl RobertaClassificationHead {
 }
 
 impl Module for RobertaClassificationHead {
-    fn name(&self) -> &str { "roberta_classification_head" }
+    fn name(&self) -> &str {
+        "roberta_classification_head"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // input: [batch, seq_len, hidden] → take index 0 along seq axis.
-        let cls = input.select(1, 0)?;          // [batch, hidden]
+        let cls = input.select(1, 0)?; // [batch, hidden]
         let x = self.dropout.forward(&cls)?;
         let x = self.dense.forward(&x)?;
         let x = x.tanh()?;
@@ -554,7 +579,7 @@ impl Module for RobertaClassificationHead {
 
     fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("dense",    self.dense.parameters()));
+        out.extend(prefix_params("dense", self.dense.parameters()));
         out.extend(prefix_params("out_proj", self.out_proj.parameters()));
         out
     }
@@ -583,17 +608,20 @@ pub type RobertaForSequenceClassification = ClassificationHead<RobertaConfig>;
 impl ClassificationHead<RobertaConfig> {
     /// Build the full graph (backbone without pooler + two-layer
     /// classification head) on `device` without loading any weights.
-    pub fn on_device(
-        config: &RobertaConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &RobertaConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = roberta_backbone_flow(config, device, /*with_pooler=*/ false)?
-            .through(RobertaClassificationHead::on_device(config, num_labels, device)?)
+            .through(RobertaClassificationHead::on_device(
+                config, num_labels, device,
+            )?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &RobertaConfig) -> Result<i64> {
@@ -621,18 +649,19 @@ impl ClassificationHead<RobertaConfig> {
 pub type RobertaForTokenClassification = TaggingHead<RobertaConfig>;
 
 impl TaggingHead<RobertaConfig> {
-    pub fn on_device(
-        config: &RobertaConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &RobertaConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = roberta_backbone_flow(config, device, /*with_pooler=*/ false)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &RobertaConfig) -> Result<i64> {
@@ -707,7 +736,9 @@ impl RobertaLMHeadTransform {
 }
 
 impl Module for RobertaLMHeadTransform {
-    fn name(&self) -> &str { "roberta_lm_head_transform" }
+    fn name(&self) -> &str {
+        "roberta_lm_head_transform"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let x = self.dense.forward(input)?;
@@ -716,8 +747,8 @@ impl Module for RobertaLMHeadTransform {
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        let mut out = prefix_params("dense",      self.dense.parameters());
-        out.extend(   prefix_params("layer_norm", self.layer_norm.parameters()));
+        let mut out = prefix_params("dense", self.dense.parameters());
+        out.extend(prefix_params("layer_norm", self.layer_norm.parameters()));
         out
     }
 }
@@ -778,7 +809,11 @@ pub(crate) fn roberta_masked_lm_graph(config: &RobertaConfig, device: Device) ->
     for i in 0..config.num_hidden_layers {
         let tag = layer_root.sub(i).to_string();
         fb = fb
-            .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::BERT, device)?)
+            .through(TransformerLayer::on_device(
+                &layer_cfg,
+                LayerNaming::BERT,
+                device,
+            )?)
             .tag(&tag)
             .using(&["attention_mask"]);
     }
@@ -787,7 +822,10 @@ pub(crate) fn roberta_masked_lm_graph(config: &RobertaConfig, device: Device) ->
     let decoder_bias = Parameter::new(
         Tensor::zeros(
             &[config.vocab_size],
-            TensorOptions { dtype: DType::Float32, device },
+            TensorOptions {
+                dtype: DType::Float32,
+                device,
+            },
         )?,
         "bias",
     );
@@ -836,7 +874,10 @@ mod tests {
             "output.dense.bias",
             "output.dense.weight",
         ];
-        suffixes.iter().map(|s| format!("roberta.encoder.layer.{i}.{s}")).collect()
+        suffixes
+            .iter()
+            .map(|s| format!("roberta.encoder.layer.{i}.{s}"))
+            .collect()
     }
 
     /// Round-trip: preset -> to_json_str -> from_json_str recovers the
@@ -849,7 +890,10 @@ mod tests {
         let recovered = RobertaConfig::from_json_str(&s).unwrap();
         assert_eq!(preset.to_json_str(), recovered.to_json_str());
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v.get("model_type").and_then(|x| x.as_str()), Some("roberta"));
+        assert_eq!(
+            v.get("model_type").and_then(|x| x.as_str()),
+            Some("roberta")
+        );
     }
 
     /// Full key set (199 keys: 5 embeddings + 16×12 layers + 2 pooler)
@@ -888,9 +932,7 @@ mod tests {
     #[test]
     fn roberta_seqcls_head_has_two_layer_keys() {
         let config = RobertaConfig::roberta_base();
-        let head = RobertaForSequenceClassification::on_device(
-            &config, 3, Device::CPU,
-        ).unwrap();
+        let head = RobertaForSequenceClassification::on_device(&config, 3, Device::CPU).unwrap();
         let expected = expected_from_graph(head.graph());
         let keys: Vec<String> = expected.iter().map(|p| p.key.clone()).collect();
         assert!(keys.contains(&"classifier.dense.weight".to_string()));
@@ -963,15 +1005,17 @@ mod tests {
         );
 
         let by_key: std::collections::HashMap<&str, &[i64]> = expected
-            .iter().map(|p| (p.key.as_str(), p.shape.as_slice())).collect();
+            .iter()
+            .map(|p| (p.key.as_str(), p.shape.as_slice()))
+            .collect();
         let v = config.vocab_size;
         let h = config.hidden_size;
         assert_eq!(by_key["roberta.embeddings.word_embeddings.weight"], &[v, h]);
-        assert_eq!(by_key["lm_head.dense.weight"],       &[h, h]);
-        assert_eq!(by_key["lm_head.dense.bias"],         &[h]);
-        assert_eq!(by_key["lm_head.layer_norm.weight"],  &[h]);
-        assert_eq!(by_key["lm_head.layer_norm.bias"],    &[h]);
-        assert_eq!(by_key["lm_head.decoder.bias"],       &[v]);
+        assert_eq!(by_key["lm_head.dense.weight"], &[h, h]);
+        assert_eq!(by_key["lm_head.dense.bias"], &[h]);
+        assert_eq!(by_key["lm_head.layer_norm.weight"], &[h]);
+        assert_eq!(by_key["lm_head.layer_norm.bias"], &[h]);
+        assert_eq!(by_key["lm_head.decoder.bias"], &[v]);
     }
 
     /// Structural tying check: exactly one `[vocab, hidden]`-shaped
@@ -1019,10 +1063,18 @@ mod tests {
             Tensor::from_i64(&[0, 100, 200, 2], &[batch, seq], dev).unwrap(),
             false,
         );
-        let tt = Variable::new(Tensor::from_i64(&[0; 4], &[batch, seq], dev).unwrap(), false);
-        let mask_flat = Tensor::ones(&[batch, seq], TensorOptions {
-            dtype: DType::Float32, device: dev,
-        }).unwrap();
+        let tt = Variable::new(
+            Tensor::from_i64(&[0; 4], &[batch, seq], dev).unwrap(),
+            false,
+        );
+        let mask_flat = Tensor::ones(
+            &[batch, seq],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: dev,
+            },
+        )
+        .unwrap();
         let mask = Variable::new(build_extended_attention_mask(&mask_flat).unwrap(), false);
 
         let out = head.graph().forward_multi(&[ids, tt, mask]).unwrap();
@@ -1034,7 +1086,10 @@ mod tests {
     fn masked_lm_has_graph_returns_inner_graph_by_reference() {
         let config = RobertaConfig::roberta_base();
         let head = RobertaForMaskedLM::on_device(&config, Device::CPU).unwrap();
-        assert!(std::ptr::eq(head.graph(), <RobertaForMaskedLM as HasGraph>::graph(&head)));
+        assert!(std::ptr::eq(
+            head.graph(),
+            <RobertaForMaskedLM as HasGraph>::graph(&head)
+        ));
     }
 
     /// Backward through the tied decoder must produce a gradient on
@@ -1052,10 +1107,18 @@ mod tests {
             Tensor::from_i64(&[0, 100, 200, 2], &[batch, seq], dev).unwrap(),
             false,
         );
-        let tt = Variable::new(Tensor::from_i64(&[0; 4], &[batch, seq], dev).unwrap(), false);
-        let mask_flat = Tensor::ones(&[batch, seq], TensorOptions {
-            dtype: DType::Float32, device: dev,
-        }).unwrap();
+        let tt = Variable::new(
+            Tensor::from_i64(&[0; 4], &[batch, seq], dev).unwrap(),
+            false,
+        );
+        let mask_flat = Tensor::ones(
+            &[batch, seq],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: dev,
+            },
+        )
+        .unwrap();
         let mask = Variable::new(build_extended_attention_mask(&mask_flat).unwrap(), false);
 
         let logits = head.graph().forward_multi(&[ids, tt, mask]).unwrap();

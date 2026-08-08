@@ -84,12 +84,7 @@ impl Graph {
 
     /// Write a human-readable training log with per-epoch metrics and ETA.
     /// `total_epochs` is used for ETA (0 to omit).
-    pub fn write_log(
-        &self,
-        path: &str,
-        total_epochs: usize,
-        tags: &[&str],
-    ) -> std::io::Result<()> {
+    pub fn write_log(&self, path: &str, total_epochs: usize, tags: &[&str]) -> std::io::Result<()> {
         let series = self.gather_series(tags);
         if series.is_empty() {
             return Err(std::io::Error::new(
@@ -120,7 +115,7 @@ impl Graph {
                     flush_times[i] - flush_times[i - 1]
                 };
                 if dur > 0.0 {
-                    let _ = write!(b, "  [{}",format_duration(dur));
+                    let _ = write!(b, "  [{}", format_duration(dur));
                     if total_epochs > 0 && i + 1 < total_epochs {
                         // Recent-pace ETA (mean of the last ≤5 epoch
                         // durations), matching the live monitor: the old
@@ -142,8 +137,7 @@ impl Graph {
                             }
                         }
                         if n > 0 {
-                            let remaining =
-                                (acc / n as f64) * (total_epochs - i - 1) as f64;
+                            let remaining = (acc / n as f64) * (total_epochs - i - 1) as f64;
                             if remaining > 0.0 {
                                 let _ = write!(b, "  ETA {}", format_duration(remaining));
                             }

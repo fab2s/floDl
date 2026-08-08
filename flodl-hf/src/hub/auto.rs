@@ -14,7 +14,7 @@ use hf_hub::api::sync::ApiBuilder;
 
 use flodl::{Device, Graph, Result, TensorError};
 
-use crate::export::{build_for_export_with_head, HeadKind};
+use crate::export::{HeadKind, build_for_export_with_head};
 use crate::models::albert::{
     AlbertForMaskedLM, AlbertForQuestionAnswering, AlbertForSequenceClassification,
     AlbertForTokenClassification,
@@ -28,20 +28,20 @@ use crate::models::bert::{
     BertForTokenClassification,
 };
 use crate::models::deberta_v2::{
-    DebertaV2ForMaskedLM, DebertaV2ForQuestionAnswering,
-    DebertaV2ForSequenceClassification, DebertaV2ForTokenClassification,
+    DebertaV2ForMaskedLM, DebertaV2ForQuestionAnswering, DebertaV2ForSequenceClassification,
+    DebertaV2ForTokenClassification,
 };
 use crate::models::distilbert::{
-    DistilBertForMaskedLM, DistilBertForQuestionAnswering,
-    DistilBertForSequenceClassification, DistilBertForTokenClassification,
+    DistilBertForMaskedLM, DistilBertForQuestionAnswering, DistilBertForSequenceClassification,
+    DistilBertForTokenClassification,
 };
 use crate::models::roberta::{
     RobertaForMaskedLM, RobertaForQuestionAnswering, RobertaForSequenceClassification,
     RobertaForTokenClassification,
 };
 use crate::models::xlm_roberta::{
-    XlmRobertaForMaskedLM, XlmRobertaForQuestionAnswering,
-    XlmRobertaForSequenceClassification, XlmRobertaForTokenClassification,
+    XlmRobertaForMaskedLM, XlmRobertaForQuestionAnswering, XlmRobertaForSequenceClassification,
+    XlmRobertaForTokenClassification,
 };
 
 #[cfg(feature = "tokenizer")]
@@ -49,9 +49,9 @@ use crate::tokenizer::HfTokenizer;
 
 use crate::safetensors_io::weights_have_pooler;
 
-use super::{fetch_config_and_weights, fetch_config_str, load_weights_with_logging};
 #[cfg(feature = "tokenizer")]
 use super::try_load_tokenizer;
+use super::{fetch_config_and_weights, fetch_config_str, load_weights_with_logging};
 
 /// Fetch a `config.json` string and safetensors blob, then parse the
 /// config through [`AutoConfig::from_json_str`]. Shared by every
@@ -110,7 +110,10 @@ impl AutoModel {
         // `[batch, hidden]` shape that diverges from RoBERTa/DistilBERT).
         // Pooler-less families ignore the flag.
         let graph = build_for_export_with_head(
-            &config, /*has_pooler=*/ false, HeadKind::Base, device,
+            &config,
+            /*has_pooler=*/ false,
+            HeadKind::Base,
+            device,
         )?;
         load_weights_with_logging(repo_id, &graph, &weights)?;
         // Normalise `architectures` to the base class name actually
@@ -168,19 +171,14 @@ impl AutoModel {
 
     /// Device-aware variant of
     /// [`from_pretrained_for_export`](Self::from_pretrained_for_export).
-    pub fn from_pretrained_for_export_on_device(
-        repo_id: &str,
-        device: Device,
-    ) -> Result<Graph> {
+    pub fn from_pretrained_for_export_on_device(repo_id: &str, device: Device) -> Result<Graph> {
         // Auto-detect the head from architectures[0]. Fetch only
         // config.json first (cheap) so we can decide the dispatch
         // without paying the full safetensors download for paths that
         // delegate to a head loader (which fetches its own).
         let config_str = fetch_config_str(repo_id)?;
         let probe = AutoConfig::from_json_str(&config_str)?;
-        let arch_first = probe
-            .architectures()
-            .and_then(|a| a.first().cloned());
+        let arch_first = probe.architectures().and_then(|a| a.first().cloned());
         let head_kind = match arch_first.as_deref() {
             Some(arch) => classify_for_hub_export(arch),
             None => HubExportHead::Base,
@@ -210,23 +208,22 @@ impl AutoModel {
         match head {
             HubExportHead::Base => Self::base_from_pretrained_for_export(repo_id, device),
             HubExportHead::SeqCls => {
-                let head = AutoModelForSequenceClassification
-                    ::from_pretrained_on_device(repo_id, device)?;
+                let head =
+                    AutoModelForSequenceClassification::from_pretrained_on_device(repo_id, device)?;
                 Ok(head.into_graph())
             }
             HubExportHead::TokCls => {
-                let head = AutoModelForTokenClassification
-                    ::from_pretrained_on_device(repo_id, device)?;
+                let head =
+                    AutoModelForTokenClassification::from_pretrained_on_device(repo_id, device)?;
                 Ok(head.into_graph())
             }
             HubExportHead::Qa => {
-                let head = AutoModelForQuestionAnswering
-                    ::from_pretrained_on_device(repo_id, device)?;
+                let head =
+                    AutoModelForQuestionAnswering::from_pretrained_on_device(repo_id, device)?;
                 Ok(head.into_graph())
             }
             HubExportHead::Mlm => {
-                let head = AutoModelForMaskedLM
-                    ::from_pretrained_on_device(repo_id, device)?;
+                let head = AutoModelForMaskedLM::from_pretrained_on_device(repo_id, device)?;
                 Ok(head.into_graph())
             }
         }
@@ -351,42 +348,54 @@ impl AutoModelForSequenceClassification {
                 let num_labels = BertForSequenceClassification::num_labels_from_config(&c)?;
                 let h = BertForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("BertForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("BertForSequenceClassification")
+                    .to_json_str();
                 (Self::Bert(h), cj)
             }
             AutoConfig::Roberta(c) => {
                 let num_labels = RobertaForSequenceClassification::num_labels_from_config(&c)?;
                 let h = RobertaForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("RobertaForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("RobertaForSequenceClassification")
+                    .to_json_str();
                 (Self::Roberta(h), cj)
             }
             AutoConfig::DistilBert(c) => {
                 let num_labels = DistilBertForSequenceClassification::num_labels_from_config(&c)?;
                 let h = DistilBertForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DistilBertForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("DistilBertForSequenceClassification")
+                    .to_json_str();
                 (Self::DistilBert(h), cj)
             }
             AutoConfig::XlmRoberta(c) => {
                 let num_labels = XlmRobertaForSequenceClassification::num_labels_from_config(&c)?;
                 let h = XlmRobertaForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("XLMRobertaForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("XLMRobertaForSequenceClassification")
+                    .to_json_str();
                 (Self::XlmRoberta(h), cj)
             }
             AutoConfig::Albert(c) => {
                 let num_labels = AlbertForSequenceClassification::num_labels_from_config(&c)?;
                 let h = AlbertForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("AlbertForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("AlbertForSequenceClassification")
+                    .to_json_str();
                 (Self::Albert(h), cj)
             }
             AutoConfig::DebertaV2(c) => {
                 let num_labels = DebertaV2ForSequenceClassification::num_labels_from_config(&c)?;
                 let h = DebertaV2ForSequenceClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DebertaV2ForSequenceClassification").to_json_str();
+                let cj = c
+                    .with_architectures("DebertaV2ForSequenceClassification")
+                    .to_json_str();
                 (Self::DebertaV2(h), cj)
             }
         };
@@ -414,42 +423,54 @@ impl AutoModelForTokenClassification {
                 let num_labels = BertForTokenClassification::num_labels_from_config(&c)?;
                 let h = BertForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("BertForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("BertForTokenClassification")
+                    .to_json_str();
                 (Self::Bert(h), cj)
             }
             AutoConfig::Roberta(c) => {
                 let num_labels = RobertaForTokenClassification::num_labels_from_config(&c)?;
                 let h = RobertaForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("RobertaForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("RobertaForTokenClassification")
+                    .to_json_str();
                 (Self::Roberta(h), cj)
             }
             AutoConfig::DistilBert(c) => {
                 let num_labels = DistilBertForTokenClassification::num_labels_from_config(&c)?;
                 let h = DistilBertForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DistilBertForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("DistilBertForTokenClassification")
+                    .to_json_str();
                 (Self::DistilBert(h), cj)
             }
             AutoConfig::XlmRoberta(c) => {
                 let num_labels = XlmRobertaForTokenClassification::num_labels_from_config(&c)?;
                 let h = XlmRobertaForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("XLMRobertaForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("XLMRobertaForTokenClassification")
+                    .to_json_str();
                 (Self::XlmRoberta(h), cj)
             }
             AutoConfig::Albert(c) => {
                 let num_labels = AlbertForTokenClassification::num_labels_from_config(&c)?;
                 let h = AlbertForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("AlbertForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("AlbertForTokenClassification")
+                    .to_json_str();
                 (Self::Albert(h), cj)
             }
             AutoConfig::DebertaV2(c) => {
                 let num_labels = DebertaV2ForTokenClassification::num_labels_from_config(&c)?;
                 let h = DebertaV2ForTokenClassification::on_device(&c, num_labels, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DebertaV2ForTokenClassification").to_json_str();
+                let cj = c
+                    .with_architectures("DebertaV2ForTokenClassification")
+                    .to_json_str();
                 (Self::DebertaV2(h), cj)
             }
         };
@@ -478,37 +499,49 @@ impl AutoModelForQuestionAnswering {
             AutoConfig::Bert(c) => {
                 let h = BertForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("BertForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("BertForQuestionAnswering")
+                    .to_json_str();
                 (Self::Bert(h), cj)
             }
             AutoConfig::Roberta(c) => {
                 let h = RobertaForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("RobertaForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("RobertaForQuestionAnswering")
+                    .to_json_str();
                 (Self::Roberta(h), cj)
             }
             AutoConfig::DistilBert(c) => {
                 let h = DistilBertForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DistilBertForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("DistilBertForQuestionAnswering")
+                    .to_json_str();
                 (Self::DistilBert(h), cj)
             }
             AutoConfig::XlmRoberta(c) => {
                 let h = XlmRobertaForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("XLMRobertaForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("XLMRobertaForQuestionAnswering")
+                    .to_json_str();
                 (Self::XlmRoberta(h), cj)
             }
             AutoConfig::Albert(c) => {
                 let h = AlbertForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("AlbertForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("AlbertForQuestionAnswering")
+                    .to_json_str();
                 (Self::Albert(h), cj)
             }
             AutoConfig::DebertaV2(c) => {
                 let h = DebertaV2ForQuestionAnswering::on_device(&c, device)?;
                 load_weights_with_logging(repo_id, h.graph(), &weights)?;
-                let cj = c.with_architectures("DebertaV2ForQuestionAnswering").to_json_str();
+                let cj = c
+                    .with_architectures("DebertaV2ForQuestionAnswering")
+                    .to_json_str();
                 (Self::DebertaV2(h), cj)
             }
         };
@@ -614,8 +647,14 @@ mod tests {
     #[test]
     fn hub_export_head_parse_round_trip() {
         assert_eq!(HubExportHead::parse("base").unwrap(), HubExportHead::Base);
-        assert_eq!(HubExportHead::parse("seqcls").unwrap(), HubExportHead::SeqCls);
-        assert_eq!(HubExportHead::parse("tokcls").unwrap(), HubExportHead::TokCls);
+        assert_eq!(
+            HubExportHead::parse("seqcls").unwrap(),
+            HubExportHead::SeqCls
+        );
+        assert_eq!(
+            HubExportHead::parse("tokcls").unwrap(),
+            HubExportHead::TokCls
+        );
         assert_eq!(HubExportHead::parse("qa").unwrap(), HubExportHead::Qa);
         assert_eq!(HubExportHead::parse("mlm").unwrap(), HubExportHead::Mlm);
     }

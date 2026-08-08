@@ -25,8 +25,12 @@ fn main() -> flodl::Result<()> {
     for (sentence, tokens) in sentences.iter().zip(&tagged) {
         println!("{sentence:?}");
         for t in tokens {
-            if !t.attends { continue; }              // drop padding
-            if t.label == "O" { continue; }          // drop non-entity tokens for readability
+            if !t.attends {
+                continue;
+            } // drop padding
+            if t.label == "O" {
+                continue;
+            } // drop non-entity tokens for readability
             println!("  {:<15} {:<8} ({:.3})", t.token, t.label, t.score);
         }
     }

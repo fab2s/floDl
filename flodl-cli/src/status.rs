@@ -117,18 +117,19 @@ fn resolve_candidates(addr_override: Option<&str>) -> (Vec<String>, String) {
         return (vec![addr], "--addr".to_string());
     }
     if let Ok(env_name) = std::env::var("FDL_ENV")
-        && let Some(cluster) = load_cluster_for_env(&env_name) {
-            let host = cluster.controller.host.clone();
-            let port = cluster.controller.port;
-            let mut candidates = vec![format!("{host}:{port}")];
-            // All-tunneled runs bind loopback only; when fdl runs on the
-            // controller box (the common case) the loopback retry finds
-            // them without reimplementing flodl's bind-scope rules.
-            if host != "127.0.0.1" && host != "localhost" {
-                candidates.push(format!("127.0.0.1:{port}"));
-            }
-            return (candidates, format!("fdl.{env_name}.yml controller"));
+        && let Some(cluster) = load_cluster_for_env(&env_name)
+    {
+        let host = cluster.controller.host.clone();
+        let port = cluster.controller.port;
+        let mut candidates = vec![format!("{host}:{port}")];
+        // All-tunneled runs bind loopback only; when fdl runs on the
+        // controller box (the common case) the loopback retry finds
+        // them without reimplementing flodl's bind-scope rules.
+        if host != "127.0.0.1" && host != "localhost" {
+            candidates.push(format!("127.0.0.1:{port}"));
         }
+        return (candidates, format!("fdl.{env_name}.yml controller"));
+    }
     eprintln!(
         "{}",
         style::dim(&format!(
@@ -241,10 +242,7 @@ fn print_status(addr: &str, body: &str) {
         "failed" => style::red(phase),
         other => other.to_string(),
     };
-    println!(
-        "cluster run @ {addr} — {}",
-        style::bold(&painted_phase),
-    );
+    println!("cluster run @ {addr} — {}", style::bold(&painted_phase),);
 
     let joined_ranks = state["joined_ranks"].as_u64().unwrap_or(0);
     let joined_hosts = state["joined_hosts"].as_u64().unwrap_or(0);
@@ -308,7 +306,12 @@ fn print_status(addr: &str, body: &str) {
         let host = m["host"].as_str().unwrap_or("?");
         let ranks: Vec<String> = m["ranks"]
             .as_array()
-            .map(|a| a.iter().filter_map(|r| r.as_u64()).map(|r| r.to_string()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.as_u64())
+                    .map(|r| r.to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         let joined_at = m["joined_at_secs"].as_u64().unwrap_or(0);
         let libtorch = m["libtorch"].as_str().unwrap_or("?");

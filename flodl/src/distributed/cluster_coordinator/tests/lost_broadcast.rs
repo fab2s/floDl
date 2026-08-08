@@ -11,10 +11,7 @@ use crate::monitor::{EventKind, Timeline};
 use super::super::{ClusterCoordinator, ClusterCoordinatorConfig, RunPhase};
 use super::ControlMsgWire;
 
-fn coord_with_timeline(
-    world_size: usize,
-    tl: std::sync::Arc<Timeline>,
-) -> ClusterCoordinator {
+fn coord_with_timeline(world_size: usize, tl: std::sync::Arc<Timeline>) -> ClusterCoordinator {
     ClusterCoordinator::for_test(
         ClusterCoordinatorConfig::new(
             ApplyPolicy::Cadence,
@@ -46,9 +43,7 @@ fn failed_broadcast_records_counter_and_timeline_event() {
     let lost: Vec<(String, usize)> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::LostBroadcast { control, failures } => {
-                Some((control.clone(), *failures))
-            }
+            EventKind::LostBroadcast { control, failures } => Some((control.clone(), *failures)),
             _ => None,
         })
         .collect();
@@ -98,10 +93,10 @@ fn the_same_heartbeat_miss_before_shutdown_is_traced() {
 
     let (_samples, events) = tl.drain();
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(&e.kind, EventKind::LostBroadcast { control, .. }
-                              if control == "CoordHeartbeat")),
+        events.iter().any(
+            |e| matches!(&e.kind, EventKind::LostBroadcast { control, .. }
+                              if control == "CoordHeartbeat")
+        ),
         "mid-run heartbeat miss emits a LostBroadcast event",
     );
 }
@@ -113,7 +108,10 @@ fn failed_shutdown_broadcast_is_exempt() {
 
     // The Shutdown send also fails (no streams) but must NOT be traced.
     let _ = coord.broadcast_control(&ControlMsgWire::Shutdown);
-    assert_eq!(coord.lost_broadcasts, 0, "Shutdown is exempt from the trace");
+    assert_eq!(
+        coord.lost_broadcasts, 0,
+        "Shutdown is exempt from the trace"
+    );
 
     let (_samples, events) = tl.drain();
     assert!(
@@ -142,7 +140,10 @@ fn an_exited_rank_is_not_addressed_and_cannot_fail_a_broadcast() {
         .expect_err("live streamless rank still fails the send");
     let msg = err.to_string();
     assert!(msg.contains("rank 0"), "live rank named: {msg}");
-    assert!(!msg.contains("rank 1"), "exited rank must not appear: {msg}");
+    assert!(
+        !msg.contains("rank 1"),
+        "exited rank must not appear: {msg}"
+    );
 
     let (_samples, events) = tl.drain();
     let failures: Vec<usize> = events
@@ -167,7 +168,10 @@ fn a_broadcast_to_a_fully_exited_cohort_is_a_clean_no_op() {
     coord.exited[1] = true;
 
     coord
-        .broadcast_control(&ControlMsgWire::EvalBroadcast { epoch: 1, metric: 8.19 })
+        .broadcast_control(&ControlMsgWire::EvalBroadcast {
+            epoch: 1,
+            metric: 8.19,
+        })
         .expect("no live addressee means nothing can fail");
     assert_eq!(coord.lost_broadcasts, 0);
 

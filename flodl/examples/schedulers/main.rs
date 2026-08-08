@@ -36,7 +36,10 @@ fn main() -> Result<()> {
     // reduce LR further regardless of the primary schedule.
     let mut plateau = PlateauScheduler::new(0.001, 10, 0.5, 1e-6);
 
-    println!("{:>5}  {:>10}  {:>10}  {:>10}", "epoch", "loss", "sched_lr", "eff_lr");
+    println!(
+        "{:>5}  {:>10}  {:>10}  {:>10}",
+        "epoch", "loss", "sched_lr", "eff_lr"
+    );
     println!("{}", "-".repeat(40));
 
     for epoch in 0..num_epochs {

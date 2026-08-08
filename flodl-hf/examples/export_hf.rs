@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flodl::{Device, Graph};
-use flodl_cli::{parse_or_schema, FdlArgs, FdlArgsTrait};
+use flodl_cli::{FdlArgs, FdlArgsTrait, parse_or_schema};
 use flodl_hf::export::{build_for_export, export_hf_dir};
 use flodl_hf::hub::HubExportHead;
 use flodl_hf::models::auto::{AutoConfig, AutoModel};
@@ -147,14 +147,12 @@ fn dispatch(cli: &ExportArgs) -> Result<(), DispatchError> {
     match (cli.hub.is_some(), cli.checkpoint.is_some()) {
         (true, true) => {
             return Err(DispatchError::Usage(
-                "--hub and --checkpoint are mutually exclusive; pass exactly one."
-                    .into(),
+                "--hub and --checkpoint are mutually exclusive; pass exactly one.".into(),
             ));
         }
         (false, false) => {
             return Err(DispatchError::Usage(
-                "missing required input: pass --hub <repo_id> or --checkpoint <file.fdl>."
-                    .into(),
+                "missing required input: pass --hub <repo_id> or --checkpoint <file.fdl>.".into(),
             ));
         }
         _ => {}
@@ -179,9 +177,9 @@ fn dispatch(cli: &ExportArgs) -> Result<(), DispatchError> {
     }
     let head_override = match cli.head.as_deref() {
         None | Some("auto") => None,
-        Some(other) => Some(
-            HubExportHead::parse(other).map_err(|e| DispatchError::Usage(e.to_string()))?,
-        ),
+        Some(other) => {
+            Some(HubExportHead::parse(other).map_err(|e| DispatchError::Usage(e.to_string()))?)
+        }
     };
 
     let out_arg = cli
@@ -273,9 +271,7 @@ fn run_hub(
 /// Hub source without an explicit flag.
 fn inject_source_repo(canonical: &str, repo_id: &str) -> flodl::Result<String> {
     let mut v: serde_json::Value = serde_json::from_str(canonical).map_err(|e| {
-        flodl::TensorError::new(&format!(
-            "inject_source_repo: parse canonical config: {e}"
-        ))
+        flodl::TensorError::new(&format!("inject_source_repo: parse canonical config: {e}"))
     })?;
     let obj = v.as_object_mut().ok_or_else(|| {
         flodl::TensorError::new("inject_source_repo: canonical config is not a JSON object")
@@ -307,10 +303,7 @@ fn run_checkpoint(
         let cfg_path = resolve_path(cfg);
         eprintln!("reading config from {} ...", cfg_path.display());
         std::fs::read_to_string(&cfg_path).map_err(|e| {
-            flodl::TensorError::new(&format!(
-                "cannot read --config {}: {e}",
-                cfg_path.display()
-            ))
+            flodl::TensorError::new(&format!("cannot read --config {}: {e}", cfg_path.display()))
         })?
     } else {
         let sidecar = sidecar_for(&checkpoint_path);
@@ -322,10 +315,7 @@ fn run_checkpoint(
         }
         eprintln!("reading sidecar from {} ...", sidecar.display());
         std::fs::read_to_string(&sidecar).map_err(|e| {
-            flodl::TensorError::new(&format!(
-                "cannot read sidecar {}: {e}",
-                sidecar.display()
-            ))
+            flodl::TensorError::new(&format!("cannot read sidecar {}: {e}", sidecar.display()))
         })?
     };
 
@@ -371,10 +361,7 @@ fn run_checkpoint(
     if preserve_source_config {
         let source_path = out_dir.join("config.source.json");
         std::fs::write(&source_path, &config_str).map_err(|e| {
-            flodl::TensorError::new(&format!(
-                "write {}: {e}",
-                source_path.display(),
-            ))
+            flodl::TensorError::new(&format!("write {}: {e}", source_path.display(),))
         })?;
         eprintln!(
             "wrote source config to {} (canonical config.json kept for AutoConfig)",
@@ -392,7 +379,10 @@ fn run_checkpoint(
             out_dir.display(),
         );
     } else {
-        eprintln!("copied {copied} tokenizer file(s) into {}", out_dir.display());
+        eprintln!(
+            "copied {copied} tokenizer file(s) into {}",
+            out_dir.display()
+        );
     }
 
     println!(

@@ -4,7 +4,9 @@ use std::ffi::CStr;
 
 use flodl_sys as ffi;
 
-use super::{check_err, Device, DType, Result, Tensor, TensorError, TensorOptions, LIVE_TENSOR_COUNT};
+use super::{
+    DType, Device, LIVE_TENSOR_COUNT, Result, Tensor, TensorError, TensorOptions, check_err,
+};
 use std::sync::atomic::Ordering;
 
 /// Returns true if a GPU is available.
@@ -17,7 +19,9 @@ pub fn gpu_available() -> bool {
     // creating a real symbol dependency on c10_cuda.so. This prevents
     // --as-needed from dropping CUDA libs. The call is cheap (no-op on
     // non-CUDA builds since the symbol resolves to a stub returning 0).
-    unsafe { let _ = ffi::flodl_force_gpu_link(); }
+    unsafe {
+        let _ = ffi::flodl_force_gpu_link();
+    }
     unsafe { ffi::flodl_gpu_is_available() != 0 }
 }
 
@@ -292,9 +296,7 @@ pub fn gpu_is_integrated(device_index: i32) -> Option<bool> {
 pub fn cuda_compute_capability(device_index: i32) -> Option<(u32, u32)> {
     let mut major: i32 = 0;
     let mut minor: i32 = 0;
-    let err = unsafe {
-        ffi::flodl_cuda_compute_capability(device_index, &mut major, &mut minor)
-    };
+    let err = unsafe { ffi::flodl_cuda_compute_capability(device_index, &mut major, &mut minor) };
     if err.is_null() {
         Some((major as u32, minor as u32))
     } else {
@@ -306,12 +308,20 @@ pub fn cuda_compute_capability(device_index: i32) -> Option<(u32, u32)> {
 /// Enumerate all available GPU devices.
 pub fn gpu_devices() -> Vec<DeviceInfo> {
     let n = gpu_device_count();
-    (0..n).filter_map(|i| {
-        let name = gpu_device_name_idx(i)?;
-        let total_memory = gpu_memory_info_idx(i).map(|(_, t)| t).unwrap_or(0);
-        let (sm_major, sm_minor) = cuda_compute_capability(i).unwrap_or((0, 0));
-        Some(DeviceInfo { index: i as u8, name, total_memory, sm_major, sm_minor })
-    }).collect()
+    (0..n)
+        .filter_map(|i| {
+            let name = gpu_device_name_idx(i)?;
+            let total_memory = gpu_memory_info_idx(i).map(|(_, t)| t).unwrap_or(0);
+            let (sm_major, sm_minor) = cuda_compute_capability(i).unwrap_or((0, 0));
+            Some(DeviceInfo {
+                index: i as u8,
+                name,
+                total_memory,
+                sm_major,
+                sm_minor,
+            })
+        })
+        .collect()
 }
 
 /// Probe whether a CUDA device can execute compute kernels under the
@@ -322,7 +332,10 @@ pub fn probe_device(device: Device) -> Result<()> {
         Device::CUDA(i) => i,
         Device::CPU => return Ok(()),
     };
-    let opts = TensorOptions { dtype: DType::Float32, device };
+    let opts = TensorOptions {
+        dtype: DType::Float32,
+        device,
+    };
     match Tensor::zeros(&[1], opts) {
         Ok(t) => {
             // Also try a simple op to verify kernels load
@@ -332,8 +345,8 @@ pub fn probe_device(device: Device) -> Result<()> {
         Err(e) => {
             let msg = format!("{}", e);
             if msg.contains("no kernel image") {
-                let name = gpu_device_name_idx(idx as i32)
-                    .unwrap_or_else(|| format!("CUDA({})", idx));
+                let name =
+                    gpu_device_name_idx(idx as i32).unwrap_or_else(|| format!("CUDA({})", idx));
                 // `cuda_compute_capability` is NVIDIA-only and returns
                 // `None` on a ROCm build, so the sm_/cu### advice below
                 // is emitted only where it actually means something.
@@ -344,7 +357,11 @@ pub fn probe_device(device: Device) -> Result<()> {
                         "CUDA({}) {} (sm_{}{}) cannot run kernels in this libtorch build. \
                          Recommended: switch to libtorch {} \
                          (in Dockerfile, change the cu### variant)",
-                        idx, name, sm_maj, sm_min, recommended_cuda_variant(sm_maj)
+                        idx,
+                        name,
+                        sm_maj,
+                        sm_min,
+                        recommended_cuda_variant(sm_maj)
                     ))),
                     // No compute capability means a non-NVIDIA build, so
                     // name the architecture the vendor's own way instead
@@ -408,7 +425,9 @@ pub fn usable_gpu_devices() -> Vec<Device> {
         let names: Vec<String> = usable.iter().map(|d| format!("{}", d)).collect();
         crate::verbose!(
             "[flodl] Proceeding with {}/{} devices: [{}]",
-            usable.len(), devices.len(), names.join(", ")
+            usable.len(),
+            devices.len(),
+            names.join(", ")
         );
     }
 
@@ -418,8 +437,8 @@ pub fn usable_gpu_devices() -> Vec<Device> {
 /// Recommend the best libtorch CUDA variant for a given compute capability.
 fn recommended_cuda_variant(sm_major: u32) -> &'static str {
     match sm_major {
-        0..=6 => "cu126",  // Maxwell/Pascal (sm_50-sm_61): cu126 for broadest compat
-        _ => "cu128",      // Volta+ (sm_70+): cu128 for best performance
+        0..=6 => "cu126", // Maxwell/Pascal (sm_50-sm_61): cu126 for broadest compat
+        _ => "cu128",     // Volta+ (sm_70+): cu128 for best performance
     }
 }
 
@@ -442,9 +461,10 @@ pub fn hardware_summary() -> String {
 
     if cfg!(feature = "gpu") {
         for gpu in crate::sys::detect_gpus() {
-            let _ = std::fmt::Write::write_fmt(&mut s, format_args!(
-                " | {} ({}GB)", gpu.name, gpu.total_memory_mb / 1024
-            ));
+            let _ = std::fmt::Write::write_fmt(
+                &mut s,
+                format_args!(" | {} ({}GB)", gpu.name, gpu.total_memory_mb / 1024),
+            );
         }
     }
     s
@@ -462,7 +482,9 @@ fn cpu_thread_count() -> usize {
 fn cpu_model_name() -> Option<String> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     for line in info.lines() {
-        if line.starts_with("model name") && let Some(val) = line.split(':').nth(1) {
+        if line.starts_with("model name")
+            && let Some(val) = line.split(':').nth(1)
+        {
             return Some(val.trim().to_string());
         }
     }

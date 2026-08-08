@@ -22,10 +22,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{SshConfig, DEFAULT_DATA_PATH};
+use crate::config::{DEFAULT_DATA_PATH, SshConfig};
 use crate::context::Context;
 use crate::source::{Built, Manifest};
-use crate::spec::{parse_ssh_target, split_scheme, SshTarget};
+use crate::spec::{SshTarget, parse_ssh_target, split_scheme};
 use crate::style;
 
 /// Why preparation stopped, and whether trying again could help.
@@ -202,7 +202,13 @@ pub fn prepare(spec: &PrepareSpec, notes: &mut Vec<String>) -> Result<Prepared, 
         }
         _ => (None, None, None),
     };
-    Ok(Prepared { data_path, libtorch, bin, args, run_id })
+    Ok(Prepared {
+        data_path,
+        libtorch,
+        bin,
+        args,
+        run_id,
+    })
 }
 
 /// What to build, once the controller has had its say.
@@ -230,7 +236,11 @@ fn merge_manifest<'a>(
                     .to_string(),
             ));
         };
-        return Ok(Recipe { cwd: local.cwd, build: local.build, bin });
+        return Ok(Recipe {
+            cwd: local.cwd,
+            build: local.build,
+            bin,
+        });
     };
     Ok(Recipe {
         cwd: m.cwd.as_deref().or(local.cwd),
@@ -331,24 +341,35 @@ fn fetch_source(
     if let Some(m) = &manifest {
         notes.push(format!(
             "run manifest: {}bin {}{}{}{}",
-            m.run.as_deref().map(|r| format!("run {}… ", &r[..r.len().min(8)])).unwrap_or_default(),
+            m.run
+                .as_deref()
+                .map(|r| format!("run {}… ", &r[..r.len().min(8)]))
+                .unwrap_or_default(),
             m.bin,
-            m.cwd.as_deref().map(|c| format!(" in {c}")).unwrap_or_default(),
+            m.cwd
+                .as_deref()
+                .map(|c| format!(" in {c}"))
+                .unwrap_or_default(),
             m.published_epoch
                 .and_then(age_hint)
                 .map(|age| format!(", published {age}"))
                 .unwrap_or_default(),
-            if m.built { "" } else { " — NOT built by the controller" },
+            if m.built {
+                ""
+            } else {
+                " — NOT built by the controller"
+            },
         ));
         if let (Some(theirs), Some(ours)) = (&m.rustc, local_rustc())
-            && theirs != &ours {
-                notes.push(format!(
-                    "the controller built this with {theirs}, this box has \
+            && theirs != &ours
+        {
+            notes.push(format!(
+                "the controller built this with {theirs}, this box has \
                      {ours} — advisory only, every box compiles its own \
                      binary and a toolchain too old fails loudly at compile \
                      time",
-                ));
-            }
+            ));
+        }
     }
     Ok((dest, manifest))
 }
@@ -412,19 +433,20 @@ fn build_source(
         if let Some((_, variant)) = libtorch
             && let flodl_hw::VariantClass::Vendor(vendor) =
                 flodl_hw::classify_variant_label(variant)
-                && let Some(gap) = crate::util::requirements::toolkit_gap(vendor) {
-                    return Fail::Permanent(format!(
-                        "{} — and this box is missing the {vendor} toolkit \
+            && let Some(gap) = crate::util::requirements::toolkit_gap(vendor)
+        {
+            return Fail::Permanent(format!(
+                "{} — and this box is missing the {vendor} toolkit \
                          headers under {} ({}), which a `--features {}` \
                          compile needs. Re-dialing cannot install a package: \
                          {}",
-                        e.message(),
-                        gap.root.display(),
-                        gap.headers.join(", "),
-                        vendor.cargo_feature(),
-                        gap.install,
-                    ));
-                }
+                e.message(),
+                gap.root.display(),
+                gap.headers.join(", "),
+                vendor.cargo_feature(),
+                gap.install,
+            ));
+        }
         // Still transient, with the worker's next step spelled out: this
         // box cannot fix a compile error, and it must not stop over one.
         Fail::Transient(format!(
@@ -492,13 +514,9 @@ fn check_gpu_stack() -> Result<(), Fail> {
 /// covered card), and a variant with no `.arch` metadata gates nothing
 /// here — `fdl probe` flags missing metadata as its own issue, and
 /// refusing to dial over it would stop working setups.
-fn check_arch_coverage(
-    libtorch: &(PathBuf, String),
-    offered: Option<&[u8]>,
-) -> Result<(), Fail> {
+fn check_arch_coverage(libtorch: &(PathBuf, String), offered: Option<&[u8]>) -> Result<(), Fail> {
     let (dir, label) = libtorch;
-    let flodl_hw::VariantClass::Vendor(vendor) = flodl_hw::classify_variant_label(label)
-    else {
+    let flodl_hw::VariantClass::Vendor(vendor) = flodl_hw::classify_variant_label(label) else {
         return Ok(());
     };
     let info = crate::libtorch::detect::libtorch_info_from_dir(label.clone(), dir);
@@ -542,10 +560,7 @@ fn check_arch_coverage(
 /// - `path` alone: a root provisioning already placed. Verified, shipped.
 /// - `source` (with `path` as the mountpoint, default
 ///   [`DEFAULT_DATA_PATH`]): established here when it is not already up.
-fn resolve_data_root(
-    spec: &DataSpec,
-    notes: &mut Vec<String>,
-) -> Result<Option<PathBuf>, Fail> {
+fn resolve_data_root(spec: &DataSpec, notes: &mut Vec<String>) -> Result<Option<PathBuf>, Fail> {
     let Some(source) = spec.source else {
         let Some(path) = spec.path else {
             return Ok(None);
@@ -599,9 +614,8 @@ fn resolve_data_root(
 /// `canonicalize` would silently replace what the operator declared with
 /// whatever its symlinks point at.
 fn absolute(path: &str) -> Result<PathBuf, Fail> {
-    std::path::absolute(path).map_err(|e| {
-        Fail::Permanent(format!("cannot resolve data path `{path}`: {e}"))
-    })
+    std::path::absolute(path)
+        .map_err(|e| Fail::Permanent(format!("cannot resolve data path `{path}`: {e}")))
 }
 
 /// A readable directory is all a source root has to be — a rank reads it
@@ -691,11 +705,7 @@ fn parse_source(spec: &str) -> Result<SshTarget, Fail> {
 /// The mount outlives the attempt, and the run: it is provisioning state,
 /// which is what makes a re-dial cheap (the next attempt finds it and
 /// reuses it). `fusermount -u <mountpoint>` drops it.
-fn mount_sshfs(
-    target: &SshTarget,
-    mountpoint: &Path,
-    ssh: Option<&SshConfig>,
-) -> Result<(), Fail> {
+fn mount_sshfs(target: &SshTarget, mountpoint: &Path, ssh: Option<&SshConfig>) -> Result<(), Fail> {
     if !crate::util::system::has_command("sshfs") {
         return Err(Fail::Permanent(format!(
             "data_source needs sshfs, which is not installed — \
@@ -735,11 +745,7 @@ fn mount_sshfs(
 /// Assemble the sshfs command: user options first (OpenSSH takes the
 /// first value it sees per key, so the operator's win), then flodl's
 /// defaults. Returned as argv for testability.
-fn sshfs_argv(
-    target: &SshTarget,
-    mountpoint: &Path,
-    ssh: Option<&SshConfig>,
-) -> Vec<String> {
+fn sshfs_argv(target: &SshTarget, mountpoint: &Path, ssh: Option<&SshConfig>) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "sshfs".into(),
         target.remote.clone(),
@@ -752,10 +758,9 @@ fn sshfs_argv(
     if let Some(ssh) = ssh {
         // The tunnel's own options and key: same box, same trust path,
         // which that key has to actually permit (see `DataSpec::ssh`).
-        if let Some(warning) = crate::cluster::batchmode_override_warning(
-            &ssh.options,
-            &target.remote,
-        ) {
+        if let Some(warning) =
+            crate::cluster::batchmode_override_warning(&ssh.options, &target.remote)
+        {
             eprintln!("{warning}");
         }
         for o in &ssh.options {
@@ -851,22 +856,24 @@ fn check_writable(
     })?;
 
     if let Some(fs_type) = crate::probe::detect_fs_type(dir)
-        && (fs_type == "tmpfs" || fs_type == "ramfs") {
-            notes.push(format!(
-                "{label} directory {} is on {fs_type} (RAM-backed) — \
+        && (fs_type == "tmpfs" || fs_type == "ramfs")
+    {
+        notes.push(format!(
+            "{label} directory {} is on {fs_type} (RAM-backed) — \
                  staging there spends RAM, not disk",
-                dir.display(),
-            ));
-        }
+            dir.display(),
+        ));
+    }
     if let Some(kib) = available_kib(dir)
-        && kib < LOW_SPACE_KIB {
-            notes.push(format!(
-                "{label} directory {} has {} MiB free — smaller than any \
+        && kib < LOW_SPACE_KIB
+    {
+        notes.push(format!(
+            "{label} directory {} has {} MiB free — smaller than any \
                  real corpus",
-                dir.display(),
-                kib / 1024,
-            ));
-        }
+            dir.display(),
+            kib / 1024,
+        ));
+    }
     Ok(())
 }
 
@@ -949,7 +956,10 @@ mod tests {
         match check_arch_coverage(&lt, None) {
             Err(err) => {
                 assert!(nvidia_present, "refused with no matching device: {err:?}");
-                assert!(err.is_permanent(), "kernels do not grow by waiting: {err:?}");
+                assert!(
+                    err.is_permanent(),
+                    "kernels do not grow by waiting: {err:?}"
+                );
                 assert!(err.message().contains("no kernel image"), "got: {err:?}");
             }
             Ok(()) => assert!(
@@ -975,7 +985,10 @@ mod tests {
         // wrapper's job — dispatch on the scheme, hand back a target.
         assert_eq!(
             parse_source("sshfs://flodl@exa:2222/flodl/data").unwrap(),
-            SshTarget { remote: "flodl@exa:/flodl/data".into(), port: Some(2222) },
+            SshTarget {
+                remote: "flodl@exa:/flodl/data".into(),
+                port: Some(2222)
+            },
         );
     }
 
@@ -1014,7 +1027,10 @@ mod tests {
             bin: Some("target/release/x"),
             ssh: None,
         };
-        let bare = Manifest { bin: "target/release/y".into(), ..Manifest::default() };
+        let bare = Manifest {
+            bin: "target/release/y".into(),
+            ..Manifest::default()
+        };
         let recipe = merge_manifest(&local, Some(&bare)).unwrap();
         assert_eq!(recipe.cwd, Some("ddp-bench"));
         assert_eq!(recipe.build, Some("./ci/node-build.sh"));
@@ -1029,7 +1045,10 @@ mod tests {
         // This is also the window a publish opens on purpose: it clears the
         // manifest before it touches the tree, so a box dialing mid-publish
         // must come back rather than train something unvalidated.
-        let local = SourceSpec { from: "rsync://ctrl:/srv/run/tree", ..Default::default() };
+        let local = SourceSpec {
+            from: "rsync://ctrl:/srv/run/tree",
+            ..Default::default()
+        };
         let err = merge_manifest(&local, None).unwrap_err();
         assert!(!err.is_permanent(), "the fix is a publish away: {err:?}");
         assert!(err.message().contains("fdl publish"), "got: {err:?}");
@@ -1046,7 +1065,11 @@ mod tests {
         let fail = |variant: &str| {
             let libtorch = (dir.clone(), variant.to_string());
             build_source(
-                &Recipe { cwd: None, build: Some("exit 3"), bin: "x" },
+                &Recipe {
+                    cwd: None,
+                    build: Some("exit 3"),
+                    bin: "x",
+                },
                 &dir,
                 Some(&libtorch),
                 &mut Vec::new(),
@@ -1060,10 +1083,19 @@ mod tests {
         let err = fail("precompiled/rocm70");
         match crate::util::requirements::toolkit_gap(flodl_hw::GpuVendor::Amd) {
             Some(gap) => {
-                assert!(err.is_permanent(), "waiting cannot install a package: {err:?}");
-                assert!(err.message().contains(&gap.install), "the fix must be named: {err:?}");
+                assert!(
+                    err.is_permanent(),
+                    "waiting cannot install a package: {err:?}"
+                );
+                assert!(
+                    err.message().contains(&gap.install),
+                    "the fix must be named: {err:?}"
+                );
             }
-            None => assert!(!err.is_permanent(), "toolkit present, so a compile error stays a push away: {err:?}"),
+            None => assert!(
+                !err.is_permanent(),
+                "toolkit present, so a compile error stays a push away: {err:?}"
+            ),
         }
         // A CPU variant wants no toolkit, so the failure stays transient
         // whatever this box has installed.
@@ -1075,12 +1107,12 @@ mod tests {
     #[test]
     fn a_source_spec_rejects_every_broken_shape_permanently() {
         for spec in [
-            "/flodl/data",                 // no scheme: belongs in data_path
-            "smb://server/share",          // scheme we do not ship
-            "sshfs://exa",                 // no path
-            "sshfs://exa:banana/data",     // port that is not a number
-            "sshfs://:/flodl/data",        // empty host
-            "sshfs://exa:/",               // root is not a source root
+            "/flodl/data",             // no scheme: belongs in data_path
+            "smb://server/share",      // scheme we do not ship
+            "sshfs://exa",             // no path
+            "sshfs://exa:banana/data", // port that is not a number
+            "sshfs://:/flodl/data",    // empty host
+            "sshfs://exa:/",           // root is not a source root
         ] {
             let err = parse_source(spec).unwrap_err();
             assert!(err.is_permanent(), "{spec} should be permanent: {err:?}");
@@ -1114,8 +1146,14 @@ mod tests {
         assert_eq!(argv[2], "/flodl/data");
         // First -o value wins in OpenSSH: the user's override must
         // appear before flodl's default of the same key.
-        let user_pos = argv.iter().position(|a| a == "ServerAliveInterval=5").unwrap();
-        let default_pos = argv.iter().position(|a| a == "ServerAliveInterval=15").unwrap();
+        let user_pos = argv
+            .iter()
+            .position(|a| a == "ServerAliveInterval=5")
+            .unwrap();
+        let default_pos = argv
+            .iter()
+            .position(|a| a == "ServerAliveInterval=15")
+            .unwrap();
         assert!(user_pos < default_pos);
         assert!(argv.contains(&"IdentityFile=/etc/flodl/join_key".to_string()));
         // The port rides the SOURCE spec, not the tunnel block: they can
@@ -1140,7 +1178,10 @@ mod tests {
     fn no_data_fields_prepares_nothing() {
         let mut notes = Vec::new();
         let got = resolve_data_root(&DataSpec::default(), &mut notes).unwrap();
-        assert_eq!(got, None, "a run that never mentions data must ship nothing");
+        assert_eq!(
+            got, None,
+            "a run that never mentions data must ship nothing"
+        );
         assert!(notes.is_empty());
     }
 
@@ -1152,7 +1193,10 @@ mod tests {
         let name = format!("fdl-prep-rel-{}-{}", std::process::id(), next_probe_id());
         let dir = cwd.join(&name);
         std::fs::create_dir_all(&dir).unwrap();
-        let spec = DataSpec { path: Some(&name), ..Default::default() };
+        let spec = DataSpec {
+            path: Some(&name),
+            ..Default::default()
+        };
         let got = resolve_data_root(&spec, &mut Vec::new()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Some(dir));
@@ -1168,7 +1212,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.display().to_string();
         let mut notes = Vec::new();
-        let spec = DataSpec { path: Some(&path), ..Default::default() };
+        let spec = DataSpec {
+            path: Some(&path),
+            ..Default::default()
+        };
         assert_eq!(
             resolve_data_root(&spec, &mut notes).unwrap(),
             Some(dir.clone()),
@@ -1182,7 +1229,10 @@ mod tests {
             .join("fdl-prep-absent-do-not-create")
             .display()
             .to_string();
-        let spec = DataSpec { path: Some(&missing), ..Default::default() };
+        let spec = DataSpec {
+            path: Some(&missing),
+            ..Default::default()
+        };
         let err = resolve_data_root(&spec, &mut Vec::new()).unwrap_err();
         assert!(err.is_permanent(), "got: {err:?}");
         // Every fix, named: provision it, repoint it, or let fdl mount it.
@@ -1237,15 +1287,17 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(leftovers.is_empty(), "probe file left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "probe file left behind: {leftovers:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_missing_directory_we_must_not_create_is_permanent() {
         let dir = std::env::temp_dir().join("fdl-prep-absent-stage-dir");
-        let err = check_writable("disk stage", &dir, false, &mut Vec::new())
-            .unwrap_err();
+        let err = check_writable("disk stage", &dir, false, &mut Vec::new()).unwrap_err();
         assert!(err.is_permanent(), "got: {err:?}");
     }
 

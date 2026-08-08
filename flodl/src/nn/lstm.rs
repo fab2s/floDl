@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 
 use crate::autograd::Variable;
-use crate::tensor::{Device, DType, Result, RnnParams, Tensor, TensorOptions};
+use crate::tensor::{DType, Device, Result, RnnParams, Tensor, TensorOptions};
 
+use super::Module;
 use super::lstmcell::LSTMCell;
 use super::parameter::Parameter;
-use super::Module;
 
 /// Multi-layer LSTM (Long Short-Term Memory) sequence module.
 ///
@@ -109,7 +109,8 @@ impl LSTM {
         // directly — the staleness check is an integer compare, no FFI.
         {
             let cell_params = self.parameters();
-            let generations: Vec<u64> = cell_params.iter()
+            let generations: Vec<u64> = cell_params
+                .iter()
                 .map(|p| p.variable.data_generation())
                 .collect();
             let mut cache = self.rnn_params.borrow_mut();
@@ -118,9 +119,7 @@ impl LSTM {
                 None => true,
             };
             if stale {
-                let params: Vec<Tensor> = cell_params.iter()
-                    .map(|p| p.variable.data())
-                    .collect();
+                let params: Vec<Tensor> = cell_params.iter().map(|p| p.variable.data()).collect();
                 *cache = Some((
                     RnnParams::new(&params, 2, nl, self.batch_first, true)?,
                     generations,
@@ -129,15 +128,24 @@ impl LSTM {
         }
         let cache = self.rnn_params.borrow();
         let (output, h_n, c_n) = input.data().lstm_seq_cached(
-            &h_0, &c_0, &cache.as_ref().unwrap().0, nl, self.batch_first,
+            &h_0,
+            &c_0,
+            &cache.as_ref().unwrap().0,
+            nl,
+            self.batch_first,
         )?;
 
-        Ok((Variable::wrap(output), (Variable::wrap(h_n), Variable::wrap(c_n))))
+        Ok((
+            Variable::wrap(output),
+            (Variable::wrap(h_n), Variable::wrap(c_n)),
+        ))
     }
 }
 
 impl Module for LSTM {
-    fn name(&self) -> &str { "lstm" }
+    fn name(&self) -> &str {
+        "lstm"
+    }
 
     /// Module trait forward: runs the full sequence with zero-initialized state.
     /// Returns only the output sequence (not h_n/c_n). Use [`forward_seq`](LSTM::forward_seq)
@@ -166,8 +174,8 @@ mod tests {
         let (output, (h_n, c_n)) = lstm.forward_seq(&x, None).unwrap();
 
         assert_eq!(output.shape(), vec![5, 3, 8]); // [seq, batch, hidden]
-        assert_eq!(h_n.shape(), vec![2, 3, 8]);    // [layers, batch, hidden]
-        assert_eq!(c_n.shape(), vec![2, 3, 8]);    // [layers, batch, hidden]
+        assert_eq!(h_n.shape(), vec![2, 3, 8]); // [layers, batch, hidden]
+        assert_eq!(c_n.shape(), vec![2, 3, 8]); // [layers, batch, hidden]
     }
 
     #[test]
@@ -181,14 +189,26 @@ mod tests {
         let b = LSTM::on_device(4, 6, 2, false, dev).unwrap();
         let x = Variable::new(Tensor::randn(&[3, 2, 4], opts).unwrap(), false);
 
-        let out_a = a.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let out_a = a
+            .forward_seq(&x, None)
+            .unwrap()
+            .0
+            .data()
+            .to_f32_vec()
+            .unwrap();
         let _ = b.forward_seq(&x, None).unwrap(); // builds b's cache from its own init
 
         // Replace b's params with a's — exactly what load_checkpoint does.
         for (pa, pb) in a.parameters().iter().zip(b.parameters().iter()) {
             pb.variable.set_data(pa.variable.data());
         }
-        let out_b = b.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let out_b = b
+            .forward_seq(&x, None)
+            .unwrap()
+            .0
+            .data()
+            .to_f32_vec()
+            .unwrap();
         let max_diff = out_a
             .iter()
             .zip(&out_b)
@@ -214,20 +234,40 @@ mod tests {
         let b = LSTM::on_device(4, 6, 2, false, dev).unwrap();
         let x = Variable::new(Tensor::randn(&[3, 2, 4], opts).unwrap(), false);
 
-        let out_a = a.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
+        let out_a = a
+            .forward_seq(&x, None)
+            .unwrap()
+            .0
+            .data()
+            .to_f32_vec()
+            .unwrap();
         let _ = b.forward_seq(&x, None).unwrap(); // build b's cache from its own init
 
         // Index-named pairs: same order in a and b, so load maps by name.
         let named = |m: &LSTM| -> Vec<(String, crate::nn::Parameter)> {
-            m.parameters().into_iter().enumerate().map(|(i, p)| (i.to_string(), p)).collect()
+            m.parameters()
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| (i.to_string(), p))
+                .collect()
         };
         let mut buf = Vec::new();
         save_checkpoint(&mut buf, &named(&a), &[], None).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         load_checkpoint(&mut cursor, &named(&b), &[], None).unwrap();
 
-        let out_b = b.forward_seq(&x, None).unwrap().0.data().to_f32_vec().unwrap();
-        let max_diff = out_a.iter().zip(&out_b).map(|(l, r)| (l - r).abs()).fold(0f32, f32::max);
+        let out_b = b
+            .forward_seq(&x, None)
+            .unwrap()
+            .0
+            .data()
+            .to_f32_vec()
+            .unwrap();
+        let max_diff = out_a
+            .iter()
+            .zip(&out_b)
+            .map(|(l, r)| (l - r).abs())
+            .fold(0f32, f32::max);
         assert!(
             max_diff < 1e-5,
             "forward after checkpoint load must match source (max diff {max_diff})"
@@ -319,7 +359,9 @@ mod tests {
     #[test]
     fn test_lstm_builder_pattern() {
         let dev = crate::tensor::test_device();
-        let lstm = LSTM::on_device(4, 8, 1, false, dev).unwrap().batch_first(true);
+        let lstm = LSTM::on_device(4, 8, 1, false, dev)
+            .unwrap()
+            .batch_first(true);
         let opts = crate::tensor::test_opts();
         let x = Variable::new(Tensor::randn(&[3, 5, 4], opts).unwrap(), false);
         let (output, _) = lstm.forward_seq(&x, None).unwrap();

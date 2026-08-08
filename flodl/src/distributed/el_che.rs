@@ -110,7 +110,10 @@ struct RingBuffer {
 
 impl RingBuffer {
     fn new(capacity: usize) -> Self {
-        Self { samples: Vec::with_capacity(capacity), capacity }
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+        }
     }
 
     fn push(&mut self, value: f64) {
@@ -150,8 +153,7 @@ impl RingBuffer {
 /// nudge factor and a shorter sustain count as trust accumulates (see
 /// `lr_event_meta::base_factor_for` / `sustain_k_for`).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
-    serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -257,8 +259,7 @@ impl WindowReport {
         let mut ms = Vec::with_capacity(self.wall_ms.len());
         let mut batches = Vec::with_capacity(self.wall_ms.len());
         for r in 0..self.wall_ms.len() {
-            let has_sample =
-                self.delivered_batches[r] > 0 && self.delivered_ms[r] > 0.0;
+            let has_sample = self.delivered_batches[r] > 0 && self.delivered_ms[r] > 0.0;
             if has_sample {
                 ms.push(self.delivered_ms[r]);
                 batches.push(self.delivered_batches[r]);
@@ -447,9 +448,7 @@ impl ElChe {
                 .map(|_| RingBuffer::new(TRUST_WINDOW_CAP))
                 .collect(),
             consecutive_zero_reports: vec![0; world_size],
-            batch_counts_window: std::collections::VecDeque::with_capacity(
-                BATCH_COUNTS_WINDOW_CAP,
-            ),
+            batch_counts_window: std::collections::VecDeque::with_capacity(BATCH_COUNTS_WINDOW_CAP),
             calibrated: false,
             overhead_target: 0.05,
             min_anchor: anchor,
@@ -499,9 +498,8 @@ impl ElChe {
     /// [`CheckpointMeta::with_elche_state`]:
     ///     crate::distributed::CheckpointMeta::with_elche_state
     pub fn to_state(&self) -> crate::distributed::ElCheState {
-        let smoothed_ms_per_batch: Vec<f64> = (0..self.world_size)
-            .map(|r| self.smoothed_ms(r))
-            .collect();
+        let smoothed_ms_per_batch: Vec<f64> =
+            (0..self.world_size).map(|r| self.smoothed_ms(r)).collect();
         crate::distributed::ElCheState {
             anchor: self.anchor,
             anchor_rank: self.anchor_rank,
@@ -565,10 +563,7 @@ impl ElChe {
         }
         // `calibrated` is true iff any rank had a real reading — matches
         // the post-`report_timing` invariant the snapshot was taken under.
-        self.calibrated = state
-            .smoothed_ms_per_batch
-            .iter()
-            .any(|&v| v > 0.0);
+        self.calibrated = state.smoothed_ms_per_batch.iter().any(|&v| v > 0.0);
         Ok(())
     }
 
@@ -614,30 +609,28 @@ impl ElChe {
             return Some(cohort[0]);
         }
         if let Some(c) = self.anchor_rank
-            && cohort.contains(&c) {
-                let cur = self.smoothed_ms(c);
-                let challenger = cohort
-                    .iter()
-                    .copied()
-                    .filter(|&r| r != c)
-                    .map(|r| (r, self.smoothed_ms(r)))
-                    .max_by(|(_, a), (_, b)| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                if let Some((other, other_ms)) = challenger
-                    && other_ms > cur * (1.0 + DOMINANCE_MARGIN) {
-                        return Some(other);
-                    }
-                return Some(c);
+            && cohort.contains(&c)
+        {
+            let cur = self.smoothed_ms(c);
+            let challenger = cohort
+                .iter()
+                .copied()
+                .filter(|&r| r != c)
+                .map(|r| (r, self.smoothed_ms(r)))
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((other, other_ms)) = challenger
+                && other_ms > cur * (1.0 + DOMINANCE_MARGIN)
+            {
+                return Some(other);
             }
+            return Some(c);
+        }
         cohort.into_iter().min()
     }
 
     /// `ms_per_batch` of the elected anchor (smoothed). 0.0 if not yet elected.
     fn slow_ms(&self) -> f64 {
-        self.anchor_rank
-            .map(|r| self.smoothed_ms(r))
-            .unwrap_or(0.0)
+        self.anchor_rank.map(|r| self.smoothed_ms(r)).unwrap_or(0.0)
     }
 
     /// Set the target per-window FIXED overhead (reduce + fill) as a
@@ -773,8 +766,7 @@ impl ElChe {
             if rank == slow_rank {
                 self.batch_counts[rank] = self.anchor;
             } else {
-                self.batch_counts[rank] =
-                    (self.anchor as f64 * ratio).round().max(1.0) as usize;
+                self.batch_counts[rank] = (self.anchor as f64 * ratio).round().max(1.0) as usize;
             }
         }
         // The user is asserting `slow_rank` is the slowest device; record it
@@ -977,11 +969,11 @@ impl ElChe {
         }
         // Honor user-defined drift cap.
         if let Some(max_diff) = self.max_batch_diff {
-            let smoothed: Vec<f64> = (0..self.world_size)
-                .map(|r| self.smoothed_ms(r))
-                .collect();
+            let smoothed: Vec<f64> = (0..self.world_size).map(|r| self.smoothed_ms(r)).collect();
             let max_ms = smoothed.iter().copied().fold(0.0_f64, f64::max);
-            let min_ms = smoothed.iter().copied()
+            let min_ms = smoothed
+                .iter()
+                .copied()
                 .filter(|&m| m > 0.0)
                 .fold(f64::MAX, f64::min);
             if max_ms > 0.0 && min_ms.is_finite() && min_ms > 0.0 {
@@ -1188,12 +1180,10 @@ impl ElChe {
         // the larger/newer GPU can't transiently flip the anchor away from
         // the actual slow rank. The cohort filter inside `elect_anchor`
         // then does the load-bearing work of excluding clearly-fast ranks.
-        let allow_election =
-            self.anchor_rank.is_none() || self.phase >= Phase::Stable;
-        if allow_election
-            && let Some(elected) = self.elect_anchor() {
-                self.anchor_rank = Some(elected);
-            }
+        let allow_election = self.anchor_rank.is_none() || self.phase >= Phase::Stable;
+        if allow_election && let Some(elected) = self.elect_anchor() {
+            self.anchor_rank = Some(elected);
+        }
 
         // No anchor yet (no positive readings on any rank) — bail.
         let anchor_rank = match self.anchor_rank {
@@ -1211,10 +1201,11 @@ impl ElChe {
             // has missed a full trust window of reports, stop trusting
             // the pin and elect from the ranks that DO have data.
             if self.consecutive_zero_reports[anchor_rank] >= TRUST_WINDOW_CAP
-                && let Some(elected) = self.elect_anchor() {
-                    self.anchor_rank = Some(elected);
-                    slow_ms = self.smoothed_ms(elected);
-                }
+                && let Some(elected) = self.elect_anchor()
+            {
+                self.anchor_rank = Some(elected);
+                slow_ms = self.smoothed_ms(elected);
+            }
             if slow_ms <= 0.0 {
                 return;
             }
@@ -1274,12 +1265,16 @@ impl ElChe {
         if self.batch_counts_window.len() >= BATCH_COUNTS_WINDOW_CAP {
             self.batch_counts_window.pop_front();
         }
-        self.batch_counts_window.push_back(self.batch_counts.clone());
+        self.batch_counts_window
+            .push_back(self.batch_counts.clone());
         self.calibrated = true;
         self.calibration_count += 1;
         crate::verbose!(
             "  ddp-diag: ms_per_batch={:?} batch_counts={:?} anchor_rank={:?} anchor={}",
-            self.ms_per_batch().iter().map(|m| (m * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            self.ms_per_batch()
+                .iter()
+                .map(|m| (m * 10.0).round() / 10.0)
+                .collect::<Vec<_>>(),
             self.batch_counts,
             self.anchor_rank,
             self.anchor,
@@ -1341,7 +1336,9 @@ impl ElChe {
         if next != self.phase {
             crate::verbose!(
                 "  ddp: ElChe phase {:?} -> {:?} (calibration #{}, anchor=rank {})",
-                self.phase, next, self.calibration_count,
+                self.phase,
+                next,
+                self.calibration_count,
                 self.anchor_rank.map(|r| r as i64).unwrap_or(-1),
             );
             self.phase = next;
@@ -1430,7 +1427,12 @@ impl ElChe {
         if marginal_b <= 0.0 {
             return None;
         }
-        let fill_b = self.pending_window_fill_ms.get(b).copied().unwrap_or(0.0).max(0.0);
+        let fill_b = self
+            .pending_window_fill_ms
+            .get(b)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         let reduce_ms = sync_ms.max(0.0);
         let window_compute = self.anchor as f64 * marginal_b;
         let fixed = reduce_ms + fill_b;
@@ -1561,11 +1563,11 @@ impl ElChe {
                 let used: usize = self.batch_counts.iter().sum();
                 if let Some(rem) = max_total.checked_sub(used)
                     && rem > 0
-                        && let Some(fastest) = (0..self.world_size)
-                            .max_by_key(|&r| self.batch_counts[r])
-                        {
-                            self.batch_counts[fastest] += rem;
-                        }
+                    && let Some(fastest) =
+                        (0..self.world_size).max_by_key(|&r| self.batch_counts[r])
+                {
+                    self.batch_counts[fastest] += rem;
+                }
             }
         }
         // Slack is consumed exactly once per recompute. Zeroing here
@@ -1641,7 +1643,6 @@ mod spec_prior {
             .map(|(rank, _)| rank)
     }
 }
-
 
 #[cfg(test)]
 mod meta_nudge_tests {

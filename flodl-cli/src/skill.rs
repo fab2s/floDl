@@ -23,12 +23,10 @@ struct SkillInfo {
     description: &'static str,
 }
 
-const SKILLS: &[SkillInfo] = &[
-    SkillInfo {
-        name: "port",
-        description: "Port PyTorch scripts to flodl",
-    },
-];
+const SKILLS: &[SkillInfo] = &[SkillInfo {
+    name: "port",
+    description: "Port PyTorch scripts to flodl",
+}];
 
 // ---------------------------------------------------------------------------
 // Tool detection
@@ -47,7 +45,6 @@ impl Tool {
             Tool::Cursor => "Cursor",
         }
     }
-
 }
 
 /// Detect which AI tools are present in the current directory.
@@ -96,9 +93,10 @@ fn find_ai_dir() -> Option<PathBuf> {
 /// Install skills for the detected (or specified) AI tool.
 pub fn install(tool_override: Option<&str>, skill_filter: Option<&str>) -> Result<(), String> {
     let tools = if let Some(name) = tool_override {
-        vec![parse_tool(name).ok_or_else(|| {
-            format!("unknown tool: '{}'. Supported: claude, cursor", name)
-        })?]
+        vec![
+            parse_tool(name)
+                .ok_or_else(|| format!("unknown tool: '{}'. Supported: claude, cursor", name))?,
+        ]
     } else {
         let detected = detect_tools();
         if detected.is_empty() {
@@ -125,7 +123,8 @@ pub fn install(tool_override: Option<&str>, skill_filter: Option<&str>) -> Resul
 }
 
 fn install_claude(ai_dir: &Option<PathBuf>, skill_filter: Option<&str>) -> Result<(), String> {
-    let skills_to_install: Vec<&SkillInfo> = SKILLS.iter()
+    let skills_to_install: Vec<&SkillInfo> = SKILLS
+        .iter()
         .filter(|s| skill_filter.is_none() || skill_filter == Some(s.name))
         .collect();
 
@@ -220,8 +219,7 @@ fn install_cursor(ai_dir: &Option<PathBuf>, skill_filter: Option<&str>) -> Resul
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), String> {
-    fs::write(path, content)
-        .map_err(|e| format!("cannot write {}: {}", path.display(), e))
+    fs::write(path, content).map_err(|e| format!("cannot write {}: {}", path.display(), e))
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +241,11 @@ pub fn list() {
         println!("Detected tools:");
         for tool in &tools {
             let installed = check_installed(tool);
-            let status = if installed { "installed" } else { "not installed" };
+            let status = if installed {
+                "installed"
+            } else {
+                "not installed"
+            };
             println!("  {:<16} {}", tool.name(), status);
         }
         println!();
@@ -256,11 +258,9 @@ pub fn list() {
 fn check_installed(tool: &Tool) -> bool {
     match tool {
         Tool::Claude => Path::new(".claude/skills/port/SKILL.md").exists(),
-        Tool::Cursor => {
-            fs::read_to_string(".cursorrules")
-                .map(|c| c.contains("flodl porting"))
-                .unwrap_or(false)
-        }
+        Tool::Cursor => fs::read_to_string(".cursorrules")
+            .map(|c| c.contains("flodl porting"))
+            .unwrap_or(false),
     }
 }
 

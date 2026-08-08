@@ -219,10 +219,7 @@ impl AvgCycleState {
         if let Some(div) = sync_divergence {
             self.divergence[rank] = Some(div);
         }
-        if rank < self.acked.len()
-            && !self.acked[rank]
-            && step_count > self.step_snapshot[rank]
-        {
+        if rank < self.acked.len() && !self.acked[rank] && step_count > self.step_snapshot[rank] {
             self.acked[rank] = true;
             self.capture_sync_elapsed_if_complete();
         }
@@ -256,19 +253,16 @@ impl AvgCycleState {
                 ),
             }
         }
-        if rank < self.acked.len()
-            && !self.acked[rank]
-            && step_count > self.step_snapshot[rank]
-        {
+        if rank < self.acked.len() && !self.acked[rank] && step_count > self.step_snapshot[rank] {
             self.acked[rank] = true;
             // Per-rank sync lag (trigger broadcast → this rank's
             // SyncAck). Captured BEFORE the all-acked elapsed capture
             // takes `started_at`.
             if let Some(start) = self.started_at
-                && rank < self.sync_lag_ms.len() {
-                    self.sync_lag_ms[rank] =
-                        Some(start.elapsed().as_secs_f64() * 1000.0);
-                }
+                && rank < self.sync_lag_ms.len()
+            {
+                self.sync_lag_ms[rank] = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
             self.capture_sync_elapsed_if_complete();
         }
     }
@@ -280,10 +274,10 @@ impl AvgCycleState {
     /// its prior value or `None`.
     pub(super) fn note_snapshot_ready(&mut self, rank: usize) {
         if rank < self.upload_ms.len()
-            && let Some(start) = self.started_at {
-                self.upload_ms[rank] =
-                    Some(start.elapsed().as_secs_f64() * 1000.0);
-            }
+            && let Some(start) = self.started_at
+        {
+            self.upload_ms[rank] = Some(start.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     /// Take `started_at` into `last_sync_ms` once every rank has
@@ -292,30 +286,24 @@ impl AvgCycleState {
     /// see `nccl_sync_settled`.)
     pub(super) fn capture_sync_elapsed_if_complete(&mut self) {
         if self.acked.iter().all(|&a| a)
-            && let Some(start) = self.started_at.take() {
-                self.last_sync_ms = start.elapsed().as_secs_f64() * 1000.0;
-            }
+            && let Some(start) = self.started_at.take()
+        {
+            self.last_sync_ms = start.elapsed().as_secs_f64() * 1000.0;
+        }
     }
 
     /// Every alive rank has acked (dead ranks count as acked — their
     /// evidence will never arrive and the surviving cohort has fully
     /// settled without them).
-    pub(super) fn all_alive_acked(
-        &self,
-        mut is_dead: impl FnMut(usize) -> bool,
-    ) -> bool {
+    pub(super) fn all_alive_acked(&self, mut is_dead: impl FnMut(usize) -> bool) -> bool {
         (0..self.acked.len()).all(|r| is_dead(r) || self.acked[r])
     }
 
     /// Every alive rank's bridge SyncAck has populated its divergence
     /// slot — the CPU finalize gate (see [`CpuAvgPhase`] for why the
     /// gate is divergence, not `acked`).
-    pub(super) fn all_alive_diverged(
-        &self,
-        mut is_dead: impl FnMut(usize) -> bool,
-    ) -> bool {
-        (0..self.divergence.len())
-            .all(|r| is_dead(r) || self.divergence[r].is_some())
+    pub(super) fn all_alive_diverged(&self, mut is_dead: impl FnMut(usize) -> bool) -> bool {
+        (0..self.divergence.len()).all(|r| is_dead(r) || self.divergence[r].is_some())
     }
 
     /// Take `last_sync_ms` (returning it, resetting to 0.0) — consumed
@@ -335,18 +323,13 @@ impl AvgCycleState {
     pub(super) fn divergence_report(
         &self,
     ) -> crate::distributed::ddp_run::convergence::DivergenceReport {
-        let pre_norms: Option<Vec<f64>> =
-            if self.pre_norm.iter().all(|p| p.is_some()) {
-                Some(self.pre_norm.iter().map(|p| p.unwrap()).collect())
-            } else {
-                None
-            };
+        let pre_norms: Option<Vec<f64>> = if self.pre_norm.iter().all(|p| p.is_some()) {
+            Some(self.pre_norm.iter().map(|p| p.unwrap()).collect())
+        } else {
+            None
+        };
         crate::distributed::ddp_run::convergence::DivergenceReport {
-            deltas: self
-                .divergence
-                .iter()
-                .map(|d| d.unwrap_or(0.0))
-                .collect(),
+            deltas: self.divergence.iter().map(|d| d.unwrap_or(0.0)).collect(),
             pre_norms,
             post_norm: self.post_norm,
         }
@@ -378,7 +361,12 @@ impl AvgCycleState {
     /// Open the CPU Pending window (phase + its wall-clock). No-op on
     /// NCCL (the inline finish has no pending phase).
     pub(super) fn begin_cpu_pending(&mut self, now: Instant) {
-        if let CycleMachine::Cpu { phase, pending_since, .. } = &mut self.machine {
+        if let CycleMachine::Cpu {
+            phase,
+            pending_since,
+            ..
+        } = &mut self.machine
+        {
             *phase = CpuAvgPhase::Pending;
             *pending_since = Some(now);
         }
@@ -389,7 +377,10 @@ impl AvgCycleState {
     pub(super) fn cpu_pending(&self) -> bool {
         matches!(
             self.machine,
-            CycleMachine::Cpu { phase: CpuAvgPhase::Pending, .. }
+            CycleMachine::Cpu {
+                phase: CpuAvgPhase::Pending,
+                ..
+            }
         )
     }
 
@@ -406,7 +397,12 @@ impl AvgCycleState {
     /// `pending_since` (for the `CpuAvgEnd { duration_ms }` payload).
     /// Returns `None` on NCCL or when no window was open.
     pub(super) fn finish_cpu_pending(&mut self) -> Option<Instant> {
-        if let CycleMachine::Cpu { phase, pending_since, .. } = &mut self.machine {
+        if let CycleMachine::Cpu {
+            phase,
+            pending_since,
+            ..
+        } = &mut self.machine
+        {
             *phase = CpuAvgPhase::Idle;
             pending_since.take()
         } else {

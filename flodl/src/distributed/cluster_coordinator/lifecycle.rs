@@ -13,8 +13,8 @@ use crate::distributed::wire::{ControlFrame, ControlMsgWire, MsgKind, SessionSal
 use crate::tensor::{Result, TensorError};
 
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig,
-    RunPhase, initial_callback_role, relay_reader_loop,
+    ClusterCoordinator, ClusterCoordinatorConfig, RunPhase, initial_callback_role,
+    relay_reader_loop,
 };
 
 impl ClusterCoordinator {
@@ -48,9 +48,7 @@ impl ClusterCoordinator {
         let bound_port = listener
             .local_addr()
             .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_coordinator: local_addr() failed: {e}"
-                ))
+                TensorError::new(&format!("cluster_coordinator: local_addr() failed: {e}"))
             })?
             .port();
         Ok((listener, bound_port))
@@ -68,9 +66,7 @@ impl ClusterCoordinator {
         let bound_port = listener
             .local_addr()
             .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_coordinator: local_addr() failed: {e}"
-                ))
+                TensorError::new(&format!("cluster_coordinator: local_addr() failed: {e}"))
             })?
             .port();
         let source = crate::distributed::port_mux::StreamSource::from_listener(
@@ -124,8 +120,8 @@ impl ClusterCoordinator {
         // window bounded admission, this bounds the dial-in that follows —
         // a registered-but-never-dialing relay must fail the run loudly
         // here, not leave the cohort to die of its own rank-side deadlines.
-        let formation_deadline = std::time::Instant::now()
-            + Duration::from_secs(config.formation_timeout_secs);
+        let formation_deadline =
+            std::time::Instant::now() + Duration::from_secs(config.formation_timeout_secs);
         while covered < world_size {
             let mut stream = match source.try_accept("cluster_coordinator")? {
                 Some(s) => s,
@@ -187,9 +183,7 @@ impl ClusterCoordinator {
                             None => {
                                 expected_sig = Some((*sig, host.clone(), *rank));
                             }
-                            Some((expected, seed_host, seed_rank))
-                                if expected != sig =>
-                            {
+                            Some((expected, seed_host, seed_rank)) if expected != sig => {
                                 return Err(TensorError::new(&format!(
                                     "cluster_coordinator: model mismatch at \
                                      formation: rank {rank} on host {host:?} \
@@ -201,9 +195,7 @@ impl ClusterCoordinator {
                                      or a wrong `bin:` on one box is the \
                                      usual cause",
                                     crate::distributed::membership::hex_prefix(sig),
-                                    crate::distributed::membership::hex_prefix(
-                                        expected,
-                                    ),
+                                    crate::distributed::membership::hex_prefix(expected,),
                                 )));
                             }
                             Some(_) => {}
@@ -260,9 +252,7 @@ impl ClusterCoordinator {
             stream
                 .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
                 .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_coordinator: set_write_timeout: {e}"
-                    ))
+                    TensorError::new(&format!("cluster_coordinator: set_write_timeout: {e}"))
                 })?;
             control_streams.push(stream);
             conn_reads.push(read_half);
@@ -273,11 +263,9 @@ impl ClusterCoordinator {
         // tag + payload).
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let (timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
-        let (metrics_tx, metrics_rx) =
-            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
+        let (metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
 
-        let mut reader_handles: Vec<Option<JoinHandle<()>>> =
-            Vec::with_capacity(conn_reads.len());
+        let mut reader_handles: Vec<Option<JoinHandle<()>>> = Vec::with_capacity(conn_reads.len());
         for (conn_idx, mut read_half) in conn_reads.into_iter().enumerate() {
             let tx = timing_tx.clone();
             let mtx = metrics_tx.clone();
@@ -350,8 +338,7 @@ impl ClusterCoordinator {
         // `calibrated` mirrors the post-restore ElChe state: true when
         // any rank has a positive smoothed reading. Matches the
         // invariant the snapshot was taken under.
-        let calibrated = config.start_elche_state.is_some()
-            && el_che.is_calibrated();
+        let calibrated = config.start_elche_state.is_some() && el_che.is_calibrated();
         Ok(ClusterCoordinator {
             policy: config.policy,
             backend: config.backend,
@@ -405,20 +392,11 @@ impl ClusterCoordinator {
             rank_hosts: config.rank_hosts.clone(),
             max_failure: config.max_failure,
             epoch_callback_policy: config.epoch_callback_policy,
-            checkpoint_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
-            eval_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
+            checkpoint_role: initial_callback_role(config.epoch_callback_policy, world_size),
+            eval_role: initial_callback_role(config.epoch_callback_policy, world_size),
             pending_eval_intent: false,
             pending_checkpoint_intent: false,
-            epoch_callback_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
+            epoch_callback_role: initial_callback_role(config.epoch_callback_policy, world_size),
             epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
@@ -449,9 +427,9 @@ impl ClusterCoordinator {
             // Resolve progressive: explicit override wins, otherwise
             // auto-on for Cadence/Async, off for Sync (Sync dispatches
             // whole epochs; there is nothing to stream).
-            progressive: config.progressive.unwrap_or(
-                !matches!(config.policy, ApplyPolicy::Sync),
-            ),
+            progressive: config
+                .progressive
+                .unwrap_or(!matches!(config.policy, ApplyPolicy::Sync)),
             // Floor for proportional chunk sizing after calibration.
             min_chunk_batches: 4,
             final_window_plan: None,

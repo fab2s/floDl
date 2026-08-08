@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
+use super::GraphExt;
 use super::node::*;
 use super::profile;
-use super::GraphExt;
 use crate::autograd::Variable;
 use crate::nn::{Buffer, Module, Parameter};
 use crate::tensor::{Result, TensorError};
@@ -72,8 +72,8 @@ pub struct Graph {
     // Tag groups: group name → suffixed tag names
     pub(crate) tag_groups: HashMap<String, Vec<String>>,
     // Observation: tag mapping (immutable after build)
-    pub(crate) tag_names: HashMap<String, (usize, usize)>,           // tag name → (node_idx, port_idx)
-    pub(crate) tag_capture: HashMap<usize, Vec<(String, usize)>>,     // node_idx → [(tag_name, port_idx)]
+    pub(crate) tag_names: HashMap<String, (usize, usize)>, // tag name → (node_idx, port_idx)
+    pub(crate) tag_capture: HashMap<usize, Vec<(String, usize)>>, // node_idx → [(tag_name, port_idx)]
     // Observation: mutable state (RefCell/Cell for &self methods)
     pub(crate) tagged_outputs: RefCell<HashMap<String, Variable>>,
     pub(crate) batch_buffer: RefCell<HashMap<String, Vec<f64>>>,
@@ -154,9 +154,8 @@ pub struct Graph {
     // pushes the first aggregated view (single-GPU runs that never
     // hit the coord-side aggregation keep this `None` forever and
     // fall back to local epoch_history).
-    pub(crate) aggregated_metrics: std::sync::Arc<
-        std::sync::Mutex<Option<crate::distributed::EpochMetrics>>,
-    >,
+    pub(crate) aggregated_metrics:
+        std::sync::Arc<std::sync::Mutex<Option<crate::distributed::EpochMetrics>>>,
 }
 
 /// Binding between a `DataLoader` and a [`Graph`] for integrated training.
@@ -295,33 +294,35 @@ impl Graph {
         for (idx, node) in nodes.iter().enumerate() {
             if let Some(ref module) = node.module
                 && let Some(child_graph) = module.as_graph()
-                    && let Some(child_label) = child_graph.label() {
-                        if child_label.contains('.') {
-                            return Err(TensorError::new(&format!(
-                                "child graph label {:?} contains a dot — \
+                && let Some(child_label) = child_graph.label()
+            {
+                if child_label.contains('.') {
+                    return Err(TensorError::new(&format!(
+                        "child graph label {:?} contains a dot — \
                                  dots are reserved for path separators",
-                                child_label
-                            )));
-                        }
-                        if children.contains_key(child_label) {
-                            return Err(TensorError::new(&format!(
-                                "duplicate child graph label {:?} at the same tree level",
-                                child_label
-                            )));
-                        }
-                        // Validate: label doesn't shadow a tag on a different node
-                        if let Some(&(tag_ni, _)) = tag_names_map.get(child_label)
-                            && tag_ni != idx {
-                                return Err(TensorError::new(&format!(
-                                    "child graph label {:?} collides with a tag \
+                        child_label
+                    )));
+                }
+                if children.contains_key(child_label) {
+                    return Err(TensorError::new(&format!(
+                        "duplicate child graph label {:?} at the same tree level",
+                        child_label
+                    )));
+                }
+                // Validate: label doesn't shadow a tag on a different node
+                if let Some(&(tag_ni, _)) = tag_names_map.get(child_label)
+                    && tag_ni != idx
+                {
+                    return Err(TensorError::new(&format!(
+                        "child graph label {:?} collides with a tag \
                                      on a different node",
-                                    child_label
-                                )));
-                            }
-                        children.insert(child_label.to_string(), idx);
-                        child_graph.composed.set(true);
-                    }
-                    // Unlabeled graphs: not registered, no tree features, no error
+                        child_label
+                    )));
+                }
+                children.insert(child_label.to_string(), idx);
+                child_graph.composed.set(true);
+            }
+            // Unlabeled graphs: not registered, no tree features, no error
         }
 
         // Auto-internal inference: underscore-prefixed tags
@@ -377,12 +378,8 @@ impl Graph {
             .iter()
             .map(|ep| {
                 let ni = node_index[&ep.node_id];
-                let port_idx = port_index(
-                    &nodes[ni].input_ports,
-                    &ep.port,
-                    &ep.node_id,
-                    "graph input",
-                )?;
+                let port_idx =
+                    port_index(&nodes[ni].input_ports, &ep.port, &ep.node_id, "graph input")?;
                 Ok(InputRoute {
                     node_idx: ni,
                     port_idx,
@@ -401,9 +398,7 @@ impl Graph {
 
         // Pre-compute input port counts and allocate execution buffers
         let node_input_count: Vec<usize> = nodes.iter().map(|nd| nd.input_ports.len()).collect();
-        let exec_slots = RefCell::new(
-            node_input_count.iter().map(|&c| vec![None; c]).collect(),
-        );
+        let exec_slots = RefCell::new(node_input_count.iter().map(|&c| vec![None; c]).collect());
 
         let graph = Ok(Graph {
             nodes,
@@ -454,10 +449,9 @@ impl Graph {
             aggregated_metrics: std::sync::Arc::new(std::sync::Mutex::new(None)),
         });
 
-        if verbose
-            && let Ok(ref g) = graph {
-                crate::verbose!("{}", g.tree_summary());
-            }
+        if verbose && let Ok(ref g) = graph {
+            crate::verbose!("{}", g.tree_summary());
+        }
 
         graph
     }
@@ -575,8 +569,7 @@ impl Graph {
         // not a non-leaf with CopyBackward from native autograd.
         for p in self.parameters() {
             if p.variable.data().device() != device
-                && let Ok(t) = p.variable.data().detach()
-                    .and_then(|d| d.to_device(device))
+                && let Ok(t) = p.variable.data().detach().and_then(|d| d.to_device(device))
             {
                 p.variable.set_data(t);
             }
@@ -610,21 +603,13 @@ impl Graph {
     /// (e.g. `"linear_1"`). When a node has multiple parameters with the same
     /// name, suffixes `_0`, `_1`, ... are appended to disambiguate.
     pub fn named_parameters(&self) -> Vec<(String, Parameter)> {
-        self.named_items(
-            |m| m.parameters(),
-            |p| p.variable.id(),
-            |p| p.name.clone(),
-        )
+        self.named_items(|m| m.parameters(), |p| p.variable.id(), |p| p.name.clone())
     }
 
     /// Return buffers with qualified names, using the same prefix logic
     /// as `named_parameters()`.
     pub fn named_buffers(&self) -> Vec<(String, Buffer)> {
-        self.named_items(
-            |m| m.buffers(),
-            |b| b.id(),
-            |b| b.name.clone(),
-        )
+        self.named_items(|m| m.buffers(), |b| b.id(), |b| b.name.clone())
     }
 
     /// Shared body of [`named_parameters`](Self::named_parameters) and
@@ -652,7 +637,8 @@ impl Graph {
 
         for &ni in &self.order {
             if let Some(ref module) = self.nodes[ni].module {
-                let prefix = idx_to_tag.get(&ni)
+                let prefix = idx_to_tag
+                    .get(&ni)
                     .cloned()
                     .unwrap_or_else(|| self.nodes[ni].id.clone());
 
@@ -693,7 +679,8 @@ impl Graph {
 
     /// Full 64-character hex structural hash (computed lazily, cached).
     pub fn structural_hash(&self) -> &str {
-        self.structural_hash_cache.get_or_init(|| self.compute_structural_hash())
+        self.structural_hash_cache
+            .get_or_init(|| self.compute_structural_hash())
     }
 
     /// First 8 characters of the structural hash.
@@ -762,8 +749,6 @@ fn topological_levels(
     Ok(levels)
 }
 
-
 #[cfg(test)]
 #[path = "tests/mod.rs"]
 mod tests;
-

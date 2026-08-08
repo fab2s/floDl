@@ -69,10 +69,7 @@ pub fn merge_layers<I>(layers: I) -> Value
 where
     I: IntoIterator<Item = Value>,
 {
-    layers
-        .into_iter()
-        .reduce(deep_merge)
-        .unwrap_or(Value::Null)
+    layers.into_iter().reduce(deep_merge).unwrap_or(Value::Null)
 }
 
 // ── Discovery ───────────────────────────────────────────────────────────
@@ -157,7 +154,9 @@ pub enum AnnotatedNode {
     /// Mapping node. `entries` preserves insertion order matching
     /// [`deep_merge`]'s re-key-to-end behaviour (overridden keys move to
     /// the tail of the map, matching the final `serde_yaml_ng` serialisation).
-    Map { entries: Vec<(Value, AnnotatedNode)> },
+    Map {
+        entries: Vec<(Value, AnnotatedNode)>,
+    },
 }
 
 impl AnnotatedNode {
@@ -215,11 +214,7 @@ fn to_annotated(v: &Value, source: usize) -> AnnotatedNode {
 /// Merge `over` onto `base` with provenance. Mirrors [`deep_merge`] but
 /// carries source indices; `over_source` is the layer index for any
 /// leaves the overlay introduces or replaces.
-fn deep_merge_annotated(
-    base: AnnotatedNode,
-    over: &Value,
-    over_source: usize,
-) -> AnnotatedNode {
+fn deep_merge_annotated(base: AnnotatedNode, over: &Value, over_source: usize) -> AnnotatedNode {
     match (base, over) {
         (AnnotatedNode::Map { mut entries }, Value::Mapping(over_map)) => {
             for (k, v) in over_map {
@@ -334,9 +329,7 @@ fn render_leaf_entry(key: &str, value: &Value, tag: &str, indent: usize, out: &m
                         // defensive fallback).
                         let mut it = m.iter();
                         if let Some((first_k, first_v)) = it.next() {
-                            render_mapping_field(
-                                first_k, first_v, indent + 2, Some("- "), out,
-                            );
+                            render_mapping_field(first_k, first_v, indent + 2, Some("- "), out);
                             for (k, v) in it {
                                 render_mapping_field(k, v, indent + 4, None, out);
                             }
@@ -349,7 +342,12 @@ fn render_leaf_entry(key: &str, value: &Value, tag: &str, indent: usize, out: &m
             }
         }
         other => {
-            emit_line(out, indent, &format!("{key}: {}", format_scalar(other)), Some(tag));
+            emit_line(
+                out,
+                indent,
+                &format!("{key}: {}", format_scalar(other)),
+                Some(tag),
+            );
         }
     }
 }
@@ -471,7 +469,11 @@ fn align_comments(raw: &str) -> String {
                 let body_width = body.chars().count();
                 // If the body is too wide to align cleanly, fall back to a
                 // 2-space gutter for that single line.
-                let target_col = if body_width > ALIGN_CAP { body_width + 2 } else { col };
+                let target_col = if body_width > ALIGN_CAP {
+                    body_width + 2
+                } else {
+                    col
+                };
                 for _ in body_width..target_col {
                     out.push(' ');
                 }
@@ -594,7 +596,10 @@ fn format_scalar(v: &Value) -> String {
         Value::String(s) => format_string(s),
         Value::Sequence(_) | Value::Mapping(_) => {
             // Shouldn't be called with a container — defensive fallback.
-            serde_yaml_ng::to_string(v).unwrap_or_default().trim().to_string()
+            serde_yaml_ng::to_string(v)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
         }
         Value::Tagged(t) => serde_yaml_ng::to_string(&**t)
             .unwrap_or_default()
@@ -702,7 +707,10 @@ fn resolve_chain_inner(
     if stack.contains(&canonical) {
         let mut chain: Vec<String> = stack.iter().map(|p| p.display().to_string()).collect();
         chain.push(canonical.display().to_string());
-        return Err(format!("inherit-from cycle detected: {}", chain.join(" -> ")));
+        return Err(format!(
+            "inherit-from cycle detected: {}",
+            chain.join(" -> ")
+        ));
     }
 
     stack.push(canonical.clone());

@@ -20,8 +20,8 @@ use flodl_hf::task_heads::{
 };
 
 use common::{
-    assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels, qa_positions,
-    seqcls_labels, tokcls_labels, token_type_ids, BATCH, CUDA, SEQ,
+    BATCH, CUDA, SEQ, assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels,
+    qa_positions, seqcls_labels, tokcls_labels, token_type_ids,
 };
 
 const NUM_LABELS: i64 = 3;

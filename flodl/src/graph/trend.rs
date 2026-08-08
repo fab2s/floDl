@@ -47,10 +47,7 @@ impl Trend {
 
     /// Minimum value, or `+inf` if empty.
     pub fn min(&self) -> f64 {
-        self.values
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
+        self.values.iter().copied().fold(f64::INFINITY, f64::min)
     }
 
     /// Maximum value, or `-inf` if empty.

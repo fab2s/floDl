@@ -69,19 +69,17 @@ use std::time::Duration;
 
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
-use crate::distributed::wire::{read_handshake_ack, write_handshake_rank};
 use crate::distributed::ddp_run::{
     ControlMsg, EpochFn, EpochPlan, GpuWorker, RankCallbacks, TimingMsg, WorkerConfig,
 };
 use crate::distributed::nccl::NcclRankComm;
-use crate::distributed::relay::mux::{try_read_len_framed, write_len_framed, LenFramedRead};
-use crate::distributed::wire::{
-    ControlFrame, ControlMsgWire, MsgKind, SessionSalt,
-};
+use crate::distributed::nccl_session::PendingNcclSession;
+use crate::distributed::relay::mux::{LenFramedRead, try_read_len_framed, write_len_framed};
+use crate::distributed::wire::{ControlFrame, ControlMsgWire, MsgKind, SessionSalt};
+use crate::distributed::wire::{read_handshake_ack, write_handshake_rank};
 use crate::distributed::wire_convert::{
     control_wire_to_msg, metrics_msg_to_wire, timing_msg_to_wire,
 };
-use crate::distributed::nccl_session::PendingNcclSession;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
@@ -199,21 +197,18 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // Ranks dial their host-local relay's control loopback. The relay
         // process may bind a beat after the rank starts (launcher spawns
         // both), so retry briefly rather than fail on the first refusal.
-        let stream = crate::distributed::wire::connect_with_retry(coord_addr, "cluster_worker coord")?;
+        let stream =
+            crate::distributed::wire::connect_with_retry(coord_addr, "cluster_worker coord")?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| {
-                TensorError::new(&format!("cluster_worker: set_read_timeout: {e}"))
-            })?;
+            .map_err(|e| TensorError::new(&format!("cluster_worker: set_read_timeout: {e}")))?;
         // Write-stall ceiling (fd-level, covers every cloned handle): a
         // wedged relay errors the outbound bridge and the heartbeat
         // emitter instead of parking them — the bridges then unwind and
         // the rank exits rather than hanging silently.
         stream
             .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
-            .map_err(|e| {
-                TensorError::new(&format!("cluster_worker: set_write_timeout: {e}"))
-            })?;
+            .map_err(|e| TensorError::new(&format!("cluster_worker: set_write_timeout: {e}")))?;
 
         // Two independent stream handles so the inbound reader and the
         // outbound writer can sit on different threads without
@@ -230,9 +225,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // Clear the handshake timeout; per-frame waits can run long.
         handshake_stream
             .set_read_timeout(Some(Duration::from_millis(250)))
-            .map_err(|e| {
-                TensorError::new(&format!("cluster_worker: set_read_timeout: {e}"))
-            })?;
+            .map_err(|e| TensorError::new(&format!("cluster_worker: set_read_timeout: {e}")))?;
 
         let read_stream = handshake_stream;
         let mut write_stream = read_stream.try_clone().map_err(|e| {
@@ -273,8 +266,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         let timing_tx_for_heartbeat = timing_tx.clone();
         let timing_tx_for_inbound = timing_tx.clone();
         let (metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::ddp_run::MetricsMsg>();
-        let (param_tx, param_rx) =
-            mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
+        let (param_tx, param_rx) = mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
         let (final_param_tx, final_param_rx) =
             mpsc::channel::<crate::distributed::ddp_run::ParamSnapshot>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
@@ -292,8 +284,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // Constructed BEFORE inner so the NCCL watchdog thread (below)
         // can take an Arc clone. The inbound bridge populates both
         // when the coord broadcasts `DeclareDead` / `NewNcclSession`.
-        let local_dead_ranks =
-            crate::distributed::controller::DeadRanks::new(config.world_size);
+        let local_dead_ranks = crate::distributed::controller::DeadRanks::new(config.world_size);
         let nccl_session_mailbox: Arc<std::sync::Mutex<Option<PendingNcclSession>>> =
             Arc::new(std::sync::Mutex::new(None));
 
@@ -433,9 +424,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
                     );
                 })
                 .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_worker: spawn param bridge: {e}"
-                    ))
+                    TensorError::new(&format!("cluster_worker: spawn param bridge: {e}"))
                 })?,
         );
         // `final_param_rx` is parked on `ClusterWorker` (instead of being
@@ -456,16 +445,10 @@ impl<M: Module + 'static> ClusterWorker<M> {
             thread::Builder::new()
                 .name(format!("flodl-worker-heartbeat:r{rank_out}"))
                 .spawn(move || {
-                    heartbeat_loop(
-                        rank_for_hb,
-                        timing_tx_for_heartbeat,
-                        shutdown_for_hb,
-                    );
+                    heartbeat_loop(rank_for_hb, timing_tx_for_heartbeat, shutdown_for_hb);
                 })
                 .map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster_worker: spawn heartbeat thread: {e}"
-                    ))
+                    TensorError::new(&format!("cluster_worker: spawn heartbeat thread: {e}"))
                 })?,
         );
 
@@ -495,17 +478,10 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 thread::Builder::new()
                     .name(format!("flodl-worker-nccl-watchdog:r{rank_out}"))
                     .spawn(move || {
-                        nccl_watchdog_loop(
-                            rank_for_wd,
-                            slot_for_wd,
-                            dead_for_wd,
-                            shutdown_for_wd,
-                        );
+                        nccl_watchdog_loop(rank_for_wd, slot_for_wd, dead_for_wd, shutdown_for_wd);
                     })
                     .map_err(|e| {
-                        TensorError::new(&format!(
-                            "cluster_worker: spawn NCCL watchdog: {e}"
-                        ))
+                        TensorError::new(&format!("cluster_worker: spawn NCCL watchdog: {e}"))
                     })?,
             );
         }
@@ -597,7 +573,11 @@ impl<M: Module + 'static> ClusterWorker<M> {
 
         let exit_clean = (|| -> Result<bool> {
             loop {
-                let prev_update = if prof { self.inner().last_update_at() } else { None };
+                let prev_update = if prof {
+                    self.inner().last_update_at()
+                } else {
+                    None
+                };
                 let w0 = std::time::Instant::now();
                 // Inline the wait (NOT `next_plan`) so the prof split can
                 // isolate the barrier wait from the epoch_fn fire.
@@ -652,7 +632,11 @@ impl<M: Module + 'static> ClusterWorker<M> {
             // much of "compute" is actually the synchronous D2H readout.
             let snap_s = inner.snapshot_readout_ms_total() / 1e3;
             let snap_n = inner.snapshot_readout_count();
-            let snap_per = if snap_n > 0 { snap_s / snap_n as f64 } else { 0.0 };
+            let snap_per = if snap_n > 0 {
+                snap_s / snap_n as f64
+            } else {
+                0.0
+            };
             // run_epoch split: compute + data are what ElChe's
             // share_complete_ms sees; `other` (= run_epoch - compute -
             // data) is the ctrl/sync/transport overhead it does NOT —
@@ -696,7 +680,11 @@ impl<M: Module + 'static> ClusterWorker<M> {
                 eprintln!(
                     "[worker-mem] rank={} rss={:.2}GB pss={:.2}GB \
                      private={:.2}GB shared={:.2}GB",
-                    inner.rank(), gb(rss), gb(pss), gb(private), gb(shared),
+                    inner.rank(),
+                    gb(rss),
+                    gb(pss),
+                    gb(private),
+                    gb(shared),
                 );
             }
         }
@@ -802,15 +790,16 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // ready. Best-effort: an error from snapshot_params (e.g. CUDA
         // pinned-memory failure inside send_final_snapshot) leaves the
         // channel empty and we surface `None` up to the caller.
-        let final_snapshot = self.final_param_rx.take().and_then(|rx| {
-            match rx.try_recv() {
+        let final_snapshot = self
+            .final_param_rx
+            .take()
+            .and_then(|rx| match rx.try_recv() {
                 Ok(snap) => Some(snap),
-                Err(mpsc::TryRecvError::Empty) => rx
-                    .recv_timeout(std::time::Duration::from_millis(500))
-                    .ok(),
+                Err(mpsc::TryRecvError::Empty) => {
+                    rx.recv_timeout(std::time::Duration::from_millis(500)).ok()
+                }
                 Err(mpsc::TryRecvError::Disconnected) => None,
-            }
-        });
+            });
 
         // Drop inner → all mpsc::Sender clones held by the inner
         // disconnect → bridges see Disconnected on their Receivers and
@@ -849,7 +838,9 @@ fn smaps_rollup_kb() -> Option<(u64, u64, u64, u64)> {
     let (mut shared, mut private) = (0u64, 0u64);
     for line in text.lines() {
         let mut it = line.split_whitespace();
-        let (Some(key), Some(val)) = (it.next(), it.next()) else { continue };
+        let (Some(key), Some(val)) = (it.next(), it.next()) else {
+            continue;
+        };
         let Ok(kb) = val.parse::<u64>() else { continue };
         match key {
             "Rss:" => rss = Some(kb),
@@ -862,14 +853,13 @@ fn smaps_rollup_kb() -> Option<(u64, u64, u64, u64)> {
     Some((rss?, pss?, shared, private))
 }
 
-
 mod bridges;
 mod param_bridge;
 // Re-exported only for the CPU-reduce integration test that drives
 // `sumcount_reduce` directly; production callers are inside param_bridge.
+use bridges::*;
 #[cfg(test)]
 pub(crate) use param_bridge::sumcount_reduce;
-use bridges::*;
 use param_bridge::*;
 
 #[cfg(test)]

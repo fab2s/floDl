@@ -32,14 +32,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::wire::{
-    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES,
-    SessionSalt, connect_with_retry, salt_from_hex, scaled_deadline_secs,
-    write_channel_magic, write_stall_timeout,
+    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
+    connect_with_retry, salt_from_hex, scaled_deadline_secs, write_channel_magic,
+    write_stall_timeout,
 };
 use crate::tensor::{Result, TensorError};
 
-use super::spawn::{build_local_relay_command, build_local_spawn_command, forward_lines};
 use super::ENV_AGENT_JSON;
+use super::spawn::{build_local_relay_command, build_local_spawn_command, forward_lines};
 
 /// Budget for the controller's reply to a hello (scaled). The accept /
 /// reject decision is immediate on the controller; only the network sits
@@ -138,9 +138,8 @@ impl AgentSpec {
 
     /// Hex-encode for [`ENV_AGENT_JSON`] (the spawner side).
     pub fn to_env_hex(&self) -> Result<String> {
-        let json = serde_json::to_string(self).map_err(|e| {
-            TensorError::new(&format!("cluster agent: spec JSON encode: {e}"))
-        })?;
+        let json = serde_json::to_string(self)
+            .map_err(|e| TensorError::new(&format!("cluster agent: spec JSON encode: {e}")))?;
         Ok(crate::distributed::cluster::hex_encode(json.as_bytes()))
     }
 }
@@ -198,10 +197,7 @@ pub(crate) fn join_world(
             JOIN_REPLY_TIMEOUT_SECS,
         ))))
         .map_err(|e| TensorError::new(&format!("cluster agent: set_read_timeout: {e}")))?;
-    crate::distributed::wire::warn_cleartext_public_peer(
-        "cluster agent join",
-        addr,
-    );
+    crate::distributed::wire::warn_cleartext_public_peer("cluster agent join", addr);
     write_channel_magic(&mut stream, CHANNEL_MAGIC_JOIN)?;
 
     // Pre-admission frames ride the join key: the pre-shared salt in
@@ -219,7 +215,11 @@ pub(crate) fn join_world(
         )
     })?;
     let (ranks, salt, formation_wait_secs) = match reply.decode::<JoinMsgWire>()? {
-        JoinMsgWire::Accept { ranks, salt_hex, formation_wait_secs } => {
+        JoinMsgWire::Accept {
+            ranks,
+            salt_hex,
+            formation_wait_secs,
+        } => {
             let salt = match (pre_shared, salt_hex) {
                 (Some(s), _) => s,
                 (None, Some(hex)) => salt_from_hex(&hex)?,
@@ -262,7 +262,10 @@ pub(crate) fn join_world(
         )
     })?;
     match frame.decode::<JoinMsgWire>()? {
-        JoinMsgWire::WorldFormed { envelope_hex, relay_spec_hex } => {
+        JoinMsgWire::WorldFormed {
+            envelope_hex,
+            relay_spec_hex,
+        } => {
             // The controller authors dial addresses from ITS view of
             // the topology, but only THIS agent knows the address that
             // provably reaches the controller from THIS host — the one
@@ -287,9 +290,7 @@ pub(crate) fn join_world(
                 gpu_ram_share,
             )?;
             let relay_spec_hex = relay_spec_hex
-                .map(|hex| {
-                    rewrite_relay_controller(&hex, controller_host, controller_port)
-                })
+                .map(|hex| rewrite_relay_controller(&hex, controller_host, controller_port))
                 .transpose()?;
             Ok(JoinOutcome {
                 salt,
@@ -342,8 +343,7 @@ fn localize_envelope(
     controller.insert("host".into(), serde_json::Value::String(host.to_string()));
     controller.insert("port".into(), serde_json::Value::from(port));
     if data_path.is_some() || gpu_ram_share.is_some() {
-        let Some(worker) = envelope.get_mut("worker").and_then(|w| w.as_object_mut())
-        else {
+        let Some(worker) = envelope.get_mut("worker").and_then(|w| w.as_object_mut()) else {
             return Err(TensorError::new(
                 "cluster agent: envelope carries no worker object",
             ));
@@ -358,28 +358,22 @@ fn localize_envelope(
             worker.insert("gpu_ram_share".into(), serde_json::Value::from(share));
         }
     }
-    let json = serde_json::to_string(&envelope).map_err(|e| {
-        TensorError::new(&format!("cluster agent: envelope re-encode: {e}"))
-    })?;
+    let json = serde_json::to_string(&envelope)
+        .map_err(|e| TensorError::new(&format!("cluster agent: envelope re-encode: {e}")))?;
     Ok(crate::distributed::cluster::hex_encode(json.as_bytes()))
 }
 
 /// Same rewrite for the relay spec: the relay is this host's out-dialer,
 /// so it must dial the road the join proved works.
-fn rewrite_relay_controller(
-    relay_spec_hex: &str,
-    host: &str,
-    port: u16,
-) -> Result<String> {
+fn rewrite_relay_controller(relay_spec_hex: &str, host: &str, port: u16) -> Result<String> {
     let bytes = crate::distributed::cluster::hex_decode(relay_spec_hex)
         .map_err(|e| TensorError::new(&format!("cluster agent: relay spec hex: {e}")))?;
     let mut spec: super::RelaySpec = serde_json::from_slice(&bytes)
         .map_err(|e| TensorError::new(&format!("cluster agent: relay spec JSON: {e}")))?;
     spec.controller_host = host.to_string();
     spec.controller_port = port;
-    let json = serde_json::to_string(&spec).map_err(|e| {
-        TensorError::new(&format!("cluster agent: relay spec re-encode: {e}"))
-    })?;
+    let json = serde_json::to_string(&spec)
+        .map_err(|e| TensorError::new(&format!("cluster agent: relay spec re-encode: {e}")))?;
     Ok(crate::distributed::cluster::hex_encode(json.as_bytes()))
 }
 
@@ -468,11 +462,7 @@ pub fn run_agent() -> Result<()> {
             spec.host,
         )));
     }
-    let pre_shared = spec
-        .salt_hex
-        .as_deref()
-        .map(salt_from_hex)
-        .transpose()?;
+    let pre_shared = spec.salt_hex.as_deref().map(salt_from_hex).transpose()?;
 
     eprintln!(
         "cluster agent: host {:?} dialing controller {}:{} with {} rank(s) \
@@ -482,7 +472,11 @@ pub fn run_agent() -> Result<()> {
         spec.controller_port,
         devices.len(),
         devices,
-        if pre_shared.is_some() { "pre-shared salt" } else { "open" },
+        if pre_shared.is_some() {
+            "pre-shared salt"
+        } else {
+            "open"
+        },
     );
 
     let hello = build_hello(&spec, &devices, gpus)?;
@@ -525,11 +519,7 @@ pub(crate) fn join_and_spawn_local(
             spec.host,
         )));
     }
-    let pre_shared = spec
-        .salt_hex
-        .as_deref()
-        .map(salt_from_hex)
-        .transpose()?;
+    let pre_shared = spec.salt_hex.as_deref().map(salt_from_hex).transpose()?;
     let hello = build_hello(&spec, &devices, gpus)?;
     let outcome = join_world(
         &spec.controller_host,
@@ -572,9 +562,8 @@ pub(crate) fn spawn_host_children(
             devices.len(),
         )));
     }
-    let exe = std::env::current_exe().map_err(|e| {
-        TensorError::new(&format!("cluster agent: current_exe() failed: {e}"))
-    })?;
+    let exe = std::env::current_exe()
+        .map_err(|e| TensorError::new(&format!("cluster agent: current_exe() failed: {e}")))?;
     let user_args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut children: Vec<HostChild> = Vec::with_capacity(devices.len() + 1);
@@ -586,7 +575,9 @@ pub(crate) fn spawn_host_children(
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| {
                 TensorError::new(&format!("cluster agent: spawn relay failed: {e}"))
             })?;
@@ -609,9 +600,7 @@ pub(crate) fn spawn_host_children(
             });
         }
 
-        for (local_rank, (&phys, &grank)) in
-            devices.iter().zip(outcome.ranks.iter()).enumerate()
-        {
+        for (local_rank, (&phys, &grank)) in devices.iter().zip(outcome.ranks.iter()).enumerate() {
             let mut cmd = build_local_spawn_command(
                 &exe,
                 &user_args,
@@ -622,7 +611,9 @@ pub(crate) fn spawn_host_children(
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| {
                 TensorError::new(&format!(
                     "cluster agent: spawn rank {grank} (device {phys}) failed: {e}"
@@ -688,9 +679,9 @@ fn supervise(
     // partially read header would desync the channel).
     let abort = Arc::new(AtomicBool::new(false));
     let abort_reason = Arc::new(std::sync::Mutex::new(String::new()));
-    let mut reader = stream.try_clone().map_err(|e| {
-        TensorError::new(&format!("cluster agent: join stream try_clone: {e}"))
-    })?;
+    let mut reader = stream
+        .try_clone()
+        .map_err(|e| TensorError::new(&format!("cluster agent: join stream try_clone: {e}")))?;
     // The reply deadline from the join phase is still armed; supervision
     // reads must block indefinitely (training runs for hours).
     reader
@@ -753,10 +744,7 @@ fn supervise(
     while live > 0 {
         if !aborted && abort.load(Ordering::SeqCst) {
             aborted = true;
-            let reason = abort_reason
-                .lock()
-                .map(|r| r.clone())
-                .unwrap_or_default();
+            let reason = abort_reason.lock().map(|r| r.clone()).unwrap_or_default();
             eprintln!(
                 "cluster agent: tearing down host {host:?} ({reason}); killing \
                  {live} child(ren)"
@@ -780,10 +768,7 @@ fn supervise(
                     let code = status.code().unwrap_or(-1);
                     let clean = status.success();
                     if !clean {
-                        eprintln!(
-                            "cluster agent: {} exited with {status}",
-                            children[i].label,
-                        );
+                        eprintln!("cluster agent: {} exited with {status}", children[i].label,);
                     }
                     match children[i].rank {
                         Some(rank) => {
@@ -823,10 +808,7 @@ fn supervise(
                     reaped[i] = true;
                     live -= 1;
                     progressed = true;
-                    eprintln!(
-                        "cluster agent: wait on {} failed: {e}",
-                        children[i].label,
-                    );
+                    eprintln!("cluster agent: wait on {} failed: {e}", children[i].label,);
                 }
             }
         }
@@ -916,9 +898,7 @@ mod tests {
             data_channel: true,
             frame_ceiling_bytes: 1024,
         };
-        crate::distributed::cluster::hex_encode(
-            serde_json::to_string(&spec).unwrap().as_bytes(),
-        )
+        crate::distributed::cluster::hex_encode(serde_json::to_string(&spec).unwrap().as_bytes())
     }
 
     /// A fake controller serving exactly one join dial: consume the
@@ -934,8 +914,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            expect_channel_magic(&mut stream, CHANNEL_MAGIC_JOIN, "fake controller")
-                .unwrap();
+            expect_channel_magic(&mut stream, CHANNEL_MAGIC_JOIN, "fake controller").unwrap();
             let frame = ControlFrame::read_from(&mut stream, &key)
                 .unwrap()
                 .expect("hello frame");
@@ -1038,12 +1017,13 @@ mod tests {
         // so this box writes them into the envelope its ranks read.
         assert_eq!(envelope["worker"]["data_path"], "/srv/corpus");
         assert_eq!(envelope["worker"]["gpu_ram_share"], 0.4);
-        assert_eq!(envelope["worker"]["host"], "worker-x", "other fields untouched");
+        assert_eq!(
+            envelope["worker"]["host"], "worker-x",
+            "other fields untouched"
+        );
         let relay: super::super::RelaySpec = serde_json::from_slice(
-            &crate::distributed::cluster::hex_decode(
-                outcome.relay_spec_hex.as_deref().unwrap(),
-            )
-            .unwrap(),
+            &crate::distributed::cluster::hex_decode(outcome.relay_spec_hex.as_deref().unwrap())
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(relay.controller_host, "127.0.0.1");
@@ -1065,26 +1045,21 @@ mod tests {
             // controller resolved into this envelope.
             "worker": { "host": "exa", "data_path": "/flodl/data", "gpu_ram_share": 0.25 },
         });
-        let hex = crate::distributed::cluster::hex_encode(
-            envelope.to_string().as_bytes(),
-        );
+        let hex = crate::distributed::cluster::hex_encode(envelope.to_string().as_bytes());
         let out = localize_envelope(&hex, "127.0.0.1", 40123, None, None).unwrap();
-        let got: serde_json::Value = serde_json::from_slice(
-            &crate::distributed::cluster::hex_decode(&out).unwrap(),
-        )
-        .unwrap();
+        let got: serde_json::Value =
+            serde_json::from_slice(&crate::distributed::cluster::hex_decode(&out).unwrap())
+                .unwrap();
         assert_eq!(got["worker"]["data_path"], "/flodl/data");
         assert_eq!(got["worker"]["gpu_ram_share"], 0.25);
         assert_eq!(got["controller"]["host"], "127.0.0.1");
 
         // ... and a walk-in's values win over whatever the envelope
         // carried, because the controller cannot have known better.
-        let out =
-            localize_envelope(&hex, "127.0.0.1", 40123, Some("/srv/c"), Some(0.5)).unwrap();
-        let got: serde_json::Value = serde_json::from_slice(
-            &crate::distributed::cluster::hex_decode(&out).unwrap(),
-        )
-        .unwrap();
+        let out = localize_envelope(&hex, "127.0.0.1", 40123, Some("/srv/c"), Some(0.5)).unwrap();
+        let got: serde_json::Value =
+            serde_json::from_slice(&crate::distributed::cluster::hex_decode(&out).unwrap())
+                .unwrap();
         assert_eq!(got["worker"]["data_path"], "/srv/c");
         assert_eq!(got["worker"]["gpu_ram_share"], 0.5);
     }
@@ -1128,8 +1103,7 @@ mod tests {
                 },
             ],
         );
-        let outcome =
-            join_world("127.0.0.1", port, Some(salt), test_hello(), None, None).unwrap();
+        let outcome = join_world("127.0.0.1", port, Some(salt), test_hello(), None, None).unwrap();
         assert_eq!(outcome.salt, salt);
         assert!(outcome.relay_spec_hex.is_none());
         controller.join().unwrap();
@@ -1142,7 +1116,9 @@ mod tests {
         let (port, controller) = fake_controller(
             zero,
             salt,
-            vec![JoinMsgWire::Reject { reason: "dataset signature mismatch".to_string() }],
+            vec![JoinMsgWire::Reject {
+                reason: "dataset signature mismatch".to_string(),
+            }],
         );
         let err = join_world("127.0.0.1", port, None, test_hello(), None, None)
             .unwrap_err()
@@ -1160,7 +1136,9 @@ mod tests {
                     salt_hex: Some(salt_to_hex(&salt)),
                     formation_wait_secs: 60,
                 },
-                JoinMsgWire::Abort { reason: "quorum not met".to_string() },
+                JoinMsgWire::Abort {
+                    reason: "quorum not met".to_string(),
+                },
             ],
         );
         let err = join_world("127.0.0.1", port, None, test_hello(), None, None)

@@ -47,21 +47,14 @@ impl ClusterCoordinator {
             return crate::distributed::ddp_run::ratio_to_sizes(ratios, epoch_samples);
         }
         match self.policy {
-            ApplyPolicy::Sync => crate::distributed::ddp_run::equal_sizes(
-                self.world_size,
-                epoch_samples,
-            ),
+            ApplyPolicy::Sync => {
+                crate::distributed::ddp_run::equal_sizes(self.world_size, epoch_samples)
+            }
             ApplyPolicy::Cadence | ApplyPolicy::Async => {
                 if self.el_che.is_calibrated() || self.el_che.has_speed_hint() {
-                    crate::distributed::ddp_run::throughput_sizes(
-                        &self.el_che,
-                        epoch_samples,
-                    )
+                    crate::distributed::ddp_run::throughput_sizes(&self.el_che, epoch_samples)
                 } else {
-                    crate::distributed::ddp_run::equal_sizes(
-                        self.world_size,
-                        epoch_samples,
-                    )
+                    crate::distributed::ddp_run::equal_sizes(self.world_size, epoch_samples)
                 }
             }
         }
@@ -288,9 +281,7 @@ impl ClusterCoordinator {
             // The failed take is already rolled back inside
             // `dispatch_next_chunk_with_batches`; heartbeat staleness reaps
             // the rank and its span is redistributed.
-            let plan = match self.dispatch_next_chunk_with_batches(
-                rank, epoch, batch_count,
-            ) {
+            let plan = match self.dispatch_next_chunk_with_batches(rank, epoch, batch_count) {
                 Ok(plan) => plan,
                 Err(e) => {
                     eprintln!(
@@ -389,17 +380,20 @@ impl ClusterCoordinator {
                 self.dispatch_hold_logged[rank] = true;
                 crate::debug!(
                     "  ddp: reduce barrier HOLD rank {rank} | steps={} budget={}",
-                    self.window.steps(rank), reduce_budget,
+                    self.window.steps(rank),
+                    reduce_budget,
                 );
             }
             return;
         }
 
-        if self.chunk_pools.get(&epoch).is_some_and(|p| p.remaining() > 0) {
+        if self
+            .chunk_pools
+            .get(&epoch)
+            .is_some_and(|p| p.remaining() > 0)
+        {
             let batches = self.compute_chunk_batches(rank, epoch);
-            if let Err(e) = self.dispatch_next_chunk_with_batches(
-                rank, epoch, batches,
-            ) {
+            if let Err(e) = self.dispatch_next_chunk_with_batches(rank, epoch, batches) {
                 crate::verbose!(
                     "  ddp: dispatch_next_chunk(rank={rank}, epoch={epoch}) error: {e}"
                 );
@@ -448,8 +442,7 @@ impl ClusterCoordinator {
         }
 
         if !self.chunk_pools.contains_key(&next_epoch) {
-            let batch_total =
-                (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
+            let batch_total = (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
             let span_sizes = self.reservation_span_sizes(batch_total);
             self.chunk_pools.insert(
                 next_epoch,
@@ -462,9 +455,7 @@ impl ClusterCoordinator {
             crate::verbose!("  ddp: streaming -> epoch {next_epoch} pool created");
         }
         let batches = self.compute_chunk_batches(rank, next_epoch);
-        if let Err(e) = self.dispatch_next_chunk_with_batches(
-            rank, next_epoch, batches,
-        ) {
+        if let Err(e) = self.dispatch_next_chunk_with_batches(rank, next_epoch, batches) {
             crate::verbose!(
                 "  ddp: dispatch_next_chunk(rank={rank}, next_epoch={next_epoch}) error: {e}"
             );
@@ -544,8 +535,10 @@ impl ClusterCoordinator {
         if samples == 0 {
             return None;
         }
-        let (offset, actual_size) =
-            self.chunk_pools.get_mut(&epoch)?.take_chunk(samples, rank)?;
+        let (offset, actual_size) = self
+            .chunk_pools
+            .get_mut(&epoch)?
+            .take_chunk(samples, rank)?;
         self.rank_epoch[rank] = epoch;
         Some(crate::distributed::wire::EpochPlanWire {
             epoch: epoch as u64,
@@ -596,7 +589,11 @@ impl ClusterCoordinator {
             } else {
                 None
             };
-            planned.push(PlannedUpdate { rank, next_plan, prev_epoch });
+            planned.push(PlannedUpdate {
+                rank,
+                next_plan,
+                prev_epoch,
+            });
         }
         planned
     }
@@ -607,12 +604,7 @@ impl ClusterCoordinator {
     /// entry.
     pub(super) fn rollback_planned_update(&mut self, planned: &PlannedUpdate) {
         if let Some(plan) = &planned.next_plan {
-            self.rollback_chunk_take(
-                planned.rank,
-                plan.epoch as usize,
-                plan,
-                planned.prev_epoch,
-            );
+            self.rollback_chunk_take(planned.rank, plan.epoch as usize, plan, planned.prev_epoch);
         }
     }
 
@@ -639,7 +631,11 @@ impl ClusterCoordinator {
             return None;
         }
         let epoch = self.rank_epoch[rank];
-        if self.chunk_pools.get(&epoch).is_none_or(|p| p.remaining() == 0) {
+        if self
+            .chunk_pools
+            .get(&epoch)
+            .is_none_or(|p| p.remaining() == 0)
+        {
             return None;
         }
         self.refresh_final_window_plan(epoch);
@@ -717,7 +713,11 @@ impl ClusterCoordinator {
         self.last_aggregated_epoch = lowest.checked_sub(1);
         crate::verbose!(
             "  ddp: resume from coverage | epochs {:?} reconstructed, active epoch {lowest}",
-            coverage.per_epoch.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+            coverage
+                .per_epoch
+                .iter()
+                .map(|e| e.epoch)
+                .collect::<Vec<_>>(),
         );
         // Dispatch the first chunk of the active epoch to every live rank; the
         // streaming path (drain_metrics / wake_idle_ranks_in_progressive) takes
@@ -813,8 +813,7 @@ impl ClusterCoordinator {
         ) {
             return;
         }
-        let alive: Vec<bool> =
-            (0..self.world_size).map(|r| !self.is_dead(r)).collect();
+        let alive: Vec<bool> = (0..self.world_size).map(|r| !self.is_dead(r)).collect();
         let alloc = final_window_alloc(rem, counts, &alive);
         crate::debug!(
             "  ddp: final-window plan pinned | epoch={epoch} rem={rem} \
@@ -884,7 +883,10 @@ impl ClusterCoordinator {
             if !predicted.is_empty() {
                 segments.push((
                     (epoch + 1) as u64,
-                    predicted.iter().map(|&(o, s)| (o as u64, s as u64)).collect(),
+                    predicted
+                        .iter()
+                        .map(|&(o, s)| (o as u64, s as u64))
+                        .collect(),
                 ));
             }
             if segments.is_empty() {
@@ -917,8 +919,7 @@ impl ClusterCoordinator {
         if next_epoch >= self.num_epochs() || self.batch_size == 0 {
             return Vec::new();
         }
-        let batch_total =
-            (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
+        let batch_total = (self.epoch_samples(next_epoch) / self.batch_size) * self.batch_size;
         if batch_total == 0 {
             return Vec::new();
         }
@@ -951,11 +952,7 @@ impl ClusterCoordinator {
     /// each, where the boundary can move under throughput drift. Spans
     /// may overlap across ranks (margins are staged by several ranks
     /// on purpose); allocation stays exclusive in the pool.
-    pub(super) fn advisory_spans_for_rank(
-        &self,
-        epoch: usize,
-        rank: usize,
-    ) -> Vec<(usize, usize)> {
+    pub(super) fn advisory_spans_for_rank(&self, epoch: usize, rank: usize) -> Vec<(usize, usize)> {
         let Some(pool) = self.chunk_pools.get(&epoch) else {
             return Vec::new();
         };
@@ -999,9 +996,10 @@ impl ClusterCoordinator {
         // its fold crumb deliberately runs one batch past the reduce budget on
         // a slow rank). See `docs/design/epoch-tail-allocation.md`.
         if let Some(plan) = self.final_window_plan.as_ref()
-            && plan.epoch == epoch {
-                return plan.alloc.get(rank).copied().unwrap_or(0);
-            }
+            && plan.epoch == epoch
+        {
+            return plan.alloc.get(rank).copied().unwrap_or(0);
+        }
 
         // EDGE SCHEDULE (epoch / run tail). When less than a full window of
         // work remains (`remaining < Σ batch_counts`), EVERY progressive
@@ -1048,9 +1046,7 @@ impl ClusterCoordinator {
         if !self.el_che.is_calibrated() && !self.el_che.has_speed_hint() {
             // Probe: small equal chunks for fast calibration (~10%
             // per rank, min 4 batches).
-            let probe = (self.total_samples
-                / (self.world_size * 10 * self.batch_size))
-                .max(4);
+            let probe = (self.total_samples / (self.world_size * 10 * self.batch_size)).max(4);
             return probe.min(remaining_batches);
         }
         // Calibrated: proportional to ElChe's throughput-derived batch counts.
@@ -1059,8 +1055,7 @@ impl ClusterCoordinator {
         if total_counts == 0 {
             return remaining_batches.min(self.min_chunk_batches);
         }
-        let ratio = counts.get(rank).copied().unwrap_or(0) as f64
-            / total_counts as f64;
+        let ratio = counts.get(rank).copied().unwrap_or(0) as f64 / total_counts as f64;
         let target = (remaining_batches as f64 * ratio).ceil() as usize;
         let sized = target.max(self.min_chunk_batches).min(remaining_batches);
         // REDUCE BARRIER cap: never dispatch past the rank's remaining
@@ -1082,8 +1077,7 @@ impl ClusterCoordinator {
     fn cap_to_reduce_budget(&self, rank: usize, sized: usize) -> usize {
         let budget = self.reduce_step_budget(rank);
         if budget > 0 {
-            let budget_remaining =
-                budget.saturating_sub(self.window.steps(rank)).max(1);
+            let budget_remaining = budget.saturating_sub(self.window.steps(rank)).max(1);
             sized.min(budget_remaining)
         } else {
             sized
@@ -1144,8 +1138,7 @@ impl ClusterCoordinator {
             if self.is_dead(rank) {
                 continue;
             }
-            let has_inflight = self.chunk_pools.values()
-                .any(|p| p.in_flight(rank) > 0);
+            let has_inflight = self.chunk_pools.values().any(|p| p.in_flight(rank) > 0);
             if !has_inflight {
                 self.dispatch_next_chunk(rank);
             }
@@ -1176,9 +1169,7 @@ fn fastest_alive_rank(counts: &[usize], alive: &[bool]) -> Option<usize> {
 /// too small for any pair), the lone 1 is left as is and that window's feed
 /// falls back to the compute scale — irreducible and benign.
 fn consolidate_lone_ones(alloc: &mut [usize], alive: &[bool]) {
-    while let Some(orphan) =
-        (0..alloc.len()).find(|&r| alive[r] && alloc[r] == 1)
-    {
+    while let Some(orphan) = (0..alloc.len()).find(|&r| alive[r] && alloc[r] == 1) {
         let peer = (0..alloc.len())
             .filter(|&p| p != orphan && alive[p] && alloc[p] >= 1)
             .min_by_key(|&p| alloc[p]);
@@ -1212,10 +1203,7 @@ fn final_window_alloc(rem: usize, counts: &[usize], alive: &[bool]) -> Vec<usize
     if rem == 0 {
         return alloc;
     }
-    let total: usize = (0..world)
-        .filter(|&r| alive[r])
-        .map(|r| counts[r])
-        .sum();
+    let total: usize = (0..world).filter(|&r| alive[r]).map(|r| counts[r]).sum();
     if total == 0 {
         return alloc;
     }
@@ -1267,9 +1255,7 @@ fn final_window_alloc(rem: usize, counts: &[usize], alive: &[bool]) -> Vec<usize
         placed += floor;
         frac.push((r, exact - floor as f64));
     }
-    frac.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    frac.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut leftover = rem - placed;
     let mut i = 0;
     while leftover > 0 && !frac.is_empty() {
@@ -1339,15 +1325,27 @@ mod final_window_alloc_tests {
         let alive = [true, true, true];
         let mut a = [1, 1, 0];
         consolidate_lone_ones(&mut a, &alive);
-        assert!(a.iter().all(|&n| n != 1) && a.iter().sum::<usize>() == 2, "{a:?}");
+        assert!(
+            a.iter().all(|&n| n != 1) && a.iter().sum::<usize>() == 2,
+            "{a:?}"
+        );
         let mut b = [2, 1, 1];
         consolidate_lone_ones(&mut b, &alive);
-        assert!(b.iter().all(|&n| n != 1) && b.iter().sum::<usize>() == 4, "{b:?}");
+        assert!(
+            b.iter().all(|&n| n != 1) && b.iter().sum::<usize>() == 4,
+            "{b:?}"
+        );
     }
 
     #[test]
     fn fastest_rank_skips_dead() {
-        assert_eq!(fastest_alive_rank(&[71, 18, 15], &[false, true, true]), Some(1));
-        assert_eq!(fastest_alive_rank(&[71, 18, 15], &[true, true, true]), Some(0));
+        assert_eq!(
+            fastest_alive_rank(&[71, 18, 15], &[false, true, true]),
+            Some(1)
+        );
+        assert_eq!(
+            fastest_alive_rank(&[71, 18, 15], &[true, true, true]),
+            Some(0)
+        );
     }
 }

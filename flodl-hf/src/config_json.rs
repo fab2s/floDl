@@ -27,9 +27,7 @@ pub(crate) fn required_i64(v: &Value, key: &str) -> Result<i64> {
 /// `model_type`.
 pub(crate) fn required_string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v.get(key).and_then(|x| x.as_str()).ok_or_else(|| {
-        TensorError::new(&format!(
-            "config.json missing required string field: {key}",
-        ))
+        TensorError::new(&format!("config.json missing required string field: {key}",))
     })
 }
 
@@ -84,9 +82,7 @@ pub(crate) fn parse_id2label(v: &Value) -> Result<Option<Vec<String>>> {
             ))
         })?;
         let label = val.as_str().ok_or_else(|| {
-            TensorError::new(&format!(
-                "config.json: id2label[{k}] is not a string",
-            ))
+            TensorError::new(&format!("config.json: id2label[{k}] is not a string",))
         })?;
         pairs.push((id, label.to_string()));
     }
@@ -117,9 +113,9 @@ pub(crate) fn parse_id2label(v: &Value) -> Result<Option<Vec<String>>> {
 ///   for the same approximation)
 fn map_hidden_act(s: &str) -> Result<GeluApprox> {
     match s {
-        "gelu"                   => Ok(GeluApprox::Exact),
-        "gelu_new"               => Ok(GeluApprox::Tanh),
-        "gelu_pytorch_tanh"      => Ok(GeluApprox::Tanh),
+        "gelu" => Ok(GeluApprox::Exact),
+        "gelu_new" => Ok(GeluApprox::Tanh),
+        "gelu_pytorch_tanh" => Ok(GeluApprox::Tanh),
         other => Err(TensorError::new(&format!(
             "config.json: unsupported hidden_act = {other:?}. \
              flodl-hf currently maps {{\"gelu\", \"gelu_new\", \
@@ -141,9 +137,7 @@ fn map_hidden_act(s: &str) -> Result<GeluApprox> {
 /// Different families ship the field under different names —
 /// most use `"hidden_act"`, DistilBERT uses `"activation"` — so the
 /// caller passes the key.
-pub(crate) fn optional_hidden_act(
-    v: &Value, key: &str, default: &str,
-) -> Result<GeluApprox> {
+pub(crate) fn optional_hidden_act(v: &Value, key: &str, default: &str) -> Result<GeluApprox> {
     let raw = v.get(key).and_then(|x| x.as_str()).unwrap_or(default);
     map_hidden_act(raw)
 }
@@ -211,9 +205,7 @@ pub(crate) fn emit_hidden_act(act: GeluApprox) -> &'static str {
 /// is the family base name (`BertModel`, `RobertaModel`, …).
 pub(crate) fn emit_architectures(stored: Option<&[String]>, default_class: &str) -> Value {
     let arr: Vec<Value> = match stored {
-        Some(names) if !names.is_empty() => {
-            names.iter().map(|s| Value::from(s.as_str())).collect()
-        }
+        Some(names) if !names.is_empty() => names.iter().map(|s| Value::from(s.as_str())).collect(),
         _ => vec![Value::from(default_class)],
     };
     Value::Array(arr)
@@ -285,15 +277,12 @@ mod tests {
 
     #[test]
     fn parse_id2label_orders_and_rejects_gaps() {
-        let v: Value = serde_json::from_str(
-            r#"{"id2label": {"2": "c", "0": "a", "1": "b"}}"#,
-        ).unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"id2label": {"2": "c", "0": "a", "1": "b"}}"#).unwrap();
         let out = parse_id2label(&v).unwrap().unwrap();
         assert_eq!(out, vec!["a", "b", "c"]);
 
-        let gap: Value = serde_json::from_str(
-            r#"{"id2label": {"0": "a", "2": "c"}}"#,
-        ).unwrap();
+        let gap: Value = serde_json::from_str(r#"{"id2label": {"0": "a", "2": "c"}}"#).unwrap();
         let err = parse_id2label(&gap).unwrap_err();
         assert!(format!("{err}").contains("contiguous"), "got: {err}");
     }

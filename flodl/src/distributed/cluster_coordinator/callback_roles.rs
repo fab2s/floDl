@@ -55,9 +55,8 @@ impl ClusterCoordinator {
             // in its intended-actuation window (it fires proactively on
             // an LR cliff, BEFORE divergence rises, so guard-`Stable` +
             // meta-`NudgeDown` is the common case).
-            self.el_che.apply_verdict(
-                crate::distributed::el_che::AnchorVerdict::NudgeDown { factor },
-            );
+            self.el_che
+                .apply_verdict(crate::distributed::el_che::AnchorVerdict::NudgeDown { factor });
             let new = self.el_che.anchor();
             if let Some(ref tl) = self.timeline {
                 tl.event(crate::monitor::EventKind::MetaNudge {
@@ -68,7 +67,9 @@ impl ClusterCoordinator {
             }
             crate::verbose!(
                 "  ddp: meta-controller nudge factor={:.3} anchor {} -> {}",
-                factor, old, new,
+                factor,
+                old,
+                new,
             );
         }
     }
@@ -137,9 +138,7 @@ impl ClusterCoordinator {
         if dead_rank == self.epoch_callback_role {
             self.epoch_callback_role = self.resolve_fastest_role();
         }
-        if self.epoch_callback_role != prev_epoch
-            && self.epoch_callback_role != usize::MAX
-        {
+        if self.epoch_callback_role != prev_epoch && self.epoch_callback_role != usize::MAX {
             self.epoch_role_dirty = true;
         }
     }
@@ -211,9 +210,8 @@ impl ClusterCoordinator {
                     .get(&version)
                     .cloned()
                     .unwrap_or_default();
-                let next = (0..self.world_size).find(|&r| {
-                    r != rank && !self.is_dead(r) && !tried_snapshot.contains(&r)
-                });
+                let next = (0..self.world_size)
+                    .find(|&r| r != rank && !self.is_dead(r) && !tried_snapshot.contains(&r));
                 match next {
                     Some(r) => {
                         self.checkpoint_role = r;
@@ -268,19 +266,16 @@ impl ClusterCoordinator {
         // report regardless of error: the closure wall-time is honest
         // even when the metric is not.
         let alpha = 0.3_f64;
-        self.last_eval_elapsed_ms_ewma =
-            Some(match self.last_eval_elapsed_ms_ewma {
-                Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
-                None => elapsed_ms,
-            });
+        self.last_eval_elapsed_ms_ewma = Some(match self.last_eval_elapsed_ms_ewma {
+            Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
+            None => elapsed_ms,
+        });
         // User-facing dispatch: fire `eval_result_fn` on success; log
         // and continue on failure. Errors from the closure are logged
         // and training continues, matching `metrics_fn`'s
         // SkipAndContinue default.
         if let Some(err_msg) = error {
-            eprintln!(
-                "cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}"
-            );
+            eprintln!("cluster_coordinator: eval_fn returned error (epoch {epoch}): {err_msg}");
         } else {
             // Broadcast the elected rank's eval to every rank so the
             // cooperative tier's `Worker::poll_eval` surfaces it without a
@@ -289,22 +284,21 @@ impl ClusterCoordinator {
             // drains it in the same control pass (before returning `None` from
             // `wait_for_epoch_plan`). Broadcast failures are non-fatal (a
             // rank's stream may already be closing at shutdown).
-            if let Err(e) = self.broadcast_control(
-                &crate::distributed::wire::ControlMsgWire::EvalBroadcast {
+            if let Err(e) =
+                self.broadcast_control(&crate::distributed::wire::ControlMsgWire::EvalBroadcast {
                     epoch: epoch as u64,
                     metric,
-                },
-            ) {
-                crate::verbose!(
-                    "  ddp: EvalBroadcast (epoch {epoch}) failed: {e}"
-                );
+                })
+            {
+                crate::verbose!("  ddp: EvalBroadcast (epoch {epoch}) failed: {e}");
             }
             if let Some(ref f) = self.eval_result_fn
-                && let Err(e) = f(epoch, metric) {
-                    eprintln!(
-                        "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
-                    );
-                }
+                && let Err(e) = f(epoch, metric)
+            {
+                eprintln!(
+                    "cluster_coordinator: eval_result_fn returned error (epoch {epoch}): {e}"
+                );
+            }
         }
     }
 
@@ -319,11 +313,10 @@ impl ClusterCoordinator {
         // `build_window_report`).
         self.window.absorb_callback_cost(rank, elapsed_ms);
         let alpha = 0.3_f64;
-        self.last_epoch_fn_elapsed_ms_ewma =
-            Some(match self.last_epoch_fn_elapsed_ms_ewma {
-                Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
-                None => elapsed_ms,
-            });
+        self.last_epoch_fn_elapsed_ms_ewma = Some(match self.last_epoch_fn_elapsed_ms_ewma {
+            Some(prev) => alpha * elapsed_ms + (1.0 - alpha) * prev,
+            None => elapsed_ms,
+        });
     }
 
     /// Detect "next cycle is the last cycle of the current epoch" and,
@@ -360,9 +353,7 @@ impl ClusterCoordinator {
         // aligned at finish_averaging time; any rank's view works).
         let epoch = self.rank_epoch.first().copied().unwrap_or(0);
         let remaining_batches = match self.chunk_pools.get(&epoch) {
-            Some(pool) if pool.remaining() >= self.batch_size => {
-                pool.remaining() / self.batch_size
-            }
+            Some(pool) if pool.remaining() >= self.batch_size => pool.remaining() / self.batch_size,
             _ => return,
         };
         let total_counts: usize = self.el_che.batch_counts().iter().sum();
@@ -384,22 +375,28 @@ impl ClusterCoordinator {
         // checkpoint_fn cadence: same `epoch > 0 && epoch % every == 0`
         // shape the dispatch site uses.
         if let Some(every) = self.checkpoint_every
-            && every > 0 && next_epoch > 0 && next_epoch % every == 0
-                && let Some(ewma) = self.last_checkpoint_elapsed_ms_ewma {
-                    let role = self.checkpoint_role;
-                    if role < self.world_size {
-                        slack_ms[role] += ewma;
-                    }
-                }
+            && every > 0
+            && next_epoch > 0
+            && next_epoch % every == 0
+            && let Some(ewma) = self.last_checkpoint_elapsed_ms_ewma
+        {
+            let role = self.checkpoint_role;
+            if role < self.world_size {
+                slack_ms[role] += ewma;
+            }
+        }
         // eval_fn cadence: mirror of checkpoint cadence.
         if let Some(every) = self.eval_every_epochs
-            && every > 0 && next_epoch > 0 && next_epoch % every == 0
-                && let Some(ewma) = self.last_eval_elapsed_ms_ewma {
-                    let role = self.eval_role;
-                    if role < self.world_size {
-                        slack_ms[role] += ewma;
-                    }
-                }
+            && every > 0
+            && next_epoch > 0
+            && next_epoch % every == 0
+            && let Some(ewma) = self.last_eval_elapsed_ms_ewma
+        {
+            let role = self.eval_role;
+            if role < self.world_size {
+                slack_ms[role] += ewma;
+            }
+        }
         // Guard: drop sub-threshold per-rank entries. Both an absolute
         // floor (100 ms — below noise on any realistic sync cycle) and
         // a relative floor (5 % of anchor wall-time — sub-noise on
@@ -454,8 +451,7 @@ impl ClusterCoordinator {
         // but not as bad as hanging the cluster on an unrecoverable
         // failure.
         if let Some(ref stem) = self.save_path {
-            let meta_path =
-                crate::distributed::CheckpointBundle::meta_path(stem);
+            let meta_path = crate::distributed::CheckpointBundle::meta_path(stem);
             // Cluster-wide epoch: take the max across all known ranks.
             // Each rank's `rank_epoch[r]` reflects the last StartEpoch
             // dispatched to that rank, so max is the highest epoch any

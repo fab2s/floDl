@@ -19,9 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::monitor::record::{
-    build_tree, leaf_path_segments, Leaf, NodeRecord, Reductions, Res,
-};
+use crate::monitor::record::{Leaf, NodeRecord, Reductions, Res, build_tree, leaf_path_segments};
 
 pub(super) use crate::monitor::record::rank_record_path;
 
@@ -112,7 +110,6 @@ pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
     build_tree(&leaves, &Reductions::new())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,10 +143,7 @@ mod tests {
 
     #[test]
     fn single_host_multi_rank_skips_the_host_tier() {
-        let root = build_window_tree(&[
-            stat(0, "h1", 3, Some(0.2)),
-            stat(1, "h1", 1, Some(0.6)),
-        ]);
+        let root = build_window_tree(&[stat(0, "h1", 3, Some(0.2)), stat(1, "h1", 1, Some(0.6))]);
         assert_eq!(root.children.len(), 2);
         assert_eq!(root.children[0].path, vec!["root", "rank0"]);
         // Work-weighted loss: (0.2*3 + 0.6*1)/4 = 0.3
@@ -232,10 +226,7 @@ mod tests {
 
     #[test]
     fn throughput_sums_and_device_rides_the_leaf() {
-        let root = build_window_tree(&[
-            stat(0, "h1", 2, Some(0.2)),
-            stat(1, "h1", 2, Some(0.2)),
-        ]);
+        let root = build_window_tree(&[stat(0, "h1", 2, Some(0.2)), stat(1, "h1", 2, Some(0.2))]);
         // throughput is a core Sum.
         assert_eq!(metric(&root, "throughput"), Some(20.0));
         let r1 = root

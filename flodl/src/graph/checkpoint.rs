@@ -95,7 +95,9 @@ impl Graph {
                 hasher.update(b"\0");
 
                 // Sorted parameters
-                let mut params: Vec<_> = module.parameters().into_iter()
+                let mut params: Vec<_> = module
+                    .parameters()
+                    .into_iter()
                     .map(|p| (p.name.clone(), p.variable.shape()))
                     .collect();
                 params.sort_by(|a, b| a.0.cmp(&b.0));
@@ -109,7 +111,9 @@ impl Graph {
                 }
 
                 // Sorted buffers
-                let mut bufs: Vec<_> = module.buffers().into_iter()
+                let mut bufs: Vec<_> = module
+                    .buffers()
+                    .into_iter()
                     .map(|b| (b.name.clone(), b.shape()))
                     .collect();
                 bufs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -174,7 +178,11 @@ impl Graph {
             hasher.update(b"\0");
         }
 
-        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 

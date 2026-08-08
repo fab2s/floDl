@@ -333,8 +333,7 @@ pub struct ClusterCoordinatorConfig {
     /// Shared CPU-forge handle, set by the launcher so the coordinator can arm
     /// a consensus model save the controller reduce thread fulfills. Not serde
     /// (an `Arc`); `None` on NCCL / non-launcher paths.
-    pub checkpoint_forge:
-        Option<std::sync::Arc<crate::distributed::CheckpointForge>>,
+    pub checkpoint_forge: Option<std::sync::Arc<crate::distributed::CheckpointForge>>,
 
     /// Optional [`crate::monitor::Timeline`] shared with the user-side
     /// harness. When set, `trigger_averaging` and `finish_averaging_*`
@@ -405,8 +404,7 @@ impl ClusterCoordinatorConfig {
             dashboard_theme: None,
             scalar_reductions: crate::monitor::record::Reductions::new(),
             max_log_size: None,
-            epoch_callback_policy:
-                crate::distributed::ddp_run::EpochCallbackPolicy::default(),
+            epoch_callback_policy: crate::distributed::ddp_run::EpochCallbackPolicy::default(),
             progressive: None,
             start_epoch: 0,
             start_global_step: 0,
@@ -438,10 +436,7 @@ impl ClusterCoordinatorConfig {
     /// `SyncEnd` event emission. The launcher / user harness
     /// constructs the timeline; threading it here makes the cluster
     /// coord's averaging activity visible in `summary.sync_count`.
-    pub fn timeline(
-        mut self,
-        tl: std::sync::Arc<crate::monitor::Timeline>,
-    ) -> Self {
+    pub fn timeline(mut self, tl: std::sync::Arc<crate::monitor::Timeline>) -> Self {
         self.timeline = Some(tl);
         self
     }
@@ -455,10 +450,7 @@ impl ClusterCoordinatorConfig {
     /// the convergence-guard build path in the orchestrator (the coord
     /// itself doesn't carry guard state — the boxed guard is already
     /// rebuilt with restored history before reaching this config).
-    pub fn resume_from_meta(
-        mut self,
-        meta: &crate::distributed::CheckpointMeta,
-    ) -> Self {
+    pub fn resume_from_meta(mut self, meta: &crate::distributed::CheckpointMeta) -> Self {
         self.start_epoch = meta.epoch;
         self.start_global_step = meta.global_step;
         self.start_avg_count = meta.sync_round;
@@ -490,10 +482,7 @@ impl ClusterCoordinatorConfig {
     }
 
     /// Attach the user-supplied eval-result callback (controller-side).
-    pub fn eval_result_fn(
-        mut self,
-        f: crate::distributed::ddp_run::EvalResultFn,
-    ) -> Self {
+    pub fn eval_result_fn(mut self, f: crate::distributed::ddp_run::EvalResultFn) -> Self {
         self.eval_result_fn = Some(f);
         self
     }
@@ -515,7 +504,11 @@ impl ClusterCoordinatorConfig {
     /// capped at `max_bytes` (`0` = library default).
     pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
         self.record_log_dir = Some(dir.into());
-        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
+        self.max_log_size = if max_bytes == 0 {
+            None
+        } else {
+            Some(max_bytes)
+        };
         self
     }
 
@@ -532,10 +525,7 @@ impl ClusterCoordinatorConfig {
     }
 
     /// Carry the user-scalar roll-up declarations through to the launcher.
-    pub fn scalar_reductions(
-        mut self,
-        reductions: crate::monitor::record::Reductions,
-    ) -> Self {
+    pub fn scalar_reductions(mut self, reductions: crate::monitor::record::Reductions) -> Self {
         self.scalar_reductions = reductions;
         self
     }
@@ -615,10 +605,7 @@ impl ClusterCoordinatorConfig {
         self
     }
 
-    pub fn with_convergence_guard(
-        mut self,
-        guard: Box<dyn ConvergenceGuard>,
-    ) -> Self {
+    pub fn with_convergence_guard(mut self, guard: Box<dyn ConvergenceGuard>) -> Self {
         self.convergence_guard = guard;
         self
     }
@@ -655,10 +642,7 @@ impl ClusterCoordinatorConfig {
     /// for elastic-membership (rank-death-survives-the-run) semantics.
     /// Pass the same `Arc<DeadRanks>` to
     /// `start_with_dead_ranks`.
-    pub fn dead_ranks(
-        mut self,
-        ledger: Arc<crate::distributed::controller::DeadRanks>,
-    ) -> Self {
+    pub fn dead_ranks(mut self, ledger: Arc<crate::distributed::controller::DeadRanks>) -> Self {
         self.dead_ranks = Some(ledger);
         self
     }
@@ -741,4 +725,3 @@ impl ClusterCoordinatorConfig {
         self
     }
 }
-

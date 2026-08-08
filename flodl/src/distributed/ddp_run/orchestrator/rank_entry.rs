@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::distributed::ddp_run::{
-    ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy,
-    RankCallbacks, SchedulerFn, TrainedState, Worker, WorkerConfig, pick_space,
+    ApplyPolicy, AverageBackend, DdpRunConfig, EpochCallbackPolicy, RankCallbacks, SchedulerFn,
+    TrainedState, Worker, WorkerConfig, pick_space,
 };
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{DType, Device, Result, Tensor, TensorError};
@@ -39,11 +39,13 @@ fn parse_or_resolve_socket_addr(addr: &str) -> Result<std::net::SocketAddr> {
     if let Ok(s) = addr.parse::<std::net::SocketAddr>() {
         return Ok(s);
     }
-    let mut iter = addr.to_socket_addrs().map_err(|e| {
-        TensorError::new(&format!("ddp: resolve addr '{addr}': {e}"))
-    })?;
+    let mut iter = addr
+        .to_socket_addrs()
+        .map_err(|e| TensorError::new(&format!("ddp: resolve addr '{addr}': {e}")))?;
     iter.next().ok_or_else(|| {
-        TensorError::new(&format!("ddp: resolve addr '{addr}': no addresses returned"))
+        TensorError::new(&format!(
+            "ddp: resolve addr '{addr}': no addresses returned"
+        ))
     })
 }
 
@@ -95,8 +97,7 @@ pub(crate) fn write_rank_death_record(
     let Some(stem) = save_path else {
         return;
     };
-    let record =
-        crate::distributed::RankDeathRecord::new(global_rank, world_size, reason);
+    let record = crate::distributed::RankDeathRecord::new(global_rank, world_size, reason);
     let path = crate::distributed::CheckpointBundle::rank_death_path(stem, global_rank);
     match record.write_to_file(&path) {
         Ok(()) => eprintln!(
@@ -225,16 +226,18 @@ impl DdpHandle {
         // the sockets it actually dials.
         let coord_addr_str = format!(
             "127.0.0.1:{}",
-            cluster.controller.port.saturating_add(
-                crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET,
-            )
+            cluster
+                .controller
+                .port
+                .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET,)
         );
         let controller_addr_str = match backend {
             AverageBackend::Cpu => Some(format!(
                 "127.0.0.1:{}",
-                cluster.controller.port.saturating_add(
-                    crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET,
-                )
+                cluster
+                    .controller
+                    .port
+                    .saturating_add(crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET,)
             )),
             AverageBackend::Nccl => None,
         };
@@ -302,8 +305,9 @@ impl DdpHandle {
         // Exit non-zero on Err so the launcher SIGTERMs local peers (a returned
         // Err risks being swallowed by a caller's run-loop, hanging blocked
         // peers).
-        let write_death_record =
-            |reason: String| write_rank_death_record(save_path.as_deref(), global_rank, world_size, reason);
+        let write_death_record = |reason: String| {
+            write_rank_death_record(save_path.as_deref(), global_rank, world_size, reason)
+        };
         let final_state = match worker_outcome {
             Ok(Ok(state)) => state,
             Ok(Err(e)) => {
@@ -410,7 +414,10 @@ impl DdpHandle {
             )),
             Err(e) => {
                 write_rank_death_record(
-                    save_path.as_deref(), global_rank, world_size, e.to_string(),
+                    save_path.as_deref(),
+                    global_rank,
+                    world_size,
+                    e.to_string(),
                 );
                 Err(e)
             }
@@ -476,9 +483,8 @@ impl DdpHandle {
         // Controller-driven role assignment: every rank holds the callback
         // closures; the coord's runtime role push gates who fires. Validates
         // the policy (loud on an out-of-bounds `Rank(n)`).
-        let fires_callbacks = rank_fires_callbacks(
-            config.epoch_callback_policy, global_rank, world_size,
-        )?;
+        let fires_callbacks =
+            rank_fires_callbacks(config.epoch_callback_policy, global_rank, world_size)?;
         let epoch_fn = if fires_callbacks { epoch_fn } else { None };
         let checkpoint_fn = if fires_callbacks { checkpoint_fn } else { None };
         let eval_fn = if fires_callbacks { eval_fn } else { None };
@@ -487,16 +493,17 @@ impl DdpHandle {
         // Ranks reach the coordinator through their host-local relay's control
         // loopback (+5); the CPU backend's reduce channel rides the relay's
         // data loopback (+4).
-        let coord_port = cluster.controller.port.saturating_add(
-            crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET,
-        );
-        let coord_addr =
-            parse_or_resolve_socket_addr(&format!("127.0.0.1:{coord_port}"))?;
+        let coord_port = cluster
+            .controller
+            .port
+            .saturating_add(crate::distributed::relay::RELAY_CONTROL_LOOPBACK_OFFSET);
+        let coord_addr = parse_or_resolve_socket_addr(&format!("127.0.0.1:{coord_port}"))?;
         let controller_addr_str = match backend {
             AverageBackend::Cpu => {
-                let controller_port = cluster.controller.port.saturating_add(
-                    crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET,
-                );
+                let controller_port = cluster
+                    .controller
+                    .port
+                    .saturating_add(crate::distributed::relay::RELAY_DATA_LOOPBACK_OFFSET);
                 Some(format!("127.0.0.1:{controller_port}"))
             }
             AverageBackend::Nccl => None,
@@ -518,7 +525,9 @@ impl DdpHandle {
             AverageBackend::Nccl => {
                 let rdv = cluster.rendezvous(dataset_sig)?;
                 let comm = crate::distributed::nccl::NcclRankComm::init_rank(
-                    global_rank, world_size, rdv.unique_id(),
+                    global_rank,
+                    world_size,
+                    rdv.unique_id(),
                 )?;
                 drop(rdv);
                 Some(comm)
@@ -548,20 +557,22 @@ impl DdpHandle {
         // (which smooth but do not erase divergent initial state).
         let tmp_model = model_factory(device)?;
         let initial_params_local: Vec<Tensor> = tmp_model
-            .parameters().iter().map(|p| p.variable.data()).collect();
+            .parameters()
+            .iter()
+            .map(|p| p.variable.data())
+            .collect();
         crate::distributed::ddp_run::ensure_trainable_params(
-            initial_params_local.len(), "ddp: cluster rank",
+            initial_params_local.len(),
+            "ddp: cluster rank",
         )?;
-        let initial_buffers_local: Vec<Tensor> = tmp_model
-            .buffers().iter().map(|b| b.get()).collect();
+        let initial_buffers_local: Vec<Tensor> =
+            tmp_model.buffers().iter().map(|b| b.get()).collect();
         // Hashed while the constructed model is still in hand: the
         // coordinator refuses a formation whose ranks disagree on this
         // (names/shapes/dtypes), instead of hanging at the first
         // collective.
-        let model_sig = crate::distributed::model_sig::model_sig(
-            &tmp_model.parameters(),
-            &tmp_model.buffers(),
-        );
+        let model_sig =
+            crate::distributed::model_sig::model_sig(&tmp_model.parameters(), &tmp_model.buffers());
         // Model-derived frame ceiling for this rank's length-prefixed readers,
         // installed BEFORE the first framed read (the bootstrap consensus).
         {
@@ -622,7 +633,9 @@ impl DdpHandle {
                 // buffers e.g. BatchNorm's i64 num_batches_tracked are
                 // deterministic counters initialized identically on every rank).
                 let f32_buffers: Vec<&Tensor> = initial_buffers_local
-                    .iter().filter(|b| b.dtype() == DType::Float32).collect();
+                    .iter()
+                    .filter(|b| b.dtype() == DType::Float32)
+                    .collect();
                 if !f32_buffers.is_empty() {
                     let broadcast = client.broadcast_from_root(&f32_buffers, 0)?;
                     crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
@@ -641,10 +654,12 @@ impl DdpHandle {
             }
         }
 
-        let initial_params: Vec<Tensor> = initial_params_local.iter()
+        let initial_params: Vec<Tensor> = initial_params_local
+            .iter()
             .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
             .collect::<Result<Vec<_>>>()?;
-        let initial_buffers: Vec<Tensor> = initial_buffers_local.iter()
+        let initial_buffers: Vec<Tensor> = initial_buffers_local
+            .iter()
             .map(|t| t.to_device(Device::CPU).and_then(|t| t.pin_memory()))
             .collect::<Result<Vec<_>>>()?;
         drop(tmp_model);
@@ -662,9 +677,7 @@ impl DdpHandle {
             // On resume, reproduce the recorded epoch permutation exactly; the
             // coordinator reads the same meta, so the cohort stays consistent
             // without a broadcast.
-            seed: crate::distributed::ddp_run::resolve_shuffle_seed(
-                config.resume_from.as_deref(),
-            )?,
+            seed: crate::distributed::ddp_run::resolve_shuffle_seed(config.resume_from.as_deref())?,
             epoch_splits: config.epoch_splits.max(1),
             max_grad_norm: config.max_grad_norm,
             vram_pool: config.vram_pool,
@@ -685,11 +698,11 @@ impl DdpHandle {
             // Mirror the coord's staleness threshold so both liveness
             // directions keep one notion of "gone"; an explicit user
             // heartbeat_timeout_secs wins unscaled.
-            coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or_else(
-                || crate::distributed::wire::scaled_deadline_secs(
+            coord_liveness_timeout_secs: config.heartbeat_timeout_secs.unwrap_or_else(|| {
+                crate::distributed::wire::scaled_deadline_secs(
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
-                ),
-            ),
+                )
+            }),
             model_sig,
         };
 
@@ -722,12 +735,13 @@ impl DdpHandle {
         // when not resuming / no outer optimizer / sidecar absent; errors are
         // logged + ignored (resume from zero momentum is a safe fallback).
         if let Some(stem) = config.resume_from.as_ref()
-            && let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem) {
-                eprintln!(
-                    "cluster_worker: rank {global_rank} outer-momentum resume \
+            && let Err(e) = cluster_worker.inner_mut().resume_outer_momentum(stem)
+        {
+            eprintln!(
+                "cluster_worker: rank {global_rank} outer-momentum resume \
                      failed ({e}); starting from zero momentum"
-                );
-            }
+            );
+        }
         Ok(cluster_worker)
     }
 }

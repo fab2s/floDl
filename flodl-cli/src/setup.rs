@@ -136,7 +136,10 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         let owned: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();
         println!();
         if has_docker {
-            println!("  Note: building natively would also need: {}", tools.join(", "));
+            println!(
+                "  Note: building natively would also need: {}",
+                tools.join(", ")
+            );
             println!("        {}", requirements::install_hint(&owned));
             println!("        (not needed if you build in the dev container)");
         } else {
@@ -160,7 +163,10 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     if !ctx.is_project {
         println!("  Not inside a floDl project.");
-        println!("  libtorch will be installed to: {}", ctx.libtorch_dir().display());
+        println!(
+            "  libtorch will be installed to: {}",
+            ctx.libtorch_dir().display()
+        );
         println!();
     }
 
@@ -168,31 +174,31 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
     let mut skip_download = false;
 
     if !opts.force
-        && let Some(ref info) = existing {
-            // The variant PATH carries the vendor, not `.arch`'s `cuda=`
-            // field: a ROCm build has no CUDA toolkit version and writes
-            // `cuda=none` there, exactly like a CPU build. Reading that
-            // field as "is this a GPU install" labelled every existing
-            // ROCm install CPU-only and re-downloaded over it.
-            match detect::variant_vendor(&info.path) {
-                Some(vendor) => {
-                    println!("  Found existing {vendor} libtorch: {}", info.path);
-                    if opts.non_interactive {
-                        println!("  Keeping existing installation.");
-                        skip_download = true;
-                    } else if !prompt::ask_yn("  Download fresh?", false) {
-                        skip_download = true;
-                    }
-                    println!();
+        && let Some(ref info) = existing
+    {
+        // The variant PATH carries the vendor, not `.arch`'s `cuda=`
+        // field: a ROCm build has no CUDA toolkit version and writes
+        // `cuda=none` there, exactly like a CPU build. Reading that
+        // field as "is this a GPU install" labelled every existing
+        // ROCm install CPU-only and re-downloaded over it.
+        match detect::variant_vendor(&info.path) {
+            Some(vendor) => {
+                println!("  Found existing {vendor} libtorch: {}", info.path);
+                if opts.non_interactive {
+                    println!("  Keeping existing installation.");
+                    skip_download = true;
+                } else if !prompt::ask_yn("  Download fresh?", false) {
+                    skip_download = true;
                 }
-                None => println!("  Found existing CPU libtorch."),
+                println!();
             }
+            None => println!("  Found existing CPU libtorch."),
         }
+    }
 
     if !skip_download {
         // Always download CPU variant (useful as fallback).
-        let mounted_docker_project =
-            ctx.is_project && ctx.root.join("Dockerfile").exists();
+        let mounted_docker_project = ctx.is_project && ctx.root.join("Dockerfile").exists();
         let plan = macos_docker_plan(
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -248,7 +254,10 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
                     .map(|g| format!("{} ({})", g.short_name(), g.arch_label()))
                     .collect();
                 println!();
-                println!("  AMD GPU(s) detected ({}) outside the ROCm 7.0", names.join(", "));
+                println!(
+                    "  AMD GPU(s) detected ({}) outside the ROCm 7.0",
+                    names.join(", ")
+                );
                 println!("  build's targets, so only CPU libtorch is installed.");
                 println!("  Covered targets: {}", download::rocm_archs());
             } else {
@@ -360,9 +369,7 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         // reports as "no active variant". Claim the pointer for CPU
         // only if it is still unclaimed, so this can never demote a GPU
         // variant.
-        if detect::read_active(root).is_none()
-            && detect::is_valid_variant(root, CPU_VARIANT)
-        {
+        if detect::read_active(root).is_none() && detect::is_valid_variant(root, CPU_VARIANT) {
             detect::set_active(root, CPU_VARIANT)?;
         }
     }
@@ -390,7 +397,11 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!("  ===============");
         println!();
         if let Some(info) = &active {
-            println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
+            println!(
+                "  libtorch:  {} ({})",
+                info.path,
+                active_label(active_vendor)
+            );
             println!("  Location:  {}", ctx.libtorch_dir().display());
         }
         println!();
@@ -485,8 +496,7 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         // genuinely different artifacts (different base, different device
         // nodes), so building `cuda` on an AMD box builds the wrong one.
         if let Some(vendor) = active_vendor.filter(|_| !gpus.is_empty()) {
-            let service =
-                crate::run::resolve_docker_service(crate::run::LOGICAL_GPU_SERVICE, root);
+            let service = crate::run::resolve_docker_service(crate::run::LOGICAL_GPU_SERVICE, root);
             let _ = std::fs::create_dir_all(format!(".cargo-cache-{service}"));
             let _ = std::fs::create_dir_all(format!(".cargo-git-{service}"));
 
@@ -508,7 +518,11 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     // Show active libtorch
     if let Some(info) = &active {
-        println!("  libtorch:  {} ({})", info.path, active_label(active_vendor));
+        println!(
+            "  libtorch:  {} ({})",
+            info.path,
+            active_label(active_vendor)
+        );
     }
 
     let gpu_ready = !gpus.is_empty() && active_vendor.is_some();
@@ -530,19 +544,20 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
 
     // Native instructions
     if (build_mode == "native" || build_mode == "both")
-        && let Some(info) = &active {
-            let lt_path = format!("libtorch/{}", info.path);
-            println!();
-            println!("  Build natively:");
-            println!("    export LIBTORCH_PATH=\"{}\"", lt_path);
-            for line in detect::ld_library_path_lines(active_vendor, "$LIBTORCH_PATH/lib") {
-                println!("    {line}");
-            }
-            match active_vendor.filter(|_| gpu_ready) {
-                Some(vendor) => println!("    cargo test --features {}", vendor.cargo_feature()),
-                None => println!("    cargo test"),
-            }
+        && let Some(info) = &active
+    {
+        let lt_path = format!("libtorch/{}", info.path);
+        println!();
+        println!("  Build natively:");
+        println!("    export LIBTORCH_PATH=\"{}\"", lt_path);
+        for line in detect::ld_library_path_lines(active_vendor, "$LIBTORCH_PATH/lib") {
+            println!("    {line}");
         }
+        match active_vendor.filter(|_| gpu_ready) {
+            Some(vendor) => println!("    cargo test --features {}", vendor.cargo_feature()),
+            None => println!("    cargo test"),
+        }
+    }
 
     // No-build-environment fallback: only reachable from the
     // docker-only-no-cargo branch where the user declined Docker
@@ -609,7 +624,11 @@ mod tests {
 
     #[test]
     fn non_macos_hosts_are_unaffected() {
-        for (os, arch) in [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64")] {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
             assert_eq!(
                 macos_docker_plan(os, arch, true),
                 MacDockerPlan::HostBuild,

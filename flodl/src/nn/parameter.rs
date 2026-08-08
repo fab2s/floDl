@@ -57,10 +57,14 @@ mod tests {
     use crate::tensor::TensorOptions;
 
     fn make_param(name: &str) -> Parameter {
-        let t = Tensor::randn(&[3, 2], TensorOptions {
-            dtype: crate::tensor::DType::Float32,
-            device: crate::tensor::test_device(),
-        }).unwrap();
+        let t = Tensor::randn(
+            &[3, 2],
+            TensorOptions {
+                dtype: crate::tensor::DType::Float32,
+                device: crate::tensor::test_device(),
+            },
+        )
+        .unwrap();
         Parameter::new(t, name)
     }
 
@@ -78,7 +82,10 @@ mod tests {
         // Use a simple sum so we don't need matmul
         let y = p.variable.data().sum().unwrap();
         let _ = y.backward();
-        assert!(p.variable.grad().is_none(), "frozen param should have no gradient");
+        assert!(
+            p.variable.grad().is_none(),
+            "frozen param should have no gradient"
+        );
     }
 
     #[test]
@@ -99,7 +106,10 @@ mod tests {
         let y = x.matmul(&p.variable).unwrap();
         let loss = y.sum().unwrap();
         loss.backward().unwrap();
-        assert!(p.variable.grad().is_some(), "unfrozen param should have gradient");
+        assert!(
+            p.variable.grad().is_some(),
+            "unfrozen param should have gradient"
+        );
     }
 
     #[test]

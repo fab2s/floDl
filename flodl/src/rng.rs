@@ -6,10 +6,10 @@
 //! For seeding libtorch tensor operations (dropout, randn, etc.), use
 //! [`manual_seed`](crate::manual_seed) instead.
 
-use rand::rngs::SmallRng;
 use rand::distr::{Distribution, Uniform};
-use rand::{RngExt, SeedableRng};
+use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
+use rand::{RngExt, SeedableRng};
 
 /// A lightweight, deterministic random number generator.
 ///
@@ -32,12 +32,16 @@ pub struct Rng {
 impl Rng {
     /// Create a deterministic RNG from a fixed seed.
     pub fn seed(seed: u64) -> Self {
-        Self { inner: SmallRng::seed_from_u64(seed) }
+        Self {
+            inner: SmallRng::seed_from_u64(seed),
+        }
     }
 
     /// Create an RNG seeded from the operating system.
     pub fn from_entropy() -> Self {
-        Self { inner: rand::make_rng() }
+        Self {
+            inner: rand::make_rng(),
+        }
     }
 
     /// Uniform random `usize` in `[0, n)`.
@@ -74,7 +78,10 @@ impl Rng {
     /// # Panics
     /// Panics if `low >= high`.
     pub fn range(&mut self, low: i64, high: i64) -> i64 {
-        assert!(low < high, "Rng::range requires low < high, got {low} >= {high}");
+        assert!(
+            low < high,
+            "Rng::range requires low < high, got {low} >= {high}"
+        );
         Uniform::new(low, high).unwrap().sample(&mut self.inner)
     }
 
@@ -268,7 +275,10 @@ mod tests {
         let n = 10_000;
         let hits = (0..n).filter(|_| rng.bernoulli(0.5)).count();
         let ratio = hits as f64 / n as f64;
-        assert!((0.45..0.55).contains(&ratio), "bernoulli(0.5) ratio = {ratio}");
+        assert!(
+            (0.45..0.55).contains(&ratio),
+            "bernoulli(0.5) ratio = {ratio}"
+        );
     }
 
     #[test]
@@ -330,7 +340,12 @@ mod tests {
         let (seed, picks, splits, pass) = (42u64, 100usize, 7usize, 2usize);
         let mut cat = Vec::new();
         for split in 0..splits {
-            cat.extend(epoch_split_permutation(seed, pass * splits + split, splits, picks));
+            cat.extend(epoch_split_permutation(
+                seed,
+                pass * splits + split,
+                splits,
+                picks,
+            ));
         }
         assert_eq!(cat, epoch_permutation(seed, pass, picks));
     }
@@ -339,14 +354,18 @@ mod tests {
     fn split_sizes_are_balanced_and_contiguous() {
         let (picks, splits) = (100usize, 7usize);
         // 100 / 7 = 14 r 2 → the first two splits carry the remainder.
-        let sizes: Vec<usize> =
-            (0..splits).map(|s| epoch_split_span(s, splits, picks).1).collect();
+        let sizes: Vec<usize> = (0..splits)
+            .map(|s| epoch_split_span(s, splits, picks).1)
+            .collect();
         assert_eq!(sizes, vec![15, 15, 14, 14, 14, 14, 14]);
 
         let mut at = 0;
         for split in 0..splits {
             let (start, len) = epoch_split_span(split, splits, picks);
-            assert_eq!(start, at, "split {split} must start where the previous ended");
+            assert_eq!(
+                start, at,
+                "split {split} must start where the previous ended"
+            );
             at += len;
         }
         assert_eq!(at, picks, "splits must cover the pass exactly");
@@ -370,7 +389,10 @@ mod tests {
     fn crossing_splits_starts_a_new_pass() {
         let (seed, picks, splits) = (42u64, 100usize, 4usize);
         // event 0 and event `splits` are both split 0, of pass 0 and 1.
-        assert_eq!(epoch_split_span(0, splits, picks), epoch_split_span(splits, splits, picks));
+        assert_eq!(
+            epoch_split_span(0, splits, picks),
+            epoch_split_span(splits, splits, picks)
+        );
         assert_ne!(
             epoch_split_permutation(seed, 0, splits, picks),
             epoch_split_permutation(seed, splits, splits, picks),
@@ -402,7 +424,9 @@ mod tests {
     fn clone_preserves_state() {
         let mut a = Rng::seed(42);
         // advance a few steps
-        for _ in 0..10 { a.f64(); }
+        for _ in 0..10 {
+            a.f64();
+        }
         let mut b = a.clone();
         let va: Vec<f64> = (0..50).map(|_| a.f64()).collect();
         let vb: Vec<f64> = (0..50).map(|_| b.f64()).collect();

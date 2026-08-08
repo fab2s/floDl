@@ -14,9 +14,9 @@ use crate::models::deberta_v2::{
     DebertaV2ForSequenceClassification, DebertaV2ForTokenClassification, DebertaV2Model,
 };
 
-use super::{fetch_config_and_weights, load_weights_with_logging};
 #[cfg(feature = "tokenizer")]
 use super::try_load_tokenizer;
+use super::{fetch_config_and_weights, load_weights_with_logging};
 
 impl DebertaV2Model {
     /// Download a pretrained DeBERTa-v2/v3 checkpoint from the
@@ -54,7 +54,11 @@ impl DebertaV2ForSequenceClassification {
         let num_labels = Self::num_labels_from_config(&config)?;
         let head = Self::on_device(&config, num_labels, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("DebertaV2ForSequenceClassification").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("DebertaV2ForSequenceClassification")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -76,7 +80,11 @@ impl DebertaV2ForTokenClassification {
         let num_labels = Self::num_labels_from_config(&config)?;
         let head = Self::on_device(&config, num_labels, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("DebertaV2ForTokenClassification").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("DebertaV2ForTokenClassification")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -97,7 +105,11 @@ impl DebertaV2ForQuestionAnswering {
         let (config, weights) = fetch_config_and_weights(repo_id, DebertaV2Config::from_json_str)?;
         let head = Self::on_device(&config, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("DebertaV2ForQuestionAnswering").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("DebertaV2ForQuestionAnswering")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -125,7 +137,11 @@ impl DebertaV2ForMaskedLM {
         let (config, weights) = fetch_config_and_weights(repo_id, DebertaV2Config::from_json_str)?;
         let head = Self::on_device(&config, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("DebertaV2ForMaskedLM").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("DebertaV2ForMaskedLM")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),

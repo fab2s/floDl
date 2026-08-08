@@ -9,9 +9,9 @@ use crate::models::roberta::{
 
 use crate::safetensors_io::weights_have_pooler;
 
-use super::{fetch_config_and_weights, load_weights_with_logging};
 #[cfg(feature = "tokenizer")]
 use super::try_load_tokenizer;
+use super::{fetch_config_and_weights, load_weights_with_logging};
 
 impl RobertaModel {
     /// Download a pretrained RoBERTa checkpoint from the HuggingFace
@@ -71,7 +71,11 @@ impl RobertaForSequenceClassification {
         let num_labels = Self::num_labels_from_config(&config)?;
         let head = Self::on_device(&config, num_labels, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("RobertaForSequenceClassification").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("RobertaForSequenceClassification")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -95,7 +99,11 @@ impl RobertaForTokenClassification {
         let num_labels = Self::num_labels_from_config(&config)?;
         let head = Self::on_device(&config, num_labels, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("RobertaForTokenClassification").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("RobertaForTokenClassification")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -117,7 +125,11 @@ impl RobertaForQuestionAnswering {
         let (config, weights) = fetch_config_and_weights(repo_id, RobertaConfig::from_json_str)?;
         let head = Self::on_device(&config, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("RobertaForQuestionAnswering").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("RobertaForQuestionAnswering")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),
@@ -147,7 +159,11 @@ impl RobertaForMaskedLM {
         let (config, weights) = fetch_config_and_weights(repo_id, RobertaConfig::from_json_str)?;
         let head = Self::on_device(&config, device)?;
         load_weights_with_logging(repo_id, head.graph(), &weights)?;
-        head.graph().set_source_config(config.with_architectures("RobertaForMaskedLM").to_json_str());
+        head.graph().set_source_config(
+            config
+                .with_architectures("RobertaForMaskedLM")
+                .to_json_str(),
+        );
         #[cfg(feature = "tokenizer")]
         let head = match try_load_tokenizer(repo_id) {
             Some(tok) => head.with_tokenizer(tok),

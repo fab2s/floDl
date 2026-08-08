@@ -4,8 +4,8 @@ use std::process::Command;
 
 use crate::tensor::TensorError;
 
-use super::profile::Profile;
 use super::Graph;
+use super::profile::Profile;
 
 impl Graph {
     /// Graphviz DOT representation of the graph structure.
@@ -166,8 +166,7 @@ impl Graph {
             let _ = writeln!(
                 b,
                 "  \"{}\" -> \"state_read_{}\" [style=dotted color=\"#e67e22\" label=\"state\" fontcolor=\"#e67e22\" constraint=false];",
-                writer_id,
-                writer_id
+                writer_id, writer_id
             );
         }
 
@@ -200,7 +199,11 @@ fn node_label(id: &str, tags: &[String]) -> String {
     let mut label = clean_id(id).to_string();
     if !tags.is_empty() {
         label += "\\n";
-        label += &tags.iter().map(|t| format!("#{}", t)).collect::<Vec<_>>().join(" ");
+        label += &tags
+            .iter()
+            .map(|t| format!("#{}", t))
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     label
 }
@@ -308,16 +311,21 @@ fn render_svg(dot: &str, path: Option<&str>) -> crate::tensor::Result<Vec<u8>> {
     {
         use std::io::Write as IoWrite;
         let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(dot.as_bytes())
+        stdin
+            .write_all(dot.as_bytes())
             .map_err(|e| TensorError::new(&format!("failed to write DOT to stdin: {}", e)))?;
     }
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| TensorError::new(&format!("dot process failed: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TensorError::new(&format!("dot exited with {}: {}", output.status, stderr)));
+        return Err(TensorError::new(&format!(
+            "dot exited with {}: {}",
+            output.status, stderr
+        )));
     }
 
     if let Some(p) = path {
@@ -344,6 +352,6 @@ fn which_dot() -> crate::tensor::Result<String> {
          apt install graphviz   (Debian/Ubuntu)\n  \
          brew install graphviz  (macOS)\n\n\
          Or use .dot() to get the DOT string and render online at:\n  \
-         https://dreampuf.github.io/GraphvizOnline"
+         https://dreampuf.github.io/GraphvizOnline",
     ))
 }

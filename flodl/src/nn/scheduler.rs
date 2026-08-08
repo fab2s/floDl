@@ -26,7 +26,10 @@ impl StepDecay {
     /// Panics at construction — a fail-fast config check before the run,
     /// not a cryptic mid-training divide-by-zero.
     pub fn new(base_lr: f64, step_size: usize, gamma: f64) -> Self {
-        assert!(step_size >= 1, "StepDecay: step_size must be >= 1, got {step_size}");
+        assert!(
+            step_size >= 1,
+            "StepDecay: step_size must be >= 1, got {step_size}"
+        );
         StepDecay {
             base_lr,
             step_size,
@@ -61,7 +64,10 @@ impl CosineScheduler {
     /// If `total_steps == 0` (would yield a NaN LR via 0/0 in [`lr`](Self::lr)).
     /// Fail-fast at construction rather than a NaN partway through training.
     pub fn new(base_lr: f64, min_lr: f64, total_steps: usize) -> Self {
-        assert!(total_steps >= 1, "CosineScheduler: total_steps must be >= 1, got {total_steps}");
+        assert!(
+            total_steps >= 1,
+            "CosineScheduler: total_steps must be >= 1, got {total_steps}"
+        );
         CosineScheduler {
             base_lr,
             min_lr,
@@ -147,12 +153,7 @@ pub struct PlateauScheduler {
 impl PlateauScheduler {
     /// Create a plateau scheduler that reduces lr by `factor` after `patience` epochs
     /// without improvement, down to `min_lr`.
-    pub fn new(
-        base_lr: f64,
-        patience: usize,
-        factor: f64,
-        min_lr: f64,
-    ) -> Self {
+    pub fn new(base_lr: f64, patience: usize, factor: f64, min_lr: f64) -> Self {
         PlateauScheduler {
             patience,
             factor,
@@ -345,8 +346,16 @@ impl CyclicLR {
     /// If `step_size == 0` (each phase is a divisor, and the cycle length
     /// `up + down` is a modulus, in [`lr`](Self::lr)).
     pub fn new(base_lr: f64, max_lr: f64, step_size: usize) -> Self {
-        assert!(step_size >= 1, "CyclicLR: step_size must be >= 1, got {step_size}");
-        CyclicLR { base_lr, max_lr, step_size_up: step_size, step_size_down: step_size }
+        assert!(
+            step_size >= 1,
+            "CyclicLR: step_size must be >= 1, got {step_size}"
+        );
+        CyclicLR {
+            base_lr,
+            max_lr,
+            step_size_up: step_size,
+            step_size_down: step_size,
+        }
     }
 
     /// Create with asymmetric up/down phase lengths.
@@ -354,12 +363,22 @@ impl CyclicLR {
     /// # Panics
     /// If either `step_size_up` or `step_size_down` is 0 (each is a divisor,
     /// and their sum is the cycle-length modulus, in [`lr`](Self::lr)).
-    pub fn asymmetric(base_lr: f64, max_lr: f64, step_size_up: usize, step_size_down: usize) -> Self {
+    pub fn asymmetric(
+        base_lr: f64,
+        max_lr: f64,
+        step_size_up: usize,
+        step_size_down: usize,
+    ) -> Self {
         assert!(
             step_size_up >= 1 && step_size_down >= 1,
             "CyclicLR: step_size_up and step_size_down must be >= 1, got up={step_size_up} down={step_size_down}"
         );
-        CyclicLR { base_lr, max_lr, step_size_up, step_size_down }
+        CyclicLR {
+            base_lr,
+            max_lr,
+            step_size_up,
+            step_size_down,
+        }
     }
 
     /// Compute learning rate at the given step.
@@ -495,7 +514,13 @@ mod tests {
         let mut prev = 0.0;
         for step in 0..=30 {
             let lr = sched.lr(step);
-            assert!(lr >= prev, "LR should increase during warmup: step={}, lr={}, prev={}", step, lr, prev);
+            assert!(
+                lr >= prev,
+                "LR should increase during warmup: step={}, lr={}, prev={}",
+                step,
+                lr,
+                prev
+            );
             prev = lr;
         }
     }
@@ -506,7 +531,13 @@ mod tests {
         let mut prev = f64::MAX;
         for step in 30..=100 {
             let lr = sched.lr(step);
-            assert!(lr <= prev + 1e-10, "LR should decrease during decay: step={}, lr={}, prev={}", step, lr, prev);
+            assert!(
+                lr <= prev + 1e-10,
+                "LR should decrease during decay: step={}, lr={}, prev={}",
+                step,
+                lr,
+                prev
+            );
             prev = lr;
         }
     }

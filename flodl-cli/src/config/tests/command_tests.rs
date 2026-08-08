@@ -54,7 +54,10 @@ fn load_command_skips_auto_probe_for_cargo_entries() {
         "cargo entry must not be auto-probed (compile latency would ruin --help)"
     );
     let cached = crate::schema_cache::cache_path(&cmd_dir, "cargo-cmd");
-    assert!(!cached.exists(), "no cache should be written for cargo entries");
+    assert!(
+        !cached.exists(),
+        "no cache should be written for cargo entries"
+    );
 }
 
 #[test]
@@ -103,7 +106,10 @@ fn load_command_compile_false_keeps_cargo_skip() {
 
     let cfg = load_command(&cmd_dir).expect("load ok");
     assert_eq!(cfg.compile, Some(false));
-    assert!(cfg.schema.is_none(), "cargo skip honored when compile: false");
+    assert!(
+        cfg.schema.is_none(),
+        "cargo skip honored when compile: false"
+    );
     let cached = crate::schema_cache::cache_path(&cmd_dir, "cargo-compile-false");
     assert!(!cached.exists());
 }
@@ -126,7 +132,6 @@ fn load_command_auto_probe_failure_falls_through_silently() {
 
 // ── Cluster topology (multi-host DDP overlay) ───────────────────
 
-
 /// Editing a CLI struct must invalidate the cached schema.
 ///
 /// Regression: invalidation compared the cache only against `fdl.yml`, so a
@@ -139,7 +144,11 @@ fn touching_a_source_file_invalidates_a_compiled_commands_schema() {
     let tmp = TempDir::new();
     let cmd_dir = tmp.0.join("srcwatch");
     std::fs::create_dir_all(cmd_dir.join("src")).unwrap();
-    std::fs::write(cmd_dir.join("fdl.yml"), "entry: cargo run --\ncompile: true\n").unwrap();
+    std::fs::write(
+        cmd_dir.join("fdl.yml"),
+        "entry: cargo run --\ncompile: true\n",
+    )
+    .unwrap();
     std::fs::write(cmd_dir.join("Cargo.toml"), "[package]\nname=\"srcwatch\"\n").unwrap();
     let main_rs = cmd_dir.join("src").join("main.rs");
     std::fs::write(&main_rs, "fn main(){}\n").unwrap();
@@ -199,12 +208,19 @@ fn schema_source_scan_skips_build_output_and_stays_bounded() {
     assert!(names.contains(&"cli.rs".to_string()));
     assert!(names.contains(&"Cargo.toml".to_string()));
     assert!(
-        !refs.iter().any(|p| p.components().any(|c| c.as_os_str() == "target")),
+        !refs
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == "target")),
         "target/ dwarfs the source tree and must never be walked",
     );
     assert!(
-        !refs.iter().any(|p| p.components().any(|c| c.as_os_str() == ".fdl")),
+        !refs
+            .iter()
+            .any(|p| p.components().any(|c| c.as_os_str() == ".fdl")),
         "the cache's own dir must not invalidate the cache",
     );
-    assert!(!names.contains(&"notes.md".to_string()), "only sources count");
+    assert!(
+        !names.contains(&"notes.md".to_string()),
+        "only sources count"
+    );
 }

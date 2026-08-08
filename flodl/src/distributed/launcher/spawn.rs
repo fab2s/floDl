@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -211,8 +211,7 @@ pub(super) fn supervise_children(
     // already-reaped child — so a kill can never hit a recycled PID.
     let kill_all = Arc::new(AtomicBool::new(false));
 
-    let (tx, rx) =
-        mpsc::channel::<(String, usize, Vec<usize>, std::io::Result<ExitStatus>)>();
+    let (tx, rx) = mpsc::channel::<(String, usize, Vec<usize>, std::io::Result<ExitStatus>)>();
     let mut watchers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(children.len());
     let mut all_forwarders: Vec<thread::JoinHandle<()>> = Vec::new();
     for (host, lr, granks, mut child, fwd) in children {
@@ -268,8 +267,7 @@ pub(super) fn supervise_children(
     drop(tx);
 
     let mut any_failure: Option<TensorError> = None;
-    let mut finished: std::collections::HashSet<(String, usize)> =
-        std::collections::HashSet::new();
+    let mut finished: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     let mut terminated_peers = false;
     let mut tolerated_deaths: usize = 0;
     while let Ok((host, lr, granks, st)) = rx.recv() {
@@ -342,52 +340,54 @@ pub(super) fn supervise_children(
     // individual children. Deaths within tolerance on a run that drained
     // to completion are a degraded-but-valid result.
     if any_failure.is_none()
-        && let Some(e) = elastic.as_ref() {
-            let dead = e.dead_ranks.dead_count();
-            let limit = e.max_failure.map(|t| t.limit_for(e.world_size));
-            if dead >= e.world_size {
-                any_failure = Some(TensorError::new(
-                    "cluster launcher: every rank was lost; consensus checkpoint \
+        && let Some(e) = elastic.as_ref()
+    {
+        let dead = e.dead_ranks.dead_count();
+        let limit = e.max_failure.map(|t| t.limit_for(e.world_size));
+        if dead >= e.world_size {
+            any_failure = Some(TensorError::new(
+                "cluster launcher: every rank was lost; consensus checkpoint \
                      saved if a save path was armed",
-                ));
-            } else if let Some(l) = limit
-                && dead >= l {
-                    any_failure = Some(TensorError::new(&format!(
-                        "cluster launcher: max_failure exceeded ({dead}/{} ranks \
+            ));
+        } else if let Some(l) = limit
+            && dead >= l
+        {
+            any_failure = Some(TensorError::new(&format!(
+                "cluster launcher: max_failure exceeded ({dead}/{} ranks \
                          dead, threshold {l}); coordinator dispatched \
                          save-and-shutdown — consensus checkpoint saved if a \
                          save path was armed",
-                        e.world_size,
-                    )));
-                }
-            if any_failure.is_none() {
-                if dead > 0 {
-                    eprintln!(
-                        "cluster launcher: run completed DEGRADED — {dead} of {} \
+                e.world_size,
+            )));
+        }
+        if any_failure.is_none() {
+            if dead > 0 {
+                eprintln!(
+                    "cluster launcher: run completed DEGRADED — {dead} of {} \
                          ranks lost along the way (tolerated by elastic \
                          membership); survivors carried the full workload",
-                        e.world_size,
-                    );
-                } else if tolerated_deaths > 0 {
-                    // Supervision tolerated a non-zero child exit that the
-                    // coordinator never registered as a rank death — the
-                    // report landed after it stopped ticking, i.e. in the
-                    // teardown window, AFTER the run had already drained to
-                    // completion. No work was redistributed and nothing was
-                    // lost, so this is NOT a degraded run; calling it one
-                    // (with the self-contradictory "0 of N ranks lost")
-                    // mislabeled healthy runs. Still worth a line: a rank
-                    // exiting non-zero at teardown is a signal the operator
-                    // may want to chase.
-                    eprintln!(
-                        "cluster launcher: run completed; {tolerated_deaths} \
+                    e.world_size,
+                );
+            } else if tolerated_deaths > 0 {
+                // Supervision tolerated a non-zero child exit that the
+                // coordinator never registered as a rank death — the
+                // report landed after it stopped ticking, i.e. in the
+                // teardown window, AFTER the run had already drained to
+                // completion. No work was redistributed and nothing was
+                // lost, so this is NOT a degraded run; calling it one
+                // (with the self-contradictory "0 of N ranks lost")
+                // mislabeled healthy runs. Still worth a line: a rank
+                // exiting non-zero at teardown is a signal the operator
+                // may want to chase.
+                eprintln!(
+                    "cluster launcher: run completed; {tolerated_deaths} \
                          child exit(s) in the teardown window were tolerated \
                          (never registered as rank deaths) — full workload \
                          delivered, nothing redistributed",
-                    );
-                }
+                );
             }
         }
+    }
     any_failure
 }
 
@@ -411,7 +411,6 @@ pub(super) struct ElasticSupervision {
     pub cohort_formed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-
 /// Build the `Command` that fork+execs a local rank child. Sets all the
 /// env vars the rank-side `LocalCluster::from_env` + `dispatch` expect,
 /// and strips `FLODL_INTERNAL_FULL_CLUSTER_JSON` so the child detects `Role::Rank`.
@@ -424,10 +423,7 @@ pub(super) fn build_local_spawn_command(
 ) -> Command {
     let mut cmd = Command::new(exe);
     cmd.args(user_args)
-        .env(
-            crate::distributed::cluster::ENV_CLUSTER_JSON,
-            envelope_hex,
-        )
+        .env(crate::distributed::cluster::ENV_CLUSTER_JSON, envelope_hex)
         .env(
             crate::distributed::cluster::ENV_LOCAL_RANK,
             local_rank.to_string(),
@@ -522,7 +518,8 @@ pub(super) fn build_ssh_spawn_command(
         // policy defaults below: without the forward this session is not a
         // tunnel at all, so failing to bind it must kill the session — not
         // a preference a stray option should silently disable.
-        c.arg("-R").arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"));
+        c.arg("-R")
+            .arg(format!("127.0.0.1:{port}:127.0.0.1:{port}"));
         c.arg("-o").arg("ExitOnForwardFailure=yes");
     }
     // User `ssh.options` are emitted FIRST so they take precedence: OpenSSH
@@ -573,16 +570,16 @@ pub(super) fn build_ssh_spawn_command(
 fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
     opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
-        (k.trim().eq_ignore_ascii_case("BatchMode")
-            && !v.trim().eq_ignore_ascii_case("yes"))
-        .then(|| {
-            format!(
-                "flodl: host {host:?} ssh.options set `{}` — flodl's ssh \
+        (k.trim().eq_ignore_ascii_case("BatchMode") && !v.trim().eq_ignore_ascii_case("yes")).then(
+            || {
+                format!(
+                    "flodl: host {host:?} ssh.options set `{}` — flodl's ssh \
                  dispatch is non-interactive and will hang on any prompt \
                  (passphrase, host-key). Proceeding as requested.",
-                opt.trim()
-            )
-        })
+                    opt.trim()
+                )
+            },
+        )
     })
 }
 
@@ -685,9 +682,7 @@ pub(super) fn build_remote_agent_bash_command(
     // skip itself when host_env already provides one.
     let host_env_has_ld_path = host_env.contains_key("LD_LIBRARY_PATH");
 
-    let mut s = String::with_capacity(
-        256 + user_args.iter().map(|a| a.len() + 4).sum::<usize>(),
-    );
+    let mut s = String::with_capacity(256 + user_args.iter().map(|a| a.len() + 4).sum::<usize>());
     // SALT HYGIENE: the agent spec may carry the pre-shared session salt
     // (the HMAC key). Splicing it into the command string would leave it
     // in the remote shell's argv — world-readable via `ps` /
@@ -751,11 +746,13 @@ pub(super) fn build_remote_agent_bash_command(
     // host.env: { LD_LIBRARY_PATH: ... } when they need a custom
     // value (e.g. bare-metal libnccl at /usr/local/lib).
     if let Some(pb) = prebuild
-        && !host_env_has_ld_path && !cluster_env.contains_key("LD_LIBRARY_PATH") {
-            s.push(' ');
-            s.push_str("LD_LIBRARY_PATH=");
-            s.push_str(&shell_quote(&pb.ld_library_path));
-        }
+        && !host_env_has_ld_path
+        && !cluster_env.contains_key("LD_LIBRARY_PATH")
+    {
+        s.push(' ');
+        s.push_str("LD_LIBRARY_PATH=");
+        s.push_str(&shell_quote(&pb.ld_library_path));
+    }
     // Apply user-declared env: cluster-scope first, host-scope second
     // (host overrides cluster for matching keys). In a shell assignment
     // prefix the LAST duplicate wins, so these WOULD override the

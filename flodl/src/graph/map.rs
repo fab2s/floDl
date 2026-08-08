@@ -3,8 +3,8 @@ use std::rc::Rc;
 use crate::autograd::Variable;
 use crate::nn::Module;
 
-use super::node::*;
 use super::FlowBuilder;
+use super::node::*;
 
 /// Builder for Map constructs. Created by [`FlowBuilder::map`].
 pub struct MapBuilder {

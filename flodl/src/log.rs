@@ -323,10 +323,7 @@ mod tests {
         assert_eq!(build_thread_prefix("node-a", 0, None), "[node-a:0] ");
 
         // Full cluster mode: node label, dev, rank → "[host:dev:rN] ".
-        assert_eq!(
-            build_thread_prefix("node-b", 1, Some(2)),
-            "[node-b:1:r2] "
-        );
+        assert_eq!(build_thread_prefix("node-b", 1, Some(2)), "[node-b:1:r2] ");
         assert_eq!(build_thread_prefix("node-a", 0, Some(0)), "[node-a:0:r0] ");
     }
 }

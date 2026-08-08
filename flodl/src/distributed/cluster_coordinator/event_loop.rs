@@ -47,9 +47,10 @@ impl ClusterCoordinator {
             | TimingMsgWire::ResourceSample { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness
-            && r < self.last_heartbeat.len() {
-                self.last_heartbeat[r] = Instant::now();
-            }
+            && r < self.last_heartbeat.len()
+        {
+            self.last_heartbeat[r] = Instant::now();
+        }
         match msg {
             TimingMsgWire::Batch {
                 rank,
@@ -73,8 +74,7 @@ impl ClusterCoordinator {
                 // (no completion-frame race). The window report and the
                 // window-pressure fill consume this.
                 self.window.record_batch(rank, batch_ms, data_ms);
-                self.last_step_count[rank] =
-                    self.last_step_count[rank].max(step_count);
+                self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 self.last_batch_ms[rank] = batch_ms;
                 // Sub-epoch loss feed: accumulate the per-batch loss into
                 // the window so the monitor record emitted at the reduce
@@ -105,8 +105,7 @@ impl ClusterCoordinator {
                 // `AvgCycleState::sync_ack_step_meaningful` for the
                 // full story (that bug happened once).
                 if self.cycle.sync_ack_step_meaningful() {
-                    self.last_step_count[rank] =
-                        self.last_step_count[rank].max(step_count);
+                    self.last_step_count[rank] = self.last_step_count[rank].max(step_count);
                 }
                 // Divergence / norm evidence, the ack gate, and the
                 // per-rank sync-lag capture all live on the cycle.
@@ -190,9 +189,7 @@ impl ClusterCoordinator {
                     // Broadcast the new uid to each surviving rank
                     // with its position-in-shrunken-cohort. Survivors
                     // are ordered by ascending global rank.
-                    if let Err(e) =
-                        self.broadcast_new_nccl_session(uid_bytes)
-                    {
+                    if let Err(e) = self.broadcast_new_nccl_session(uid_bytes) {
                         crate::verbose!(
                             "  ddp: NewNcclSession broadcast failed: {} \
                              (NCCL elastic membership will not recover \
@@ -216,13 +213,7 @@ impl ClusterCoordinator {
                 elapsed_ms,
                 error,
             } => {
-                self.handle_eval_result(
-                    rank as usize,
-                    epoch as usize,
-                    metric,
-                    elapsed_ms,
-                    error,
-                );
+                self.handle_eval_result(rank as usize, epoch as usize, metric, elapsed_ms, error);
             }
             TimingMsgWire::CheckpointResult {
                 rank,
@@ -230,12 +221,7 @@ impl ClusterCoordinator {
                 elapsed_ms,
                 error,
             } => {
-                self.handle_checkpoint_result(
-                    rank as usize,
-                    version,
-                    elapsed_ms,
-                    error,
-                );
+                self.handle_checkpoint_result(rank as usize, version, elapsed_ms, error);
             }
             TimingMsgWire::EpochFnElapsed {
                 rank,
@@ -254,7 +240,12 @@ impl ClusterCoordinator {
                     sink.register_port(rank as usize, port);
                 }
             }
-            TimingMsgWire::DashboardSetSvg { rank, svg, label, hash } => {
+            TimingMsgWire::DashboardSetSvg {
+                rank,
+                svg,
+                label,
+                hash,
+            } => {
                 if let Some(ref sink) = self.dashboard_sink {
                     sink.set_svg(rank as usize, svg, label, hash);
                 }
@@ -430,8 +421,7 @@ impl ClusterCoordinator {
             );
         }
         for (epoch, pool) in &self.chunk_pools {
-            let inflight: Vec<usize> =
-                (0..self.world_size).map(|r| pool.in_flight(r)).collect();
+            let inflight: Vec<usize> = (0..self.world_size).map(|r| pool.in_flight(r)).collect();
             eprintln!(
                 "  pool epoch={epoch}: remaining={} in_flight={inflight:?}",
                 pool.remaining(),
@@ -690,9 +680,10 @@ impl ClusterCoordinator {
         // when the worker closes its stream, the reader sees EOF and
         // returns, and the coord then shuts down regardless of whether
         // Exiting was received.
-        let any_reader_running = self.reader_handles.iter().any(|h| {
-            h.as_ref().is_some_and(|j| !j.is_finished())
-        });
+        let any_reader_running = self
+            .reader_handles
+            .iter()
+            .any(|h| h.as_ref().is_some_and(|j| !j.is_finished()));
         let alive = self.active_count > 0 && any_reader_running;
         // Drain metrics + try to aggregate completed epochs every tick.
         // Cheap: most ticks see an empty channel; on tick where every
@@ -773,7 +764,8 @@ impl ClusterCoordinator {
                 share_complete_ms: wire.share_complete_ms,
                 compute_only_ms: wire.compute_only_ms,
                 data_starve_ms: wire.data_starve_ms,
-                scalars: wire.scalars
+                scalars: wire
+                    .scalars
                     .into_iter()
                     .map(|(k, (sum, count))| (k, (sum, count as usize)))
                     .collect(),
@@ -792,10 +784,7 @@ impl ClusterCoordinator {
             // buffer stops growing). Metrics ride the same TCP control
             // stream as liveness — silent loss without disconnect is
             // not a failure mode this buffer needs to defend against.
-            self.metrics_buffer
-                .entry(wire.epoch)
-                .or_default()
-                .push(msg);
+            self.metrics_buffer.entry(wire.epoch).or_default().push(msg);
         }
 
         // Progressive: dispatch the next chunk to every rank that just
@@ -814,9 +803,7 @@ impl ClusterCoordinator {
     /// and the post-aggregate dispatch hooks.
     pub(super) fn aggregate_ready_epochs(&mut self) {
         // Resolve readiness per dispatch mode.
-        let alive: Vec<usize> = (0..self.world_size)
-            .filter(|r| !self.is_dead(*r))
-            .collect();
+        let alive: Vec<usize> = (0..self.world_size).filter(|r| !self.is_dead(*r)).collect();
         let ready_epochs: Vec<u64> = if self.progressive {
             // BTreeMap order: walk chunk_pools in ascending epoch
             // order, collecting done ones, STOPPING at the first
@@ -856,7 +843,8 @@ impl ClusterCoordinator {
             // (the pool's `epoch_start` is the only authority); in
             // non-progressive the worker-reported max stands.
             let epoch_ms_override = if self.progressive {
-                self.chunk_pools.remove(&(epoch_key as usize))
+                self.chunk_pools
+                    .remove(&(epoch_key as usize))
                     .map(|p| p.epoch_elapsed_ms())
             } else {
                 None
@@ -906,11 +894,12 @@ impl ClusterCoordinator {
                 });
             }
             if let Some(ref f) = self.metrics_fn
-                && let Err(e) = f(&metrics) {
-                    eprintln!(
-                        "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
-                    );
-                }
+                && let Err(e) = f(&metrics)
+            {
+                eprintln!(
+                    "cluster_coordinator: metrics_fn returned error (epoch {epoch_key}): {e}"
+                );
+            }
             // Broadcast the aggregated view back to every rank so the
             // cooperative (`into_worker`) user loop's
             // `monitor.log(&model)` sees the cross-rank picture
@@ -920,11 +909,10 @@ impl ClusterCoordinator {
             // users in process-per-rank cluster runs. Broadcast
             // failures are non-fatal — a rank's stream may have
             // already closed during shutdown; surface as verbose.
-            let wire_metrics: crate::distributed::wire::EpochMetricsWire =
-                metrics.clone().into();
-            if let Err(e) = self.broadcast_control(
-                &ControlMsgWire::EpochAggregated(Box::new(wire_metrics)),
-            ) {
+            let wire_metrics: crate::distributed::wire::EpochMetricsWire = metrics.clone().into();
+            if let Err(e) =
+                self.broadcast_control(&ControlMsgWire::EpochAggregated(Box::new(wire_metrics)))
+            {
                 crate::verbose!(
                     "  ddp: EpochAggregated broadcast (epoch {epoch_key}) failed: {}",
                     e,
@@ -976,8 +964,7 @@ impl ClusterCoordinator {
     /// coherent (the last regular reduce landed on the boundary).
     pub(super) fn needs_final_consensus_reduce(&self) -> bool {
         self.active_count >= 2
-            && (0..self.world_size)
-                .any(|r| !self.is_dead(r) && self.window.steps(r) > 0)
+            && (0..self.world_size).any(|r| !self.is_dead(r) && self.window.steps(r) > 0)
     }
 
     pub(super) fn try_advance_or_shutdown_after_aggregate(&mut self) {
@@ -1105,8 +1092,7 @@ impl ClusterCoordinator {
                 if self.is_dead(rank) {
                     continue;
                 }
-                let has_inflight = self.chunk_pools.values()
-                    .any(|p| p.in_flight(rank) > 0);
+                let has_inflight = self.chunk_pools.values().any(|p| p.in_flight(rank) > 0);
                 if !has_inflight {
                     self.dispatch_next_chunk(rank);
                 }

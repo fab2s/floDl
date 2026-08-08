@@ -6,8 +6,8 @@
 //!
 //! Run: `cargo run --example observation`
 
-use flodl::*;
 use flodl::Monitor;
+use flodl::*;
 
 fn main() -> Result<()> {
     manual_seed(42);
@@ -40,7 +40,10 @@ fn main() -> Result<()> {
     let y_batches = y_data.batches(32)?;
     let batches: Vec<_> = x_batches.into_iter().zip(y_batches).collect();
 
-    println!("{:>5}  {:>10}  {:>10}  {:>8}  {:>10}", "epoch", "loss", "slope", "stalled", "status");
+    println!(
+        "{:>5}  {:>10}  {:>10}  {:>8}  {:>10}",
+        "epoch", "loss", "slope", "stalled", "status"
+    );
     println!("{}", "-".repeat(50));
 
     for epoch in 0..num_epochs {

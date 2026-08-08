@@ -73,15 +73,16 @@ impl DdpHandle {
 
         let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
-        let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
+        let initial_params: Vec<Tensor> = tmp_model
+            .parameters()
+            .iter()
             .map(|p| p.variable.data())
             .collect();
         crate::distributed::ddp_run::ensure_trainable_params(
-            initial_params.len(), "ddp: single device",
+            initial_params.len(),
+            "ddp: single device",
         )?;
-        let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
-            .map(|b| b.get())
-            .collect();
+        let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter().map(|b| b.get()).collect();
         let graph_ref = tmp_model.as_graph();
         let architecture_svg = graph_ref
             .and_then(|g| g.svg(None).ok())
@@ -169,7 +170,8 @@ impl DdpHandle {
         }
 
         // Epoch-metrics channel for the returned DdpHandle, mirroring multi-GPU.
-        let (epoch_metrics_tx, epoch_metrics_rx) = std::sync::mpsc::channel::<ddp_run::EpochMetrics>();
+        let (epoch_metrics_tx, epoch_metrics_rx) =
+            std::sync::mpsc::channel::<ddp_run::EpochMetrics>();
         let device_index: u8 = match device {
             Device::CUDA(idx) => idx,
             _ => 0,
@@ -202,52 +204,53 @@ impl DdpHandle {
                 // Single-GPU fast path: only one rank, so the cadence-share
                 // is trivially [1.0]. No balancer involved.
                 let bc_share = vec![1.0_f64];
-                let metrics = ddp_run::aggregate_epoch_metrics(
-                    epoch, &msgs, &device_indices, &bc_share,
-                );
+                let metrics =
+                    ddp_run::aggregate_epoch_metrics(epoch, &msgs, &device_indices, &bc_share);
                 if let Some(f) = &metrics_fn
-                    && let Err(e) = f(&metrics) {
-                        eprintln!("  ddp: metrics_fn returned error (epoch {epoch}): {e}");
-                    }
+                    && let Err(e) = f(&metrics)
+                {
+                    eprintln!("  ddp: metrics_fn returned error (epoch {epoch}): {e}");
+                }
                 let _ = epoch_metrics_tx.send(metrics);
             }
 
             // Single-GPU checkpoint: version = epoch number (monotonic)
             if let (Some(every), Some(f)) = (checkpoint_every, &checkpoint_fn)
-                && every > 0 && (epoch + 1) % every == 0
-                    && let Err(e) = f((epoch + 1) as u64, worker.model()) {
-                        eprintln!("  ddp: checkpoint failed (epoch {}): {e}", epoch + 1);
-                    }
+                && every > 0
+                && (epoch + 1) % every == 0
+                && let Err(e) = f((epoch + 1) as u64, worker.model())
+            {
+                eprintln!("  ddp: checkpoint failed (epoch {}): {e}", epoch + 1);
+            }
 
             // Single-GPU eval cadence: mirrors the cluster controller's
             // dispatch. Fire after epoch N at (N+1) % every == 0 so the
             // semantic matches "evaluate the model at end of this epoch".
             // The framework flips train/eval mode; user supplies the
             // batch iteration inside the closure.
-            if let (Some(every), Some(efn), Some(ds)) =
-                (eval_every_epochs, &eval_fn, &eval_dataset)
-                && every > 0 && (epoch + 1) % every == 0 {
-                    worker.model().eval();
-                    let result = efn(worker.model(), ds.as_ref());
-                    worker.model().train();
-                    match result {
-                        Ok(metric) => {
-                            if let Some(rf) = &eval_result_fn
-                                && let Err(e) = rf(epoch + 1, metric) {
-                                    eprintln!(
-                                        "  ddp: eval_result_fn returned error (epoch {}): {e}",
-                                        epoch + 1,
-                                    );
-                                }
-                        }
-                        Err(e) => {
+            if let (Some(every), Some(efn), Some(ds)) = (eval_every_epochs, &eval_fn, &eval_dataset)
+                && every > 0
+                && (epoch + 1) % every == 0
+            {
+                worker.model().eval();
+                let result = efn(worker.model(), ds.as_ref());
+                worker.model().train();
+                match result {
+                    Ok(metric) => {
+                        if let Some(rf) = &eval_result_fn
+                            && let Err(e) = rf(epoch + 1, metric)
+                        {
                             eprintln!(
-                                "  ddp: eval_fn returned error (epoch {}): {e}",
+                                "  ddp: eval_result_fn returned error (epoch {}): {e}",
                                 epoch + 1,
                             );
                         }
                     }
+                    Err(e) => {
+                        eprintln!("  ddp: eval_fn returned error (epoch {}): {e}", epoch + 1,);
+                    }
                 }
+            }
         }
         // Drop the sender so next_metrics() returns None after the queue drains.
         drop(epoch_metrics_tx);
@@ -255,10 +258,14 @@ impl DdpHandle {
         // Capture final state before dropping the worker
         let snap = worker.snapshot_params();
         let final_state = TrainedState {
-            params: snap.params.iter()
+            params: snap
+                .params
+                .iter()
                 .map(|t| t.to_device(Device::CPU))
                 .collect::<Result<Vec<_>>>()?,
-            buffers: snap.buffers.iter()
+            buffers: snap
+                .buffers
+                .iter()
                 .map(|t| t.to_device(Device::CPU))
                 .collect::<Result<Vec<_>>>()?,
         };
@@ -318,15 +325,16 @@ impl DdpHandle {
 
         let total_samples = pick_space(dataset.len(), augment);
         let tmp_model = model_factory(device)?;
-        let initial_params: Vec<Tensor> = tmp_model.parameters().iter()
+        let initial_params: Vec<Tensor> = tmp_model
+            .parameters()
+            .iter()
             .map(|p| p.variable.data())
             .collect();
         crate::distributed::ddp_run::ensure_trainable_params(
-            initial_params.len(), "ddp: single device",
+            initial_params.len(),
+            "ddp: single device",
         )?;
-        let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter()
-            .map(|b| b.get())
-            .collect();
+        let initial_buffers: Vec<Tensor> = tmp_model.buffers().iter().map(|b| b.get()).collect();
         drop(tmp_model);
 
         let config = WorkerConfig {

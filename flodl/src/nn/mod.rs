@@ -18,96 +18,107 @@
 //! - **Checkpointing**: save/load with named parameters, dtype-aware, partial loading
 //! - **Initialization**: Xavier uniform/normal, Kaiming uniform/normal, uniform, normal, orthogonal, truncated normal
 
-pub mod parameter;
-pub mod buffer;
-pub mod init;
-pub mod linear;
 pub mod activation;
-pub mod loss;
-pub mod optim;
+pub mod amp;
+pub mod attention;
+pub mod batchnorm;
+pub mod bilinear;
+pub mod buffer;
+pub mod checkpoint;
 pub mod clip;
-pub mod scheduler;
-pub mod dropout;
-pub mod padding;
-pub mod layernorm;
-pub mod rmsnorm;
-pub mod embedding;
-pub mod grucell;
-pub mod gru;
-pub mod lstmcell;
-pub mod lstm;
 pub mod conv1d;
 pub mod conv2d;
+pub mod conv3d;
 pub mod conv_transpose1d;
 pub mod conv_transpose2d;
-pub mod conv3d;
 pub mod conv_transpose3d;
-pub mod groupnorm;
-pub mod batchnorm;
-pub mod instancenorm;
-pub mod pooling;
-pub mod bilinear;
-pub mod attention;
-pub mod rope;
-pub mod checkpoint;
-pub mod amp;
 pub mod cuda_graph;
+pub mod dropout;
+pub mod embedding;
 pub mod functional;
+pub mod groupnorm;
+pub mod gru;
+pub mod grucell;
+pub mod init;
+pub mod instancenorm;
+pub mod layernorm;
+pub mod linear;
+pub mod loss;
+pub mod lstm;
+pub mod lstmcell;
+pub mod optim;
+pub mod padding;
+pub mod parameter;
+pub mod pooling;
+pub mod rmsnorm;
+pub mod rope;
+pub mod scheduler;
 
-pub use parameter::Parameter;
-pub use buffer::Buffer;
-pub use linear::Linear;
 pub use activation::{
-    Identity, ReLU, Sigmoid, Tanh, GELU, GeluApprox, SiLU, SwiGLU,
-    LeakyReLU, ELU, Softplus, Mish,
-    SELU, Hardswish, Hardsigmoid, PReLU,
-    Softmax, LogSoftmax, Flatten,
+    ELU, Flatten, GELU, GeluApprox, Hardsigmoid, Hardswish, Identity, LeakyReLU, LogSoftmax, Mish,
+    PReLU, ReLU, SELU, SiLU, Sigmoid, Softmax, Softplus, SwiGLU, Tanh,
 };
-pub use loss::{
-    mse_loss, cross_entropy_loss, bce_loss, bce_with_logits_loss,
-    l1_loss, smooth_l1_loss, kl_div_loss,
-    nll_loss, ctc_loss, focal_loss,
-    triplet_margin_loss, cosine_embedding_loss,
-    hinge_embedding_loss, margin_ranking_loss, poisson_nll_loss,
+pub use amp::{
+    AutocastGuard, GradScaler, autocast, cast_parameters, is_autocast_enabled,
+    is_autocast_enabled_for,
 };
-pub use optim::{Optimizer, Stateful, StateKind, migrate_optim_state_file, SGD, SGDBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder, RMSprop, RMSpropBuilder, Adagrad, AdagradBuilder, RAdam, NAdam};
+pub use attention::MultiheadAttention;
+pub use batchnorm::{BatchNorm, BatchNorm2d};
+pub use bilinear::Bilinear;
+pub use buffer::Buffer;
 pub use checkpoint::{
-    save_checkpoint, load_checkpoint, save_checkpoint_file, load_checkpoint_file,
-    migrate_checkpoint, migrate_checkpoint_file, checkpoint_version, checkpoint_keys,
-    LoadReport, MigrateReport,
+    LoadReport, MigrateReport, checkpoint_keys, checkpoint_version, load_checkpoint,
+    load_checkpoint_file, migrate_checkpoint, migrate_checkpoint_file, save_checkpoint,
+    save_checkpoint_file,
 };
-pub use amp::{GradScaler, cast_parameters, AutocastGuard, autocast, is_autocast_enabled, is_autocast_enabled_for};
 pub use clip::{clip_grad_norm, clip_grad_value};
-pub use scheduler::{Scheduler, StepDecay, CosineScheduler, WarmupScheduler, PlateauScheduler, ExponentialLR, MultiStepLR, OneCycleLR, CyclicLR};
-pub use dropout::{Dropout, Dropout2d, AlphaDropout};
-pub use padding::{ZeroPad2d, ReflectionPad2d};
-pub use layernorm::LayerNorm;
-pub use rmsnorm::RMSNorm;
-pub use embedding::{Embedding, EmbeddingBag};
-pub use grucell::GRUCell;
-pub use gru::GRU;
-pub use lstmcell::LSTMCell;
-pub use lstm::LSTM;
-pub use conv1d::{Conv1d, Conv1dBuilder};
-pub use conv2d::{Conv2d, Conv2dBuilder};
 pub use conv_transpose1d::{ConvTranspose1d, ConvTranspose1dBuilder};
 pub use conv_transpose2d::{ConvTranspose2d, ConvTranspose2dBuilder};
-pub use conv3d::{Conv3d, Conv3dBuilder};
 pub use conv_transpose3d::{ConvTranspose3d, ConvTranspose3dBuilder};
+pub use conv1d::{Conv1d, Conv1dBuilder};
+pub use conv2d::{Conv2d, Conv2dBuilder};
+pub use conv3d::{Conv3d, Conv3dBuilder};
+pub use cuda_graph::{CaptureMode, GpuGraph, MemPoolId, gpu_graph_capture, gpu_graph_pool_handle};
+pub use dropout::{AlphaDropout, Dropout, Dropout2d};
+pub use embedding::{Embedding, EmbeddingBag};
+pub use functional::{GaussianBlur, gaussian_blur_2d};
 pub use groupnorm::GroupNorm;
-pub use batchnorm::{BatchNorm, BatchNorm2d};
+pub use gru::GRU;
+pub use grucell::GRUCell;
+pub use init::{
+    kaiming_normal, kaiming_uniform, normal, orthogonal, trunc_normal, uniform, uniform_bias,
+    xavier_normal, xavier_uniform,
+};
 pub use instancenorm::InstanceNorm;
-pub use pooling::{MaxPool2d, AvgPool2d, MaxPool1d, AvgPool1d, AdaptiveMaxPool2d, AdaptiveAvgPool2d, PixelShuffle, PixelUnshuffle, Upsample, Unfold, Fold};
-pub use bilinear::Bilinear;
-pub use attention::MultiheadAttention;
+pub use layernorm::LayerNorm;
+pub use linear::Linear;
+pub use loss::{
+    bce_loss, bce_with_logits_loss, cosine_embedding_loss, cross_entropy_loss, ctc_loss,
+    focal_loss, hinge_embedding_loss, kl_div_loss, l1_loss, margin_ranking_loss, mse_loss,
+    nll_loss, poisson_nll_loss, smooth_l1_loss, triplet_margin_loss,
+};
+pub use lstm::LSTM;
+pub use lstmcell::LSTMCell;
+pub use optim::{
+    Adagrad, AdagradBuilder, Adam, AdamBuilder, AdamW, AdamWBuilder, NAdam, Optimizer, RAdam,
+    RMSprop, RMSpropBuilder, SGD, SGDBuilder, StateKind, Stateful, migrate_optim_state_file,
+};
+pub use padding::{ReflectionPad2d, ZeroPad2d};
+pub use parameter::Parameter;
+pub use pooling::{
+    AdaptiveAvgPool2d, AdaptiveMaxPool2d, AvgPool1d, AvgPool2d, Fold, MaxPool1d, MaxPool2d,
+    PixelShuffle, PixelUnshuffle, Unfold, Upsample,
+};
+pub use rmsnorm::RMSNorm;
 pub use rope::RotaryEmbedding;
-pub use init::{xavier_uniform, xavier_normal, kaiming_uniform, kaiming_normal, uniform_bias, uniform, normal, orthogonal, trunc_normal};
-pub use functional::{gaussian_blur_2d, GaussianBlur};
-pub use cuda_graph::{GpuGraph, MemPoolId, CaptureMode, gpu_graph_capture, gpu_graph_pool_handle};
+pub use scheduler::{
+    CosineScheduler, CyclicLR, ExponentialLR, MultiStepLR, OneCycleLR, PlateauScheduler, Scheduler,
+    StepDecay, WarmupScheduler,
+};
 
 // Deprecated `cuda_graph*` / `CudaGraph` spellings. See `crate::compat`.
 #[allow(deprecated)]
-pub use crate::compat::{cuda_graph_capture, cuda_graph_pool_handle, CudaGraph};
+pub use crate::compat::{CudaGraph, cuda_graph_capture, cuda_graph_pool_handle};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -183,11 +194,15 @@ pub trait Module {
 
     /// Human-readable type name used as node ID prefix in graph visualization.
     /// Override to return a lowercase identifier (e.g., "linear", "gelu").
-    fn name(&self) -> &str { "module" }
+    fn name(&self) -> &str {
+        "module"
+    }
 
     /// Return direct child modules for recursive tree walks.
     /// Override in composite modules (loops, switches, gates).
-    fn sub_modules(&self) -> Vec<Rc<dyn Module>> { vec![] }
+    fn sub_modules(&self) -> Vec<Rc<dyn Module>> {
+        vec![]
+    }
 
     /// Move all parameters and buffers to the given device.
     ///
@@ -234,28 +249,38 @@ pub trait Module {
     fn set_training(&self, _training: bool) {}
 
     /// Set training mode. Shorthand for `set_training(true)`.
-    fn train(&self) { self.set_training(true); }
+    fn train(&self) {
+        self.set_training(true);
+    }
 
     /// Set eval mode. Shorthand for `set_training(false)`.
-    fn eval(&self) { self.set_training(false); }
+    fn eval(&self) {
+        self.set_training(false);
+    }
 
     /// Return per-iteration side output for loop tracing.
     /// Override in loop body modules that capture trajectory data
     /// (e.g., attention fixation points). Returns `None` by default.
     /// When `Some`, the loop executor collects traces accessible via
     /// `Graph::traces()`.
-    fn trace(&self) -> Option<Variable> { None }
+    fn trace(&self) -> Option<Variable> {
+        None
+    }
 
     /// Upcast to [`NamedInputModule`] for multi-input graphs.
     /// Override in types that implement `NamedInputModule` to enable
     /// receiving additional named inputs via graph `using()`.
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { None }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        None
+    }
 
     /// Upcast to [`LoopBody`] for loop bodies that publish named per-iteration traces.
     /// Override in types that implement `LoopBody` to enable multi-output trace
     /// publishing via [`TraceEmit::publish`]. Default returns `None`, in which
     /// case the loop runner falls back to the legacy [`Module::trace`] path.
-    fn as_loop_body(&self) -> Option<&dyn LoopBody> { None }
+    fn as_loop_body(&self) -> Option<&dyn LoopBody> {
+        None
+    }
 
     /// Opt-in identity hook for framework downcasts.
     ///
@@ -267,12 +292,16 @@ pub trait Module {
     /// of `self` — the contract is "the object this module presents to
     /// the framework", not strict identity. Default: `None` (plain
     /// leaf module, nothing to present).
-    fn as_any(&self) -> Option<&dyn std::any::Any> { None }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 
     /// SHA-256 hex hash of module architecture for checkpoint validation.
     /// Override in composite modules (Graph) that compute a deterministic
     /// hash from their topology and parameter shapes.
-    fn structural_hash(&self) -> Option<String> { None }
+    fn structural_hash(&self) -> Option<String> {
+        None
+    }
 
     /// Reset internal state (e.g. recurrent hidden state) between sequences.
     /// Called by loops before iterating to clear stale tensors whose
@@ -301,9 +330,7 @@ pub trait Module {
     /// [`crate::monitor::Monitor::log`].
     fn aggregated_metrics_slot(
         &self,
-    ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
-    >> {
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Option<crate::metrics::EpochMetrics>>>> {
         None
     }
 }
@@ -353,9 +380,7 @@ impl Module for Box<dyn Module> {
     }
     fn aggregated_metrics_slot(
         &self,
-    ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
-    >> {
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Option<crate::metrics::EpochMetrics>>>> {
         (**self).aggregated_metrics_slot()
     }
 }
@@ -364,11 +389,8 @@ impl Module for Box<dyn Module> {
 pub trait NamedInputModule: Module {
     /// Forward pass with additional named inputs from tagged graph nodes.
     /// `refs` maps tag names to their current values, as wired by `FlowBuilder::using()`.
-    fn forward_named(
-        &self,
-        input: &Variable,
-        refs: &HashMap<String, Variable>,
-    ) -> Result<Variable>;
+    fn forward_named(&self, input: &Variable, refs: &HashMap<String, Variable>)
+    -> Result<Variable>;
 }
 
 /// Per-iteration emit channel handed to [`LoopBody::step`] by the loop runner.
@@ -468,10 +490,7 @@ pub trait LoopBody: Module {
 /// Convenience helper for implementing `Module::forward` on a `LoopBody`
 /// that has no separate non-loop forward path. Allocates an empty refs map,
 /// calls `step` with a discarding emitter, and returns the result.
-pub fn forward_via_step<B: LoopBody + ?Sized>(
-    body: &B,
-    input: &Variable,
-) -> Result<Variable> {
+pub fn forward_via_step<B: LoopBody + ?Sized>(body: &B, input: &Variable) -> Result<Variable> {
     let refs: HashMap<String, Variable> = HashMap::new();
     let mut emit = TraceEmit::discard();
     body.step(input, &refs, &mut emit)

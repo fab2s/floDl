@@ -3,14 +3,12 @@
 use std::time::{Duration, Instant};
 
 use crate::autograd::{NoGradGuard, Variable};
-use crate::tensor::cuda_stream::StreamGuard;
 use crate::distributed::nccl::ReduceOp;
 use crate::nn::Module;
+use crate::tensor::cuda_stream::StreamGuard;
 use crate::tensor::{Device, Result, Tensor, TensorError, TensorOptions};
 
-use super::super::{
-    AveragedParams, ParamSnapshot,
-};
+use super::super::{AveragedParams, ParamSnapshot};
 use super::GpuWorker;
 
 /// Allocate a pinned (page-locked) CPU staging tensor matching `t`'s shape
@@ -32,7 +30,10 @@ fn pinned_like(t: &Tensor, as_bf16: bool) -> Result<Tensor> {
     } else {
         t.dtype()
     };
-    let opts = TensorOptions { dtype, device: Device::CPU };
+    let opts = TensorOptions {
+        dtype,
+        device: Device::CPU,
+    };
     Tensor::empty(&t.shape(), opts)?.pin_memory()
 }
 
@@ -145,9 +146,7 @@ pub(crate) fn weighted_allreduce_nccl(
     // all_reduce while peers do 2, leaving them waiting on a phantom. Logging
     // ENTER/EXIT of each collective per rank pins which one a stuck rank
     // parks in (NCCL busy-waits at 100% CPU with no peers).
-    crate::debug!(
-        "  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i}, gamma={gamma})"
-    );
+    crate::debug!("  ddp-areduce: rank {rank} seq={seq} COUNT enter (n_i={n_i}, gamma={gamma})");
     // γ-effective work: `gamma_mass` owns the idle guard (an idle rank
     // has zero mass for ANY γ — raw powf gives 0^0 = 1, a stale rank
     // voting at full weight, or 0^{γ<0} = ∞, a NaN consensus) and the
@@ -344,9 +343,10 @@ impl<M: Module> GpuWorker<M> {
             self.snapshot_pinned_buffers = bufs;
         }
 
-        let stream = self.comm_stream.as_ref().ok_or_else(|| {
-            TensorError::new("read_params_pinned: comm_stream absent")
-        })?;
+        let stream = self
+            .comm_stream
+            .as_ref()
+            .ok_or_else(|| TensorError::new("read_params_pinned: comm_stream absent"))?;
         {
             // copy_ respects the current stream; pinned dst + non_blocking
             // makes each D2H a true async cudaMemcpyAsync on comm_stream.
@@ -415,10 +415,14 @@ impl<M: Module> GpuWorker<M> {
                 .and_then(|c| c.copy_(&t, false).map(|()| c))
                 .unwrap_or(t)
         }
-        let params = self.param_vars.iter()
+        let params = self
+            .param_vars
+            .iter()
             .map(|v| cpu_detached(v.data()))
             .collect();
-        let buffers = self.buffer_list.iter()
+        let buffers = self
+            .buffer_list
+            .iter()
             .map(|b| cpu_detached(b.get()))
             .collect();
         (params, buffers)
@@ -448,7 +452,8 @@ impl<M: Module> GpuWorker<M> {
         if update.params.len() != self.param_vars.len() {
             return Err(TensorError::new(&format!(
                 "load_averaged: expected {} params, got {}",
-                self.param_vars.len(), update.params.len()
+                self.param_vars.len(),
+                update.params.len()
             )));
         }
 
@@ -522,12 +527,7 @@ impl<M: Module> GpuWorker<M> {
             match self.easgd_alpha {
                 None => {
                     for (var, src) in self.param_vars.iter().zip(&update.params) {
-                        h2d_copy_via_bounce(
-                            &var.data(),
-                            src,
-                            bf16_bounce.as_ref(),
-                            non_blocking,
-                        )?;
+                        h2d_copy_via_bounce(&var.data(), src, bf16_bounce.as_ref(), non_blocking)?;
                     }
                 }
                 Some(alpha) => {
@@ -547,12 +547,7 @@ impl<M: Module> GpuWorker<M> {
                     // lifetime pattern the previous staging vec relied on.
                     // Cost: one lerp launch per param instead of one fused
                     // foreach — once per reduce window, noise.
-                    let max_numel = update
-                        .params
-                        .iter()
-                        .map(|t| t.numel())
-                        .max()
-                        .unwrap_or(0);
+                    let max_numel = update.params.iter().map(|t| t.numel()).max().unwrap_or(0);
                     // Flat f32 staging: trainable params are f32 and the
                     // lerp reads f32 (a bf16-wire consensus upcasts into
                     // this staging via the bounce below); a non-f32 param
@@ -566,19 +561,12 @@ impl<M: Module> GpuWorker<M> {
                     )?;
                     for (var, src) in self.param_vars.iter().zip(&update.params) {
                         let dst = var.data();
-                        let staged = staging
-                            .narrow(0, 0, src.numel())?
-                            .reshape(&dst.shape())?;
+                        let staged = staging.narrow(0, 0, src.numel())?.reshape(&dst.shape())?;
                         // A bf16 update hops CPU-bf16 → GPU-bf16 (pinned
                         // memcpy) → this f32 staging (device upcast) —
                         // the same bounce as the overwrite path, so the
                         // lerp always reads f32.
-                        h2d_copy_via_bounce(
-                            &staged,
-                            src,
-                            bf16_bounce.as_ref(),
-                            non_blocking,
-                        )?;
+                        h2d_copy_via_bounce(&staged, src, bf16_bounce.as_ref(), non_blocking)?;
                         crate::tensor::Tensor::foreach_lerp_scalar_(
                             std::slice::from_ref(&dst),
                             std::slice::from_ref(&staged),
@@ -819,7 +807,11 @@ impl<M: Module> GpuWorker<M> {
                         crate::verbose!(
                             "  ddp-worker: rank {} sync divergence={:.6} \
                              (||delta||={:.4}, ||pre||={:.4}, ||post||={:.4})",
-                            self.rank, div, diff_sq.sqrt(), pre_norm, post_norm,
+                            self.rank,
+                            div,
+                            diff_sq.sqrt(),
+                            pre_norm,
+                            post_norm,
                         );
                         (Some(div), Some(post_norm), Some(pre_norm))
                     } else {
@@ -872,16 +864,18 @@ impl<M: Module> GpuWorker<M> {
                         }
                     }
 
-                    if let (Some(ev), Some(stream)) =
-                        (&self.copy_done, &self.comm_stream)
-                    {
+                    if let (Some(ev), Some(stream)) = (&self.copy_done, &self.comm_stream) {
                         ev.record_on(stream)?;
                     }
                     let divg_ms = divg_start.elapsed().as_secs_f64() * 1000.0;
                     let total_ms = _diag_start.elapsed().as_secs_f64() * 1000.0;
                     crate::verbose!(
                         "  ddp-sync-diag: rank {} sync_total={:.1}ms (nccl={:.1}ms divg={:.1}ms attempts={})",
-                        self.rank, total_ms, nccl_ms_total, divg_ms, attempt + 1,
+                        self.rank,
+                        total_ms,
+                        nccl_ms_total,
+                        divg_ms,
+                        attempt + 1,
                     );
                     return Ok(divergence);
                 }
@@ -918,8 +912,7 @@ impl<M: Module> GpuWorker<M> {
                                  wrong length (expected NCCL_UNIQUE_ID_BYTES)",
                             )
                         })?;
-                    let uid =
-                        crate::distributed::nccl::NcclUniqueId::from_bytes(uid_bytes);
+                    let uid = crate::distributed::nccl::NcclUniqueId::from_bytes(uid_bytes);
                     let new_comm = crate::distributed::nccl::NcclRankComm::init_rank(
                         pending.new_rank,
                         pending.new_world_size,
@@ -960,9 +953,10 @@ impl<M: Module> GpuWorker<M> {
         let max_wait = Duration::from_secs(60);
         loop {
             if let Ok(mut g) = mailbox.lock()
-                && let Some(p) = g.take() {
-                    return Ok(p);
-                }
+                && let Some(p) = g.take()
+            {
+                return Ok(p);
+            }
             // Lone-NCCL-survivor early exit: NCCL requires `world_size
             // >= 2`. When the local dead-rank ledger reports `dead_count
             // >= world_size - 1`, no surviving peer can rendezvous with
@@ -1099,7 +1093,9 @@ impl<M: Module> GpuWorker<M> {
 
         // Per-worker gradient clipping (before optimizer step).
         if let Some(max_norm) = self.max_grad_norm {
-            let params: Vec<Tensor> = self.model.parameters()
+            let params: Vec<Tensor> = self
+                .model
+                .parameters()
                 .iter()
                 .filter(|p| p.variable.grad().is_some())
                 .map(|p| p.variable.data())

@@ -8,9 +8,9 @@
 //! idioms like `t.narrow(0, i, 1)?.copy_(&src)` work. [`Tensor::contiguous`]
 //! copies only when the layout is non-contiguous (also PyTorch semantics).
 
-use std::ptr;
+use super::{Result, Tensor, TensorError, check_err, ffi_call};
 use flodl_sys::{self as ffi, FlodlTensor};
-use super::{Tensor, TensorError, check_err, Result, ffi_call};
+use std::ptr;
 
 impl Tensor {
     /// Reshape to a new shape (must have same total elements).
@@ -22,7 +22,12 @@ impl Tensor {
     /// ```
     pub fn reshape(&self, shape: &[i64]) -> Result<Tensor> {
         let mut shape = shape.to_vec();
-        ffi_call!(flodl_reshape, self.handle, shape.as_mut_ptr(), shape.len() as i32)
+        ffi_call!(
+            flodl_reshape,
+            self.handle,
+            shape.as_mut_ptr(),
+            shape.len() as i32
+        )
     }
 
     /// Swap two dimensions. Returns a view (shares storage).
@@ -37,13 +42,23 @@ impl Tensor {
     /// Broadcast to a larger shape.
     pub fn expand(&self, shape: &[i64]) -> Result<Tensor> {
         let mut shape = shape.to_vec();
-        ffi_call!(flodl_expand, self.handle, shape.as_mut_ptr(), shape.len() as i32)
+        ffi_call!(
+            flodl_expand,
+            self.handle,
+            shape.as_mut_ptr(),
+            shape.len() as i32
+        )
     }
 
     /// Permute dimensions. Returns a view (shares storage).
     pub fn permute(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
-        ffi_call!(flodl_permute, self.handle, dims.as_mut_ptr(), dims.len() as i32)
+        ffi_call!(
+            flodl_permute,
+            self.handle,
+            dims.as_mut_ptr(),
+            dims.len() as i32
+        )
     }
 
     /// Narrow (slice) along a dimension. Returns a view (shares storage),
@@ -106,9 +121,8 @@ impl Tensor {
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut result: FlodlTensor = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_cat(handles.as_mut_ptr(), handles.len() as i32, dim, &mut result)
-        };
+        let err =
+            unsafe { ffi::flodl_cat(handles.as_mut_ptr(), handles.len() as i32, dim, &mut result) };
         check_err(err)?;
         Ok(Tensor::from_raw(result))
     }
@@ -132,7 +146,12 @@ impl Tensor {
     /// Repeat the tensor along each dimension.
     pub fn repeat(&self, repeats: &[i64]) -> Result<Tensor> {
         let mut repeats = repeats.to_vec();
-        ffi_call!(flodl_repeat, self.handle, repeats.as_mut_ptr(), repeats.len() as i32)
+        ffi_call!(
+            flodl_repeat,
+            self.handle,
+            repeats.as_mut_ptr(),
+            repeats.len() as i32
+        )
     }
 
     /// Constant-value padding. Padding format matches PyTorch: [left, right, top, bottom, ...].
@@ -141,8 +160,11 @@ impl Tensor {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
             ffi::flodl_pad(
-                self.handle, padding.as_mut_ptr(), padding.len() as i32,
-                value, &mut handle,
+                self.handle,
+                padding.as_mut_ptr(),
+                padding.len() as i32,
+                value,
+                &mut handle,
             )
         };
         check_err(err)?;
@@ -158,8 +180,12 @@ impl Tensor {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
             ffi::flodl_pad_mode(
-                self.handle, padding.as_mut_ptr(), padding.len() as i32,
-                mode, value, &mut handle,
+                self.handle,
+                padding.as_mut_ptr(),
+                padding.len() as i32,
+                mode,
+                value,
+                &mut handle,
             )
         };
         check_err(err)?;
@@ -169,7 +195,12 @@ impl Tensor {
     /// Reverse the order of elements along the given dimensions.
     pub fn flip(&self, dims: &[i64]) -> Result<Tensor> {
         let mut dims = dims.to_vec();
-        ffi_call!(flodl_flip, self.handle, dims.as_mut_ptr(), dims.len() as i32)
+        ffi_call!(
+            flodl_flip,
+            self.handle,
+            dims.as_mut_ptr(),
+            dims.len() as i32
+        )
     }
 
     /// Roll elements along a dimension by `shift` positions.
@@ -190,7 +221,12 @@ impl Tensor {
     /// Repeat tensor by tiling the given number of times per dimension.
     pub fn tile(&self, reps: &[i64]) -> Result<Tensor> {
         let mut reps_buf = reps.to_vec();
-        ffi_call!(flodl_tile, self.handle, reps_buf.as_mut_ptr(), reps.len() as i32)
+        ffi_call!(
+            flodl_tile,
+            self.handle,
+            reps_buf.as_mut_ptr(),
+            reps.len() as i32
+        )
     }
 
     /// Split tensor into pieces of `split_size` along a dimension.
@@ -198,9 +234,8 @@ impl Tensor {
     pub fn split(&self, split_size: i64, dim: i32) -> Result<Vec<Tensor>> {
         let mut results_ptr: *mut FlodlTensor = ptr::null_mut();
         let mut count: i32 = 0;
-        let err = unsafe {
-            ffi::flodl_split(self.handle, split_size, dim, &mut results_ptr, &mut count)
-        };
+        let err =
+            unsafe { ffi::flodl_split(self.handle, split_size, dim, &mut results_ptr, &mut count) };
         check_err(err)?;
         let mut tensors = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
@@ -217,9 +252,7 @@ impl Tensor {
     pub fn unbind(&self, dim: i32) -> Result<Vec<Tensor>> {
         let mut results_ptr: *mut FlodlTensor = ptr::null_mut();
         let mut count: i32 = 0;
-        let err = unsafe {
-            ffi::flodl_unbind(self.handle, dim, &mut results_ptr, &mut count)
-        };
+        let err = unsafe { ffi::flodl_unbind(self.handle, dim, &mut results_ptr, &mut count) };
         check_err(err)?;
         let mut tensors = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
@@ -241,9 +274,8 @@ impl Tensor {
     pub fn chunk(&self, chunks: i32, dim: i32) -> Result<Vec<Tensor>> {
         let mut results_ptr: *mut FlodlTensor = ptr::null_mut();
         let mut count: i32 = 0;
-        let err = unsafe {
-            ffi::flodl_chunk(self.handle, chunks, dim, &mut results_ptr, &mut count)
-        };
+        let err =
+            unsafe { ffi::flodl_chunk(self.handle, chunks, dim, &mut results_ptr, &mut count) };
         check_err(err)?;
         let mut tensors = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
@@ -287,8 +319,10 @@ impl Tensor {
         let mut count: i32 = 0;
         let err = unsafe {
             ffi::flodl_meshgrid(
-                handles.as_mut_ptr(), handles.len() as i32,
-                &mut results_ptr, &mut count,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                &mut results_ptr,
+                &mut count,
             )
         };
         check_err(err)?;
@@ -370,7 +404,12 @@ mod tests {
 
         // transpose is a view: writing through it lands in the source.
         let u = Tensor::zeros(&[2, 2], test_opts()).unwrap();
-        u.transpose(0, 1).unwrap().narrow(0, 0, 1).unwrap().fill_(3.0).unwrap();
+        u.transpose(0, 1)
+            .unwrap()
+            .narrow(0, 0, 1)
+            .unwrap()
+            .fill_(3.0)
+            .unwrap();
         // Column 0 of u was filled via row 0 of the transpose.
         assert_eq!(u.to_f32_vec().unwrap(), vec![3.0, 0.0, 3.0, 0.0]);
 
@@ -392,7 +431,10 @@ mod tests {
         let e = s.expand(&[4, 3]).unwrap();
         assert_eq!(e.shape(), vec![4, 3]);
         let data = e.to_f32_vec().unwrap();
-        assert_eq!(data, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+        assert_eq!(
+            data,
+            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
@@ -404,17 +446,23 @@ mod tests {
         // Concatenate 3 tensors along dim 0
         let result = Tensor::cat_many(&[&a, &b, &c], 0).unwrap();
         assert_eq!(result.shape(), vec![6]);
-        assert_eq!(result.to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            result.to_f32_vec().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
 
         // 2D: concat along dim 1
         let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], test_device()).unwrap();
         let y = Tensor::from_f32(&[5.0, 6.0], &[2, 1], test_device()).unwrap();
-        let z = Tensor::from_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[2, 3], test_device()).unwrap();
+        let z =
+            Tensor::from_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[2, 3], test_device()).unwrap();
         let result2 = Tensor::cat_many(&[&x, &y, &z], 1).unwrap();
         assert_eq!(result2.shape(), vec![2, 6]);
         assert_eq!(
             result2.to_f32_vec().unwrap(),
-            vec![1.0, 2.0, 5.0, 7.0, 8.0, 9.0, 3.0, 4.0, 6.0, 10.0, 11.0, 12.0]
+            vec![
+                1.0, 2.0, 5.0, 7.0, 8.0, 9.0, 3.0, 4.0, 6.0, 10.0, 11.0, 12.0
+            ]
         );
 
         // Single tensor -- should just return a copy
@@ -457,7 +505,10 @@ mod tests {
         let t2 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], test_device()).unwrap();
         let row = Tensor::from_f32(&[10.0, 20.0, 30.0], &[3], test_device()).unwrap();
         let ss = t2.select_scatter(&row, 0, 0).unwrap();
-        assert_eq!(ss.to_f32_vec().unwrap(), vec![10.0, 20.0, 30.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            ss.to_f32_vec().unwrap(),
+            vec![10.0, 20.0, 30.0, 4.0, 5.0, 6.0]
+        );
     }
 
     #[test]
@@ -471,7 +522,10 @@ mod tests {
 
         let s = Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap();
         let rep = s.repeat(&[3]).unwrap();
-        assert_eq!(rep.to_f32_vec().unwrap(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(
+            rep.to_f32_vec().unwrap(),
+            vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+        );
 
         let pad = s.pad(&[1, 2], 0.0).unwrap();
         assert_eq!(pad.shape(), vec![5]);
@@ -543,14 +597,25 @@ mod tests {
         assert_eq!(grids[0].shape(), vec![3, 2]);
         assert_eq!(grids[1].shape(), vec![3, 2]);
         // Grid 0: rows repeat a values
-        assert_eq!(grids[0].to_f32_vec().unwrap(), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(
+            grids[0].to_f32_vec().unwrap(),
+            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        );
         // Grid 1: cols repeat b values
-        assert_eq!(grids[1].to_f32_vec().unwrap(), vec![4.0, 5.0, 4.0, 5.0, 4.0, 5.0]);
+        assert_eq!(
+            grids[1].to_f32_vec().unwrap(),
+            vec![4.0, 5.0, 4.0, 5.0, 4.0, 5.0]
+        );
     }
 
     #[test]
     fn test_diagonal() {
-        let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[3, 3], test_device()).unwrap();
+        let t = Tensor::from_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            &[3, 3],
+            test_device(),
+        )
+        .unwrap();
         let d = t.diagonal(0, 0, 1).unwrap().to_f32_vec().unwrap();
         assert_eq!(d, vec![1.0, 5.0, 9.0]);
         // Super-diagonal

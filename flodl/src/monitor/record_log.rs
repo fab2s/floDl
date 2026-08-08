@@ -292,10 +292,7 @@ fn safe_relative_path(path: &str) -> Option<PathBuf> {
         // Reject anything the OS would read as a root, prefix, or separator.
         let p = Path::new(seg);
         if p.components().count() != 1
-            || !matches!(
-                p.components().next(),
-                Some(std::path::Component::Normal(_))
-            )
+            || !matches!(p.components().next(), Some(std::path::Component::Normal(_)))
         {
             return None;
         }
@@ -313,8 +310,8 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("flodl-recordlog-{}-{name}", std::process::id()));
+            let p =
+                std::env::temp_dir().join(format!("flodl-recordlog-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
@@ -334,11 +331,7 @@ mod tests {
     fn path_is_the_filesystem_path() {
         let d = TempDir::new("paths");
         let log = RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES);
-        log.append(&[
-            rec("root", 1),
-            rec("root/exa", 1),
-            rec("root/exa/rank0", 1),
-        ]);
+        log.append(&[rec("root", 1), rec("root/exa", 1), rec("root/exa/rank0", 1)]);
         log.flush();
         assert!(d.0.join("root.log").is_file());
         assert!(d.0.join("root/exa.log").is_file());
@@ -404,7 +397,11 @@ mod tests {
         assert!(!kept.is_empty());
         let ticks: Vec<u64> = kept.iter().map(|v| v["tick"].as_u64().unwrap()).collect();
         assert_eq!(*ticks.last().unwrap(), 200, "newest record retained");
-        assert!(ticks.len() < 200, "old records dropped (kept {})", ticks.len());
+        assert!(
+            ticks.len() < 200,
+            "old records dropped (kept {})",
+            ticks.len()
+        );
         assert!(!ticks.contains(&1), "oldest record dropped");
         // Retained ticks stay contiguous and ordered (a ring, not a shuffle).
         for w in ticks.windows(2) {

@@ -202,7 +202,10 @@ fn freshness_flags_a_stale_lockfile() {
     // A source file newer than the lock (mtimes are second-resolution
     // on some filesystems, so set the lock visibly old).
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-    let lock = fs::File::options().write(true).open(tmp.join("Cargo.lock")).unwrap();
+    let lock = fs::File::options()
+        .write(true)
+        .open(tmp.join("Cargo.lock"))
+        .unwrap();
     lock.set_modified(old).unwrap();
     fs::write(tmp.join("main.rs"), "fn main() {}").unwrap();
     let report = freshness_report(&tmp);
@@ -240,7 +243,10 @@ fn cloud_init_embeds_the_artifacts_and_the_failure_taxonomy() {
     assert!(ci.starts_with("#cloud-config\n"));
     assert!(ci.contains("SECRET ARTIFACT"));
     // Both payloads land indented under their write_files entries.
-    assert!(ci.contains("      -----BEGIN OPENSSH PRIVATE KEY-----"), "got:\n{ci}");
+    assert!(
+        ci.contains("      -----BEGIN OPENSSH PRIVATE KEY-----"),
+        "got:\n{ci}"
+    );
     assert!(ci.contains("      join:"), "got:\n{ci}");
     assert!(ci.contains("path: /home/ubuntu/.ssh/flodl-join"));
     assert!(ci.contains("permissions: \"0600\""));
@@ -267,7 +273,10 @@ fn cloud_init_installs_what_the_instance_does_not_have() {
     assert!(ci.contains("https://flodl.dev/fdl"));
     let fdl_at = ci.find("command -v fdl").unwrap();
     let enable_at = ci.find("systemctl enable --now").unwrap();
-    assert!(fdl_at < enable_at, "fdl must be installed before the unit starts");
+    assert!(
+        fdl_at < enable_at,
+        "fdl must be installed before the unit starts"
+    );
 }
 
 #[test]
@@ -281,7 +290,10 @@ fn cloud_init_provisions_only_what_the_door_reaches_for() {
     assert!(b.contains(" - rsync\n"));
     // Installed as the service user, or cargo cannot write its registry.
     assert!(b.contains("su -l ubuntu -c"), "got:\n{b}");
-    assert!(b.contains("Environment=PATH=/home/ubuntu/.cargo/bin:"), "got:\n{b}");
+    assert!(
+        b.contains("Environment=PATH=/home/ubuntu/.cargo/bin:"),
+        "got:\n{b}"
+    );
 
     // Door `a` mounts the data root instead; a missing sshfs is classed
     // permanent, which under this unit means exit 2 and a halt.
@@ -311,11 +323,18 @@ fn a_root_instance_gets_root_s_actual_home() {
 
 #[test]
 fn the_worker_yml_speaks_each_doors_dialect() {
-    let ep = Endpoint { user: "flodl-join".into(), host: "ctrl".into(), port: 2222 };
+    let ep = Endpoint {
+        user: "flodl-join".into(),
+        host: "ctrl".into(),
+        port: 2222,
+    };
     let cli = no_flags();
 
     let b = render_worker_yml("b300", &ep, "aa".repeat(16).as_str(), Door::B, &cli);
-    assert!(b.contains("from: rsync://flodl-join@ctrl:/tree"), "got:\n{b}");
+    assert!(
+        b.contains("from: rsync://flodl-join@ctrl:/tree"),
+        "got:\n{b}"
+    );
     assert!(b.contains(&format!("token: {}", "aa".repeat(16))));
     assert!(b.contains("port: 2222"));
     assert!(b.contains("identity_file: ~/.ssh/flodl-join"));
@@ -323,7 +342,10 @@ fn the_worker_yml_speaks_each_doors_dialect() {
     assert!(b.contains("persist: true"));
 
     let a = render_worker_yml("b300", &ep, "tok", Door::A, &cli);
-    assert!(a.contains("data_source: sshfs://flodl-join@ctrl:/flodl/data"), "got:\n{a}");
+    assert!(
+        a.contains("data_source: sshfs://flodl-join@ctrl:/flodl/data"),
+        "got:\n{a}"
+    );
     assert!(!a.contains("from: rsync"), "door `a` cannot pull a source");
 
     let n = render_worker_yml("b300", &ep, "tok", Door::Nologin, &cli);
@@ -344,11 +366,17 @@ fn the_authorized_line_composes_restrictions_and_the_doors_command() {
 
     let b = authorized_keys_line(Door::B, &served, &cli, pub_line);
     assert!(b.starts_with("restrict,port-forwarding,permitopen=\"127.0.0.1:1337\","));
-    assert!(b.contains("command=\"rrsync -ro /home/op/.flodl/run\""), "got: {b}");
+    assert!(
+        b.contains("command=\"rrsync -ro /home/op/.flodl/run\""),
+        "got: {b}"
+    );
     assert!(b.ends_with(pub_line));
 
     let a = authorized_keys_line(Door::A, &served, &cli, pub_line);
-    assert!(a.contains("command=\"internal-sftp -R -d /flodl/data\""), "got: {a}");
+    assert!(
+        a.contains("command=\"internal-sftp -R -d /flodl/data\""),
+        "got: {a}"
+    );
 
     let n = authorized_keys_line(Door::Nologin, &served, &cli, pub_line);
     assert!(n.contains("command=\"/usr/sbin/nologin\""), "got: {n}");
@@ -369,7 +397,9 @@ fn the_scaffolded_overlay_loads_through_the_real_config_path() {
     )
     .unwrap();
     let project = crate::config::load_project_with_env(&base, Some("b300")).unwrap();
-    let cluster = project.cluster.expect("the overlay carries a cluster block");
+    let cluster = project
+        .cluster
+        .expect("the overlay carries a cluster block");
     let join = cluster.controller.join.expect("a join block");
     assert_eq!(join.token.as_deref(), Some(token.as_str()));
     assert_eq!(join.discovery, Some(true));
@@ -394,10 +424,7 @@ const OUR_LINE: &str = "restrict,port-forwarding,permitopen=\"127.0.0.1:1337\",\
 fn key_material_skips_quote_aware_options() {
     // The options field carries quoted spaces AND commas; the scan must
     // still land on the key type.
-    assert_eq!(
-        key_material(OUR_LINE),
-        Some(("ssh-ed25519", "AAAAour")),
-    );
+    assert_eq!(key_material(OUR_LINE), Some(("ssh-ed25519", "AAAAour")),);
     // A bare line (no options) and other key types.
     assert_eq!(
         key_material("ssh-rsa AAAAbare user@host"),
@@ -424,7 +451,10 @@ fn upsert_appends_replaces_or_leaves_identical() {
     let foreign = "ssh-ed25519 AAAAforeign someone@laptop\n# a comment\n";
     let (out, o) = upsert_authorized_line(foreign, OUR_LINE).unwrap();
     assert_eq!(o, UpsertOutcome::Appended);
-    assert!(out.starts_with(foreign), "foreign content must be untouched");
+    assert!(
+        out.starts_with(foreign),
+        "foreign content must be untouched"
+    );
     assert!(out.ends_with(&format!("{OUR_LINE}\n")));
 
     // The same key under DIFFERENT options: replaced in place, the
@@ -539,10 +569,16 @@ fn an_authorized_keys_path_under_etc_ssh_is_refused() {
 fn the_drop_in_forces_a_command_only_for_the_tunnel_only_door() {
     let deb = crate::util::platform::Platform::Debian;
     let nologin = render_sshd_conf("f", Door::Nologin, 2022, deb);
-    assert!(nologin.contains("ForceCommand /usr/sbin/nologin"), "{nologin}");
+    assert!(
+        nologin.contains("ForceCommand /usr/sbin/nologin"),
+        "{nologin}"
+    );
     for door in [Door::A, Door::B] {
         let conf = render_sshd_conf("f", door, 2022, deb);
-        assert!(!conf.contains("ForceCommand"), "{door:?} must not force one:\n{conf}");
+        assert!(
+            !conf.contains("ForceCommand"),
+            "{door:?} must not force one:\n{conf}"
+        );
     }
 }
 
@@ -551,13 +587,21 @@ fn the_drop_in_forces_a_command_only_for_the_tunnel_only_door() {
 /// that arrives on the door, including ones added later.
 #[test]
 fn the_drop_in_scopes_the_guardrail_to_the_port() {
-    let conf = render_sshd_conf("f", Door::Nologin, 2022, crate::util::platform::Platform::Debian);
+    let conf = render_sshd_conf(
+        "f",
+        Door::Nologin,
+        2022,
+        crate::util::platform::Platform::Debian,
+    );
     assert!(conf.contains("Match LocalPort 2022"), "{conf}");
     assert!(conf.contains("PermitOpen 127.0.0.1:1337"), "{conf}");
     // 22 must still be served, or the operator locks themselves out of
     // the box the moment the drop-in lands.
     assert!(conf.contains("\nPort 22\n"), "{conf}");
-    assert!(!conf.contains("Match User"), "user-scoped defeats the purpose: {conf}");
+    assert!(
+        !conf.contains("Match User"),
+        "user-scoped defeats the purpose: {conf}"
+    );
 }
 
 /// Each family's trap is named in the file it would bite.
@@ -565,9 +609,15 @@ fn the_drop_in_scopes_the_guardrail_to_the_port() {
 fn the_drop_in_names_the_per_platform_trap() {
     use crate::util::platform::Platform;
     let deb = render_sshd_conf("f", Door::Nologin, 2022, Platform::Debian);
-    assert!(deb.contains("ssh.socket"), "Debian must warn about socket activation: {deb}");
+    assert!(
+        deb.contains("ssh.socket"),
+        "Debian must warn about socket activation: {deb}"
+    );
     let rhel = render_sshd_conf("f", Door::Nologin, 2022, Platform::Rhel);
-    assert!(rhel.contains("SELinux"), "RHEL must warn about the port label: {rhel}");
+    assert!(
+        rhel.contains("SELinux"),
+        "RHEL must warn about the port label: {rhel}"
+    );
     // On the default port neither trap applies, so neither is mentioned.
     let plain = render_sshd_conf("f", Door::Nologin, 22, Platform::Debian);
     assert!(!plain.contains("ssh.socket"), "{plain}");

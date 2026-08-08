@@ -121,10 +121,7 @@ fn validate_schema_rejects_leaf_and_branch_mix() {
     root.options.insert("global".into(), opt("string"));
     root.commands.insert("train".into(), Schema::default());
     let err = validate_schema(&root).expect_err("leaf+branch mix must fail");
-    assert!(
-        err.contains("leaf or a branch"),
-        "err was: {err}"
-    );
+    assert!(err.contains("leaf or a branch"), "err was: {err}");
 }
 
 /// Validation recurses into children; a bad leaf surfaces with its path.
@@ -142,7 +139,6 @@ fn validate_schema_recurses_into_subcommands() {
 }
 
 // ── Tail validation (always-on) + strict unknown-rejection ─────
-
 
 #[test]
 fn validate_schema_rejects_required_with_default() {
@@ -251,9 +247,7 @@ fn command_spec_kind_rejects_docker_without_run() {
         docker: Some("cuda".into()),
         ..Default::default()
     };
-    let err = spec
-        .kind()
-        .expect_err("docker without run must fail");
+    let err = spec.kind().expect_err("docker without run must fail");
     assert!(err.contains("docker"), "err was: {err}");
 }
 
@@ -281,8 +275,7 @@ fn command_spec_deserialize_from_null() {
 fn command_config_arg_name_deserializes_kebab_case() {
     // YAML uses `arg-name:`, Rust field is `arg_name`.
     let yaml = "arg-name: recipe\nentry: echo\n";
-    let cfg: CommandConfig =
-        serde_yaml_ng::from_str(yaml).expect("arg-name must parse");
+    let cfg: CommandConfig = serde_yaml_ng::from_str(yaml).expect("arg-name must parse");
     assert_eq!(cfg.arg_name.as_deref(), Some("recipe"));
 }
 

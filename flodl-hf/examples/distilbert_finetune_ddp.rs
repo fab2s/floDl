@@ -94,10 +94,7 @@ impl BatchDataSet for SentimentDataset {
 /// the other `EncodedBatch` fields are unused placeholders here. A
 /// segment-sensitive backbone (e.g. BERT with `token_type_ids`) would fill them
 /// from the batch instead.
-fn train_step(
-    model: &DistilBertForSequenceClassification,
-    batch: &[Tensor],
-) -> Result<Variable> {
+fn train_step(model: &DistilBertForSequenceClassification, batch: &[Tensor]) -> Result<Variable> {
     let placeholder = Variable::new(Tensor::zeros_like(&batch[0])?, false);
     let enc = EncodedBatch {
         input_ids: Variable::new(batch[0].clone(), false),
@@ -118,16 +115,16 @@ fn main() -> Result<()> {
     let tok = HfTokenizer::from_pretrained(tok_repo)?;
 
     let train: &[(&str, i64)] = &[
-        ("This framework is a real joy to work with",          1),
-        ("I absolutely love the clean API surface",            1),
+        ("This framework is a real joy to work with", 1),
+        ("I absolutely love the clean API surface", 1),
         ("Releases land on schedule and the diff is readable", 1),
-        ("The documentation is thorough and honest",           1),
-        ("Fine-tuning just worked on the first try",           1),
-        ("The tokenizer is painfully slow",                    0),
-        ("I wasted an afternoon chasing a silent shape bug",   0),
-        ("The error messages are useless",                     0),
-        ("I cannot figure out which feature flag I need",      0),
-        ("Performance fell off a cliff after the update",      0),
+        ("The documentation is thorough and honest", 1),
+        ("Fine-tuning just worked on the first try", 1),
+        ("The tokenizer is painfully slow", 0),
+        ("I wasted an afternoon chasing a silent shape bug", 0),
+        ("The error messages are useless", 0),
+        ("I cannot figure out which feature flag I need", 0),
+        ("Performance fell off a cliff after the update", 0),
     ];
     let n = train.len();
     let dataset: Arc<dyn BatchDataSet> = Arc::new(SentimentDataset::new(&tok, train)?);

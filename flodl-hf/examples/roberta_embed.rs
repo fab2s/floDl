@@ -34,11 +34,7 @@ fn main() -> flodl::Result<()> {
 
     // RoBERTa graph takes 3 inputs: position_ids are computed internally
     // from input_ids using the padding-offset convention.
-    let pooled = graph.forward_multi(&[
-        enc.input_ids,
-        enc.token_type_ids,
-        mask,
-    ])?;
+    let pooled = graph.forward_multi(&[enc.input_ids, enc.token_type_ids, mask])?;
 
     let shape = pooled.shape();
     let hidden = shape[1] as usize;

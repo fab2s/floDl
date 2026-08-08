@@ -56,12 +56,7 @@ fn bert_qa_export_roundtrip_live() {
     let head = BertForQuestionAnswering::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
-    roundtrip_common::run_export_roundtrip(
-        head.graph(),
-        &config.to_json_str(),
-        repo,
-        "bert_qa",
-    );
+    roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "bert_qa");
 }
 
 #[test]
@@ -73,10 +68,5 @@ fn bert_mlm_export_roundtrip_live() {
     let head = BertForMaskedLM::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = BertConfig::from_json_str(&config_json).unwrap();
-    roundtrip_common::run_export_roundtrip(
-        head.graph(),
-        &config.to_json_str(),
-        repo,
-        "bert_mlm",
-    );
+    roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "bert_mlm");
 }

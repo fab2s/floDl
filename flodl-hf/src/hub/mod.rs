@@ -120,12 +120,11 @@ fn fetch_config_str(repo_id: &str) -> Result<String> {
         .map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))?;
     let repo = api.model(repo_id.to_string());
 
-    let config_path = repo.get("config.json").map_err(|e| {
-        TensorError::new(&format!("hf-hub fetch {repo_id}/config.json: {e}"))
-    })?;
-    std::fs::read_to_string(&config_path).map_err(|e| {
-        TensorError::new(&format!("read {}: {e}", config_path.display()))
-    })
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| TensorError::new(&format!("hf-hub fetch {repo_id}/config.json: {e}")))?;
+    std::fs::read_to_string(&config_path)
+        .map_err(|e| TensorError::new(&format!("read {}: {e}", config_path.display())))
 }
 
 /// Pull `config.json` + `model.safetensors` from a Hub repo and return
@@ -139,9 +138,8 @@ fn fetch_config_str_and_weights(repo_id: &str) -> Result<(String, Vec<u8>)> {
         .build()
         .map_err(|e| TensorError::new(&format!("hf-hub init: {e}")))?;
     let weights_path = fetch_safetensors(&api, repo_id)?;
-    let weights = std::fs::read(&weights_path).map_err(|e| {
-        TensorError::new(&format!("read {}: {e}", weights_path.display()))
-    })?;
+    let weights = std::fs::read(&weights_path)
+        .map_err(|e| TensorError::new(&format!("read {}: {e}", weights_path.display())))?;
     Ok((config_str, weights))
 }
 
@@ -200,14 +198,9 @@ fn try_load_tokenizer(repo_id: &str) -> Option<HfTokenizer> {
 
 /// Load safetensors into a graph, logging any discarded checkpoint keys
 /// to stderr. Shared by every `from_pretrained` path.
-fn load_weights_with_logging(
-    repo_id: &str,
-    graph: &Graph,
-    bytes: &[u8],
-) -> Result<()> {
-    let unused = load_safetensors_into_graph_with_rename_allow_unused(
-        graph, bytes, bert_legacy_key_rename,
-    )?;
+fn load_weights_with_logging(repo_id: &str, graph: &Graph, bytes: &[u8]) -> Result<()> {
+    let unused =
+        load_safetensors_into_graph_with_rename_allow_unused(graph, bytes, bert_legacy_key_rename)?;
     if !unused.is_empty() {
         eprintln!(
             "from_pretrained({repo_id}): ignored {} checkpoint key(s) not used by the model:",
@@ -237,9 +230,9 @@ mod tests {
     #[test]
     #[ignore = "network + ~440MB cache write"]
     fn bert_from_pretrained_live() {
+        use crate::models::bert::build_extended_attention_mask;
         use flodl::nn::Module;
         use flodl::{DType, Tensor, TensorOptions, Variable};
-        use crate::models::bert::build_extended_attention_mask;
 
         let graph = BertModel::from_pretrained("bert-base-uncased").unwrap();
         graph.eval();
@@ -260,13 +253,16 @@ mod tests {
             Tensor::from_i64(&[0, 0, 0, 0], &[batch, seq], dev).unwrap(),
             false,
         );
-        let mask_flat = Tensor::ones(&[batch, seq], TensorOptions {
-            dtype: DType::Float32, device: dev,
-        }).unwrap();
-        let attention_mask = Variable::new(
-            build_extended_attention_mask(&mask_flat).unwrap(),
-            false,
-        );
+        let mask_flat = Tensor::ones(
+            &[batch, seq],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: dev,
+            },
+        )
+        .unwrap();
+        let attention_mask =
+            Variable::new(build_extended_attention_mask(&mask_flat).unwrap(), false);
 
         let out = graph
             .forward_multi(&[input_ids, position_ids, token_type_ids, attention_mask])
@@ -338,9 +334,8 @@ mod tests {
         // Build the MLM head and stamp source_config exactly the way
         // BertForMaskedLM::from_pretrained_on_device does post-fix.
         let head = BertForMaskedLM::on_device(&upstream, Device::CPU).unwrap();
-        head.graph().set_source_config(
-            upstream.with_architectures("BertForMaskedLM").to_json_str(),
-        );
+        head.graph()
+            .set_source_config(upstream.with_architectures("BertForMaskedLM").to_json_str());
 
         // save_checkpoint emits the sidecar.
         let pid = std::process::id();

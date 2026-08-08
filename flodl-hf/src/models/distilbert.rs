@@ -42,11 +42,11 @@ use flodl::{
 };
 
 use crate::models::transformer_layer::{LayerNaming, TransformerLayer, TransformerLayerConfig};
-use crate::path::{prefix_params, HfPath};
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead,
-};
+use crate::path::{HfPath, prefix_params};
 pub use crate::task_heads::{Answer, TokenPrediction};
+use crate::task_heads::{
+    ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead, check_num_labels,
+};
 
 /// DistilBERT graphs take two `forward_multi` inputs — `input_ids` and
 /// an extended attention mask — in that order. DistilBERT drops BERT's
@@ -184,20 +184,20 @@ impl DistilBertConfig {
         let num_labels = parse_num_labels(&v, id2label.as_deref());
         let architectures = parse_architectures(&v);
         Ok(DistilBertConfig {
-            vocab_size:              required_i64(&v, "vocab_size")?,
-            dim:                     required_i64(&v, "dim")?,
-            n_layers:                required_i64(&v, "n_layers")?,
-            n_heads:                 required_i64(&v, "n_heads")?,
-            hidden_dim:              required_i64(&v, "hidden_dim")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
+            dim: required_i64(&v, "dim")?,
+            n_layers: required_i64(&v, "n_layers")?,
+            n_heads: required_i64(&v, "n_heads")?,
+            hidden_dim: required_i64(&v, "hidden_dim")?,
             max_position_embeddings: required_i64(&v, "max_position_embeddings")?,
-            pad_token_id:            optional_i64(&v, "pad_token_id", 0),
-            dropout:                 optional_f64(&v, "dropout", 0.1),
-            attention_dropout:       optional_f64(&v, "attention_dropout", 0.1),
-            qa_dropout:              optional_f64(&v, "qa_dropout", 0.1),
-            seq_classif_dropout:     optional_f64(&v, "seq_classif_dropout", 0.2),
-            sinusoidal_pos_embds:    optional_bool(&v, "sinusoidal_pos_embds", false),
-            layer_norm_eps:          optional_f64(&v, "layer_norm_eps", 1e-12),
-            hidden_act:              optional_hidden_act(&v, "activation", "gelu")?,
+            pad_token_id: optional_i64(&v, "pad_token_id", 0),
+            dropout: optional_f64(&v, "dropout", 0.1),
+            attention_dropout: optional_f64(&v, "attention_dropout", 0.1),
+            qa_dropout: optional_f64(&v, "qa_dropout", 0.1),
+            seq_classif_dropout: optional_f64(&v, "seq_classif_dropout", 0.2),
+            sinusoidal_pos_embds: optional_bool(&v, "sinusoidal_pos_embds", false),
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-12),
+            hidden_act: optional_hidden_act(&v, "activation", "gelu")?,
             num_labels,
             id2label,
             architectures,
@@ -243,7 +243,10 @@ impl DistilBertConfig {
         m.insert("dropout".into(), self.dropout.into());
         m.insert("attention_dropout".into(), self.attention_dropout.into());
         m.insert("qa_dropout".into(), self.qa_dropout.into());
-        m.insert("seq_classif_dropout".into(), self.seq_classif_dropout.into());
+        m.insert(
+            "seq_classif_dropout".into(),
+            self.seq_classif_dropout.into(),
+        );
         m.insert(
             "sinusoidal_pos_embds".into(),
             self.sinusoidal_pos_embds.into(),
@@ -293,11 +296,7 @@ impl DistilBertEmbeddings {
                 config.dim,
                 device,
             )?,
-            layer_norm: LayerNorm::on_device_with_eps(
-                config.dim,
-                config.layer_norm_eps,
-                device,
-            )?,
+            layer_norm: LayerNorm::on_device_with_eps(config.dim, config.layer_norm_eps, device)?,
             dropout: Dropout::new(config.dropout),
         })
     }
@@ -327,14 +326,19 @@ impl DistilBertEmbeddings {
             0.0,
             seq as f64,
             1.0,
-            TensorOptions { dtype: DType::Int64, device: input_ids.device() },
+            TensorOptions {
+                dtype: DType::Int64,
+                device: input_ids.device(),
+            },
         )?;
         pos.reshape(&[1, seq])?.expand(&[batch, seq])
     }
 }
 
 impl Module for DistilBertEmbeddings {
-    fn name(&self) -> &str { "distilbert_embeddings" }
+    fn name(&self) -> &str {
+        "distilbert_embeddings"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let pos_ids = Self::position_ids_from_input_ids(&input.data())?;
@@ -348,9 +352,15 @@ impl Module for DistilBertEmbeddings {
 
     fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("word_embeddings",     self.word_embeddings.parameters()));
-        out.extend(prefix_params("position_embeddings", self.position_embeddings.parameters()));
-        out.extend(prefix_params("LayerNorm",           self.layer_norm.parameters()));
+        out.extend(prefix_params(
+            "word_embeddings",
+            self.word_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "position_embeddings",
+            self.position_embeddings.parameters(),
+        ));
+        out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
@@ -366,13 +376,13 @@ impl Module for DistilBertEmbeddings {
 /// `hidden_dim`, …) onto the cross-family vocabulary.
 fn distilbert_layer_config(config: &DistilBertConfig) -> TransformerLayerConfig {
     TransformerLayerConfig {
-        hidden_size:                  config.dim,
-        num_attention_heads:          config.n_heads,
-        intermediate_size:            config.hidden_dim,
-        hidden_dropout_prob:          config.dropout,
+        hidden_size: config.dim,
+        num_attention_heads: config.n_heads,
+        intermediate_size: config.hidden_dim,
+        hidden_dropout_prob: config.dropout,
         attention_probs_dropout_prob: config.attention_dropout,
-        layer_norm_eps:               config.layer_norm_eps,
-        hidden_act:                   config.hidden_act,
+        layer_norm_eps: config.layer_norm_eps,
+        hidden_act: config.hidden_act,
     }
 }
 
@@ -386,10 +396,7 @@ fn distilbert_layer_config(config: &DistilBertConfig) -> TransformerLayerConfig 
 ///
 /// Graph shape: `distilbert.embeddings` →
 /// `distilbert.transformer.layer.{0..N-1}`.
-fn distilbert_backbone_flow(
-    config: &DistilBertConfig,
-    device: Device,
-) -> Result<FlowBuilder> {
+fn distilbert_backbone_flow(config: &DistilBertConfig, device: Device) -> Result<FlowBuilder> {
     let mut fb = FlowBuilder::new()
         .input(&["attention_mask"])
         .through(DistilBertEmbeddings::on_device(config, device)?)
@@ -400,7 +407,11 @@ fn distilbert_backbone_flow(
     for i in 0..config.n_layers {
         let tag = layer_root.sub(i).to_string();
         fb = fb
-            .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::DISTILBERT, device)?)
+            .through(TransformerLayer::on_device(
+                &layer_cfg,
+                LayerNaming::DISTILBERT,
+                device,
+            )?)
             .tag(&tag)
             .using(&["attention_mask"]);
     }
@@ -449,7 +460,9 @@ struct SelectClsLinear {
 }
 
 impl Module for SelectClsLinear {
-    fn name(&self) -> &str { "select_cls_linear" }
+    fn name(&self) -> &str {
+        "select_cls_linear"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // input: [B, S, dim] → [B, dim]
@@ -473,7 +486,9 @@ struct ActivationDropoutLinear {
 }
 
 impl Module for ActivationDropoutLinear {
-    fn name(&self) -> &str { "activation_dropout_linear" }
+    fn name(&self) -> &str {
+        "activation_dropout_linear"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let acted = input.relu()?;
@@ -521,11 +536,7 @@ pub type DistilBertForSequenceClassification = ClassificationHead<DistilBertConf
 impl ClassificationHead<DistilBertConfig> {
     /// Build the full graph (backbone + 2-layer classification head) on
     /// `device` without loading any weights.
-    pub fn on_device(
-        config: &DistilBertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &DistilBertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = distilbert_backbone_flow(config, device)?
             .through(SelectClsLinear {
@@ -539,7 +550,12 @@ impl ClassificationHead<DistilBertConfig> {
             })
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &DistilBertConfig) -> Result<i64> {
@@ -571,18 +587,19 @@ impl ClassificationHead<DistilBertConfig> {
 pub type DistilBertForTokenClassification = TaggingHead<DistilBertConfig>;
 
 impl TaggingHead<DistilBertConfig> {
-    pub fn on_device(
-        config: &DistilBertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &DistilBertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = distilbert_backbone_flow(config, device)?
             .through(Dropout::new(config.dropout))
             .through(Linear::on_device(config.dim, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &DistilBertConfig) -> Result<i64> {
@@ -683,7 +700,11 @@ impl MaskedLmHead<DistilBertConfig> {
         for i in 0..config.n_layers {
             let tag = layer_root.sub(i).to_string();
             fb = fb
-                .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::DISTILBERT, device)?)
+                .through(TransformerLayer::on_device(
+                    &layer_cfg,
+                    LayerNaming::DISTILBERT,
+                    device,
+                )?)
                 .tag(&tag)
                 .using(&["attention_mask"]);
         }
@@ -692,7 +713,10 @@ impl MaskedLmHead<DistilBertConfig> {
         let projector_bias = Parameter::new(
             Tensor::zeros(
                 &[config.vocab_size],
-                TensorOptions { dtype: DType::Float32, device },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device,
+                },
             )?,
             "bias",
         );
@@ -706,7 +730,10 @@ impl MaskedLmHead<DistilBertConfig> {
                 device,
             )?)
             .tag("vocab_layer_norm")
-            .through(Linear::from_shared_weight(tied_weight, Some(projector_bias)))
+            .through(Linear::from_shared_weight(
+                tied_weight,
+                Some(projector_bias),
+            ))
             .tag("vocab_projector")
             .build()?;
 

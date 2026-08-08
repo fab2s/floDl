@@ -37,7 +37,10 @@ fn print_report(root: &Path, ctx: &Context) {
     let cpu = system::cpu_model().unwrap_or_else(|| "Unknown".into());
     let threads = system::cpu_threads();
     let ram_gb = system::ram_total_gb();
-    println!("  CPU:         {} ({} threads, {}GB RAM)", cpu, threads, ram_gb);
+    println!(
+        "  CPU:         {} ({} threads, {}GB RAM)",
+        cpu, threads, ram_gb
+    );
     if let Some(os) = system::os_version() {
         println!("  OS:          {}", os);
     }
@@ -63,9 +66,10 @@ fn print_report(root: &Path, ctx: &Context) {
     let devices = &sweep.devices;
     if !devices.is_empty() {
         if sweep.has_vendor(system::GpuVendor::Nvidia)
-            && let Some(driver) = system::nvidia_driver_version() {
-                println!("  NVIDIA driver: {}", driver);
-            }
+            && let Some(driver) = system::nvidia_driver_version()
+        {
+            println!("  NVIDIA driver: {}", driver);
+        }
         println!("  Devices:     {}", devices.len());
         for d in devices {
             let vram_gb = d.total_memory_mb / 1024;

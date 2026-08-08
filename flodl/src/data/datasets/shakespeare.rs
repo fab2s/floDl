@@ -39,7 +39,8 @@ impl Shakespeare {
         if text.len() < seq_len + 1 {
             return Err(TensorError::new(&format!(
                 "Shakespeare: text length {} too short for seq_len {}",
-                text.len(), seq_len
+                text.len(),
+                seq_len
             )));
         }
 
@@ -61,22 +62,28 @@ impl Shakespeare {
         }
 
         // Encode entire text to indices
-        let encoded: Vec<i64> = chars.iter().map(|&ch| {
-            if (ch as u32) < 256 {
-                lookup[ch as usize] as i64
-            } else {
-                // Fallback for non-ASCII (shouldn't happen in Shakespeare)
-                char_to_idx.iter()
-                    .find(|(c, _)| *c == ch)
-                    .map(|(_, i)| *i as i64)
-                    .unwrap_or(0)
-            }
-        }).collect();
+        let encoded: Vec<i64> = chars
+            .iter()
+            .map(|&ch| {
+                if (ch as u32) < 256 {
+                    lookup[ch as usize] as i64
+                } else {
+                    // Fallback for non-ASCII (shouldn't happen in Shakespeare)
+                    char_to_idx
+                        .iter()
+                        .find(|(c, _)| *c == ch)
+                        .map(|(_, i)| *i as i64)
+                        .unwrap_or(0)
+                }
+            })
+            .collect();
 
         // Create non-overlapping sequences
         let n_sequences = (encoded.len() - 1) / seq_len;
         if n_sequences == 0 {
-            return Err(TensorError::new("Shakespeare: not enough text for even one sequence"));
+            return Err(TensorError::new(
+                "Shakespeare: not enough text for even one sequence",
+            ));
         }
 
         let mut input_data = Vec::with_capacity(n_sequences * seq_len);
@@ -88,8 +95,16 @@ impl Shakespeare {
             target_data.extend_from_slice(&encoded[start + 1..start + seq_len + 1]);
         }
 
-        let data = Tensor::from_i64(&input_data, &[n_sequences as i64, seq_len as i64], Device::CPU)?;
-        let targets = Tensor::from_i64(&target_data, &[n_sequences as i64, seq_len as i64], Device::CPU)?;
+        let data = Tensor::from_i64(
+            &input_data,
+            &[n_sequences as i64, seq_len as i64],
+            Device::CPU,
+        )?;
+        let targets = Tensor::from_i64(
+            &target_data,
+            &[n_sequences as i64, seq_len as i64],
+            Device::CPU,
+        )?;
 
         Ok(Shakespeare {
             data,
@@ -112,10 +127,9 @@ impl Shakespeare {
 
     /// Decode a sequence of indices back to a string.
     pub fn decode(&self, indices: &[i64]) -> String {
-        indices.iter()
-            .map(|&i| {
-                self.idx_to_char.get(i as usize).copied().unwrap_or('?')
-            })
+        indices
+            .iter()
+            .map(|&i| self.idx_to_char.get(i as usize).copied().unwrap_or('?'))
             .collect()
     }
 }
@@ -155,14 +169,32 @@ mod tests {
         let data = Shakespeare::parse(text, 3).unwrap();
 
         // Sequence 0: input="abc", target="bcd"
-        let _input_0 = data.data.select(0, 0).unwrap()
-            .select(0, 0).unwrap().to_i64_vec().unwrap()[0];
-        let target_0 = data.targets.select(0, 0).unwrap()
-            .select(0, 0).unwrap().to_i64_vec().unwrap()[0];
+        let _input_0 = data
+            .data
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .to_i64_vec()
+            .unwrap()[0];
+        let target_0 = data
+            .targets
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .to_i64_vec()
+            .unwrap()[0];
 
         // target[0] should equal input[1] (both are 'b')
-        let input_1 = data.data.select(0, 0).unwrap()
-            .select(0, 1).unwrap().to_i64_vec().unwrap()[0];
+        let input_1 = data
+            .data
+            .select(0, 0)
+            .unwrap()
+            .select(0, 1)
+            .unwrap()
+            .to_i64_vec()
+            .unwrap()[0];
         assert_eq!(target_0, input_1);
     }
 
@@ -184,8 +216,15 @@ mod tests {
 
         // Encode then decode first sequence
         let seq: Vec<i64> = (0..4)
-            .map(|j| data.data.select(0, 0).unwrap()
-                .select(0, j).unwrap().to_i64_vec().unwrap()[0])
+            .map(|j| {
+                data.data
+                    .select(0, 0)
+                    .unwrap()
+                    .select(0, j)
+                    .unwrap()
+                    .to_i64_vec()
+                    .unwrap()[0]
+            })
             .collect();
         let decoded = data.decode(&seq);
         assert_eq!(decoded, "hell");

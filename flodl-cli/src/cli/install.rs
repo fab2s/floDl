@@ -5,7 +5,6 @@ use std::process::ExitCode;
 
 use flodl_cli::{cli_error, util};
 
-
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
@@ -41,9 +40,10 @@ pub(crate) fn cmd_install(check_only: bool, dev: bool) -> ExitCode {
         println!("Installed: {current_version}");
         // Check if current install is a symlink (dev mode)
         if dest.is_symlink()
-            && let Ok(target) = std::fs::read_link(&dest) {
-                println!("Mode:      dev (symlink -> {})", target.display());
-            }
+            && let Ok(target) = std::fs::read_link(&dest)
+        {
+            println!("Mode:      dev (symlink -> {})", target.display());
+        }
         match &latest {
             Some(tag) => {
                 println!("Latest:    {tag}");
@@ -254,7 +254,9 @@ fn print_path_hint(bin_dir: &std::path::Path) -> ExitCode {
         println!();
         let shell = env::var("SHELL").unwrap_or_default();
         if shell.contains("zsh") {
-            println!("  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc");
+            println!(
+                "  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+            );
         } else {
             println!(
                 "  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && source ~/.bashrc"
@@ -296,7 +298,10 @@ fn is_newer(a: &str, b: &str) -> bool {
 }
 
 /// Download the fdl binary for this platform from a GitHub release.
-fn download_release_binary(tag: &str, home: &std::path::Path) -> Result<std::path::PathBuf, String> {
+fn download_release_binary(
+    tag: &str,
+    home: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     let os = if cfg!(target_os = "linux") {
         "linux"
     } else if cfg!(target_os = "macos") {
@@ -319,7 +324,11 @@ fn download_release_binary(tag: &str, home: &std::path::Path) -> Result<std::pat
         return Err("unsupported architecture".into());
     };
 
-    let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
+    let ext = if cfg!(target_os = "windows") {
+        ".exe"
+    } else {
+        ""
+    };
     let artifact = format!("flodl-cli-{os}-{arch}{ext}");
     let url = format!("https://github.com/flodl-labs/flodl/releases/download/{tag}/{artifact}");
 

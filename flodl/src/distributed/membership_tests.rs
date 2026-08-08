@@ -3,15 +3,15 @@
 //! real loopback sockets.
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use super::*;
 use crate::distributed::port_mux::StreamSource;
 use crate::distributed::wire::{
-    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES,
-    SessionSalt, salt_to_hex, write_channel_magic,
+    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
+    salt_to_hex, write_channel_magic,
 };
 use crate::tensor::Result;
 
@@ -122,7 +122,10 @@ fn a_vendor_mixed_cohort_is_refused_under_an_nccl_data_plane() {
     admit(&mut ledger, "green2", "builds/sm61-sm120").unwrap();
 
     // A CPU data plane genuinely works cross-vendor, so the gate is off.
-    let cpu_plane = JoinConfig { nccl_backend: false, ..test_config() };
+    let cpu_plane = JoinConfig {
+        nccl_backend: false,
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(cpu_plane, None, None).unwrap();
     admit(&mut ledger, "green", "precompiled/cu128").unwrap();
     admit(&mut ledger, "red", "precompiled/rocm70").unwrap();
@@ -141,18 +144,27 @@ fn a_cohort_straddling_a_publish_boundary_is_refused() {
         o
     };
     let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
-    ledger.admit(with_run("a", Some("run-aaaa1111")), Duration::ZERO).unwrap();
-    ledger.admit(with_run("bare", None), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_run("a", Some("run-aaaa1111")), Duration::ZERO)
+        .unwrap();
+    ledger
+        .admit(with_run("bare", None), Duration::ZERO)
+        .unwrap();
     let why = ledger
         .admit(with_run("b", Some("run-bbbb2222")), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("run identity mismatch"), "got: {why}");
-    assert!(why.contains("run-aaaa"), "the seeded id must be named: {why}");
+    assert!(
+        why.contains("run-aaaa"),
+        "the seeded id must be named: {why}"
+    );
     assert!(why.contains("next dial"), "the fix must be named: {why}");
     assert_eq!(ledger.joined_ranks(), 2);
     // The matching id keeps joining — the refusal condemned one
     // attempt, not the window.
-    ledger.admit(with_run("c", Some("run-aaaa1111")), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_run("c", Some("run-aaaa1111")), Duration::ZERO)
+        .unwrap();
 }
 
 #[test]
@@ -169,23 +181,30 @@ fn a_box_building_a_different_model_is_refused_at_admission() {
     // Controller-seeded: the launcher's own CPU-built model is the
     // run's truth, so the very first mismatching walk-in is refused —
     // no first-member luck.
-    let mut ledger =
-        MembershipLedger::new(test_config(), None, Some(sig(0xAA))).unwrap();
+    let mut ledger = MembershipLedger::new(test_config(), None, Some(sig(0xAA))).unwrap();
     let why = ledger
         .admit(with_model("odd", Some(sig(0xBB))), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("model mismatch"), "got: {why}");
     assert!(why.contains("bin:"), "the usual cause must be named: {why}");
     assert_eq!(ledger.joined_ranks(), 0);
-    ledger.admit(with_model("good", Some(sig(0xAA))), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_model("good", Some(sig(0xAA))), Duration::ZERO)
+        .unwrap();
     // No signature gates nothing (a probe-less box is not an admission
     // crime — formation still checks the model it actually builds).
-    ledger.admit(with_model("bare", None), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_model("bare", None), Duration::ZERO)
+        .unwrap();
 
     // First-member seeding when the controller passed no seed.
     let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
-    ledger.admit(with_model("a", Some(sig(1))), Duration::ZERO).unwrap();
-    ledger.admit(with_model("bare", None), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_model("a", Some(sig(1))), Duration::ZERO)
+        .unwrap();
+    ledger
+        .admit(with_model("bare", None), Duration::ZERO)
+        .unwrap();
     let why = ledger
         .admit(with_model("b", Some(sig(2))), Duration::ZERO)
         .unwrap_err();
@@ -201,22 +220,38 @@ fn nccl_version_skew_is_refused_where_that_plane_forms() {
         o
     };
     let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
-    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO)
+        .unwrap();
     // Patch skew is interoperable, and an unknown version (a CPU build,
     // a failed read) gates nothing.
-    ledger.admit(with_nccl("b", Some((2, 27, 3))), Duration::ZERO).unwrap();
-    ledger.admit(with_nccl("cpu-build", None), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_nccl("b", Some((2, 27, 3))), Duration::ZERO)
+        .unwrap();
+    ledger
+        .admit(with_nccl("cpu-build", None), Duration::ZERO)
+        .unwrap();
     let why = ledger
         .admit(with_nccl("c", Some((2, 26, 2))), Duration::ZERO)
         .unwrap_err();
     assert!(why.contains("NCCL version skew"), "got: {why}");
     assert!(why.contains("2.27"), "got: {why}");
-    assert!(why.contains("fdl nccl build"), "the bridge must be named: {why}");
+    assert!(
+        why.contains("fdl nccl build"),
+        "the bridge must be named: {why}"
+    );
     // A CPU data plane has no NCCL handshake to protect: gate off.
-    let cpu = JoinConfig { nccl_backend: false, ..test_config() };
+    let cpu = JoinConfig {
+        nccl_backend: false,
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(cpu, None, None).unwrap();
-    ledger.admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO).unwrap();
-    ledger.admit(with_nccl("b", Some((2, 26, 2))), Duration::ZERO).unwrap();
+    ledger
+        .admit(with_nccl("a", Some((2, 27, 5))), Duration::ZERO)
+        .unwrap();
+    ledger
+        .admit(with_nccl("b", Some((2, 26, 2))), Duration::ZERO)
+        .unwrap();
     assert_eq!(ledger.joined_ranks(), 2);
 }
 
@@ -226,7 +261,10 @@ fn hostile_device_lists_rejected() {
     let why = admit_host(&mut ledger, "zero", 0).unwrap_err();
     assert!(why.contains("must be non-empty"), "got: {why}");
     let why = ledger
-        .admit(offer("huge", vec![0u8; 100_000], "", sig(7)), Duration::ZERO)
+        .admit(
+            offer("huge", vec![0u8; 100_000], "", sig(7)),
+            Duration::ZERO,
+        )
         .unwrap_err();
     assert!(why.contains("exceeds the per-worker cap"), "got: {why}");
     let why = ledger
@@ -259,8 +297,13 @@ fn retract_last_returns_rank_ids_to_the_pool() {
 fn config_cross_field_validation() {
     assert!(test_config().validate().is_ok());
 
-    let zero_quorum = JoinConfig { min_rank_start: 0, ..test_config() };
-    let msg = MembershipLedger::new(zero_quorum, None, None).unwrap_err().to_string();
+    let zero_quorum = JoinConfig {
+        min_rank_start: 0,
+        ..test_config()
+    };
+    let msg = MembershipLedger::new(zero_quorum, None, None)
+        .unwrap_err()
+        .to_string();
     assert!(msg.contains("min_rank_start"), "got: {msg}");
 
     let target_below_quorum = JoinConfig {
@@ -289,10 +332,16 @@ const CAP: Duration = Duration::from_secs(600);
 
 #[test]
 fn verdict_target_closes_early() {
-    let config = JoinConfig { target_ranks: Some(2), ..test_config() };
+    let config = JoinConfig {
+        target_ranks: Some(2),
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
-    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
+        WindowVerdict::Open
+    );
     admit_host(&mut ledger, "b", 1).unwrap();
     assert!(matches!(
         ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
@@ -319,12 +368,18 @@ fn verdict_quorum_early_does_not_close_the_window() {
 
 #[test]
 fn verdict_grace_range_waits_for_quorum_then_forms() {
-    let config = JoinConfig { min_rank_start: 2, ..test_config() };
+    let config = JoinConfig {
+        min_rank_start: 2,
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Window expired below quorum, cap not yet: keep waiting.
     let in_grace = WINDOW + Duration::from_secs(30);
-    assert_eq!(ledger.verdict(in_grace, WINDOW, CAP, false), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(in_grace, WINDOW, CAP, false),
+        WindowVerdict::Open
+    );
     // Quorum arriving in the grace range forms immediately.
     admit_host(&mut ledger, "b", 1).unwrap();
     assert!(matches!(
@@ -335,7 +390,10 @@ fn verdict_grace_range_waits_for_quorum_then_forms() {
 
 #[test]
 fn verdict_cap_expiry_fails_loudly() {
-    let config = JoinConfig { min_rank_start: 2, ..test_config() };
+    let config = JoinConfig {
+        min_rank_start: 2,
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     match ledger.verdict(CAP, WINDOW, CAP, false) {
@@ -359,7 +417,10 @@ fn verdict_manual_holds_until_operator_start() {
     admit_host(&mut ledger, "a", 1).unwrap();
     // Quorum met, window expired: a manual hold stays open where auto
     // would have formed.
-    assert_eq!(ledger.verdict(WINDOW, WINDOW, CAP, false), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(WINDOW, WINDOW, CAP, false),
+        WindowVerdict::Open
+    );
     assert_eq!(
         ledger.verdict(WINDOW + Duration::from_secs(60), WINDOW, CAP, false),
         WindowVerdict::Open
@@ -392,7 +453,10 @@ fn verdict_manual_start_is_quorum_gated() {
     admit_host(&mut ledger, "a", 1).unwrap();
     // Armed below quorum: inert (the HTTP layer refuses this too, but
     // the verdict is the authority).
-    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, true), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, true),
+        WindowVerdict::Open
+    );
     assert_eq!(ledger.open_phase(), ClusterPhase::Waiting);
     admit_host(&mut ledger, "b", 1).unwrap();
     assert!(matches!(
@@ -413,7 +477,10 @@ fn verdict_hybrid_keeps_the_clock_and_adds_the_operator() {
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 1).unwrap();
     // Clock semantics intact: below target, inside the window → open.
-    assert_eq!(ledger.verdict(Duration::ZERO, WINDOW, CAP, false), WindowVerdict::Open);
+    assert_eq!(
+        ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
+        WindowVerdict::Open
+    );
     // Startable while waiting = staging.
     assert_eq!(ledger.open_phase(), ClusterPhase::Staging);
     // Operator fires early with quorum.
@@ -469,7 +536,10 @@ fn manual_mode_refuses_target_ranks() {
 #[test]
 fn open_admission_resolution_follows_bind_scope_then_knob() {
     let closed = test_config();
-    let open = JoinConfig { open_admission: true, ..test_config() };
+    let open = JoinConfig {
+        open_admission: true,
+        ..test_config()
+    };
     // Loopback bind: open admission is sound regardless of the knob.
     assert!(resolve_open_admission(&closed, true));
     assert!(resolve_open_admission(&open, true));
@@ -480,7 +550,10 @@ fn open_admission_resolution_follows_bind_scope_then_knob() {
 
 #[test]
 fn snapshot_serializes_phase_and_countdowns() {
-    let config = JoinConfig { target_ranks: Some(3), ..test_config() };
+    let config = JoinConfig {
+        target_ranks: Some(3),
+        ..test_config()
+    };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
     admit_host(&mut ledger, "a", 2).unwrap();
 
@@ -507,7 +580,10 @@ fn snapshot_serializes_phase_and_countdowns() {
         (ClusterPhase::Done, "done"),
         (ClusterPhase::Failed, "failed"),
     ] {
-        assert_eq!(serde_json::to_string(&phase).unwrap(), format!("\"{expect}\""));
+        assert_eq!(
+            serde_json::to_string(&phase).unwrap(),
+            format!("\"{expect}\"")
+        );
     }
 }
 
@@ -534,13 +610,17 @@ fn join_messages_round_trip_through_control_frames() {
             salt_hex: Some(salt_to_hex(&salt)),
             formation_wait_secs: 480,
         },
-        JoinMsgWire::Reject { reason: "duplicate".to_string() },
+        JoinMsgWire::Reject {
+            reason: "duplicate".to_string(),
+        },
         JoinMsgWire::WorldFormed {
             envelope_hex: "abcd".to_string(),
             relay_spec_hex: Some("ef01".to_string()),
         },
         JoinMsgWire::RankExited { rank: 1, code: -9 },
-        JoinMsgWire::Abort { reason: "quorum".to_string() },
+        JoinMsgWire::Abort {
+            reason: "quorum".to_string(),
+        },
     ];
     for msg in msgs {
         let mut buf = Vec::new();
@@ -601,7 +681,13 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
     let gate_board = board.clone();
     let gate = std::thread::spawn(move || {
         run_join_window(
-            &join_source, &config, &gate_salt, true, None, None, &gate_abort,
+            &join_source,
+            &config,
+            &gate_salt,
+            true,
+            None,
+            None,
+            &gate_abort,
             &gate_board,
         )
     });
@@ -611,7 +697,8 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
     let (_conn, reply) = dial_and_join(port, &salt, "host-a", 1);
     assert!(matches!(reply, JoinMsgWire::Accept { .. }));
     let mut post = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    post.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    post.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     post.write_all(
         b"POST /start HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
           Content-Length: 0\r\n\r\n",
@@ -651,7 +738,14 @@ fn spawn_window(
         let source = StreamSource::from_listener(listener, "membership-test")?;
         let status = crate::distributed::status::StatusBoard::new();
         run_join_window(
-            &source, &config, &salt, pre_shared_salt, None, None, &abort, &status,
+            &source,
+            &config,
+            &salt,
+            pre_shared_salt,
+            None,
+            None,
+            &abort,
+            &status,
         )
     });
     (port, handle)
@@ -695,7 +789,10 @@ fn dial_and_join(
 fn window_open_mode_admits_hands_out_salt_and_closes_on_target() {
     let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
     let zero_key: SessionSalt = [0u8; SESSION_SALT_BYTES];
-    let config = JoinConfig { target_ranks: Some(3), ..test_config() };
+    let config = JoinConfig {
+        target_ranks: Some(3),
+        ..test_config()
+    };
     let abort = Arc::new(AtomicBool::new(false));
     let (port, handle) = spawn_window(config, salt, false, Arc::clone(&abort));
 
@@ -703,7 +800,11 @@ fn window_open_mode_admits_hands_out_salt_and_closes_on_target() {
     // deterministic.
     let (_conn_a, reply_a) = dial_and_join(port, &zero_key, "host-a", 1);
     match reply_a {
-        JoinMsgWire::Accept { ranks, salt_hex, formation_wait_secs } => {
+        JoinMsgWire::Accept {
+            ranks,
+            salt_hex,
+            formation_wait_secs,
+        } => {
             assert_eq!(ranks, vec![0]);
             // Open admission hands the session salt out in the reply.
             assert_eq!(salt_hex.as_deref(), Some(salt_to_hex(&salt).as_str()));
@@ -722,8 +823,11 @@ fn window_open_mode_admits_hands_out_salt_and_closes_on_target() {
     // Third rank hit the target: the window closes immediately.
     let world = handle.join().unwrap().unwrap();
     assert_eq!(world.world_size, 3);
-    let hosts: Vec<&str> =
-        world.workers.iter().map(|w| w.member.host.as_str()).collect();
+    let hosts: Vec<&str> = world
+        .workers
+        .iter()
+        .map(|w| w.member.host.as_str())
+        .collect();
     assert_eq!(hosts, vec!["host-a", "host-b"]);
     assert_eq!(world.workers[1].member.ranks, vec![1, 2]);
 }
@@ -732,7 +836,10 @@ fn window_open_mode_admits_hands_out_salt_and_closes_on_target() {
 fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
     let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
     let zero_key: SessionSalt = [0u8; SESSION_SALT_BYTES];
-    let config = JoinConfig { target_ranks: Some(1), ..test_config() };
+    let config = JoinConfig {
+        target_ranks: Some(1),
+        ..test_config()
+    };
     let abort = Arc::new(AtomicBool::new(false));
     let (port, handle) = spawn_window(config, salt, true, Arc::clone(&abort));
 
@@ -769,7 +876,9 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
     // the pre-shared secret.
     let (_conn, reply) = dial_and_join(port, &salt, "honest", 1);
     match reply {
-        JoinMsgWire::Accept { ranks, salt_hex, .. } => {
+        JoinMsgWire::Accept {
+            ranks, salt_hex, ..
+        } => {
             assert_eq!(ranks, vec![0]);
             assert_eq!(salt_hex, None);
         }
@@ -784,7 +893,10 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
 fn window_rejects_non_hello_then_still_forms() {
     let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
     let zero_key: SessionSalt = [0u8; SESSION_SALT_BYTES];
-    let config = JoinConfig { target_ranks: Some(1), ..test_config() };
+    let config = JoinConfig {
+        target_ranks: Some(1),
+        ..test_config()
+    };
     let abort = Arc::new(AtomicBool::new(false));
     let (port, handle) = spawn_window(config, salt, false, Arc::clone(&abort));
 

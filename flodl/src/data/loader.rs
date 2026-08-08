@@ -85,11 +85,11 @@ pub(crate) fn initial_fill_target(full_depth: usize, source: ReserveSource) -> u
 // Budget policy (ring sizing, cache budget, prefetch depth) lives in
 // `data::budget` — one law shared with the DDP worker/stager paths.
 // Re-exported here for this module's call sites and its test file.
-pub(crate) use super::budget::{
-    prefetch_depth_from_vram, ring_slots_from_ram, sample_cache_budget, RING_SLOTS_WITH_CACHE,
-};
 #[cfg(test)]
 pub(crate) use super::budget::RING_SLOTS_FALLBACK;
+pub(crate) use super::budget::{
+    RING_SLOTS_WITH_CACHE, prefetch_depth_from_vram, ring_slots_from_ram, sample_cache_budget,
+};
 
 // ---------------------------------------------------------------------------
 // DataLoaderBuilder
@@ -238,10 +238,7 @@ impl DataLoaderBuilder {
     /// [`PickKey::rng`]: crate::data::PickKey::rng
     pub fn transform(
         mut self,
-        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> Result<Vec<Tensor>>
-            + Send
-            + Sync
-            + 'static,
+        f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> Result<Vec<Tensor>> + Send + Sync + 'static,
     ) -> Self {
         self.transform = Some(crate::data::TransformFn::new(f));
         self
@@ -517,8 +514,7 @@ impl DataLoaderBuilder {
         // `FLODL_VRAM_POOL=off` runtime kill-switch — same parse as
         // the DDP rank workers (audit D7: it used to be honored only
         // there, so a scripted A/B silently no-op'ed on the solo path).
-        let vram_pool_enabled =
-            vram_pool_enabled && !super::vram_pool::vram_pool_env_off();
+        let vram_pool_enabled = vram_pool_enabled && !super::vram_pool::vram_pool_env_off();
 
         // Augmentation is pick-space scheduling over the built-in
         // samplers; a custom sampler owns its own index stream, so the
@@ -607,7 +603,15 @@ impl DataLoaderBuilder {
         // model allocation. User override skips adaptive sizing.
         let streaming_depth = prefetch_depth.unwrap_or(BOOTSTRAP_PREFETCH);
         if use_resident {
-            match build_resident(Arc::clone(&dataset), batch_size, device, sampler, drop_last, names.clone(), pick_ctx.clone()) {
+            match build_resident(
+                Arc::clone(&dataset),
+                batch_size,
+                device,
+                sampler,
+                drop_last,
+                names.clone(),
+                pick_ctx.clone(),
+            ) {
                 Ok(loader) => Ok(loader),
                 Err(e) if device.is_cuda() && e.is_cuda_oom() => {
                     // VRAM estimate was wrong, fall back to streaming.
@@ -618,12 +622,50 @@ impl DataLoaderBuilder {
                         Box::new(SequentialSampler::new(picks))
                     };
                     crate::tensor::gpu_empty_cache();
-                    build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+                    build_streaming(
+                        dataset,
+                        batch_size,
+                        device,
+                        sampler,
+                        drop_last,
+                        streaming_depth,
+                        per_sample_bytes,
+                        vram_max_usage,
+                        ram_max_usage,
+                        gpu_ram_share,
+                        user_set_depth,
+                        activation_reserve,
+                        sample_cache,
+                        disk_stage_bytes,
+                        &disk_stage_dir,
+                        vram_pool_enabled,
+                        names,
+                        pick_ctx,
+                    )
                 }
                 Err(e) => Err(e),
             }
         } else {
-            build_streaming(dataset, batch_size, device, sampler, drop_last, streaming_depth, per_sample_bytes, vram_max_usage, ram_max_usage, gpu_ram_share, user_set_depth, activation_reserve, sample_cache, disk_stage_bytes, &disk_stage_dir, vram_pool_enabled, names, pick_ctx)
+            build_streaming(
+                dataset,
+                batch_size,
+                device,
+                sampler,
+                drop_last,
+                streaming_depth,
+                per_sample_bytes,
+                vram_max_usage,
+                ram_max_usage,
+                gpu_ram_share,
+                user_set_depth,
+                activation_reserve,
+                sample_cache,
+                disk_stage_bytes,
+                &disk_stage_dir,
+                vram_pool_enabled,
+                names,
+                pick_ctx,
+            )
         }
     }
 }
@@ -697,16 +739,15 @@ fn build_streaming(
     // not in build(): the resident path never reads through the cache,
     // so it must not create a pack file it would never use.
     if disk_stage_bytes > 0
-        && let Some(cache) = &sample_cache {
-            let dir = disk_stage_dir
-                .clone()
-                .unwrap_or_else(std::env::temp_dir);
-            cache.attach_disk(super::sample_cache::DiskStage::create(
-                &dir,
-                disk_stage_bytes,
-                dataset.len(),
-            )?);
-        }
+        && let Some(cache) = &sample_cache
+    {
+        let dir = disk_stage_dir.clone().unwrap_or_else(std::env::temp_dir);
+        cache.attach_disk(super::sample_cache::DiskStage::create(
+            &dir,
+            disk_stage_bytes,
+            dataset.len(),
+        )?);
+    }
 
     let worker = PrefetchWorker::new(
         Arc::clone(&dataset),
@@ -742,7 +783,6 @@ fn build_streaming(
         }),
     })
 }
-
 
 // ---------------------------------------------------------------------------
 // DataLoader
@@ -937,10 +977,11 @@ impl DataLoader {
     /// first-fill discount since activations remain unaccounted for.
     pub(crate) fn set_activation_reserve_auto(&mut self, bytes: usize) {
         if let LoaderInner::Streaming(l) = &mut self.inner
-            && l.reserve_source == ReserveSource::Bare {
-                l.activation_reserve = bytes;
-                l.reserve_source = ReserveSource::Auto;
-            }
+            && l.reserve_source == ReserveSource::Bare
+        {
+            l.activation_reserve = bytes;
+            l.reserve_source = ReserveSource::Auto;
+        }
     }
 
     /// Measure free VRAM and resize the prefetch in-flight target to
@@ -976,7 +1017,11 @@ impl DataLoader {
                     l.activation_reserve
                 };
                 let depth = prefetch_depth_from_vram(
-                    l.per_sample_bytes, l.batch_size, l.device, l.vram_max_usage, reserve,
+                    l.per_sample_bytes,
+                    l.batch_size,
+                    l.device,
+                    l.vram_max_usage,
+                    reserve,
                 );
                 let depth = depth.max(1);
                 l.worker.set_prefetch_depth(depth);
@@ -1030,18 +1075,14 @@ impl ResidentLoader {
         // Build index tensor on the target device (i64 for index_select)
         let k = self.pick_ctx.augment.max(1) as i64;
         let i64_indices: Vec<i64> = picks.iter().map(|&i| i as i64 / k).collect();
-        let perm = match Tensor::from_i64(
-            &i64_indices,
-            &[i64_indices.len() as i64],
-            self.device,
-        ) {
+        let perm = match Tensor::from_i64(&i64_indices, &[i64_indices.len() as i64], self.device) {
             Ok(t) => t,
             Err(e) => {
                 return EpochIterator {
                     inner: EpochIteratorInner::Failed(Some(TensorError::new(&format!(
                         "resident loader: failed to upload the epoch permutation: {e}"
                     )))),
-                }
+                };
             }
         };
 
@@ -1125,7 +1166,11 @@ impl StreamingLoader {
             // Any later raise (honest resize, auto_resize) stays <= it,
             // because "used" only grows once training runs.
             let full = prefetch_depth_from_vram(
-                self.per_sample_bytes, self.batch_size, self.device, self.vram_max_usage, 0,
+                self.per_sample_bytes,
+                self.batch_size,
+                self.device,
+                self.vram_max_usage,
+                0,
             );
             let target = if self.governor.honest_resize_done.load(Ordering::Relaxed) {
                 full.max(1)
@@ -1202,17 +1247,18 @@ impl StreamingLoader {
         // visibility the budget stays as it was (initially 0: no
         // admissions on hosts we cannot measure).
         if let Some(cache) = &self.sample_cache
-            && let Some(available) = mem {
-                let ring_bytes = (ring_slots as u64)
-                    .saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
-                let budget = sample_cache_budget(
-                    available,
-                    cache.bytes() as u64,
-                    ring_bytes,
-                    self.ram_max_usage,
-                );
-                cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
-            }
+            && let Some(available) = mem
+        {
+            let ring_bytes =
+                (ring_slots as u64).saturating_mul(self.per_sample_bytes.saturating_mul(bs) as u64);
+            let budget = sample_cache_budget(
+                available,
+                cache.bytes() as u64,
+                ring_bytes,
+                self.ram_max_usage,
+            );
+            cache.set_budget(usize::try_from(budget).unwrap_or(usize::MAX));
+        }
 
         // Start the epoch: gets a fresh per-epoch batch channel.
         // If the previous epoch was dropped mid-way, the old channel is already
@@ -1330,9 +1376,7 @@ impl<'a> Iterator for EpochIterator<'a> {
                 let remaining = iter.batch_ranges.len() - iter.pos;
                 (remaining, Some(remaining))
             }
-            EpochIteratorInner::Streaming(iter) => {
-                (iter.remaining, Some(iter.remaining))
-            }
+            EpochIteratorInner::Streaming(iter) => (iter.remaining, Some(iter.remaining)),
             EpochIteratorInner::Failed(err) => {
                 let n = usize::from(err.is_some());
                 (n, Some(n))
@@ -1427,8 +1471,7 @@ impl StreamingEpochIter<'_> {
                     }
                 }
                 self.governor.consumed.fetch_add(1, Ordering::Relaxed);
-                let run_consumed =
-                    self.governor.run_consumed.fetch_add(1, Ordering::Relaxed) + 1;
+                let run_consumed = self.governor.run_consumed.fetch_add(1, Ordering::Relaxed) + 1;
                 // Honest-probe latch, once per RUN: draining the second
                 // batch means the first batch's forward/backward/step
                 // have executed, so a probe now sees activations,
@@ -1440,10 +1483,10 @@ impl StreamingEpochIter<'_> {
                 // decision (`maybe_install`) gates on it; an explicit
                 // `.prefetch(N)` must pin the in-flight depth, not
                 // silently disable the pool tier.
-                if run_consumed >= 2
-                    && !self.governor.honest_resize_done.load(Ordering::Relaxed)
-                {
-                    self.governor.honest_resize_done.store(true, Ordering::Relaxed);
+                if run_consumed >= 2 && !self.governor.honest_resize_done.load(Ordering::Relaxed) {
+                    self.governor
+                        .honest_resize_done
+                        .store(true, Ordering::Relaxed);
                     // Honest resize of the in-flight target: adaptive
                     // mode only — a user-set depth stays exactly where
                     // the user put it. Full budget, no reserve (the
@@ -1495,11 +1538,9 @@ impl StreamingEpochIter<'_> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 
 #[cfg(test)]
 #[path = "loader_tests.rs"]

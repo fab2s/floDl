@@ -78,12 +78,14 @@ pub fn run(cli: &PublishArgs, args_tail: Option<&[String]>) -> i32 {
 /// everything. A present-but-broken config is a loud error, never a
 /// silent fallback.
 fn load_publish_block() -> Result<Option<crate::config::PublishBlock>, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("cannot read the current directory: {e}"))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
     let Some(config_path) = crate::config::find_project_config(&cwd) else {
         return Ok(None);
     };
-    let env_name = std::env::var("FDL_ENV").ok().filter(|s| !s.trim().is_empty());
+    let env_name = std::env::var("FDL_ENV")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let project = crate::config::load_project_with_env(&config_path, env_name.as_deref())
         .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
     Ok(project.publish)
@@ -151,7 +153,10 @@ fn publish(
     };
     let tree = served.join(TREE_SUBDIR);
     std::fs::create_dir_all(&tree).map_err(|e| {
-        Fail::Permanent(format!("cannot create the served directory {}: {e}", tree.display()))
+        Fail::Permanent(format!(
+            "cannot create the served directory {}: {e}",
+            tree.display()
+        ))
     })?;
 
     // Now clear it. Its presence is this command's commit point, so from
@@ -224,15 +229,22 @@ fn build_gate(
     let env = source::build_env(libtorch.as_ref());
     // A gate failure is not the worker-side "wait for the next publish":
     // the operator is standing right here, so it is theirs to fix now.
-    source::build(tree, cli.cwd.as_deref(), cli.build.as_deref(), bin, &env, notes)
-        .map(|_| ())
-        .map_err(|e| {
-            Fail::Permanent(format!(
-                "{}. Nothing was published, so the fleet keeps running \
+    source::build(
+        tree,
+        cli.cwd.as_deref(),
+        cli.build.as_deref(),
+        bin,
+        &env,
+        notes,
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        Fail::Permanent(format!(
+            "{}. Nothing was published, so the fleet keeps running \
                  whatever it had",
-                e.message(),
-            ))
-        })
+            e.message(),
+        ))
+    })
 }
 
 /// One `--gate <variant>` check-build: the same recipe against a named
@@ -270,15 +282,13 @@ fn check_gate_variant(
         format!("target/gate/{}", variant.replace('/', "-")),
     ));
     notes.push(format!("gate: check-building against {variant}"));
-    source::check_build(tree, cli.cwd.as_deref(), cli.build.as_deref(), &env, notes).map_err(
-        |e| {
-            Fail::Permanent(format!(
-                "--gate {variant}: {}. Nothing was published, so the fleet \
+    source::check_build(tree, cli.cwd.as_deref(), cli.build.as_deref(), &env, notes).map_err(|e| {
+        Fail::Permanent(format!(
+            "--gate {variant}: {}. Nothing was published, so the fleet \
                  keeps running whatever it had",
-                e.message(),
-            ))
-        },
-    )
+            e.message(),
+        ))
+    })
 }
 
 /// The report as data — the single source both renderers draw from, so
@@ -446,23 +456,39 @@ mod tests {
         let manifest = Manifest::read(&tree).unwrap().expect("a manifest");
         assert_eq!(manifest.bin, "out");
         assert_eq!(manifest.args, tail);
-        assert!(!manifest.built, "--no-build must be recorded, not glossed over");
-        assert_eq!(manifest.origin.as_deref(), Some(&*format!("file://{}", src.display())));
+        assert!(
+            !manifest.built,
+            "--no-build must be recorded, not glossed over"
+        );
+        assert_eq!(
+            manifest.origin.as_deref(),
+            Some(&*format!("file://{}", src.display()))
+        );
 
         // Now a real gate that fails: the manifest must be GONE, because a
         // worker reading one would be told a broken tree is ready.
         cli.no_build = false;
         cli.build = Some("exit 7".to_string());
         let err = publish(&cli, None).unwrap_err();
-        assert!(err.message().contains("Nothing was published"), "got: {err:?}");
-        assert_eq!(Manifest::read(&tree).unwrap(), None, "a failed gate left a manifest");
+        assert!(
+            err.message().contains("Nothing was published"),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            Manifest::read(&tree).unwrap(),
+            None,
+            "a failed gate left a manifest"
+        );
 
         // And a gate that passes writes it again, with the build recorded.
         cli.build = Some("printf x > out".to_string());
         publish(&cli, None).unwrap();
         let manifest = Manifest::read(&tree).unwrap().expect("a manifest");
         assert!(manifest.built);
-        assert!(manifest.args.is_empty(), "no tail means no args, not the previous ones");
+        assert!(
+            manifest.args.is_empty(),
+            "no tail means no args, not the previous ones"
+        );
 
         // Every publish is a NEW run identity — chaining "same args, new
         // code" is the common re-publish, which any content hash would
@@ -471,7 +497,11 @@ mod tests {
         let first_run = manifest.run.clone().expect("a publish stamps a run id");
         publish(&cli, None).unwrap();
         let manifest = Manifest::read(&tree).unwrap().expect("a manifest");
-        assert_ne!(manifest.run, Some(first_run), "a re-publish must mint a fresh id");
+        assert_ne!(
+            manifest.run,
+            Some(first_run),
+            "a re-publish must mint a fresh id"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -484,12 +514,24 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fdl-publish-typo-{}", std::process::id()));
         let tree = base.join(TREE_SUBDIR);
         std::fs::create_dir_all(&tree).unwrap();
-        let live = Manifest { bin: "target/release/train".into(), built: true, ..Default::default() };
+        let live = Manifest {
+            bin: "target/release/train".into(),
+            built: true,
+            ..Default::default()
+        };
         live.write(&tree).unwrap();
 
-        let cli = args("nonsense-with-no-scheme", "out", &base.display().to_string());
+        let cli = args(
+            "nonsense-with-no-scheme",
+            "out",
+            &base.display().to_string(),
+        );
         assert!(publish(&cli, None).is_err());
-        assert_eq!(Manifest::read(&tree).unwrap(), Some(live), "the live run was cleared");
+        assert_eq!(
+            Manifest::read(&tree).unwrap(),
+            Some(live),
+            "the live run was cleared"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -560,7 +602,11 @@ mod tests {
         };
 
         let ok = fetch(&format!("/{TREE_SUBDIR}"), "out-tree");
-        assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
         assert!(
             base.join("out-tree").join(source::MANIFEST_FILE).is_file(),
             "the /tree spelling must deliver the manifest with the source",
@@ -608,7 +654,10 @@ mod tests {
         assert_eq!(merged.build.as_deref(), Some("./ci/build.sh"));
         assert_eq!(merged.to.as_deref(), Some("/srv/run"));
         assert_eq!(merged.identity.as_deref(), Some("/etc/flodl/pub_key"));
-        assert_eq!(tail.as_deref(), Some(&["--model".to_string(), "olmo".to_string()][..]));
+        assert_eq!(
+            tail.as_deref(),
+            Some(&["--model".to_string(), "olmo".to_string()][..])
+        );
 
         // Flags win field by field, and an EMPTY `--` tail replaces the
         // block's args — explicitly none is a sayable answer.
@@ -627,7 +676,11 @@ mod tests {
         let (merged, tail) = with_block_defaults(&flags, Some(&empty), Some(block));
         assert_eq!(merged.source.as_deref(), Some("rsync://exa:/home/op/tree"));
         assert_eq!(merged.bin.as_deref(), Some("target/release/train"));
-        assert_eq!(tail.as_deref(), Some(&[][..]), "an empty tail must replace, not defer");
+        assert_eq!(
+            tail.as_deref(),
+            Some(&[][..]),
+            "an empty tail must replace, not defer"
+        );
 
         // No block at all: flags and tail pass through untouched.
         let (merged, tail) = with_block_defaults(&bare, None, None);
@@ -654,7 +707,10 @@ mod tests {
         assert_eq!(v["run"], "a1b2c3d4e5f60718");
         assert_eq!(v["args"], serde_json::json!(["--model", "olmo"]));
         let host = crate::cluster::resolve_local_hostname();
-        assert_eq!(v["worker_specs"]["plain"], format!("rsync://{host}:/srv/run/tree"));
+        assert_eq!(
+            v["worker_specs"]["plain"],
+            format!("rsync://{host}:/srv/run/tree")
+        );
         assert_eq!(v["worker_specs"]["rrsync"], format!("rsync://{host}:/tree"));
     }
 
@@ -670,9 +726,12 @@ mod tests {
         let mut cli = args("file:///unused", "out", "/unused");
 
         // Absent variant: permanent, names the fetch.
-        let err = check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![])
-            .unwrap_err();
-        assert!(err.message().contains("fdl libtorch download"), "got: {err:?}");
+        let err =
+            check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![]).unwrap_err();
+        assert!(
+            err.message().contains("fdl libtorch download"),
+            "got: {err:?}"
+        );
 
         // Present variant: the recipe sees the rocm feature and its own
         // target dir, and success needs no artifact anywhere.
@@ -687,9 +746,12 @@ mod tests {
 
         // A failing check-build reports as "nothing was published".
         cli.build = Some("exit 3".to_string());
-        let err = check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![])
-            .unwrap_err();
-        assert!(err.message().contains("Nothing was published"), "got: {err:?}");
+        let err =
+            check_gate_variant(&root, &tree, &cli, "precompiled/rocm7.0", &mut vec![]).unwrap_err();
+        assert!(
+            err.message().contains("Nothing was published"),
+            "got: {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -697,7 +759,12 @@ mod tests {
     fn a_missing_source_or_bin_says_which() {
         let mut cli = args("file:///nowhere", "out", "/tmp/fdl-publish-none");
         cli.source = None;
-        assert!(publish(&cli, None).unwrap_err().message().contains("needs a source"));
+        assert!(
+            publish(&cli, None)
+                .unwrap_err()
+                .message()
+                .contains("needs a source")
+        );
         let mut cli = args("file:///nowhere", "out", "/tmp/fdl-publish-none");
         cli.bin = None;
         assert!(publish(&cli, None).unwrap_err().message().contains("--bin"));

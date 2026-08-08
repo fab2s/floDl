@@ -1,8 +1,8 @@
 use crate::autograd::Variable;
-use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
+use crate::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
-use super::parameter::Parameter;
 use super::Module;
+use super::parameter::Parameter;
 
 /// Root Mean Square Layer Normalization.
 ///
@@ -24,7 +24,10 @@ impl RMSNorm {
 
     /// Create an RMSNorm on a specific device.
     pub fn on_device(size: i64, device: Device) -> Result<Self> {
-        let opts = TensorOptions { dtype: DType::Float32, device };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device,
+        };
         let weight = Variable::new(Tensor::ones(&[size], opts)?, true);
 
         Ok(RMSNorm {
@@ -44,7 +47,9 @@ impl RMSNorm {
 }
 
 impl Module for RMSNorm {
-    fn name(&self) -> &str { "rmsnorm" }
+    fn name(&self) -> &str {
+        "rmsnorm"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // RMS = sqrt(mean(x^2) + eps)

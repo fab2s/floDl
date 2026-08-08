@@ -19,10 +19,18 @@ use crate::style;
 
 /// Reserved top-level flags, always offered at every position.
 const TOP_FLAGS: &[&str] = &[
-    "--help", "-h", "--version", "-V",
+    "--help",
+    "-h",
+    "--version",
+    "-V",
     "--env",
-    "--ansi", "--no-ansi",
-    "-v", "-vv", "-vvv", "--quiet", "-q",
+    "--ansi",
+    "--no-ansi",
+    "-v",
+    "-vv",
+    "-vvv",
+    "--quiet",
+    "-q",
 ];
 
 /// The marker comment we use to detect our block in rc files.
@@ -234,7 +242,6 @@ impl BuiltinCommandData {
     }
 }
 
-
 impl CommandData {
     fn from_config(name: String, cfg: &CommandConfig) -> Self {
         // Split nested entries by kind so completions can treat presets
@@ -382,25 +389,22 @@ pub fn autocomplete(project: Option<(&ProjectConfig, &Path)>) {
         style::green("*"),
         style::bold(shell_name)
     );
-    eprintln!(
-        "{}  Target: {}",
-        style::green("*"),
-        style::bold(&rc_path)
-    );
+    eprintln!("{}  Target: {}", style::green("*"), style::bold(&rc_path));
 
     // Check if already installed.
     if let Ok(content) = std::fs::read_to_string(&rc_path)
-        && content.contains(MARKER) {
-            eprintln!(
-                "{}  Completions already installed. Updating...",
-                style::yellow("*")
-            );
-            let cleaned = remove_completion_block(&content);
-            if let Err(e) = std::fs::write(&rc_path, cleaned) {
-                cli_error!("cannot write {rc_path}: {e}");
-                return;
-            }
+        && content.contains(MARKER)
+    {
+        eprintln!(
+            "{}  Completions already installed. Updating...",
+            style::yellow("*")
+        );
+        let cleaned = remove_completion_block(&content);
+        if let Err(e) = std::fs::write(&rc_path, cleaned) {
+            cli_error!("cannot write {rc_path}: {e}");
+            return;
         }
+    }
 
     // Ensure target dir exists (needed for fish's config.fish).
     if let Some(parent) = std::path::Path::new(&rc_path).parent() {
@@ -433,10 +437,7 @@ pub fn autocomplete(project: Option<(&ProjectConfig, &Path)>) {
         }
     }
 
-    eprintln!(
-        "{}  Completions installed.",
-        style::green("*")
-    );
+    eprintln!("{}  Completions installed.", style::green("*"));
     eprintln!();
     eprintln!(
         "  Reload with: {}",
@@ -503,10 +504,7 @@ mod tests {
                 ty: "string".into(),
                 description: None,
                 default: None,
-                choices: Some(vec![
-                    serde_json::json!("mlp"),
-                    serde_json::json!("resnet"),
-                ]),
+                choices: Some(vec![serde_json::json!("mlp"), serde_json::json!("resnet")]),
                 short: Some("m".into()),
                 env: None,
                 completer: None,
@@ -567,7 +565,9 @@ mod tests {
             .iter()
             .find(|o| o.long == "model")
             .expect("model option present");
-        assert!(matches!(&model.value, ValueKind::Choices(cs) if cs == &vec!["mlp".to_string(), "resnet".into()]));
+        assert!(
+            matches!(&model.value, ValueKind::Choices(cs) if cs == &vec!["mlp".to_string(), "resnet".into()])
+        );
         let baseline = cmd
             .options
             .iter()
@@ -589,9 +589,14 @@ mod tests {
         let out = emit_bash(&data);
         assert!(out.contains("--model|-m"), "model|short flag present");
         assert!(out.contains("mlp resnet"), "choice values inlined");
-        assert!(out.contains("--baseline) COMPREPLY=($(compgen -f"), "path → file completion");
-        assert!(!out.contains("--validate)"),
-            "bool flags must not appear in value case (no value to complete)");
+        assert!(
+            out.contains("--baseline) COMPREPLY=($(compgen -f"),
+            "path → file completion"
+        );
+        assert!(
+            !out.contains("--validate)"),
+            "bool flags must not appear in value case (no value to complete)"
+        );
     }
 
     #[test]
@@ -703,8 +708,8 @@ mod tests {
         };
         let out = emit_bash(&data);
         assert!(
-            out.contains("quick helper nested") || out.contains("helper nested")
-                && out.contains("quick "),
+            out.contains("quick helper nested")
+                || out.contains("helper nested") && out.contains("quick "),
             "bash must include preset + sub-command tokens in position-2 word list"
         );
     }
@@ -724,7 +729,10 @@ mod tests {
 
         let fish = emit_fish(&data);
         assert!(fish.contains("-l 'help'"), "fish: help long flag missing");
-        assert!(fish.contains("-l 'version'"), "fish: version long flag missing");
+        assert!(
+            fish.contains("-l 'version'"),
+            "fish: version long flag missing"
+        );
         assert!(fish.contains("-s 'h'"), "fish: -h short missing");
     }
 
@@ -1038,9 +1046,8 @@ mod tests {
         );
         // eval's path option → file completion.
         assert!(
-            out.contains(
-                r#""${COMP_WORDS[$((2 + env_offset))]}" == "eval""#
-            ) && out.contains("--checkpoint) COMPREPLY=($(compgen -f"),
+            out.contains(r#""${COMP_WORDS[$((2 + env_offset))]}" == "eval""#)
+                && out.contains("--checkpoint) COMPREPLY=($(compgen -f"),
             "eval --checkpoint must offer file completion; got:\n{out}"
         );
     }

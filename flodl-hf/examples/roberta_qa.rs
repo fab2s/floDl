@@ -15,9 +15,7 @@
 use flodl_hf::models::roberta::RobertaForQuestionAnswering;
 
 fn main() -> flodl::Result<()> {
-    let qa = RobertaForQuestionAnswering::from_pretrained(
-        "deepset/roberta-base-squad2",
-    )?;
+    let qa = RobertaForQuestionAnswering::from_pretrained("deepset/roberta-base-squad2")?;
 
     let pairs = &[
         (
@@ -34,7 +32,10 @@ fn main() -> flodl::Result<()> {
     for ((q, c), a) in pairs.iter().zip(&answers) {
         println!("Q: {q}");
         println!("C: {c}");
-        println!("A: {:?}  (tokens [{}..={}], score={:.3})", a.text, a.start, a.end, a.score);
+        println!(
+            "A: {:?}  (tokens [{}..={}], score={:.3})",
+            a.text, a.start, a.end, a.score
+        );
         println!();
     }
     Ok(())

@@ -29,8 +29,8 @@ fn validate_tail_accepts_bool_flag() {
 fn validate_tail_strict_rejects_unknown_long_flag() {
     let schema = strict_schema_with_model_option();
     let tail = vec!["--nope".into()];
-    let err = validate_tail(&tail, &schema)
-        .expect_err("unknown long flag must error in strict mode");
+    let err =
+        validate_tail(&tail, &schema).expect_err("unknown long flag must error in strict mode");
     assert!(err.contains("--nope"), "err was: {err}");
 }
 
@@ -48,8 +48,7 @@ fn validate_tail_strict_suggests_did_you_mean() {
 fn validate_tail_strict_rejects_unknown_short_flag() {
     let schema = strict_schema_with_model_option();
     let tail = vec!["-z".into()];
-    let err = validate_tail(&tail, &schema)
-        .expect_err("unknown short must error in strict mode");
+    let err = validate_tail(&tail, &schema).expect_err("unknown short must error in strict mode");
     assert!(err.contains("-z"), "err was: {err}");
 }
 
@@ -57,10 +56,12 @@ fn validate_tail_strict_rejects_unknown_short_flag() {
 fn validate_tail_rejects_bad_choice_always_strict() {
     let schema = strict_schema_with_model_option();
     let tail = vec!["--model".into(), "lenet".into()];
-    let err = validate_tail(&tail, &schema)
-        .expect_err("out-of-set choice must error");
+    let err = validate_tail(&tail, &schema).expect_err("out-of-set choice must error");
     assert!(err.contains("lenet"), "err was: {err}");
-    assert!(err.contains("allowed"), "err should list allowed values: {err}");
+    assert!(
+        err.contains("allowed"),
+        "err should list allowed values: {err}"
+    );
 }
 
 #[test]
@@ -71,10 +72,13 @@ fn validate_tail_rejects_bad_choice_even_when_not_strict() {
     // strict.
     let schema = schema_with_model_option(false);
     let tail = vec!["--model".into(), "lenet".into()];
-    let err = validate_tail(&tail, &schema)
-        .expect_err("out-of-set choice must error without strict");
+    let err =
+        validate_tail(&tail, &schema).expect_err("out-of-set choice must error without strict");
     assert!(err.contains("lenet"), "err was: {err}");
-    assert!(err.contains("allowed"), "err should list allowed values: {err}");
+    assert!(
+        err.contains("allowed"),
+        "err should list allowed values: {err}"
+    );
 }
 
 #[test]
@@ -83,8 +87,7 @@ fn validate_tail_non_strict_tolerates_unknown_flag() {
     // candidates (the binary handles them itself).
     let schema = schema_with_model_option(false);
     let tail = vec!["--fancy-passthrough".into(), "value".into()];
-    validate_tail(&tail, &schema)
-        .expect("unknown flag must be tolerated when strict is off");
+    validate_tail(&tail, &schema).expect("unknown flag must be tolerated when strict is off");
 }
 
 #[test]
@@ -94,8 +97,7 @@ fn validate_tail_non_strict_still_checks_known_short_choices() {
     // once the user reaches a declared option, its contract holds.
     let schema = schema_with_model_option(false);
     let tail = vec!["-m".into(), "lenet".into()];
-    let err = validate_tail(&tail, &schema)
-        .expect_err("out-of-set choice via short must error");
+    let err = validate_tail(&tail, &schema).expect_err("out-of-set choice via short must error");
     assert!(err.contains("lenet"), "err was: {err}");
 }
 
@@ -125,7 +127,6 @@ fn validate_tail_passthrough_after_double_dash() {
     let tail = vec!["--".into(), "--arbitrary".into(), "anything".into()];
     validate_tail(&tail, &schema).expect("passthrough must work");
 }
-
 
 // ── Tree (variant-shaped) tail validation ───────────────────────────
 
@@ -159,8 +160,8 @@ fn validate_tail_descends_into_subcommand_leaf() {
 #[test]
 fn validate_tail_rejects_unknown_subcommand_with_suggestion() {
     let schema = strict_tree_schema();
-    let err = validate_tail(&["trian".into()], &schema)
-        .expect_err("misspelled subcommand must fail");
+    let err =
+        validate_tail(&["trian".into()], &schema).expect_err("misspelled subcommand must fail");
     assert!(err.contains("did you mean `train`"), "got: {err}");
 }
 
@@ -186,11 +187,8 @@ fn validate_tail_defers_when_option_precedes_subcommand() {
     // `42` is not a subcommand); defer to the binary's authoritative parse
     // rather than mistake the option value for the command.
     let schema = strict_tree_schema();
-    validate_tail(
-        &["--seed".into(), "42".into(), "train".into()],
-        &schema,
-    )
-    .expect("a leading option before the subcommand must defer, not error");
+    validate_tail(&["--seed".into(), "42".into(), "train".into()], &schema)
+        .expect("a leading option before the subcommand must defer, not error");
 }
 
 #[test]
@@ -226,8 +224,7 @@ fn validate_presets_strict_accepts_known_options() {
             ..Default::default()
         },
     );
-    validate_presets_strict(&commands, &schema)
-        .expect("presets with declared options must pass");
+    validate_presets_strict(&commands, &schema).expect("presets with declared options must pass");
 }
 
 #[test]
@@ -271,8 +268,8 @@ fn validate_preset_values_rejects_bad_choice_even_without_strict() {
             ..Default::default()
         },
     );
-    let err = validate_preset_values(&commands, &schema)
-        .expect_err("out-of-choices preset must error");
+    let err =
+        validate_preset_values(&commands, &schema).expect_err("out-of-choices preset must error");
     assert!(err.contains("quick"), "preset name missing: {err}");
     assert!(err.contains("model"), "option name missing: {err}");
     assert!(err.contains("lenet"), "bad value missing: {err}");
@@ -292,8 +289,7 @@ fn validate_preset_values_accepts_in_choices_preset() {
             ..Default::default()
         },
     );
-    validate_preset_values(&commands, &schema)
-        .expect("in-choices preset must pass");
+    validate_preset_values(&commands, &schema).expect("in-choices preset must pass");
 }
 
 #[test]
@@ -330,6 +326,5 @@ fn validate_preset_values_ignores_options_without_choices() {
             ..Default::default()
         },
     );
-    validate_preset_values(&commands, &schema)
-        .expect("no-choices option must accept any value");
+    validate_preset_values(&commands, &schema).expect("no-choices option must accept any value");
 }

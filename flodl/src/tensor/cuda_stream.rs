@@ -25,8 +25,8 @@ use std::ptr;
 
 use flodl_sys as ffi;
 
-use crate::tensor::{check_err, Device, Result, TensorError};
 use super::cuda_event::GpuEvent;
+use crate::tensor::{Device, Result, TensorError, check_err};
 
 /// A CUDA stream obtained from the libtorch stream pool.
 ///
@@ -47,16 +47,11 @@ impl GpuStream {
     pub fn new(device: Device, high_priority: bool) -> Result<Self> {
         let device_index = match device {
             Device::CUDA(idx) => idx as i32,
-            Device::CPU => {
-                return Err(TensorError::new(
-                    "GpuStream requires a CUDA device",
-                ))
-            }
+            Device::CPU => return Err(TensorError::new("GpuStream requires a CUDA device")),
         };
         let mut ptr: *mut c_void = ptr::null_mut();
-        let err = unsafe {
-            ffi::flodl_gpu_stream_new(device_index, high_priority as i32, &mut ptr)
-        };
+        let err =
+            unsafe { ffi::flodl_gpu_stream_new(device_index, high_priority as i32, &mut ptr) };
         check_err(err)?;
         Ok(GpuStream { ptr, device_index })
     }
@@ -70,9 +65,7 @@ impl GpuStream {
     /// Make this stream wait for a recorded event before executing any
     /// further work. Does not block the CPU.
     pub fn wait_event(&self, event: &GpuEvent) -> Result<()> {
-        let err = unsafe {
-            ffi::flodl_gpu_stream_wait_event(self.ptr, event.as_ptr())
-        };
+        let err = unsafe { ffi::flodl_gpu_stream_wait_event(self.ptr, event.as_ptr()) };
         check_err(err)
     }
 
@@ -88,11 +81,7 @@ impl GpuStream {
     pub fn current(device: Device) -> Result<Self> {
         let device_index = match device {
             Device::CUDA(idx) => idx as i32,
-            Device::CPU => {
-                return Err(TensorError::new(
-                    "GpuStream requires a CUDA device",
-                ))
-            }
+            Device::CPU => return Err(TensorError::new("GpuStream requires a CUDA device")),
         };
         let ptr = unsafe { ffi::flodl_gpu_stream_get_current(device_index) };
         if ptr.is_null() {
@@ -177,8 +166,8 @@ impl Drop for StreamGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cuda_event::GpuEventFlags;
+    use super::*;
     use crate::tensor::{Tensor, test_device, test_opts};
 
     use std::sync::Mutex;
@@ -257,8 +246,10 @@ mod tests {
 
         let vals = cpu_copy.to_f32_vec().unwrap();
         assert_eq!(vals.len(), 128);
-        assert!(vals.iter().all(|&v| (v - 42.0).abs() < 1e-5),
-            "async copy should preserve values");
+        assert!(
+            vals.iter().all(|&v| (v - 42.0).abs() < 1e-5),
+            "async copy should preserve values"
+        );
     }
 
     #[test]
@@ -293,7 +284,9 @@ mod tests {
         stream_b.synchronize().unwrap();
 
         let vals = doubled.to_f32_vec().unwrap();
-        assert!(vals.iter().all(|&v| (v - 14.0).abs() < 1e-5),
-            "cross-stream result should be 14.0");
+        assert!(
+            vals.iter().all(|&v| (v - 14.0).abs() < 1e-5),
+            "cross-stream result should be 14.0"
+        );
     }
 }

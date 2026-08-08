@@ -91,11 +91,11 @@ mod vendor;
 
 pub use amd::{rocm_runtime_lib_dir, rocm_runtime_root};
 pub use gpu::{
-    detect_gpus, detect_gpus_for, detect_gpus_physical, survey, survey_visible, survey_visible_for,
-    GpuInfo,
+    GpuInfo, detect_gpus, detect_gpus_for, detect_gpus_physical, survey, survey_visible,
+    survey_visible_for,
 };
-pub use mem::{cpu_package_count, mem_info, MemInfo};
+pub use mem::{MemInfo, cpu_package_count, mem_info};
 pub use nvidia::nvidia_driver_version;
 pub use report::{GpuSurvey, NoteKind, SurveyNote};
 pub use testing::ENV_TESTING_GPU_JSON;
-pub use vendor::{classify_variant_label, GpuArch, GpuVendor, VariantClass};
+pub use vendor::{GpuArch, GpuVendor, VariantClass, classify_variant_label};

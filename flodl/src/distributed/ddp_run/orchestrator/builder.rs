@@ -12,14 +12,13 @@ use crate::data::BatchDataSet;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor};
 
-use crate::distributed::ddp_run::{
-    ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard, DdpRunConfig,
-    EpochCallbackPolicy, EpochFn, EpochMetrics, EvalCadence, EvalFn, EvalResultFn, RankCallbacks,
-    MetricsFn, SchedulerFn,
-};
-use crate::distributed::ddp_run::worker::GpuWorker;
 use super::DdpHandle;
-
+use crate::distributed::ddp_run::worker::GpuWorker;
+use crate::distributed::ddp_run::{
+    ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard, DdpRunConfig, EpochCallbackPolicy,
+    EpochFn, EpochMetrics, EvalCadence, EvalFn, EvalResultFn, MetricsFn, RankCallbacks,
+    SchedulerFn,
+};
 
 // ---------------------------------------------------------------------------
 // DdpBuilder
@@ -484,12 +483,12 @@ where
     pub fn transform(
         mut self,
         f: impl Fn(
-                Vec<crate::tensor::Tensor>,
-                &[crate::data::PickKey],
-            ) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
-            + Send
-            + Sync
-            + 'static,
+            Vec<crate::tensor::Tensor>,
+            &[crate::data::PickKey],
+        ) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.config = self.config.with_transform(f);
         self
@@ -792,10 +791,7 @@ where
     /// Override the epoch-callback policy (which rank fires user
     /// callbacks). Default: `Fastest`. Mirrors
     /// [`DdpRunConfig::with_epoch_callback_policy`].
-    pub fn epoch_callback_policy(
-        mut self,
-        policy: EpochCallbackPolicy,
-    ) -> Self {
+    pub fn epoch_callback_policy(mut self, policy: EpochCallbackPolicy) -> Self {
         self.config = self.config.with_epoch_callback_policy(policy);
         self
     }
@@ -919,9 +915,7 @@ where
     /// the config, and reconcile the canonical `ElCheMode`. Returns the three
     /// extracted values; the builder's remaining fields flow into the chosen
     /// entry point.
-    fn finalize_and_extract(
-        &mut self,
-    ) -> Result<(Arc<dyn BatchDataSet>, usize, usize)> {
+    fn finalize_and_extract(&mut self) -> Result<(Arc<dyn BatchDataSet>, usize, usize)> {
         // Programmatic cluster: the single promotion site. Converts
         // `self.cluster` to the FLODL_INTERNAL_FULL_CLUSTER_JSON env contract
         // fdl-cli uses, so the dispatch below sees Role::Launcher exactly as if
@@ -932,7 +926,10 @@ where
         if let Some(full) = &self.cluster {
             crate::distributed::launcher::promote_programmatic_cluster(full);
         }
-        let dataset = self.dataset.take().expect("DdpBuilder: dataset is required");
+        let dataset = self
+            .dataset
+            .take()
+            .expect("DdpBuilder: dataset is required");
         let batch_size = self.batch_size.expect("DdpBuilder: batch_size is required");
         // `num_epochs` is the user's count of DATA PASSES; everything below
         // this line counts EPOCHS, and under `epoch_splits` an epoch is a
@@ -982,11 +979,12 @@ where
         }
         // easgd_alpha: blend factor semantics require (0, 1].
         if let Some(alpha) = self.config.elche.easgd_alpha
-            && !(alpha > 0.0 && alpha <= 1.0) {
-                return Err(crate::tensor::TensorError::new(&format!(
-                    "DdpBuilder: easgd_alpha must be in (0, 1], got {alpha}"
-                )));
-            }
+            && !(alpha > 0.0 && alpha <= 1.0)
+        {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "DdpBuilder: easgd_alpha must be in (0, 1], got {alpha}"
+            )));
+        }
         // gamma: the consensus allocation-weighting exponent must be
         // finite. Wired on BOTH backends: the CPU path applies it in the
         // cluster-worker bridge's frame weighting; the NCCL path folds it
@@ -1015,8 +1013,7 @@ where
         // there. Keeps the default in ONE place (`default_for`).
         if self.config.elche.easgd_alpha.is_none() {
             self.config.elche.easgd_alpha =
-                crate::distributed::ElCheConfig::default_for(self.config.elche.mode)
-                    .easgd_alpha;
+                crate::distributed::ElCheConfig::default_for(self.config.elche.mode).easgd_alpha;
         }
 
         // bf16_wire is a CPU-averaging-plane knob; the NCCL reduce never

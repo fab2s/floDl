@@ -25,7 +25,9 @@ impl Identity {
 }
 
 impl Module for Identity {
-    fn name(&self) -> &str { "identity" }
+    fn name(&self) -> &str {
+        "identity"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(input.clone())
@@ -49,7 +51,9 @@ impl ReLU {
 }
 
 impl Module for ReLU {
-    fn name(&self) -> &str { "relu" }
+    fn name(&self) -> &str {
+        "relu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.relu()
@@ -73,7 +77,9 @@ impl Sigmoid {
 }
 
 impl Module for Sigmoid {
-    fn name(&self) -> &str { "sigmoid" }
+    fn name(&self) -> &str {
+        "sigmoid"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.sigmoid()
@@ -97,7 +103,9 @@ impl Tanh {
 }
 
 impl Module for Tanh {
-    fn name(&self) -> &str { "tanh" }
+    fn name(&self) -> &str {
+        "tanh"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.tanh()
@@ -170,7 +178,9 @@ impl GELU {
     /// Erf-form GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`. The default,
     /// matching PyTorch `nn.GELU()` and HuggingFace `hidden_act="gelu"`.
     pub const fn exact() -> Self {
-        Self { approximate: GeluApprox::Exact }
+        Self {
+            approximate: GeluApprox::Exact,
+        }
     }
 
     /// Tanh-approximation GELU:
@@ -179,7 +189,9 @@ impl GELU {
     /// `hidden_act` in {`"gelu_new"`, `"gelu_pytorch_tanh"`} — required
     /// for ALBERT, GPT-2, and derivative checkpoints.
     pub const fn tanh() -> Self {
-        Self { approximate: GeluApprox::Tanh }
+        Self {
+            approximate: GeluApprox::Tanh,
+        }
     }
 
     /// Build a GELU module with a runtime-chosen [`GeluApprox`].
@@ -204,7 +216,9 @@ impl GELU {
 pub const GELU: GELU = GELU::exact();
 
 impl Module for GELU {
-    fn name(&self) -> &str { "gelu" }
+    fn name(&self) -> &str {
+        "gelu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         match self.approximate {
@@ -232,7 +246,9 @@ impl SiLU {
 }
 
 impl Module for SiLU {
-    fn name(&self) -> &str { "silu" }
+    fn name(&self) -> &str {
+        "silu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.silu()
@@ -301,7 +317,9 @@ impl SwiGLU {
 }
 
 impl Module for SwiGLU {
-    fn name(&self) -> &str { "swiglu" }
+    fn name(&self) -> &str {
+        "swiglu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let shape = input.shape();
@@ -326,7 +344,9 @@ pub struct LeakyReLU {
 
 impl Default for LeakyReLU {
     fn default() -> Self {
-        LeakyReLU { negative_slope: 0.01 }
+        LeakyReLU {
+            negative_slope: 0.01,
+        }
     }
 }
 
@@ -338,7 +358,9 @@ impl LeakyReLU {
 }
 
 impl Module for LeakyReLU {
-    fn name(&self) -> &str { "leaky_relu" }
+    fn name(&self) -> &str {
+        "leaky_relu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.leaky_relu(self.negative_slope)
@@ -364,7 +386,9 @@ impl ELU {
 }
 
 impl Module for ELU {
-    fn name(&self) -> &str { "elu" }
+    fn name(&self) -> &str {
+        "elu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.elu(self.alpha)
@@ -380,7 +404,10 @@ pub struct Softplus {
 
 impl Default for Softplus {
     fn default() -> Self {
-        Softplus { beta: 1.0, threshold: 20.0 }
+        Softplus {
+            beta: 1.0,
+            threshold: 20.0,
+        }
     }
 }
 
@@ -392,7 +419,9 @@ impl Softplus {
 }
 
 impl Module for Softplus {
-    fn name(&self) -> &str { "softplus" }
+    fn name(&self) -> &str {
+        "softplus"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.softplus(self.beta, self.threshold)
@@ -416,7 +445,9 @@ impl Mish {
 }
 
 impl Module for Mish {
-    fn name(&self) -> &str { "mish" }
+    fn name(&self) -> &str {
+        "mish"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.mish()
@@ -436,7 +467,9 @@ impl Softmax {
 }
 
 impl Module for Softmax {
-    fn name(&self) -> &str { "softmax" }
+    fn name(&self) -> &str {
+        "softmax"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.softmax(self.dim)
@@ -456,7 +489,9 @@ impl LogSoftmax {
 }
 
 impl Module for LogSoftmax {
-    fn name(&self) -> &str { "log_softmax" }
+    fn name(&self) -> &str {
+        "log_softmax"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.log_softmax(self.dim)
@@ -472,7 +507,10 @@ pub struct Flatten {
 
 impl Default for Flatten {
     fn default() -> Self {
-        Flatten { start_dim: 1, end_dim: -1 }
+        Flatten {
+            start_dim: 1,
+            end_dim: -1,
+        }
     }
 }
 
@@ -484,7 +522,9 @@ impl Flatten {
 }
 
 impl Module for Flatten {
-    fn name(&self) -> &str { "flatten" }
+    fn name(&self) -> &str {
+        "flatten"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.flatten(self.start_dim, self.end_dim)
@@ -510,7 +550,9 @@ impl SELU {
 }
 
 impl Module for SELU {
-    fn name(&self) -> &str { "selu" }
+    fn name(&self) -> &str {
+        "selu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.selu()
@@ -535,7 +577,9 @@ impl Hardswish {
 }
 
 impl Module for Hardswish {
-    fn name(&self) -> &str { "hardswish" }
+    fn name(&self) -> &str {
+        "hardswish"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.hardswish()
@@ -560,7 +604,9 @@ impl Hardsigmoid {
 }
 
 impl Module for Hardsigmoid {
-    fn name(&self) -> &str { "hardsigmoid" }
+    fn name(&self) -> &str {
+        "hardsigmoid"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.hardsigmoid()
@@ -576,10 +622,14 @@ pub struct PReLU {
 impl PReLU {
     /// Create a PReLU with `num_parameters` learnable weights (1 for shared, C for per-channel).
     pub fn new(num_parameters: i64, device: crate::tensor::Device) -> Result<Self> {
-        let init = crate::tensor::Tensor::full(&[num_parameters], 0.25, crate::tensor::TensorOptions {
-            dtype: crate::tensor::DType::Float32,
-            device,
-        })?;
+        let init = crate::tensor::Tensor::full(
+            &[num_parameters],
+            0.25,
+            crate::tensor::TensorOptions {
+                dtype: crate::tensor::DType::Float32,
+                device,
+            },
+        )?;
         Ok(Self {
             weight: Parameter::new(init, "weight"),
         })
@@ -592,7 +642,9 @@ impl PReLU {
 }
 
 impl Module for PReLU {
-    fn name(&self) -> &str { "prelu" }
+    fn name(&self) -> &str {
+        "prelu"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.prelu(&self.weight.variable)
@@ -624,7 +676,10 @@ mod tests {
         assert!((got[1] - 2.0 * silu(4.0)).abs() < 1e-5, "got {got:?}");
         // The swapped reading would be [3*silu(1), 4*silu(2)] — check we are
         // not accidentally that, since both are plausible-looking outputs.
-        assert!((got[0] - 3.0 * silu(1.0)).abs() > 1e-3, "value/gate are swapped");
+        assert!(
+            (got[0] - 3.0 * silu(1.0)).abs() > 1e-3,
+            "value/gate are swapped"
+        );
     }
 
     #[test]
@@ -643,11 +698,27 @@ mod tests {
     fn test_swiglu_backward_reaches_both_halves() {
         let t = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], test_device()).unwrap();
         let x = Variable::new(t, true);
-        SwiGLU.forward(&x).unwrap().sum().unwrap().backward().unwrap();
-        let g = x.grad().expect("input must receive a gradient").to_f32_vec().unwrap();
+        SwiGLU
+            .forward(&x)
+            .unwrap()
+            .sum()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let g = x
+            .grad()
+            .expect("input must receive a gradient")
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(g.len(), 4);
-        assert!(g[0].abs() > 1e-6 && g[1].abs() > 1e-6, "value half unreached: {g:?}");
-        assert!(g[2].abs() > 1e-6 && g[3].abs() > 1e-6, "gate half unreached: {g:?}");
+        assert!(
+            g[0].abs() > 1e-6 && g[1].abs() > 1e-6,
+            "value half unreached: {g:?}"
+        );
+        assert!(
+            g[2].abs() > 1e-6 && g[3].abs() > 1e-6,
+            "gate half unreached: {g:?}"
+        );
     }
 
     #[test]
@@ -724,8 +795,10 @@ mod tests {
         let m = Flatten::default();
         let t = Tensor::from_f32(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 2, 2], test_device(),
-        ).unwrap();
+            &[2, 2, 2],
+            test_device(),
+        )
+        .unwrap();
         let x = Variable::new(t, false);
         let y = m.forward(&x).unwrap();
         assert_eq!(y.data().shape(), vec![2, 4]); // batch dim preserved

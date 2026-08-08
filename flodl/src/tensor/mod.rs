@@ -12,9 +12,9 @@
 mod cuda;
 pub mod cuda_event;
 pub mod cuda_stream;
+mod nn_ops;
 mod ops;
 mod shape;
-mod nn_ops;
 
 pub use cuda::*;
 pub use cuda_event::{GpuEvent, GpuEventFlags};
@@ -25,19 +25,19 @@ pub use cuda_stream::{GpuStream, StreamGuard};
 // `crate::compat`.
 #[allow(deprecated)]
 pub use crate::compat::{
-    cuda_active_bytes, cuda_active_bytes_idx, cuda_allocated_bytes, cuda_allocated_bytes_idx,
-    cuda_available, cuda_device_count, cuda_device_name, cuda_device_name_idx, cuda_devices,
-    cuda_empty_cache, cuda_has_primary_context, cuda_manual_seed_all, cuda_memory_info,
-    cuda_memory_info_idx, cuda_nvml_memory_info_idx, cuda_peak_active_bytes,
-    cuda_peak_active_bytes_idx, cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx,
-    cuda_reset_peak_stats, cuda_reset_peak_stats_idx, cuda_synchronize, cuda_utilization,
-    cuda_utilization_idx, current_cuda_device, set_current_cuda_device, usable_cuda_devices,
-    CudaEvent, CudaEventFlags, CudaStream,
+    CudaEvent, CudaEventFlags, CudaStream, cuda_active_bytes, cuda_active_bytes_idx,
+    cuda_allocated_bytes, cuda_allocated_bytes_idx, cuda_available, cuda_device_count,
+    cuda_device_name, cuda_device_name_idx, cuda_devices, cuda_empty_cache,
+    cuda_has_primary_context, cuda_manual_seed_all, cuda_memory_info, cuda_memory_info_idx,
+    cuda_nvml_memory_info_idx, cuda_peak_active_bytes, cuda_peak_active_bytes_idx,
+    cuda_peak_reserved_bytes, cuda_peak_reserved_bytes_idx, cuda_reset_peak_stats,
+    cuda_reset_peak_stats_idx, cuda_synchronize, cuda_utilization, cuda_utilization_idx,
+    current_cuda_device, set_current_cuda_device, usable_cuda_devices,
 };
 
 pub use nn_ops::RnnParams;
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -357,7 +357,8 @@ impl Tensor {
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 opts.dtype as i32,
-                dt, di,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -379,7 +380,8 @@ impl Tensor {
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 opts.dtype as i32,
-                dt, di,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -395,21 +397,39 @@ impl Tensor {
     /// assert_eq!(t.shape(), vec![2, 2]);
     /// ```
     pub fn from_f32(data: &[f32], shape: &[i64], device: Device) -> Result<Self> {
-        Self::from_blob_impl("Tensor::from_f32", typed_bytes(data), shape, DType::Float32, device)
+        Self::from_blob_impl(
+            "Tensor::from_f32",
+            typed_bytes(data),
+            shape,
+            DType::Float32,
+            device,
+        )
     }
 
     /// Create a Float64 tensor from f64 data. Use when full double precision
     /// is needed (e.g. loss accumulation, high-precision metrics).
     /// `data.len()` must equal the shape product; a mismatch is a loud error.
     pub fn from_f64(data: &[f64], shape: &[i64], device: Device) -> Result<Self> {
-        Self::from_blob_impl("Tensor::from_f64", typed_bytes(data), shape, DType::Float64, device)
+        Self::from_blob_impl(
+            "Tensor::from_f64",
+            typed_bytes(data),
+            shape,
+            DType::Float64,
+            device,
+        )
     }
 
     /// Create an Int64 tensor from i64 data. Commonly used for class labels,
     /// token indices, and any integer indexing (e.g. `cross_entropy_loss` targets).
     /// `data.len()` must equal the shape product; a mismatch is a loud error.
     pub fn from_i64(data: &[i64], shape: &[i64], device: Device) -> Result<Self> {
-        Self::from_blob_impl("Tensor::from_i64", typed_bytes(data), shape, DType::Int64, device)
+        Self::from_blob_impl(
+            "Tensor::from_i64",
+            typed_bytes(data),
+            shape,
+            DType::Int64,
+            device,
+        )
     }
 
     /// Construct a tensor from raw little-endian host bytes at the
@@ -438,7 +458,10 @@ impl Tensor {
     ) -> Result<Self> {
         let numel = shape
             .iter()
-            .try_fold(1i64, |acc, &d| if d < 0 { None } else { acc.checked_mul(d) })
+            .try_fold(
+                1i64,
+                |acc, &d| if d < 0 { None } else { acc.checked_mul(d) },
+            )
             .ok_or_else(|| {
                 TensorError::new(&format!(
                     "{ctx}: invalid shape {shape:?} (negative or overflowing dimension)"
@@ -468,7 +491,8 @@ impl Tensor {
                 shape.as_mut_ptr(),
                 shape.len() as i32,
                 dtype as i32,
-                dt, di,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -512,8 +536,11 @@ impl Tensor {
         let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_rand(
-                shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, dt, di,
+                shape.as_mut_ptr(),
+                shape.len() as i32,
+                opts.dtype as i32,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -528,8 +555,11 @@ impl Tensor {
         let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_randn(
-                shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, dt, di,
+                shape.as_mut_ptr(),
+                shape.len() as i32,
+                opts.dtype as i32,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -554,9 +584,8 @@ impl Tensor {
     pub fn arange(start: f64, end: f64, step: f64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let (dt, di) = opts.device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_arange(start, end, step, opts.dtype as i32, dt, di, &mut handle)
-        };
+        let err =
+            unsafe { ffi::flodl_arange(start, end, step, opts.dtype as i32, dt, di, &mut handle) };
         check_err(err)?;
         Ok(Self::from_raw(handle))
     }
@@ -565,9 +594,7 @@ impl Tensor {
     pub fn eye(n: i64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let (dt, di) = opts.device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_eye(n, opts.dtype as i32, dt, di, &mut handle)
-        };
+        let err = unsafe { ffi::flodl_eye(n, opts.dtype as i32, dt, di, &mut handle) };
         check_err(err)?;
         Ok(Self::from_raw(handle))
     }
@@ -579,8 +606,13 @@ impl Tensor {
         let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_full(
-                shape.as_mut_ptr(), shape.len() as i32, value,
-                opts.dtype as i32, dt, di, &mut handle,
+                shape.as_mut_ptr(),
+                shape.len() as i32,
+                value,
+                opts.dtype as i32,
+                dt,
+                di,
+                &mut handle,
             )
         };
         check_err(err)?;
@@ -591,9 +623,7 @@ impl Tensor {
     pub fn randperm(n: i64, opts: TensorOptions) -> Result<Self> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let (dt, di) = opts.device.to_ffi();
-        let err = unsafe {
-            ffi::flodl_randperm(n, opts.dtype as i32, dt, di, &mut handle)
-        };
+        let err = unsafe { ffi::flodl_randperm(n, opts.dtype as i32, dt, di, &mut handle) };
         check_err(err)?;
         Ok(Self::from_raw(handle))
     }
@@ -605,9 +635,13 @@ impl Tensor {
         let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_randint(
-                low, high,
-                shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, dt, di,
+                low,
+                high,
+                shape.as_mut_ptr(),
+                shape.len() as i32,
+                opts.dtype as i32,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -623,8 +657,11 @@ impl Tensor {
         let (dt, di) = opts.device.to_ffi();
         let err = unsafe {
             ffi::flodl_empty(
-                shape.as_mut_ptr(), shape.len() as i32,
-                opts.dtype as i32, dt, di,
+                shape.as_mut_ptr(),
+                shape.len() as i32,
+                opts.dtype as i32,
+                dt,
+                di,
                 &mut handle,
             )
         };
@@ -705,9 +742,8 @@ impl Tensor {
         let n = self.numel() as usize;
         let mut buf = vec![0f32; n];
         let bytes = (n * 4) as i64;
-        let err = unsafe {
-            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes)
-        };
+        let err =
+            unsafe { ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes) };
         check_err(err)?;
         Ok(buf)
     }
@@ -741,9 +777,8 @@ impl Tensor {
         let n = self.numel() as usize;
         let mut buf = vec![0.0f64; n];
         let bytes = (n * 8) as i64;
-        let err = unsafe {
-            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes)
-        };
+        let err =
+            unsafe { ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes) };
         check_err(err)?;
         Ok(buf)
     }
@@ -758,9 +793,8 @@ impl Tensor {
         let n = self.numel() as usize;
         let mut buf = vec![0i64; n];
         let bytes = (n * 8) as i64;
-        let err = unsafe {
-            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes)
-        };
+        let err =
+            unsafe { ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, bytes) };
         check_err(err)?;
         Ok(buf)
     }
@@ -780,7 +814,8 @@ impl Tensor {
         if self.numel() != 1 {
             return Err(TensorError::new(&format!(
                 "item() requires exactly 1 element, got {} (shape {:?})",
-                self.numel(), self.shape()
+                self.numel(),
+                self.shape()
             )));
         }
         if self.dtype() != DType::Float64 {
@@ -790,9 +825,7 @@ impl Tensor {
             return self.to_dtype(DType::Float64)?.item();
         }
         let mut buf = [0.0f64; 1];
-        let err = unsafe {
-            ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, 8)
-        };
+        let err = unsafe { ffi::flodl_copy_data(self.handle, buf.as_mut_ptr() as *mut c_void, 8) };
         check_err(err)?;
         Ok(buf[0])
     }
@@ -852,9 +885,7 @@ impl Tensor {
     /// guards the block against the ALLOCATION stream and can hand the
     /// freed block to a new allocation that overwrites it mid-read.
     pub fn record_stream(&self, stream: &crate::tensor::cuda_stream::GpuStream) -> Result<()> {
-        let err = unsafe {
-            ffi::flodl_tensor_record_stream(self.handle, stream.as_ptr())
-        };
+        let err = unsafe { ffi::flodl_tensor_record_stream(self.handle, stream.as_ptr()) };
         check_err(err)
     }
 
@@ -889,7 +920,9 @@ impl Tensor {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe { ffi::flodl_grad(self.handle, &mut handle) };
         if !err.is_null() {
-            let msg = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+            let msg = unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { ffi::flodl_free_string(err) };
             panic!("Tensor::grad failed: {msg}");
         }
@@ -1084,14 +1117,29 @@ impl Tensor {
     /// - `weight_decay` — 0.0 for Adam, >0 for AdamW (decoupled)
     /// - `step` — timestep for bias correction
     pub fn adam_step(
-        &self, grad: &Tensor, m: &Tensor, v: &Tensor,
-        lr: f64, beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        &self,
+        grad: &Tensor,
+        m: &Tensor,
+        v: &Tensor,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        step: i64,
     ) -> Result<()> {
         let err = unsafe {
             ffi::flodl_adam_step(
-                self.handle, grad.handle, m.handle, v.handle,
-                lr, beta1, beta2, eps, weight_decay, step,
+                self.handle,
+                grad.handle,
+                m.handle,
+                v.handle,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                step,
             )
         };
         check_err(err)
@@ -1101,9 +1149,16 @@ impl Tensor {
     /// Eliminates per-param FFI overhead. `lrs[i]` supports per-group LR.
     #[allow(clippy::too_many_arguments)]
     pub fn adam_step_batched(
-        params: &[Tensor], grads: &[Tensor], ms: &[Tensor], vs: &[Tensor],
-        lrs: &mut [f64], beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, step: i64,
+        params: &[Tensor],
+        grads: &[Tensor],
+        ms: &[Tensor],
+        vs: &[Tensor],
+        lrs: &mut [f64],
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        step: i64,
     ) -> Result<()> {
         let count = params.len() as i32;
         let mut p_handles: Vec<FlodlTensor> = params.iter().map(|t| t.handle).collect();
@@ -1112,10 +1167,17 @@ impl Tensor {
         let mut v_handles: Vec<FlodlTensor> = vs.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_adam_step_batched(
-                p_handles.as_mut_ptr(), g_handles.as_mut_ptr(),
-                m_handles.as_mut_ptr(), v_handles.as_mut_ptr(),
-                lrs.as_mut_ptr(), count,
-                beta1, beta2, eps, weight_decay, step,
+                p_handles.as_mut_ptr(),
+                g_handles.as_mut_ptr(),
+                m_handles.as_mut_ptr(),
+                v_handles.as_mut_ptr(),
+                lrs.as_mut_ptr(),
+                count,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                step,
             )
         };
         check_err(err)
@@ -1137,16 +1199,27 @@ impl Tensor {
     /// - `grad_scale` / `found_inf`: pass `None` to skip mixed-precision integration.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_adam_(
-        params: &[Tensor], grads: &[Tensor], exp_avgs: &[Tensor], exp_avg_sqs: &[Tensor],
-        lr: f64, beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, steps: &[i64],
-        grad_scale: Option<&Tensor>, found_inf: Option<&Tensor>,
+        params: &[Tensor],
+        grads: &[Tensor],
+        exp_avgs: &[Tensor],
+        exp_avg_sqs: &[Tensor],
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        steps: &[i64],
+        grad_scale: Option<&Tensor>,
+        found_inf: Option<&Tensor>,
     ) -> Result<()> {
-        if params.is_empty() { return Ok(()); }
+        if params.is_empty() {
+            return Ok(());
+        }
         if steps.len() != params.len() {
             return Err(TensorError::new(&format!(
                 "fused_adam_: steps length {} does not match params length {}",
-                steps.len(), params.len()
+                steps.len(),
+                params.len()
             )));
         }
         let count = params.len() as i32;
@@ -1158,8 +1231,19 @@ impl Tensor {
         let fi = found_inf.map_or(ptr::null_mut(), |t| t.handle);
         let err = unsafe {
             ffi::flodl_fused_adam_(
-                p.as_mut_ptr(), g.as_mut_ptr(), m.as_mut_ptr(), v.as_mut_ptr(),
-                count, lr, beta1, beta2, eps, weight_decay, steps.as_ptr(), gs, fi,
+                p.as_mut_ptr(),
+                g.as_mut_ptr(),
+                m.as_mut_ptr(),
+                v.as_mut_ptr(),
+                count,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                steps.as_ptr(),
+                gs,
+                fi,
             )
         };
         check_err(err)
@@ -1172,16 +1256,27 @@ impl Tensor {
     /// With `weight_decay = 0.0`, identical to `fused_adam_`.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_adamw_(
-        params: &[Tensor], grads: &[Tensor], exp_avgs: &[Tensor], exp_avg_sqs: &[Tensor],
-        lr: f64, beta1: f64, beta2: f64, eps: f64,
-        weight_decay: f64, steps: &[i64],
-        grad_scale: Option<&Tensor>, found_inf: Option<&Tensor>,
+        params: &[Tensor],
+        grads: &[Tensor],
+        exp_avgs: &[Tensor],
+        exp_avg_sqs: &[Tensor],
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        steps: &[i64],
+        grad_scale: Option<&Tensor>,
+        found_inf: Option<&Tensor>,
     ) -> Result<()> {
-        if params.is_empty() { return Ok(()); }
+        if params.is_empty() {
+            return Ok(());
+        }
         if steps.len() != params.len() {
             return Err(TensorError::new(&format!(
                 "fused_adamw_: steps length {} does not match params length {}",
-                steps.len(), params.len()
+                steps.len(),
+                params.len()
             )));
         }
         let count = params.len() as i32;
@@ -1193,8 +1288,19 @@ impl Tensor {
         let fi = found_inf.map_or(ptr::null_mut(), |t| t.handle);
         let err = unsafe {
             ffi::flodl_fused_adamw_(
-                p.as_mut_ptr(), g.as_mut_ptr(), m.as_mut_ptr(), v.as_mut_ptr(),
-                count, lr, beta1, beta2, eps, weight_decay, steps.as_ptr(), gs, fi,
+                p.as_mut_ptr(),
+                g.as_mut_ptr(),
+                m.as_mut_ptr(),
+                v.as_mut_ptr(),
+                count,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                steps.as_ptr(),
+                gs,
+                fi,
             )
         };
         check_err(err)
@@ -1212,7 +1318,9 @@ impl Tensor {
     /// In-place add scalar to all tensors: `tensors[i] += scalar`.
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_add_scalar_(tensors: &[Tensor], scalar: f64) -> Result<()> {
-        if tensors.is_empty() { return Ok(()); }
+        if tensors.is_empty() {
+            return Ok(());
+        }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_foreach_add_scalar_(handles.as_mut_ptr(), handles.len() as i32, scalar)
@@ -1223,7 +1331,9 @@ impl Tensor {
     /// In-place multiply all tensors by scalar: `tensors[i] *= scalar`.
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_mul_scalar_(tensors: &[Tensor], scalar: f64) -> Result<()> {
-        if tensors.is_empty() { return Ok(()); }
+        if tensors.is_empty() {
+            return Ok(());
+        }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_foreach_mul_scalar_(handles.as_mut_ptr(), handles.len() as i32, scalar)
@@ -1234,30 +1344,31 @@ impl Tensor {
     /// In-place zero all tensors: `tensors[i] = 0`.
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_zero_(tensors: &[Tensor]) -> Result<()> {
-        if tensors.is_empty() { return Ok(()); }
+        if tensors.is_empty() {
+            return Ok(());
+        }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
-        let err = unsafe {
-            ffi::flodl_foreach_zero_(handles.as_mut_ptr(), handles.len() as i32)
-        };
+        let err = unsafe { ffi::flodl_foreach_zero_(handles.as_mut_ptr(), handles.len() as i32) };
         check_err(err)
     }
 
     /// In-place add two tensor lists: `tensors1[i] += alpha * tensors2[i]`.
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_add_list_(tensors1: &[Tensor], tensors2: &[Tensor], alpha: f64) -> Result<()> {
-        if tensors1.is_empty() { return Ok(()); }
+        if tensors1.is_empty() {
+            return Ok(());
+        }
         if tensors1.len() != tensors2.len() {
             return Err(TensorError::new(&format!(
                 "foreach_add_list_: list length mismatch ({} vs {})",
-                tensors1.len(), tensors2.len(),
+                tensors1.len(),
+                tensors2.len(),
             )));
         }
         let mut h1: Vec<FlodlTensor> = tensors1.iter().map(|t| t.handle).collect();
         let mut h2: Vec<FlodlTensor> = tensors2.iter().map(|t| t.handle).collect();
         let err = unsafe {
-            ffi::flodl_foreach_add_list_(
-                h1.as_mut_ptr(), h2.as_mut_ptr(), h1.len() as i32, alpha,
-            )
+            ffi::flodl_foreach_add_list_(h1.as_mut_ptr(), h2.as_mut_ptr(), h1.len() as i32, alpha)
         };
         check_err(err)
     }
@@ -1265,12 +1376,16 @@ impl Tensor {
     /// Compute per-tensor norms. Returns a Vec of scalar tensors.
     /// Single batched kernel on CUDA instead of N separate norm calls.
     pub fn foreach_norm(tensors: &[Tensor], ord: f64) -> Result<Vec<Tensor>> {
-        if tensors.is_empty() { return Ok(vec![]); }
+        if tensors.is_empty() {
+            return Ok(vec![]);
+        }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let mut results: Vec<FlodlTensor> = vec![ptr::null_mut(); tensors.len()];
         let err = unsafe {
             ffi::flodl_foreach_norm(
-                handles.as_mut_ptr(), handles.len() as i32, ord,
+                handles.as_mut_ptr(),
+                handles.len() as i32,
+                ord,
                 results.as_mut_ptr(),
             )
         };
@@ -1280,19 +1395,29 @@ impl Tensor {
 
     /// In-place lerp: `tensors1[i] += weight * (tensors2[i] - tensors1[i])`.
     /// Single batched kernel on CUDA instead of N separate launches.
-    pub fn foreach_lerp_scalar_(tensors1: &[Tensor], tensors2: &[Tensor], weight: f64) -> Result<()> {
-        if tensors1.is_empty() { return Ok(()); }
+    pub fn foreach_lerp_scalar_(
+        tensors1: &[Tensor],
+        tensors2: &[Tensor],
+        weight: f64,
+    ) -> Result<()> {
+        if tensors1.is_empty() {
+            return Ok(());
+        }
         if tensors1.len() != tensors2.len() {
             return Err(TensorError::new(&format!(
                 "foreach_lerp_scalar_: list length mismatch ({} vs {})",
-                tensors1.len(), tensors2.len(),
+                tensors1.len(),
+                tensors2.len(),
             )));
         }
         let mut h1: Vec<FlodlTensor> = tensors1.iter().map(|t| t.handle).collect();
         let mut h2: Vec<FlodlTensor> = tensors2.iter().map(|t| t.handle).collect();
         let err = unsafe {
             ffi::flodl_foreach_lerp_scalar_(
-                h1.as_mut_ptr(), h2.as_mut_ptr(), h1.len() as i32, weight,
+                h1.as_mut_ptr(),
+                h2.as_mut_ptr(),
+                h1.len() as i32,
+                weight,
             )
         };
         check_err(err)
@@ -1301,11 +1426,11 @@ impl Tensor {
     /// In-place sqrt: `tensors[i] = sqrt(tensors[i])`.
     /// Single batched kernel on CUDA instead of N separate launches.
     pub fn foreach_sqrt_(tensors: &[Tensor]) -> Result<()> {
-        if tensors.is_empty() { return Ok(()); }
+        if tensors.is_empty() {
+            return Ok(());
+        }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
-        let err = unsafe {
-            ffi::flodl_foreach_sqrt_(handles.as_mut_ptr(), handles.len() as i32)
-        };
+        let err = unsafe { ffi::flodl_foreach_sqrt_(handles.as_mut_ptr(), handles.len() as i32) };
         check_err(err)
     }
 
@@ -1386,7 +1511,11 @@ impl fmt::Debug for Tensor {
 pub fn test_device() -> Device {
     use std::sync::Once;
     static PRINT: Once = Once::new();
-    let dev = if cfg!(feature = "gpu") && gpu_available() { Device::CUDA(0) } else { Device::CPU };
+    let dev = if cfg!(feature = "gpu") && gpu_available() {
+        Device::CUDA(0)
+    } else {
+        Device::CPU
+    };
     PRINT.call_once(|| eprintln!("\n*** flodl test device: {} ***\n", dev));
     dev
 }
@@ -1394,7 +1523,10 @@ pub fn test_device() -> Device {
 /// Returns `TensorOptions` for tests (Float32 on `test_device()`).
 #[cfg(test)]
 pub fn test_opts() -> TensorOptions {
-    TensorOptions { dtype: DType::Float32, device: test_device() }
+    TensorOptions {
+        dtype: DType::Float32,
+        device: test_device(),
+    }
 }
 
 #[cfg(test)]

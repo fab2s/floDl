@@ -25,14 +25,13 @@ impl ThresholdHalt {
 }
 
 impl Module for ThresholdHalt {
-    fn name(&self) -> &str { "threshold_halt" }
+    fn name(&self) -> &str {
+        "threshold_halt"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let data = input.data().to_f32_vec()?;
-        let max_val = data
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let val = max_val - self.threshold; // positive when exceeded → halt
         Ok(Variable::new(
             Tensor::from_f32(&[val], &[1], input.device())?,
@@ -75,7 +74,9 @@ impl LearnedHalt {
 }
 
 impl Module for LearnedHalt {
-    fn name(&self) -> &str { "learned_halt" }
+    fn name(&self) -> &str {
+        "learned_halt"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let probe = self.proj.forward(input)?;

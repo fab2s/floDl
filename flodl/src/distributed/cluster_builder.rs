@@ -183,16 +183,17 @@ impl ClusterBuilder {
         // resolved at startup on the owning host.
         for w in &self.workers {
             if let Some(devs) = w.local_devices.as_deref()
-                && devs.len() != w.ranks.len() {
-                    return Err(TensorError::new(&format!(
-                        "ClusterBuilder: host {:?}: devices ({}) and ranks ({}) \
+                && devs.len() != w.ranks.len()
+            {
+                return Err(TensorError::new(&format!(
+                    "ClusterBuilder: host {:?}: devices ({}) and ranks ({}) \
                          length mismatch — supply exactly one device index per \
                          rank, or use all_devices()",
-                        w.host,
-                        devs.len(),
-                        w.ranks.len(),
-                    )));
-                }
+                    w.host,
+                    devs.len(),
+                    w.ranks.len(),
+                )));
+            }
         }
         // Reserved-env-key check: a user env map (cluster- or host-scope)
         // must not carry a key the launcher owns per-rank — the launcher
@@ -747,22 +748,22 @@ mod tests {
     fn build_two_host_cluster() {
         let cluster = ClusterBuilder::new()
             .controller("192.168.122.1")
-                .port(29500)
+            .port(29500)
             .done()
             .host("exa")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("virbr0")
-                .path("/opt/flodl")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("virbr0")
+            .path("/opt/flodl")
             .done()
             .host("flodl-pascal")
-                .ranks([1, 2])
-                .all_devices()
-                .nccl_socket_ifname("enp1s0")
-                .path("/mnt/rdl")
-                .ssh_port(2222)
-                .ssh_identity_file("/keys/cluster")
-                .ssh_option("StrictHostKeyChecking=no")
+            .ranks([1, 2])
+            .all_devices()
+            .nccl_socket_ifname("enp1s0")
+            .path("/mnt/rdl")
+            .ssh_port(2222)
+            .ssh_identity_file("/keys/cluster")
+            .ssh_option("StrictHostKeyChecking=no")
             .done()
             .build()
             .expect("build succeeds");
@@ -787,12 +788,13 @@ mod tests {
     #[test]
     fn build_rejects_rank_gap() {
         let err = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0, 2]) // skips 1 → gap
-                .devices([0, 1])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0, 2]) // skips 1 → gap
+            .devices([0, 1])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect_err("gap must error");
@@ -803,10 +805,10 @@ mod tests {
     fn build_rejects_missing_controller() {
         let err = ClusterBuilder::new()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect_err("missing controller(...) call must error");
@@ -816,12 +818,13 @@ mod tests {
     #[test]
     fn build_rejects_empty_controller_host() {
         let err = ClusterBuilder::new()
-            .controller("").done()
+            .controller("")
+            .done()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect_err("empty controller host must error");
@@ -831,7 +834,8 @@ mod tests {
     #[test]
     fn build_rejects_no_workers() {
         let err = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .build()
             .expect_err("no workers must error");
         assert!(err.to_string().contains("worker"), "err: {err}");
@@ -840,12 +844,13 @@ mod tests {
     #[test]
     fn controller_path_defaults_to_cwd_when_unset() {
         let cluster = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect("build succeeds");
@@ -859,58 +864,72 @@ mod tests {
     fn controller_path_override() {
         let cluster = ClusterBuilder::new()
             .controller("localhost")
-                .port(2222)
-                .path("/opt/flodl")
-                .docker("cuda")
-                .arch("precompiled/cu128")
+            .port(2222)
+            .path("/opt/flodl")
+            .docker("cuda")
+            .arch("precompiled/cu128")
             .done()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect("build succeeds");
         assert_eq!(cluster.controller.port, 2222);
         assert_eq!(cluster.controller.path, "/opt/flodl");
         assert_eq!(cluster.controller.docker.as_deref(), Some("cuda"));
-        assert_eq!(cluster.controller.arch.as_deref(), Some("precompiled/cu128"));
+        assert_eq!(
+            cluster.controller.arch.as_deref(),
+            Some("precompiled/cu128")
+        );
     }
 
     #[test]
     fn cluster_scope_env_flows_into_full_cluster() {
         let cluster = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .env("NCCL_P2P_DISABLE", "1")
             .env("NCCL_SHM_DISABLE", "1")
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect("build succeeds");
-        assert_eq!(cluster.env.get("NCCL_P2P_DISABLE").map(String::as_str), Some("1"));
-        assert_eq!(cluster.env.get("NCCL_SHM_DISABLE").map(String::as_str), Some("1"));
+        assert_eq!(
+            cluster.env.get("NCCL_P2P_DISABLE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            cluster.env.get("NCCL_SHM_DISABLE").map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]
     fn host_scope_env_flows_into_worker() {
         let cluster = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
-                .env("LD_LIBRARY_PATH", "/opt/custom/lib")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
+            .env("LD_LIBRARY_PATH", "/opt/custom/lib")
             .done()
             .build()
             .expect("build succeeds");
         assert_eq!(
-            cluster.workers[0].env.get("LD_LIBRARY_PATH").map(String::as_str),
+            cluster.workers[0]
+                .env
+                .get("LD_LIBRARY_PATH")
+                .map(String::as_str),
             Some("/opt/custom/lib"),
         );
     }
@@ -918,14 +937,15 @@ mod tests {
     #[test]
     fn repeated_env_key_last_wins() {
         let cluster = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .env("K", "first")
             .env("K", "second")
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect("build succeeds");
@@ -935,13 +955,14 @@ mod tests {
     #[test]
     fn build_rejects_reserved_cluster_env_key() {
         let err = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .env("CUDA_VISIBLE_DEVICES", "3") // reserved (launcher-owned)
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect_err("reserved cluster-scope env key must error");
@@ -951,13 +972,14 @@ mod tests {
     #[test]
     fn build_rejects_reserved_host_env_key() {
         let err = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
-                .env("FLODL_INTERNAL_LOCAL_RANK", "0") // reserved prefix
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
+            .env("FLODL_INTERNAL_LOCAL_RANK", "0") // reserved prefix
             .done()
             .build()
             .expect_err("reserved host-scope env key must error");
@@ -967,15 +989,16 @@ mod tests {
     #[test]
     fn build_allows_non_reserved_env_keys() {
         ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .env("NCCL_P2P_DISABLE", "1")
             .env("FLODL_DASHBOARD_BIND", "0.0.0.0")
             .host("h0")
-                .ranks([0])
-                .devices([0])
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
-                .env("LD_LIBRARY_PATH", "/opt/custom/lib")
+            .ranks([0])
+            .devices([0])
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
+            .env("LD_LIBRARY_PATH", "/opt/custom/lib")
             .done()
             .build()
             .expect("non-reserved env keys must pass");
@@ -984,12 +1007,13 @@ mod tests {
     #[test]
     fn build_rejects_devices_ranks_length_mismatch() {
         let err = ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0, 1]) // 2 ranks
-                .devices([0])  // 1 device → mismatch
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0, 1]) // 2 ranks
+            .devices([0]) // 1 device → mismatch
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect_err("devices/ranks length mismatch must error");
@@ -1001,12 +1025,13 @@ mod tests {
         // all_devices() is unresolved ("all") → exempt from the
         // explicit-devices length check; count is resolved at startup.
         ClusterBuilder::new()
-            .controller("localhost").done()
+            .controller("localhost")
+            .done()
             .host("h0")
-                .ranks([0, 1])
-                .all_devices()
-                .nccl_socket_ifname("lo")
-                .path("/tmp")
+            .ranks([0, 1])
+            .all_devices()
+            .nccl_socket_ifname("lo")
+            .path("/tmp")
             .done()
             .build()
             .expect("all_devices() bypasses the explicit-length check");

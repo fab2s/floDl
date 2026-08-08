@@ -55,9 +55,9 @@
 
 use serde_json::Value;
 
+use crate::GpuInfo;
 use crate::report::{GpuSurvey, NoteKind, SurveyNote};
 use crate::vendor::{GpuArch, GpuVendor};
-use crate::GpuInfo;
 
 /// Env var carrying a spoofed GPU survey. See the module docs.
 pub const ENV_TESTING_GPU_JSON: &str = "FLODL_TESTING_GPU_JSON";
@@ -95,14 +95,14 @@ fn parse_survey(raw: &str) -> Result<GpuSurvey, String> {
             let devices = match field(&root, "gpus") {
                 Some(Value::Array(items)) => items,
                 Some(other) => {
-                    return Err(format!("`gpus` must be an array, found {}", kind(other)))
+                    return Err(format!("`gpus` must be an array, found {}", kind(other)));
                 }
                 None => &empty,
             };
             let notes = match field(&root, "notes") {
                 Some(Value::Array(items)) => items,
                 Some(other) => {
-                    return Err(format!("`notes` must be an array, found {}", kind(other)))
+                    return Err(format!("`notes` must be an array, found {}", kind(other)));
                 }
                 None => &empty,
             };
@@ -112,7 +112,7 @@ fn parse_survey(raw: &str) -> Result<GpuSurvey, String> {
             return Err(format!(
                 "expected an array of devices or a {{\"gpus\":[...]}} envelope, found {}",
                 kind(other)
-            ))
+            ));
         }
     };
 
@@ -177,8 +177,7 @@ fn parse_device(v: &Value, pos: usize) -> Result<GpuInfo, String> {
             let s = j.as_str().ok_or_else(|| {
                 format!("device {pos}: `vendor` must be a string, found {}", kind(j))
             })?;
-            GpuVendor::parse(s)
-                .ok_or_else(|| format!("device {pos}: unknown vendor {s:?}"))?
+            GpuVendor::parse(s).ok_or_else(|| format!("device {pos}: unknown vendor {s:?}"))?
         }
     };
 
@@ -189,11 +188,13 @@ fn parse_device(v: &Value, pos: usize) -> Result<GpuInfo, String> {
         .or_else(|| field(v, "sm"))
         .ok_or_else(|| format!("device {pos}: missing required `arch`"))?;
     let token = raw_arch.as_str().ok_or_else(|| {
-        format!("device {pos}: `arch` must be a string, found {}", kind(raw_arch))
+        format!(
+            "device {pos}: `arch` must be a string, found {}",
+            kind(raw_arch)
+        )
     })?;
-    let arch = GpuArch::parse(vendor, token).ok_or_else(|| {
-        format!("device {pos}: {token:?} is not a valid {vendor} arch")
-    })?;
+    let arch = GpuArch::parse(vendor, token)
+        .ok_or_else(|| format!("device {pos}: {token:?} is not a valid {vendor} arch"))?;
 
     let index = match field(v, "index") {
         None => u8::try_from(pos).map_err(|_| {
@@ -226,13 +227,17 @@ fn parse_device(v: &Value, pos: usize) -> Result<GpuInfo, String> {
         None => format!("{vendor} spoofed {arch}"),
         Some(j) => j
             .as_str()
-            .ok_or_else(|| {
-                format!("device {pos}: `name` must be a string, found {}", kind(j))
-            })?
+            .ok_or_else(|| format!("device {pos}: `name` must be a string, found {}", kind(j)))?
             .to_string(),
     };
 
-    Ok(GpuInfo { index, vendor, name, arch, total_memory_mb })
+    Ok(GpuInfo {
+        index,
+        vendor,
+        name,
+        arch,
+        total_memory_mb,
+    })
 }
 
 fn parse_note(v: &Value) -> Result<SurveyNote, String> {
@@ -244,20 +249,23 @@ fn parse_note(v: &Value) -> Result<SurveyNote, String> {
     let vendor = match field(v, "vendor") {
         None => GpuVendor::Nvidia,
         Some(j) => {
-            let s = j.as_str().ok_or_else(|| {
-                format!("note: `vendor` must be a string, found {}", kind(j))
-            })?;
+            let s = j
+                .as_str()
+                .ok_or_else(|| format!("note: `vendor` must be a string, found {}", kind(j)))?;
             GpuVendor::parse(s).ok_or_else(|| format!("note: unknown vendor {s:?}"))?
         }
     };
     let note_kind = match field(v, "kind") {
         None => NoteKind::HardwareUnusable,
         Some(j) => {
-            let s = j.as_str().ok_or_else(|| {
-                format!("note: `kind` must be a string, found {}", kind(j))
-            })?;
+            let s = j
+                .as_str()
+                .ok_or_else(|| format!("note: `kind` must be a string, found {}", kind(j)))?;
             NoteKind::parse(s).ok_or_else(|| {
-                format!("note: unknown kind {s:?} (allowed: {})", NoteKind::ALL_NAMES)
+                format!(
+                    "note: unknown kind {s:?} (allowed: {})",
+                    NoteKind::ALL_NAMES
+                )
             })?
         }
     };
@@ -268,7 +276,11 @@ fn parse_note(v: &Value) -> Result<SurveyNote, String> {
             .ok_or_else(|| format!("note: `message` must be a string, found {}", kind(j)))?
             .to_string(),
     };
-    Ok(SurveyNote { vendor, kind: note_kind, message })
+    Ok(SurveyNote {
+        vendor,
+        kind: note_kind,
+        message,
+    })
 }
 
 #[cfg(test)]
@@ -288,7 +300,13 @@ mod tests {
         assert_eq!(s.devices[0].index, 0, "index defaults to array position");
         assert_eq!(s.devices[0].short_name(), "Radeon RX 6800");
         assert_eq!(s.devices[1].index, 3, "explicit index wins");
-        assert_eq!(s.devices[1].arch, GpuArch::Sm { major: 12, minor: 0 });
+        assert_eq!(
+            s.devices[1].arch,
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
+        );
         assert!(s.notes.is_empty());
     }
 
@@ -304,7 +322,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.devices.len(), 1);
-        assert_eq!(s.devices[0].arch, GpuArch::Sm { major: 12, minor: 0 });
+        assert_eq!(
+            s.devices[0].arch,
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
+        );
         assert_eq!(s.devices[0].total_memory_mb, 16311);
     }
 
@@ -383,24 +407,48 @@ mod tests {
     #[test]
     fn rejects_wrong_types_and_out_of_range_values() {
         for (input, want) in [
-            (r#"[{"arch":"sm_86","index":"0"}]"#, "must be a non-negative integer"),
-            (r#"[{"arch":"sm_86","index":300}]"#, "exceeds the device-index range"),
-            (r#"[{"arch":"sm_86","index":-1}]"#, "must be a non-negative integer"),
-            (r#"[{"arch":"sm_86","vram_mb":-5}]"#, "must be a non-negative integer"),
-            (r#"[{"arch":"sm_86","vram_mb":1.5}]"#, "must be a non-negative integer"),
+            (
+                r#"[{"arch":"sm_86","index":"0"}]"#,
+                "must be a non-negative integer",
+            ),
+            (
+                r#"[{"arch":"sm_86","index":300}]"#,
+                "exceeds the device-index range",
+            ),
+            (
+                r#"[{"arch":"sm_86","index":-1}]"#,
+                "must be a non-negative integer",
+            ),
+            (
+                r#"[{"arch":"sm_86","vram_mb":-5}]"#,
+                "must be a non-negative integer",
+            ),
+            (
+                r#"[{"arch":"sm_86","vram_mb":1.5}]"#,
+                "must be a non-negative integer",
+            ),
             (r#"[{"arch":"sm_86","name":7}]"#, "`name` must be a string"),
             (r#"[{"arch":7}]"#, "`arch` must be a string"),
             (r#"[{"vendor":"intel","arch":"sm_86"}]"#, "unknown vendor"),
             (r#"["sm_86"]"#, "must be an object"),
             (r#"{"gpus":7}"#, "`gpus` must be an array"),
             (r#"{"notes":7}"#, "`notes` must be an array"),
-            (r#"{"notes":[{"vendor":"amd"}]}"#, "missing required `message`"),
-            (r#"{"notes":[{"kind":"nope","message":"m"}]}"#, "unknown kind"),
+            (
+                r#"{"notes":[{"vendor":"amd"}]}"#,
+                "missing required `message`",
+            ),
+            (
+                r#"{"notes":[{"kind":"nope","message":"m"}]}"#,
+                "unknown kind",
+            ),
             ("7", "expected an array of devices"),
             ("\"hi\"", "expected an array of devices"),
         ] {
             let e = parse_survey(input).unwrap_err();
-            assert!(e.contains(want), "input {input}\n  got: {e}\n  want: {want}");
+            assert!(
+                e.contains(want),
+                "input {input}\n  got: {e}\n  want: {want}"
+            );
         }
     }
 
@@ -414,7 +462,10 @@ mod tests {
             assert!(parse_survey(bad).is_err(), "should reject {bad:?}");
         }
         let deep = format!("{}{}", "[".repeat(300), "]".repeat(300));
-        assert!(parse_survey(&deep).is_err(), "recursion limit must reject, not overflow");
+        assert!(
+            parse_survey(&deep).is_err(),
+            "recursion limit must reject, not overflow"
+        );
     }
 
     #[test]

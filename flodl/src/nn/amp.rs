@@ -7,7 +7,7 @@ use flodl_sys as ffi;
 use crate::autograd::Variable;
 use crate::tensor::{DType, Result, Tensor};
 
-use super::checkpoint::{write_f64_le, read_f64_le, write_i64_le, read_i64_le};
+use super::checkpoint::{read_f64_le, read_i64_le, write_f64_le, write_i64_le};
 use super::optim::Stateful;
 use super::parameter::Parameter;
 
@@ -33,17 +33,13 @@ pub struct AutocastGuard {
 impl AutocastGuard {
     /// Enable CUDA autocast with the given dtype (typically `Float16` or `BFloat16`).
     pub fn new(dtype: DType) -> Self {
-        let guard = unsafe {
-            ffi::flodl_autocast_guard_new(ffi::FLODL_CUDA, dtype as i32)
-        };
+        let guard = unsafe { ffi::flodl_autocast_guard_new(ffi::FLODL_CUDA, dtype as i32) };
         AutocastGuard { guard }
     }
 
     /// Enable autocast for a specific device type with the given dtype.
     pub fn for_device(device_type: i32, dtype: DType) -> Self {
-        let guard = unsafe {
-            ffi::flodl_autocast_guard_new(device_type, dtype as i32)
-        };
+        let guard = unsafe { ffi::flodl_autocast_guard_new(device_type, dtype as i32) };
         AutocastGuard { guard }
     }
 }
@@ -176,7 +172,11 @@ impl GradScaler {
     ///
     /// Returns true if the step was taken (all gradients finite).
     /// Returns false if inf/nan detected (optimizer step skipped).
-    pub fn step(&mut self, params: &[Parameter], step_fn: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+    pub fn step(
+        &mut self,
+        params: &[Parameter],
+        step_fn: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<bool> {
         let inv_scale = 1.0 / self.scale;
 
         // Unscale and check all gradients
@@ -227,7 +227,9 @@ impl GradScaler {
 }
 
 impl Stateful for GradScaler {
-    fn state_kind(&self) -> crate::nn::StateKind { crate::nn::StateKind::GradScaler }
+    fn state_kind(&self) -> crate::nn::StateKind {
+        crate::nn::StateKind::GradScaler
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_f64_le(w, self.scale)?;
@@ -261,9 +263,7 @@ mod tests {
     #[test]
     fn test_autocast_closure() {
         assert!(!is_autocast_enabled());
-        let was_enabled = autocast(DType::Float16, || {
-            is_autocast_enabled()
-        });
+        let was_enabled = autocast(DType::Float16, || is_autocast_enabled());
         assert!(was_enabled);
         assert!(!is_autocast_enabled());
     }
@@ -300,9 +300,7 @@ mod tests {
     #[test]
     fn test_grad_scaler_scale() {
         let scaler = GradScaler::new();
-        let loss = Variable::new(
-            Tensor::from_f32(&[1.0], &[1], test_device()).unwrap(), true,
-        );
+        let loss = Variable::new(Tensor::from_f32(&[1.0], &[1], test_device()).unwrap(), true);
         let scaled = scaler.scale(&loss).unwrap();
         assert!((scaled.item().unwrap() - 65536.0).abs() < 1.0);
     }
@@ -320,7 +318,12 @@ mod tests {
         p.variable.set_grad(grad);
 
         let mut stepped = false;
-        let ok = scaler.step(std::slice::from_ref(&p), &mut || { stepped = true; Ok(()) }).unwrap();
+        let ok = scaler
+            .step(std::slice::from_ref(&p), &mut || {
+                stepped = true;
+                Ok(())
+            })
+            .unwrap();
         assert!(ok);
         assert!(stepped);
     }
@@ -360,7 +363,12 @@ mod tests {
         p.variable.set_grad(grad);
 
         let mut stepped = false;
-        let ok = scaler.step(&[p], &mut || { stepped = true; Ok(()) }).unwrap();
+        let ok = scaler
+            .step(&[p], &mut || {
+                stepped = true;
+                Ok(())
+            })
+            .unwrap();
         assert!(!ok, "step should be skipped on inf");
         assert!(!stepped, "optimizer should not have stepped");
     }

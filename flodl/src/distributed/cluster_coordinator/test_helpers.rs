@@ -11,8 +11,8 @@ use crate::distributed::wire::{SessionSalt, TimingMsgWire};
 
 use super::cycle_state::AvgCycleState;
 use super::{
-    ClusterCoordinator, ClusterCoordinatorConfig,
-    NcclRendezvousPending, RunPhase, initial_callback_role,
+    ClusterCoordinator, ClusterCoordinatorConfig, NcclRendezvousPending, RunPhase,
+    initial_callback_role,
 };
 
 impl ClusterCoordinator {
@@ -130,17 +130,14 @@ impl ClusterCoordinator {
     #[cfg(test)]
     pub(crate) fn for_test(mut config: ClusterCoordinatorConfig) -> Self {
         let world_size = config.world_size;
-        let salt: SessionSalt =
-            [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
+        let salt: SessionSalt = [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
         let (_timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
-        let (_metrics_tx, metrics_rx) =
-            mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
+        let (_metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
         let el_che = std::mem::replace(
             &mut config.el_che,
             crate::distributed::ddp::ElChe::new(world_size.max(1), 1),
         );
-        let calibrated = config.start_elche_state.is_some()
-            && el_che.is_calibrated();
+        let calibrated = config.start_elche_state.is_some() && el_che.is_calibrated();
         ClusterCoordinator {
             policy: config.policy,
             backend: config.backend,
@@ -180,7 +177,7 @@ impl ClusterCoordinator {
             stall_since: None,
             stall_last_dump: None,
             dead_ranks: config.dead_ranks,
-        reported_deaths: None,
+            reported_deaths: None,
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             rendezvous_timeout_secs: config.rendezvous_timeout_secs,
             last_heartbeat: vec![Instant::now(); world_size],
@@ -192,20 +189,11 @@ impl ClusterCoordinator {
             rank_hosts: config.rank_hosts.clone(),
             max_failure: config.max_failure,
             epoch_callback_policy: config.epoch_callback_policy,
-            checkpoint_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
-            eval_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
+            checkpoint_role: initial_callback_role(config.epoch_callback_policy, world_size),
+            eval_role: initial_callback_role(config.epoch_callback_policy, world_size),
             pending_eval_intent: false,
             pending_checkpoint_intent: false,
-            epoch_callback_role: initial_callback_role(
-                config.epoch_callback_policy,
-                world_size,
-            ),
+            epoch_callback_role: initial_callback_role(config.epoch_callback_policy, world_size),
             epoch_role_dirty: true,
             checkpoint_tried_ranks: std::collections::HashMap::new(),
             last_checkpoint_elapsed_ms_ewma: None,
@@ -233,9 +221,9 @@ impl ClusterCoordinator {
             metrics_rx,
             metrics_buffer: std::collections::BTreeMap::new(),
             chunk_pools: std::collections::BTreeMap::new(),
-            progressive: config.progressive.unwrap_or(
-                !matches!(config.policy, ApplyPolicy::Sync),
-            ),
+            progressive: config
+                .progressive
+                .unwrap_or(!matches!(config.policy, ApplyPolicy::Sync)),
             min_chunk_batches: 4,
             final_window_plan: None,
             metrics_fn: config.metrics_fn.clone(),
@@ -291,11 +279,7 @@ impl ClusterCoordinator {
     /// arbitrary `Instant`. Used by
     /// `checkpoint_role_failover_on_rank_death` to age out a rank.
     #[cfg(test)]
-    pub(crate) fn set_last_heartbeat_for_test(
-        &mut self,
-        rank: usize,
-        when: Instant,
-    ) {
+    pub(crate) fn set_last_heartbeat_for_test(&mut self, rank: usize, when: Instant) {
         self.last_heartbeat[rank] = when;
     }
 
@@ -317,10 +301,7 @@ impl ClusterCoordinator {
         self.resolve_fastest_role()
     }
     #[cfg(test)]
-    pub(crate) fn re_resolve_callback_roles_on_death_for_test(
-        &mut self,
-        dead_rank: usize,
-    ) {
+    pub(crate) fn re_resolve_callback_roles_on_death_for_test(&mut self, dead_rank: usize) {
         self.re_resolve_callback_roles_on_death(dead_rank);
     }
     #[cfg(test)]
@@ -360,18 +341,10 @@ impl ClusterCoordinator {
     /// known `remaining()`. Production code creates pools in
     /// `dispatch_epoch`; tests skip that scaffold.
     #[cfg(test)]
-    pub(crate) fn install_chunk_pool_for_test(
-        &mut self,
-        epoch: usize,
-        total_samples: usize,
-    ) {
+    pub(crate) fn install_chunk_pool_for_test(&mut self, epoch: usize, total_samples: usize) {
         self.chunk_pools.insert(
             epoch,
-            crate::distributed::chunk_pool::ChunkPool::new(
-                epoch,
-                total_samples,
-                self.world_size,
-            ),
+            crate::distributed::chunk_pool::ChunkPool::new(epoch, total_samples, self.world_size),
         );
     }
 
@@ -414,9 +387,7 @@ impl ClusterCoordinator {
     /// slack-producer tests to drive `report_timing` calibrate the
     /// el_che before invoking the producer.
     #[cfg(test)]
-    pub(crate) fn el_che_mut_for_test(
-        &mut self,
-    ) -> &mut crate::distributed::ddp::ElChe {
+    pub(crate) fn el_che_mut_for_test(&mut self) -> &mut crate::distributed::ddp::ElChe {
         &mut self.el_che
     }
 

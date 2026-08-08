@@ -43,7 +43,7 @@ use std::ptr;
 
 use flodl_sys as ffi;
 
-use crate::tensor::{check_err, Result};
+use crate::tensor::{Result, check_err};
 
 /// Memory pool identifier for sharing allocations between CUDA graphs.
 ///
@@ -95,9 +95,7 @@ impl GpuGraph {
     /// will be recorded until [`capture_end`](GpuGraph::capture_end).
     pub fn capture_begin(&mut self, pool: Option<MemPoolId>, mode: CaptureMode) -> Result<()> {
         let (hi, lo) = pool.map_or((0, 0), |p| (p.hi, p.lo));
-        let err = unsafe {
-            ffi::flodl_gpu_graph_capture_begin(self.ptr, hi, lo, mode as i32)
-        };
+        let err = unsafe { ffi::flodl_gpu_graph_capture_begin(self.ptr, hi, lo, mode as i32) };
         check_err(err)
     }
 
@@ -212,7 +210,10 @@ mod tests {
         dst.copy_(&src, false).unwrap();
 
         let buf = dst.to_f32_vec().unwrap();
-        assert!(buf.iter().all(|&v| v == 1.0), "copy_ should have filled dst with 1.0");
+        assert!(
+            buf.iter().all(|&v| v == 1.0),
+            "copy_ should have filled dst with 1.0"
+        );
     }
 
     #[test]
@@ -243,15 +244,19 @@ mod tests {
             let sum = a.add(&b)?;
             c.copy_(&sum, false)?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Replay
         graph.replay().unwrap();
         crate::tensor::gpu_synchronize(0);
 
         let buf = c.to_f32_vec().unwrap();
-        assert!(buf.iter().all(|&v| (v - 2.0).abs() < 1e-5),
-            "c should be 2.0 after replay, got {:?}", &buf[..4]);
+        assert!(
+            buf.iter().all(|&v| (v - 2.0).abs() < 1e-5),
+            "c should be 2.0 after replay, got {:?}",
+            &buf[..4]
+        );
     }
 
     #[test]
@@ -262,7 +267,7 @@ mod tests {
         }
         let _lock = GRAPH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::autograd::Variable;
-        use crate::nn::{Linear, Module, mse_loss, Adam, Optimizer};
+        use crate::nn::{Adam, Linear, Module, Optimizer, mse_loss};
 
         let dev = test_device();
         let model = Linear::on_device(4, 2, dev).unwrap();
@@ -285,7 +290,8 @@ mod tests {
             let loss = mse_loss(&pred, &tgt)?;
             loss.backward()?;
             optimizer.step()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Replay a few times
         for _ in 0..5 {
@@ -295,7 +301,10 @@ mod tests {
 
         // Params should have changed
         let final_data = params[0].variable.data().to_f32_vec().unwrap();
-        assert_ne!(init_data, final_data, "params should have changed after graph replay");
+        assert_ne!(
+            init_data, final_data,
+            "params should have changed after graph replay"
+        );
     }
 
     #[test]
@@ -306,7 +315,10 @@ mod tests {
         }
         let _lock = GRAPH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pool = gpu_graph_pool_handle();
-        assert!(pool.hi != 0 || pool.lo != 0, "pool handle should be nonzero");
+        assert!(
+            pool.hi != 0 || pool.lo != 0,
+            "pool handle should be nonzero"
+        );
     }
 
     #[test]
@@ -327,7 +339,8 @@ mod tests {
             let sum = a.add(&b)?;
             c.copy_(&sum, false)?;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         graph.replay().unwrap();
         crate::tensor::gpu_synchronize(0);
@@ -346,7 +359,10 @@ mod tests {
         graph.replay().unwrap();
         crate::tensor::gpu_synchronize(0);
         let buf = c.to_f32_vec().unwrap();
-        assert!(buf.iter().all(|&v| (v - 3.0).abs() < 1e-5),
-            "after recapture, c should be 3.0, got {:?}", &buf[..4]);
+        assert!(
+            buf.iter().all(|&v| (v - 3.0).abs() < 1e-5),
+            "after recapture, c should be 3.0, got {:?}",
+            &buf[..4]
+        );
     }
 }

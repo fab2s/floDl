@@ -1,9 +1,9 @@
 use crate::autograd::{Variable, conv_transpose1d};
-use crate::tensor::{Result, Device};
+use crate::tensor::{Device, Result};
 
+use super::Module;
 use super::init::{kaiming_uniform, uniform_bias};
 use super::parameter::Parameter;
-use super::Module;
 
 /// Transposed 1D convolution (deconvolution) layer.
 ///
@@ -87,26 +87,56 @@ impl ConvTranspose1dBuilder {
     /// Build the transposed convolution layer with the configured parameters.
     pub fn done(self) -> Result<ConvTranspose1d> {
         ConvTranspose1d::build(
-            self.in_channels, self.out_channels, self.kernel_size,
-            self.with_bias, self.stride, self.padding, self.output_padding,
-            self.dilation, self.groups, self.device,
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.with_bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.dilation,
+            self.groups,
+            self.device,
         )
     }
 }
 
 impl ConvTranspose1d {
     /// Create a ConvTranspose1d layer with default settings and bias.
-    pub fn new(
-        in_channels: i64, out_channels: i64, kernel_size: i64,
-    ) -> Result<Self> {
-        Self::build(in_channels, out_channels, kernel_size, true, 1, 0, 0, 1, 1, Device::CPU)
+    pub fn new(in_channels: i64, out_channels: i64, kernel_size: i64) -> Result<Self> {
+        Self::build(
+            in_channels,
+            out_channels,
+            kernel_size,
+            true,
+            1,
+            0,
+            0,
+            1,
+            1,
+            Device::CPU,
+        )
     }
 
     /// Create a ConvTranspose1d layer on a specific device.
     pub fn on_device(
-        in_channels: i64, out_channels: i64, kernel_size: i64, device: Device,
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
+        device: Device,
     ) -> Result<Self> {
-        Self::build(in_channels, out_channels, kernel_size, true, 1, 0, 0, 1, 1, device)
+        Self::build(
+            in_channels,
+            out_channels,
+            kernel_size,
+            true,
+            1,
+            0,
+            0,
+            1,
+            1,
+            device,
+        )
     }
 
     /// Start a fluent builder for full configuration.
@@ -117,7 +147,11 @@ impl ConvTranspose1d {
     ///     .with_output_padding(1)
     ///     .done()?;
     /// ```
-    pub fn configure(in_channels: i64, out_channels: i64, kernel_size: i64) -> ConvTranspose1dBuilder {
+    pub fn configure(
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
+    ) -> ConvTranspose1dBuilder {
         ConvTranspose1dBuilder {
             in_channels,
             out_channels,
@@ -135,10 +169,16 @@ impl ConvTranspose1d {
     /// Fully configurable ConvTranspose1d constructor.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        in_channels: i64, out_channels: i64, kernel_size: i64,
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
         with_bias: bool,
-        stride: i64, padding: i64, output_padding: i64,
-        dilation: i64, groups: i64, device: Device,
+        stride: i64,
+        padding: i64,
+        output_padding: i64,
+        dilation: i64,
+        groups: i64,
+        device: Device,
     ) -> Result<Self> {
         super::init::validate_conv_groups("ConvTranspose1d", in_channels, out_channels, groups)?;
         // Note: weight shape is [in_channels, out_channels/groups, K]
@@ -159,7 +199,10 @@ impl ConvTranspose1d {
         };
 
         Ok(ConvTranspose1d {
-            weight: Parameter { variable: weight, name: "weight".into() },
+            weight: Parameter {
+                variable: weight,
+                name: "weight".into(),
+            },
             bias,
             stride,
             padding,
@@ -171,7 +214,9 @@ impl ConvTranspose1d {
 }
 
 impl Module for ConvTranspose1d {
-    fn name(&self) -> &str { "conv_t1d" }
+    fn name(&self) -> &str {
+        "conv_t1d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         conv_transpose1d(
@@ -203,9 +248,7 @@ mod tests {
     #[test]
     fn test_conv_transpose1d_forward() {
         let conv = ConvTranspose1d::on_device(4, 2, 3, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 4, 10], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 4, 10], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         // output_size = (10-1)*1 - 2*0 + 3 = 12
         assert_eq!(y.shape(), vec![1, 2, 12]);
@@ -214,9 +257,7 @@ mod tests {
     #[test]
     fn test_conv_transpose1d_gradient() {
         let conv = ConvTranspose1d::on_device(4, 2, 3, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 4, 8], test_opts()).unwrap(), true,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 4, 8], test_opts()).unwrap(), true);
         let y = conv.forward(&x).unwrap().sum().unwrap();
         y.backward().unwrap();
         assert!(x.grad().is_some());
@@ -231,12 +272,8 @@ mod tests {
 
     #[test]
     fn test_conv_transpose1d_with_stride() {
-        let conv = ConvTranspose1d::build(
-            4, 2, 3, true, 2, 0, 0, 1, 1, test_device(),
-        ).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 4, 5], test_opts()).unwrap(), false,
-        );
+        let conv = ConvTranspose1d::build(4, 2, 3, true, 2, 0, 0, 1, 1, test_device()).unwrap();
+        let x = Variable::new(Tensor::randn(&[1, 4, 5], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         // output_size = (5-1)*2 - 2*0 + 3 = 11
         assert_eq!(y.shape(), vec![1, 2, 11]);

@@ -2,9 +2,9 @@ use crate::autograd::Variable;
 use crate::nn::Module;
 use crate::tensor::{Result, TensorError};
 
-use super::node::DEFAULT_INPUT;
 use super::execution::GraphEpochIterator;
 use super::graph::{DataLoaderBinding, Graph};
+use super::node::DEFAULT_INPUT;
 
 // ---------------------------------------------------------------------------
 // Optimizer + training-step integration (single-device)
@@ -63,7 +63,8 @@ impl Graph {
     /// the caller can leave the optimizer LR alone.
     fn scheduled_lr(&self) -> Option<f64> {
         let sched = self.scheduler.borrow();
-        sched.as_ref()
+        sched
+            .as_ref()
             .map(|s| s.lr(self.training_step.get()) * self.lr_scale.get())
     }
 
@@ -246,7 +247,6 @@ impl Graph {
             .batch_size
     }
 
-
     /// Batch-aware forward pass.
     ///
     /// Extracts the primary input and auxiliary graph inputs from the named
@@ -263,12 +263,16 @@ impl Graph {
             let binding = guard.as_ref().ok_or_else(|| {
                 TensorError::new("Graph::forward_batch: call set_data_loader() first")
             })?;
-            (binding.forward_input.clone(), binding.shard_input_map.clone())
+            (
+                binding.forward_input.clone(),
+                binding.shard_input_map.clone(),
+            )
         };
 
         // Build full input vector from batch using shard_input_map.
         let batch_names = batch.names();
-        let graph_inputs: Vec<Variable> = shard_input_map.iter()
+        let graph_inputs: Vec<Variable> = shard_input_map
+            .iter()
             .map(|&idx| Variable::new(batch[batch_names[idx].as_str()].clone(), false))
             .collect();
 

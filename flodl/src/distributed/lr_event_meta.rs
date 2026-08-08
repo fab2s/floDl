@@ -125,7 +125,12 @@ impl LrEventMeta {
         let lr_window = VecDeque::with_capacity(config.lr_window_cap);
         let anchor_window = VecDeque::with_capacity(config.anchor_window_cap);
         let guard_window = VecDeque::with_capacity(config.guard_window_cap);
-        Self { config, lr_window, anchor_window, guard_window }
+        Self {
+            config,
+            lr_window,
+            anchor_window,
+            guard_window,
+        }
     }
 
     /// Create with default configuration.
@@ -149,8 +154,16 @@ impl LrEventMeta {
         phase: Phase,
     ) -> MetaAction {
         push_capped(&mut self.lr_window, lr, self.config.lr_window_cap);
-        push_capped(&mut self.anchor_window, anchor, self.config.anchor_window_cap);
-        push_capped(&mut self.guard_window, verdict, self.config.guard_window_cap);
+        push_capped(
+            &mut self.anchor_window,
+            anchor,
+            self.config.anchor_window_cap,
+        );
+        push_capped(
+            &mut self.guard_window,
+            verdict,
+            self.config.guard_window_cap,
+        );
 
         // Probe: no calibration, all signals noise. Don't act.
         if phase < Phase::Warmup {
@@ -181,8 +194,10 @@ impl LrEventMeta {
             (None, None) => MetaAction::Noop,
             (Some(f), None) | (None, Some(f)) => MetaAction::NudgeDown { factor: f },
             (Some(f1), Some(f2)) => {
-                let combined = (f1 * f2)
-                    .clamp(self.config.effective_factor_min, self.config.effective_factor_max);
+                let combined = (f1 * f2).clamp(
+                    self.config.effective_factor_min,
+                    self.config.effective_factor_max,
+                );
                 MetaAction::NudgeDown { factor: combined }
             }
         }
@@ -242,16 +257,12 @@ impl LrEventMeta {
         if k == 0 || self.guard_window.len() < k {
             return false;
         }
-        self.guard_window
-            .iter()
-            .rev()
-            .take(k)
-            .all(|v| {
-                matches!(
-                    v,
-                    ConvergenceAction::NudgeDown { .. } | ConvergenceAction::SuppressGrowth,
-                )
-            })
+        self.guard_window.iter().rev().take(k).all(|v| {
+            matches!(
+                v,
+                ConvergenceAction::NudgeDown { .. } | ConvergenceAction::SuppressGrowth,
+            )
+        })
     }
 
     /// Compute the effective nudge factor: `base − (1 − base) · anchor_trend`,
@@ -261,7 +272,10 @@ impl LrEventMeta {
     /// reduction).
     fn effective_factor(&self, base: f64, trend: f64) -> f64 {
         let raw = base - (1.0 - base) * trend;
-        raw.clamp(self.config.effective_factor_min, self.config.effective_factor_max)
+        raw.clamp(
+            self.config.effective_factor_min,
+            self.config.effective_factor_max,
+        )
     }
 
     /// Read-only access to the recorded LR window (oldest → newest).
@@ -405,7 +419,12 @@ mod tests {
     fn probe_phase_silences_both_watchers() {
         let mut meta = LrEventMeta::with_default_config();
         // Build a state that would otherwise fire LR cliff: 0.1 → 0.01 (90% drop).
-        meta.observe(0.1, 100, ConvergenceAction::NudgeDown { factor: 0.5 }, Phase::Probe);
+        meta.observe(
+            0.1,
+            100,
+            ConvergenceAction::NudgeDown { factor: 0.5 },
+            Phase::Probe,
+        );
         let action = meta.observe(
             0.01,
             100,
@@ -445,7 +464,11 @@ mod tests {
             last = meta.observe(lr, 100, ConvergenceAction::Stable, Phase::Stable);
             lr *= 0.98; // 2% drop per cycle, well under 30% threshold
         }
-        assert_eq!(last, MetaAction::Noop, "smooth decay must not fire LR cliff");
+        assert_eq!(
+            last,
+            MetaAction::Noop,
+            "smooth decay must not fire LR cliff"
+        );
     }
 
     #[test]
@@ -481,7 +504,10 @@ mod tests {
         let mut meta = LrEventMeta::new(cfg);
         meta.observe(1.0, 100, ConvergenceAction::Stable, Phase::Stable);
         let action = meta.observe(0.65, 100, ConvergenceAction::Stable, Phase::Stable);
-        assert!(matches!(action, MetaAction::NudgeDown { .. }), "35% drop over threshold");
+        assert!(
+            matches!(action, MetaAction::NudgeDown { .. }),
+            "35% drop over threshold"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -532,7 +558,11 @@ mod tests {
         meta.observe(0.1, 100, ConvergenceAction::Stable, Phase::Stable);
         meta.observe(0.1, 100, nudge, Phase::Stable);
         let action = meta.observe(0.1, 100, nudge, Phase::Stable);
-        assert_eq!(action, MetaAction::Noop, "Stable phase needs K=3, only 2 sustained");
+        assert_eq!(
+            action,
+            MetaAction::Noop,
+            "Stable phase needs K=3, only 2 sustained"
+        );
     }
 
     #[test]
@@ -574,7 +604,10 @@ mod tests {
             meta.observe(0.1, a, ConvergenceAction::Stable, Phase::Stable);
         }
         let trend = meta.anchor_trend();
-        assert!(trend > 0.0, "rising anchor must have positive trend, got {trend}");
+        assert!(
+            trend > 0.0,
+            "rising anchor must have positive trend, got {trend}"
+        );
     }
 
     #[test]
@@ -584,7 +617,10 @@ mod tests {
             meta.observe(0.1, a, ConvergenceAction::Stable, Phase::Stable);
         }
         let trend = meta.anchor_trend();
-        assert!(trend < 0.0, "falling anchor must have negative trend, got {trend}");
+        assert!(
+            trend < 0.0,
+            "falling anchor must have negative trend, got {trend}"
+        );
     }
 
     #[test]
@@ -594,7 +630,10 @@ mod tests {
             meta.observe(0.1, 100, ConvergenceAction::Stable, Phase::Stable);
         }
         let trend = meta.anchor_trend();
-        assert!(trend.abs() < 1e-9, "constant anchor trend must be 0, got {trend}");
+        assert!(
+            trend.abs() < 1e-9,
+            "constant anchor trend must be 0, got {trend}"
+        );
     }
 
     #[test]
@@ -673,7 +712,10 @@ mod tests {
                 // LR cliff: base 0.5, trend 0 → 0.5
                 // Convergence at Mature: base 0.7, trend 0 → 0.7
                 // Compound: 0.5 * 0.7 = 0.35
-                assert!((factor - 0.35).abs() < 1e-9, "expected compound 0.35, got {factor}");
+                assert!(
+                    (factor - 0.35).abs() < 1e-9,
+                    "expected compound 0.35, got {factor}"
+                );
             }
             MetaAction::Noop => panic!("both watchers should fire and compound"),
         }
@@ -717,8 +759,14 @@ mod tests {
             MetaAction::NudgeDown { factor } => {
                 // base = 0.5, trend ≈ -0.444 → effective = 0.5 - 0.5 * (-0.444) ≈ 0.722.
                 // Falling-trend regime: factor closer to 1 = less aggressive.
-                assert!(factor > 0.5, "falling trend must dampen factor, got {factor}");
-                assert!(factor < 0.95, "factor should not be fully clamped, got {factor}");
+                assert!(
+                    factor > 0.5,
+                    "falling trend must dampen factor, got {factor}"
+                );
+                assert!(
+                    factor < 0.95,
+                    "factor should not be fully clamped, got {factor}"
+                );
             }
             MetaAction::Noop => panic!("LR cliff still fires under dampening"),
         }
@@ -735,8 +783,14 @@ mod tests {
         let action = meta.observe(0.01, 140, ConvergenceAction::Stable, Phase::Stable);
         match action {
             MetaAction::NudgeDown { factor } => {
-                assert!(factor < 0.5, "rising trend must amplify nudge, got {factor}");
-                assert!(factor > 0.1, "factor should not be fully clamped, got {factor}");
+                assert!(
+                    factor < 0.5,
+                    "rising trend must amplify nudge, got {factor}"
+                );
+                assert!(
+                    factor > 0.1,
+                    "factor should not be fully clamped, got {factor}"
+                );
             }
             MetaAction::Noop => panic!("LR cliff fires regardless of trend"),
         }

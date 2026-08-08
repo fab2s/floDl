@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::distributed::ModelSchema;
 use crate::distributed::controller::{DTYPE_F32, RoundFrame, TensorPayload};
-use crate::nn::checkpoint::{LoadReport, RawCheckpointEntry, dtype_tag, save_checkpoint_from_raw_file};
+use crate::nn::checkpoint::{
+    LoadReport, RawCheckpointEntry, dtype_tag, save_checkpoint_from_raw_file,
+};
 use crate::nn::{Buffer, Module, Parameter};
 use crate::tensor::{DType, Result, TensorError};
 
@@ -262,7 +264,11 @@ impl CheckpointForge {
 /// bytes directly (no `Tensor` reconstruction) and commits with a temp-file +
 /// atomic rename, so a crash mid-write never leaves a torn `.fdl` that resume
 /// could mistake for valid.
-fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &Path) -> Result<()> {
+fn write_consensus_fdl(
+    schema: &ModelSchema,
+    payloads: &[TensorPayload],
+    path: &Path,
+) -> Result<()> {
     if payloads.len() != schema.tensor_count() {
         return Err(TensorError::new(&format!(
             "checkpoint_forge: accumulated {} tensors but schema expects \
@@ -312,9 +318,7 @@ fn write_consensus_fdl(schema: &ModelSchema, payloads: &[TensorPayload], path: &
             } else {
                 let vals = crate::distributed::controller::payload_to_f32(p)?;
                 Ok(Some(
-                    crate::distributed::controller::f32_slice_to_payload_bytes(
-                        &vals, DTYPE_F32,
-                    )?,
+                    crate::distributed::controller::f32_slice_to_payload_bytes(&vals, DTYPE_F32)?,
                 ))
             }
         })
@@ -404,7 +408,10 @@ pub fn load_outer_momentum<M: Module + ?Sized>(
     let mut targets: Vec<(String, Parameter)> = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
         let zeros = crate::tensor::Tensor::zeros_like(&p.variable.data())?;
-        targets.push((consensus_param_key(i), Parameter::new(zeros, "outer_momentum")));
+        targets.push((
+            consensus_param_key(i),
+            Parameter::new(zeros, "outer_momentum"),
+        ));
     }
     crate::nn::load_checkpoint_file(path, &targets, &[], None)?;
     Ok(targets.iter().map(|(_, p)| p.variable.data()).collect())
@@ -466,13 +473,19 @@ mod tests {
         // model's own names (which can repeat across layers).
         crate::nn::load_checkpoint_file(
             path.to_str().unwrap(),
-            &[("p0".to_string(), tw.clone()), ("p1".to_string(), tb.clone())],
+            &[
+                ("p0".to_string(), tw.clone()),
+                ("p1".to_string(), tb.clone()),
+            ],
             &[("b0".to_string(), trm.clone())],
             None,
         )
         .unwrap();
 
-        assert_eq!(tw.variable.data().to_f32_vec().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            tw.variable.data().to_f32_vec().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
         assert_eq!(tb.variable.data().to_f32_vec().unwrap(), vec![5.0, 6.0]);
         assert_eq!(trm.get().to_f32_vec().unwrap(), vec![7.0, 8.0]);
 
@@ -494,8 +507,7 @@ mod tests {
         let frame = tensors_to_round_frame(&[&w], DTYPE_BF16).unwrap();
         assert_eq!(frame.tensors[0].dtype, DTYPE_BF16);
 
-        let dir =
-            std::env::temp_dir().join(format!("flodl_forge_bf16_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flodl_forge_bf16_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus.fdl");
         forge.arm(path.clone());
@@ -550,7 +562,11 @@ mod tests {
         forge.arm(path.clone());
         assert!(forge.is_armed());
         // Stash momentum, then complete the model accumulation (params, buffers).
-        forge.stash_outer_momentum(tensors_to_round_frame(&[&mw, &mb], DTYPE_F32).unwrap().tensors);
+        forge.stash_outer_momentum(
+            tensors_to_round_frame(&[&mw, &mb], DTYPE_F32)
+                .unwrap()
+                .tensors,
+        );
         forge.accumulate(tensors_to_round_frame(&[&w, &b], DTYPE_F32).unwrap());
         forge.accumulate(tensors_to_round_frame(&[&rm], DTYPE_F32).unwrap()); // completes
 
@@ -571,12 +587,18 @@ mod tests {
         let t1 = Parameter::new(cpu_tensor(&[0.0; 2], &[2]), "m1");
         crate::nn::load_checkpoint_file(
             outer_path.to_str().unwrap(),
-            &[("p0".to_string(), t0.clone()), ("p1".to_string(), t1.clone())],
+            &[
+                ("p0".to_string(), t0.clone()),
+                ("p1".to_string(), t1.clone()),
+            ],
             &[],
             None,
         )
         .unwrap();
-        assert_eq!(t0.variable.data().to_f32_vec().unwrap(), vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(
+            t0.variable.data().to_f32_vec().unwrap(),
+            vec![0.1, 0.2, 0.3, 0.4]
+        );
         assert_eq!(t1.variable.data().to_f32_vec().unwrap(), vec![0.5, 0.6]);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -610,7 +632,10 @@ mod tests {
         assert!(model_found, ".fdl written");
         // Give any (erroneous) sidecar writer a chance, then assert absence.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(!outer_path.exists(), "no .outer.fdl when no momentum stashed");
+        assert!(
+            !outer_path.exists(),
+            "no .outer.fdl when no momentum stashed"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -666,7 +691,10 @@ mod tests {
         let tb = Parameter::new(cpu_tensor(&[0.0; 1], &[1]), "b");
         crate::nn::load_checkpoint_file(
             path.to_str().unwrap(),
-            &[("p0".to_string(), tw.clone()), ("p1".to_string(), tb.clone())],
+            &[
+                ("p0".to_string(), tw.clone()),
+                ("p1".to_string(), tb.clone()),
+            ],
             &[],
             None,
         )

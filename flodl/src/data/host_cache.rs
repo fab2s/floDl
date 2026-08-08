@@ -205,9 +205,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("f.bin"), b"abc").unwrap();
 
-        let got = resolve_cached(&root, "sub", "f.bin", |p| p.exists(), |_| {
-            panic!("must not fetch when the source root already has it")
-        })
+        let got = resolve_cached(
+            &root,
+            "sub",
+            "f.bin",
+            |p| p.exists(),
+            |_| panic!("must not fetch when the source root already has it"),
+        )
         .unwrap();
 
         assert_eq!(got, dir.join("f.bin"));
@@ -227,9 +231,7 @@ mod tests {
         let cache = data_cache_dir().join(&sub);
         let _ = fs::remove_dir_all(&cache);
 
-        let right_size = |p: &Path| {
-            fs::metadata(p).map(|m| m.len() == 3).unwrap_or(false)
-        };
+        let right_size = |p: &Path| fs::metadata(p).map(|m| m.len() == 3).unwrap_or(false);
         let got = resolve_cached(&root, &sub, "f.bin", right_size, |dst| {
             publish_atomically(dst, |f| {
                 use std::io::Write;
@@ -238,7 +240,10 @@ mod tests {
         })
         .unwrap();
 
-        assert!(got.starts_with(data_cache_dir()), "fetched copy must land in the cache: {got:?}");
+        assert!(
+            got.starts_with(data_cache_dir()),
+            "fetched copy must land in the cache: {got:?}"
+        );
         assert_eq!(fs::read(&got).unwrap(), b"abc");
         fs::remove_dir_all(&root).unwrap();
         let _ = fs::remove_dir_all(&cache);
@@ -262,12 +267,18 @@ mod tests {
         let cache = data_cache_dir().join(&sub);
         let _ = fs::remove_dir_all(&cache);
 
-        let got = resolve_cached(&root, &sub, "f.bin", |p| p.exists(), |dst| {
-            publish_atomically(dst, |f| {
-                use std::io::Write;
-                f.write_all(b"fetched").map_err(|e| write_error(dst, &e))
-            })
-        })
+        let got = resolve_cached(
+            &root,
+            &sub,
+            "f.bin",
+            |p| p.exists(),
+            |dst| {
+                publish_atomically(dst, |f| {
+                    use std::io::Write;
+                    f.write_all(b"fetched").map_err(|e| write_error(dst, &e))
+                })
+            },
+        )
         .unwrap();
 
         assert_eq!(fs::read(&got).unwrap(), b"fetched");
@@ -301,12 +312,18 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("simulated"), "got: {err}");
 
-        assert!(!dest.exists(), "destination must not exist after a failed publish");
+        assert!(
+            !dest.exists(),
+            "destination must not exist after a failed publish"
+        );
         let leftovers: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(leftovers.is_empty(), "temp must be cleaned up, found {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp must be cleaned up, found {leftovers:?}"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -319,7 +336,8 @@ mod tests {
 
         publish_atomically(&dest, |f| {
             use std::io::Write;
-            f.write_all(&[7u8; 4096]).map_err(|e| write_error(&dest, &e))
+            f.write_all(&[7u8; 4096])
+                .map_err(|e| write_error(&dest, &e))
         })
         .unwrap();
 

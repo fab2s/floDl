@@ -1,8 +1,8 @@
 use crate::autograd::{self, Variable};
-use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
+use crate::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
-use super::parameter::Parameter;
 use super::Module;
+use super::parameter::Parameter;
 
 /// Single-step GRU cell backed by fused ATen `gru_cell` kernel.
 ///
@@ -38,16 +38,23 @@ impl GRUCell {
     /// Create a GRU cell on a specific device.
     pub fn on_device(input_size: i64, hidden_size: i64, device: Device) -> Result<Self> {
         let bound = 1.0 / (hidden_size as f64).sqrt();
-        let opts = TensorOptions { dtype: DType::Float32, device };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device,
+        };
 
         let w_ih = Tensor::rand(&[3 * hidden_size, input_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let w_hh = Tensor::rand(&[3 * hidden_size, hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let b_ih = Tensor::rand(&[3 * hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let b_hh = Tensor::rand(&[3 * hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
 
         Ok(GRUCell {
             w_ih: Parameter::new(w_ih, "w_ih"),
@@ -66,24 +73,29 @@ impl GRUCell {
         let h = match h {
             Some(h) => h.clone(),
             None => {
-                let opts = TensorOptions { dtype: DType::Float32, device: self.w_ih.variable.device() };
-                Variable::new(
-                    Tensor::zeros(&[batch, self.hidden_size], opts)?,
-                    false,
-                )
+                let opts = TensorOptions {
+                    dtype: DType::Float32,
+                    device: self.w_ih.variable.device(),
+                };
+                Variable::new(Tensor::zeros(&[batch, self.hidden_size], opts)?, false)
             }
         };
 
         autograd::gru_cell(
-            x, &h,
-            &self.w_ih.variable, &self.w_hh.variable,
-            &self.b_ih.variable, &self.b_hh.variable,
+            x,
+            &h,
+            &self.w_ih.variable,
+            &self.w_hh.variable,
+            &self.b_ih.variable,
+            &self.b_hh.variable,
         )
     }
 }
 
 impl Module for GRUCell {
-    fn name(&self) -> &str { "grucell" }
+    fn name(&self) -> &str {
+        "grucell"
+    }
 
     /// Module trait forward: runs a single step with zero-initialized hidden state.
     /// Does not accept or return hidden state -- use [`forward_step`](GRUCell::forward_step)
@@ -113,7 +125,10 @@ mod tests {
     #[test]
     fn test_grucell_forward() {
         let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+        let x = Variable::new(
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
         let h = gru.forward_step(&x, None).unwrap();
         assert_eq!(h.shape(), vec![2, 3]);
 
@@ -126,7 +141,9 @@ mod tests {
     fn test_grucell_gradient() {
         let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), true);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            true,
+        );
         let h = gru.forward_step(&x, None).unwrap();
         let loss = h.sum().unwrap();
         loss.backward().unwrap();
@@ -143,7 +160,9 @@ mod tests {
     fn test_grucell_multi_step() {
         let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
 
         // Run 5 steps, each feeding previous hidden state
         let mut h: Option<Variable> = None;
@@ -174,15 +193,27 @@ mod tests {
 
             let xp_var = Variable::new(from_f32(&xp, &[2, 2]), false);
             let xm_var = Variable::new(from_f32(&xm, &[2, 2]), false);
-            let fp: f64 = gru.forward_step(&xp_var, None).unwrap()
-                .sum().unwrap().item().unwrap();
-            let fm: f64 = gru.forward_step(&xm_var, None).unwrap()
-                .sum().unwrap().item().unwrap();
+            let fp: f64 = gru
+                .forward_step(&xp_var, None)
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap();
+            let fm: f64 = gru
+                .forward_step(&xm_var, None)
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap();
             let numerical = (fp - fm) / (2.0 * eps);
             assert!(
                 (analytical[i] as f64 - numerical).abs() < 0.05,
                 "grad mismatch at {}: analytical={}, numerical={}",
-                i, analytical[i], numerical
+                i,
+                analytical[i],
+                numerical
             );
         }
     }
@@ -191,7 +222,10 @@ mod tests {
     fn test_grucell_module_forward() {
         use crate::nn::Module;
         let gru = GRUCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+        let x = Variable::new(
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
         let y = gru.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 3]);
     }

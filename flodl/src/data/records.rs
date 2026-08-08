@@ -135,16 +135,19 @@ impl FixedStrideRecords {
         #[cfg(not(unix))]
         {
             use std::io::{Read, Seek, SeekFrom};
-            let _guard = self.seek_lock.lock().map_err(|_| {
-                TensorError::new("FixedStrideRecords: seek lock poisoned")
-            })?;
+            let _guard = self
+                .seek_lock
+                .lock()
+                .map_err(|_| TensorError::new("FixedStrideRecords: seek lock poisoned"))?;
             let mut f = &self.file;
-            f.seek(SeekFrom::Start(offset)).and_then(|_| f.read_exact(&mut buf)).map_err(|e| {
-                TensorError::new(&format!(
-                    "FixedStrideRecords: read of record {index} failed at {}: {e}",
-                    self.path.display()
-                ))
-            })?;
+            f.seek(SeekFrom::Start(offset))
+                .and_then(|_| f.read_exact(&mut buf))
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "FixedStrideRecords: read of record {index} failed at {}: {e}",
+                        self.path.display()
+                    ))
+                })?;
         }
 
         Ok(buf)

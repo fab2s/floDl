@@ -16,12 +16,12 @@
 //! - **Observation**: [`tagged_at()`](Graph::tagged_at), [`collect_at()`](Graph::collect_at),
 //!   [`record_at()`](Graph::record_at), [`trend_at()`](Graph::trend_at)
 
-use std::collections::HashMap;
+use super::trend::Trend;
+use super::{Graph, GraphExt};
 use crate::autograd::Variable;
 use crate::nn::{self, Buffer, Module, Parameter};
 use crate::tensor::{Result, TensorError};
-use super::{Graph, GraphExt};
-use super::trend::Trend;
+use std::collections::HashMap;
 
 /// What a label path resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,10 @@ impl Graph {
                         first, full_path
                     )));
                 }
-                return Ok(ResolvedPath::Tag { graph: self, tag: first.to_string() });
+                return Ok(ResolvedPath::Tag {
+                    graph: self,
+                    tag: first.to_string(),
+                });
             }
             return Err(TensorError::new(&format!(
                 "{:?} is not a subgraph or tag of this graph (path: {:?})",
@@ -106,9 +109,12 @@ impl Graph {
 
     /// Direct children: label -> child graph.
     pub fn tree_children(&self) -> HashMap<&str, &Graph> {
-        self.children.iter()
+        self.children
+            .iter()
             .filter_map(|(label, &ni)| {
-                self.nodes[ni].module.as_ref()
+                self.nodes[ni]
+                    .module
+                    .as_ref()
                     .and_then(|m| m.as_graph())
                     .map(|g| (label.as_str(), g))
             })
@@ -117,7 +123,8 @@ impl Graph {
 
     /// Get a direct child graph by label (one level only).
     pub fn child_graph(&self, label: &str) -> Option<&Graph> {
-        self.children.get(label)
+        self.children
+            .get(label)
             .and_then(|&ni| self.nodes[ni].module.as_ref())
             .and_then(|m| m.as_graph())
     }
@@ -127,7 +134,8 @@ impl Graph {
         match self.resolve(path)? {
             ResolvedPath::Subgraph(g) => Ok(g),
             ResolvedPath::Tag { .. } => Err(TensorError::new(&format!(
-                "path {:?} resolves to a tag, not a subgraph", path
+                "path {:?} resolves to a tag, not a subgraph",
+                path
             ))),
         }
     }
@@ -179,7 +187,9 @@ impl Graph {
             ResolvedPath::Tag { graph, ref tag } => {
                 if let Some(&(ni, _)) = graph.tag_names.get(tag.as_str()) {
                     if let Some(ref module) = graph.nodes[ni].module {
-                        Ok(module.parameters().into_iter()
+                        Ok(module
+                            .parameters()
+                            .into_iter()
                             .map(|p| (format!("{}/{}", tag, p.name), p))
                             .collect())
                     } else {
@@ -199,7 +209,9 @@ impl Graph {
             ResolvedPath::Tag { graph, ref tag } => {
                 if let Some(&(ni, _)) = graph.tag_names.get(tag.as_str()) {
                     if let Some(ref module) = graph.nodes[ni].module {
-                        Ok(module.buffers().into_iter()
+                        Ok(module
+                            .buffers()
+                            .into_iter()
                             .map(|b| (format!("{}/{}", tag, b.name), b))
                             .collect())
                     } else {
@@ -267,11 +279,12 @@ impl Graph {
             }
             ResolvedPath::Tag { graph, ref tag } => {
                 if let Some(&(ni, _)) = graph.tag_names.get(tag.as_str())
-                    && let Some(ref module) = graph.nodes[ni].module {
-                        crate::nn::walk_modules(module.as_ref(), &mut |m| {
-                            m.set_training(training);
-                        });
-                    }
+                    && let Some(ref module) = graph.nodes[ni].module
+                {
+                    crate::nn::walk_modules(module.as_ref(), &mut |m| {
+                        m.set_training(training);
+                    });
+                }
             }
         }
         Ok(())
@@ -286,7 +299,8 @@ impl Graph {
     pub fn tagged_at(&self, path: &str) -> Result<Option<Variable>> {
         match self.resolve(path)? {
             ResolvedPath::Subgraph(_) => Err(TensorError::new(&format!(
-                "path {:?} resolves to a subgraph, not a tag", path
+                "path {:?} resolves to a subgraph, not a tag",
+                path
             ))),
             ResolvedPath::Tag { graph, ref tag } => Ok(graph.tagged(tag)),
         }
@@ -300,7 +314,8 @@ impl Graph {
             match self.resolve(path)? {
                 ResolvedPath::Subgraph(_) => {
                     return Err(TensorError::new(&format!(
-                        "collect_at: {:?} resolves to a subgraph, not a tag", path
+                        "collect_at: {:?} resolves to a subgraph, not a tag",
+                        path
                     )));
                 }
                 ResolvedPath::Tag { graph, ref tag } => {

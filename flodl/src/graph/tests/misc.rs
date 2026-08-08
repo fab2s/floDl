@@ -46,7 +46,6 @@ fn test_walk_modules() {
 
 // --- Profiling tests ---
 
-
 #[test]
 fn test_profiling_basic() {
     let graph = FlowBuilder::from(Linear::on_device(3, 4, crate::tensor::test_device()).unwrap())
@@ -97,10 +96,7 @@ fn test_profiling_basic() {
 
 #[test]
 fn test_profiling_timing_trend() {
-    let graph = FlowBuilder::from(ScalarSum)
-        .tag("loss")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(ScalarSum).tag("loss").build().unwrap();
 
     graph.enable_profiling();
 
@@ -194,23 +190,32 @@ fn test_named_parameters_tagged_prefix() {
 
     let named = graph.named_parameters();
     // First Linear is tagged "encoder", second is untagged
-    let encoder_params: Vec<&str> = named.iter()
+    let encoder_params: Vec<&str> = named
+        .iter()
         .filter(|(n, _)| n.starts_with("encoder/"))
         .map(|(n, _)| n.as_str())
         .collect();
-    assert_eq!(encoder_params.len(), 2, "tagged node should have 2 params with 'encoder/' prefix");
+    assert_eq!(
+        encoder_params.len(),
+        2,
+        "tagged node should have 2 params with 'encoder/' prefix"
+    );
 
     // Untagged node uses its node_id (like "linear_2")
-    let untagged: Vec<&str> = named.iter()
+    let untagged: Vec<&str> = named
+        .iter()
         .filter(|(n, _)| !n.starts_with("encoder/"))
         .map(|(n, _)| n.as_str())
         .collect();
     assert_eq!(untagged.len(), 2, "untagged node should have 2 params");
-    assert!(untagged[0].contains('/'), "should have prefix/name format: {}", untagged[0]);
+    assert!(
+        untagged[0].contains('/'),
+        "should have prefix/name format: {}",
+        untagged[0]
+    );
 }
 
 // --- Structural hash tests ---
-
 
 #[test]
 fn test_structural_hash_deterministic() {
@@ -256,7 +261,6 @@ fn test_short_hash_length() {
     assert!(g.structural_hash().starts_with(g.short_hash()));
 }
 
-
 #[test]
 fn test_label_default_none() {
     let g = FlowBuilder::from(Linear::on_device(2, 3, crate::tensor::test_device()).unwrap())
@@ -290,7 +294,6 @@ fn test_label_does_not_affect_hash() {
     assert_eq!(g1.structural_hash(), g2.structural_hash());
 }
 
-
 #[test]
 fn test_graph_save_load_checkpoint() {
     let g = FlowBuilder::from(Linear::on_device(4, 8, crate::tensor::test_device()).unwrap())
@@ -323,10 +326,16 @@ fn test_graph_save_load_checkpoint() {
     assert!(report.missing.is_empty());
 
     // Verify weights match
-    for ((n1, p1), (n2, p2)) in g.named_parameters().iter().zip(g2.named_parameters().iter()) {
+    for ((n1, p1), (n2, p2)) in g
+        .named_parameters()
+        .iter()
+        .zip(g2.named_parameters().iter())
+    {
         assert_eq!(n1, n2);
-        assert_eq!(p1.variable.data().to_f32_vec().unwrap(),
-                   p2.variable.data().to_f32_vec().unwrap());
+        assert_eq!(
+            p1.variable.data().to_f32_vec().unwrap(),
+            p2.variable.data().to_f32_vec().unwrap()
+        );
     }
 
     std::fs::remove_file(path_str).ok();
@@ -403,7 +412,10 @@ fn test_save_checkpoint_no_sidecar_when_source_config_unset() {
     std::fs::remove_file(&sidecar).ok();
 
     g.save_checkpoint(path_str).unwrap();
-    assert!(!sidecar.exists(), "sidecar must not be written when source_config is unset");
+    assert!(
+        !sidecar.exists(),
+        "sidecar must not be written when source_config is unset"
+    );
 
     std::fs::remove_file(path_str).ok();
 }
@@ -447,7 +459,10 @@ fn test_clear_source_config_disables_sidecar() {
     std::fs::remove_file(&sidecar).ok();
 
     g.save_checkpoint(path_str).unwrap();
-    assert!(!sidecar.exists(), "cleared source_config must not emit sidecar");
+    assert!(
+        !sidecar.exists(),
+        "cleared source_config must not emit sidecar"
+    );
 
     std::fs::remove_file(path_str).ok();
 }
@@ -478,7 +493,6 @@ fn test_graph_checkpoint_gz() {
 
 // --- collect_with reduction tests ---
 
-
 #[test]
 fn test_graph_set_scheduler_drives_optimizer_lr() {
     let (graph, x) = graph_with_optim(0.0); // start at 0 so we detect writes
@@ -494,9 +508,12 @@ fn test_graph_set_scheduler_drives_optimizer_lr() {
         // After step(), training_step has advanced and the LR set BEFORE
         // optimizer.step() reflects the *previous* training_step value.
         let expected_lr = expected_step as f64 * 0.1;
-        assert!((current_optim_lr(&graph) - expected_lr).abs() < 1e-9,
+        assert!(
+            (current_optim_lr(&graph) - expected_lr).abs() < 1e-9,
             "after step {}: expected LR {expected_lr}, got {}",
-            expected_step + 1, current_optim_lr(&graph));
+            expected_step + 1,
+            current_optim_lr(&graph)
+        );
         assert_eq!(graph.training_step(), expected_step + 1);
     }
 }
@@ -517,9 +534,11 @@ fn test_graph_lr_scale_multiplies_scheduler_output() {
     y.sum().unwrap().backward().unwrap();
     graph.step().unwrap();
     // Step 1: scheduler returns 0.1 -> 0.1 * 2.5 = 0.25
-    assert!((current_optim_lr(&graph) - 0.25).abs() < 1e-9,
+    assert!(
+        (current_optim_lr(&graph) - 0.25).abs() < 1e-9,
         "expected LR 0.25 (sched 0.1 * scale 2.5), got {}",
-        current_optim_lr(&graph));
+        current_optim_lr(&graph)
+    );
 }
 
 #[test]
@@ -530,9 +549,11 @@ fn test_graph_no_scheduler_leaves_lr_alone() {
     let y = graph.forward(&x).unwrap();
     y.sum().unwrap().backward().unwrap();
     graph.step().unwrap();
-    assert!((current_optim_lr(&graph) - 0.123).abs() < 1e-9,
+    assert!(
+        (current_optim_lr(&graph) - 0.123).abs() < 1e-9,
         "no scheduler attached: LR must be untouched, got {}",
-        current_optim_lr(&graph));
+        current_optim_lr(&graph)
+    );
     // training_step still increments (it's a per-step counter, scheduler-independent).
     assert_eq!(graph.training_step(), 1);
 }
@@ -552,7 +573,10 @@ fn graph_ext_downcasts_graph_and_rejects_leaves() {
     assert!(std::ptr::eq(recovered, &graph), "identity, not a copy");
 
     let boxed: Box<dyn Module> = Box::new(FlowBuilder::from(Doubler).build().unwrap());
-    assert!(boxed.as_graph().is_some(), "Box<dyn Module> forwards as_any");
+    assert!(
+        boxed.as_graph().is_some(),
+        "Box<dyn Module> forwards as_any"
+    );
 
     let leaf: &dyn Module = &Doubler;
     assert!(leaf.as_graph().is_none(), "leaf modules present nothing");

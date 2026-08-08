@@ -24,7 +24,10 @@ impl BatchDataSet for DeterministicDataset {
     }
     fn get_batch(&self, indices: &[usize]) -> Result<Vec<Tensor>> {
         let n = indices.len() as i64;
-        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: Device::CPU,
+        };
         // Scalar derived deterministically from the indices; uniform rows are
         // fine — only determinism across the two workers matters.
         let s: usize = indices.iter().copied().sum();
@@ -43,8 +46,7 @@ fn make_det_worker(total: usize) -> (GpuWorker<Linear>, WorkerChannels) {
     let dev = test_device();
 
     let tmp = Linear::on_device(4, 2, dev).unwrap();
-    let initial_params: Vec<Tensor> =
-        tmp.parameters().iter().map(|p| p.variable.data()).collect();
+    let initial_params: Vec<Tensor> = tmp.parameters().iter().map(|p| p.variable.data()).collect();
     let initial_buffers: Vec<Tensor> = tmp.buffers().iter().map(|b| b.get()).collect();
     drop(tmp);
 
@@ -288,7 +290,15 @@ fn cooperative_worker_matches_managed_run_epoch_plan() {
     {
         // Both on CPU (snapshot + finish land on CPU). Same init + same data +
         // same ops => bit-identical up to a tiny tolerance.
-        let diff: f64 = m.sub(c).unwrap().abs().unwrap().sum().unwrap().item().unwrap();
+        let diff: f64 = m
+            .sub(c)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum()
+            .unwrap()
+            .item()
+            .unwrap();
         assert!(
             diff < 1e-6,
             "param {i} diverged between managed and cooperative: L1 diff = {diff}"

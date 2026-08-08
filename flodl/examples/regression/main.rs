@@ -86,7 +86,13 @@ fn logistic_regression() -> Result<()> {
     let feats = Tensor::randn(&[m as i64, 2], opts)?;
     let feats_vec = feats.to_f32_vec()?;
     let labels: Vec<f32> = (0..m)
-        .map(|i| if feats_vec[2 * i] + feats_vec[2 * i + 1] > 0.0 { 1.0 } else { 0.0 })
+        .map(|i| {
+            if feats_vec[2 * i] + feats_vec[2 * i + 1] > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect();
     let y_data = Tensor::from_f32(&labels, &[m as i64, 1], Device::CPU)?;
 
@@ -122,7 +128,10 @@ fn logistic_regression() -> Result<()> {
         })
         .count();
 
-    println!("  accuracy: {:.1}% ({correct}/{m})", 100.0 * correct as f32 / m as f32);
+    println!(
+        "  accuracy: {:.1}% ({correct}/{m})",
+        100.0 * correct as f32 / m as f32
+    );
     Ok(())
 }
 
@@ -184,7 +193,13 @@ mod tests {
         let feats = Tensor::randn(&[m as i64, 2], opts)?;
         let feats_vec = feats.to_f32_vec()?;
         let labels: Vec<f32> = (0..m)
-            .map(|i| if feats_vec[2 * i] + feats_vec[2 * i + 1] > 0.0 { 1.0 } else { 0.0 })
+            .map(|i| {
+                if feats_vec[2 * i] + feats_vec[2 * i + 1] > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let y_data = Tensor::from_f32(&labels, &[m as i64, 1], Device::CPU)?;
 
@@ -214,7 +229,10 @@ mod tests {
             })
             .count();
 
-        assert!(correct as f32 / m as f32 > 0.9, "accuracy too low: {correct}/{m}");
+        assert!(
+            correct as f32 / m as f32 > 0.9,
+            "accuracy too low: {correct}/{m}"
+        );
         Ok(())
     }
 }

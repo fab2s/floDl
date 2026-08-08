@@ -39,7 +39,8 @@ fn one_hot_encode(seq: &str) -> Tensor {
         };
         data[channel * SEQ_LEN + i] = 1.0;
     }
-    Tensor::from_f32(&data, &[4, SEQ_LEN as i64], Device::CPU).expect("failed to build one-hot tensor")
+    Tensor::from_f32(&data, &[4, SEQ_LEN as i64], Device::CPU)
+        .expect("failed to build one-hot tensor")
 }
 
 /// Generate a random DNA string of length `len`.

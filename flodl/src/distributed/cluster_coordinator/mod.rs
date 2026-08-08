@@ -83,14 +83,12 @@ use crate::distributed::ddp::ElChe;
 use crate::distributed::ddp_run::convergence::ConvergenceGuard;
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::relay::mux::{MuxRead, MuxRecord, RelayControlMsg};
-use crate::distributed::wire::{
-    ControlFrame, MsgKind, SessionSalt, TimingMsgWire,
-};
+use crate::distributed::wire::{ControlFrame, MsgKind, SessionSalt, TimingMsgWire};
 
-pub mod config;
 mod alerts;
 mod averaging;
 mod callback_roles;
+pub mod config;
 mod cycle_cpu;
 mod cycle_nccl;
 mod cycle_state;
@@ -98,10 +96,10 @@ mod dead_ranks;
 mod epoch_dispatch;
 mod event_loop;
 mod lifecycle;
-mod window_ledger;
-mod window_records;
 #[cfg(test)]
 mod test_helpers;
+mod window_ledger;
+mod window_records;
 
 pub use config::ClusterCoordinatorConfig;
 
@@ -154,7 +152,11 @@ fn initial_callback_role(
 ) -> usize {
     match policy {
         crate::distributed::ddp_run::EpochCallbackPolicy::Rank(n) => {
-            if world_size == 0 { 0 } else { n.min(world_size - 1) }
+            if world_size == 0 {
+                0
+            } else {
+                n.min(world_size - 1)
+            }
         }
         crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => 0,
     }
@@ -275,7 +277,6 @@ struct FinalWindowPlan {
 /// tick through the same death side-effect chain. The shared ledger
 /// dedups: stale or duplicate reports are skipped.
 pub type ReportedDeaths = std::sync::Arc<std::sync::Mutex<Vec<usize>>>;
-
 
 /// Process-model coordinator: drives the per-cluster scheduling state
 /// machine while talking to remote rank processes over TCP.
@@ -500,8 +501,7 @@ pub struct ClusterCoordinator {
     /// untried live rank on retry, and (b) detect exhaustion (all
     /// live ranks tried + failed → give up on this version; existing
     /// `MaxFailureThreshold` governs the longer-term run health).
-    checkpoint_tried_ranks:
-        std::collections::HashMap<u64, std::collections::HashSet<usize>>,
+    checkpoint_tried_ranks: std::collections::HashMap<u64, std::collections::HashSet<usize>>,
     /// EWMA of recent successful checkpoint wall-times (ms). Reserved
     /// for v2 rendezvous-aware scheduling (controller aligns
     /// checkpoint dispatch with AllReduce barriers so the cost
@@ -597,7 +597,8 @@ pub struct ClusterCoordinator {
     run_phase: RunPhase,
     /// Cached epoch plans: computed once per epoch, consistent across
     /// ranks regardless of when the StartEpoch frame goes out.
-    epoch_plan_cache: std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
+    epoch_plan_cache:
+        std::collections::HashMap<usize, Vec<crate::distributed::wire::EpochPlanWire>>,
     /// Total samples in the dataset; basis for partition computation.
     /// Always the whole pick space — see [`Self::epoch_samples`] for
     /// what a single epoch covers.
@@ -632,10 +633,7 @@ pub struct ClusterCoordinator {
     /// `ChunkPool::is_epoch_done()` returns true for progressive).
     /// `BTreeMap` rather than `HashMap` so progressive aggregation
     /// walks epochs in ascending order.
-    metrics_buffer: std::collections::BTreeMap<
-        u64,
-        Vec<crate::distributed::ddp_run::MetricsMsg>,
-    >,
+    metrics_buffer: std::collections::BTreeMap<u64, Vec<crate::distributed::ddp_run::MetricsMsg>>,
     /// Per-epoch progressive chunk pools. Created on `dispatch_epoch`
     /// when [`Self::progressive`] is set, drained by
     /// `drain_metrics_and_aggregate` on epoch completion. `BTreeMap`
@@ -791,7 +789,6 @@ impl ClusterCoordinator {
         self.active_count
     }
 
-
     pub fn max_overshoot(&self) -> usize {
         self.max_overshoot
     }
@@ -799,7 +796,6 @@ impl ClusterCoordinator {
     pub fn el_che(&self) -> &ElChe {
         &self.el_che
     }
-
 
     /// Per-rank wall-time (ms) from `RequestParams` broadcast to that
     /// rank's
@@ -956,9 +952,7 @@ fn relay_reader_loop(
             Ok(MuxRead::Record(MuxRecord::Control(_))) => {
                 // Hello/HelloAck occur only at startup; ignore mid-stream.
             }
-            Ok(MuxRead::Record(
-                MuxRecord::HostFrame { .. } | MuxRecord::Broadcast { .. },
-            )) => {
+            Ok(MuxRead::Record(MuxRecord::HostFrame { .. } | MuxRecord::Broadcast { .. })) => {
                 // Data-channel fold records; they never ride the control
                 // channel. Drop with a diagnostic.
                 eprintln!(
@@ -1008,8 +1002,7 @@ fn dispatch_control_frame(
             // stability (the enum value is part of the protocol surface).
             true
         }
-        MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous
-        | MsgKind::Join => {
+        MsgKind::Control | MsgKind::ParamSnapshotMeta | MsgKind::Rendezvous | MsgKind::Join => {
             eprintln!(
                 "cluster_coordinator: reader r{rank} got unexpected MsgKind {:?} on \
                  rank→coord path; dropping",
@@ -1019,7 +1012,6 @@ fn dispatch_control_frame(
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

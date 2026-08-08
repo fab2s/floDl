@@ -22,8 +22,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::data::sample_cache::SampleCache;
 use crate::data::BatchDataSet;
+use crate::data::sample_cache::SampleCache;
 use crate::tensor::{Result, Tensor, TensorOptions};
 
 use super::super::{make_partition, pick_space};
@@ -388,11 +388,7 @@ fn stager_ram_budget(
     //
     let available = if crate::tensor::gpu_available() {
         let device = crate::tensor::Device::CUDA(crate::tensor::current_gpu_device());
-        crate::data::budget::unified_adjusted_available(
-            m.available_bytes,
-            device,
-            gpu_ram_share,
-        )
+        crate::data::budget::unified_adjusted_available(m.available_bytes, device, gpu_ram_share)
     } else {
         m.available_bytes
     };
@@ -569,8 +565,7 @@ fn stager_loop(
     let mut pending: Option<StageAdvisory> = None;
     // Pinned-tier eviction candidates, farthest-next-use first;
     // re-snapshotted per advisory against the fresh stream.
-    let mut victims: std::collections::VecDeque<(usize, usize)> =
-        std::collections::VecDeque::new();
+    let mut victims: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
     // Remaining advised picks per sample (this advisory's horizon);
     // prices the flow window's retention.
     let mut sample_counts: HashMap<usize, usize> = HashMap::new();
@@ -594,10 +589,15 @@ fn stager_loop(
             // content drops only through next-use eviction —
             // farthest-first, in favor of sooner-needed samples — never
             // as a blanket flush.
-            let held =
-                cache.bytes() as u64 + stream.lock().map(|p| p.bytes() as u64).unwrap_or(0);
-            let share =
-                stager_ram_budget(rank, world_size, &a.counts, ram_max_usage, gpu_ram_share, held);
+            let held = cache.bytes() as u64 + stream.lock().map(|p| p.bytes() as u64).unwrap_or(0);
+            let share = stager_ram_budget(
+                rank,
+                world_size,
+                &a.counts,
+                ram_max_usage,
+                gpu_ram_share,
+                held,
+            );
             // `sample_cache=false` pins the retained tier at zero and
             // hands the whole staging share to the flow window (the
             // TrainerConfig/DdpBuilder knob mirroring the solo
@@ -696,13 +696,7 @@ fn stager_loop(
                 // full-of-sooner-data means: wait for the frontier or
                 // the next advisory.
                 let pinned_room = cache.bytes() + sample_bytes <= pinned_budget
-                    || evict_pinned_for(
-                        &cache,
-                        &mut victims,
-                        pos,
-                        sample_bytes,
-                        pinned_budget,
-                    );
+                    || evict_pinned_for(&cache, &mut victims, pos, sample_bytes, pinned_budget);
                 let stream_room = stream
                     .lock()
                     .map(|p| p.has_room_for(sample_bytes.max(1), pos))
@@ -723,14 +717,14 @@ fn stager_loop(
                 // the training path's to surface (same source) — the
                 // stager moves on.
                 if let Ok(batch) = dataset.get_batch(&[idx]) {
-                    sample_bytes = sample_bytes
-                        .max(crate::data::budget::retained_cost_estimate(&batch));
+                    sample_bytes =
+                        sample_bytes.max(crate::data::budget::retained_cost_estimate(&batch));
                     if !cache.contains_ram(idx)
-                        && let Ok(mut p) = stream.lock() {
-                            let remaining =
-                                sample_counts.get(&idx).copied().unwrap_or(1);
-                            let _ = p.offer(idx, batch, pos, remaining);
-                        }
+                        && let Ok(mut p) = stream.lock()
+                    {
+                        let remaining = sample_counts.get(&idx).copied().unwrap_or(1);
+                        let _ = p.offer(idx, batch, pos, remaining);
+                    }
                     staged.fetch_add(1, Ordering::Relaxed);
                 }
                 pos += 1;
@@ -829,7 +823,10 @@ mod tests {
         let r = pool.take(12).unwrap();
         assert_eq!(r[0].to_f64_vec().unwrap(), vec![12.0]);
         assert!(!pool.contains(12));
-        assert!(pool.offer(13, row(13.0), 20, 1), "room after the frontier passed");
+        assert!(
+            pool.offer(13, row(13.0), 20, 1),
+            "room after the frontier passed"
+        );
     }
 
     #[test]
@@ -844,7 +841,10 @@ mod tests {
         let positions: HashMap<usize, usize> = [(2usize, 0usize)].into_iter().collect();
         pool.refresh_positions(&positions, &HashMap::new());
         assert!(pool.offer(3, row(3.0), 7, 1));
-        assert!(!pool.contains(1), "vanished-from-stream entry evicted first");
+        assert!(
+            !pool.contains(1),
+            "vanished-from-stream entry evicted first"
+        );
         assert!(pool.contains(2), "soonest-recurring entry kept");
     }
 
@@ -948,8 +948,19 @@ mod tests {
         let (staged, cache, stream, calls) = staged_setup(12);
         let dataset: Arc<dyn BatchDataSet> = Arc::clone(&staged) as Arc<dyn BatchDataSet>;
 
-        let handle =
-            spawn_stager(dataset, Arc::clone(&cache), stream, 42, 1, 0, 1, 1, 0.5, None, true);
+        let handle = spawn_stager(
+            dataset,
+            Arc::clone(&cache),
+            stream,
+            42,
+            1,
+            0,
+            1,
+            1,
+            0.5,
+            None,
+            true,
+        );
         // Advisory: own span (0,4) + a margin span (8,2) of epoch 0,
         // plus a cross-epoch segment into epoch 1 — the stager walks
         // across the boundary without ceremony.
@@ -974,7 +985,11 @@ mod tests {
         let _ = staged.get_batch(&plan_e0).unwrap();
         let plan_e1 = make_partition(0, 2, 12, 1, 1, 42);
         let _ = staged.get_batch(&plan_e1).unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), before, "served from the tier");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            before,
+            "served from the tier"
+        );
 
         drop(handle); // disconnect + join
     }

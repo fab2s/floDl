@@ -149,12 +149,10 @@ fn resolve_tag(ctx: &Context, override_tag: Option<String>) -> Result<String, St
 fn detect_arch_list() -> Result<String, String> {
     let gpus = system::detect_gpus();
     if gpus.is_empty() {
-        return Err(
-            "No NVIDIA GPUs detected.\n\
+        return Err("No NVIDIA GPUs detected.\n\
              NCCL builds need GPU arch info to set NVCC_GENCODE.\n\
              Use --archs to specify manually (e.g. --archs \"6.1;12.0\")."
-                .into(),
-        );
+            .into());
     }
 
     // nvcc gencode targets: NVIDIA devices only. (RCCL, the AMD
@@ -166,7 +164,10 @@ fn detect_arch_list() -> Result<String, String> {
         .collect();
     caps.sort();
     caps.dedup();
-    let caps: Vec<String> = caps.iter().map(|(ma, mi)| format!("{}.{}", ma, mi)).collect();
+    let caps: Vec<String> = caps
+        .iter()
+        .map(|(ma, mi)| format!("{}.{}", ma, mi))
+        .collect();
 
     println!("  GPUs detected:");
     for g in &gpus {
@@ -181,9 +182,11 @@ fn detect_arch_list() -> Result<String, String> {
 /// suffix untouched.
 fn version_dir_part(tag: &str) -> String {
     if let Some((base, rest)) = tag.rsplit_once('-')
-        && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            return base.to_string();
-        }
+        && !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return base.to_string();
+    }
     tag.to_string()
 }
 
@@ -194,10 +197,7 @@ fn arch_gencode(archs: &str) -> String {
         .split(';')
         .map(|cap| {
             let clean = cap.replace('.', "");
-            format!(
-                "-gencode=arch=compute_{},code=sm_{}",
-                clean, clean
-            )
+            format!("-gencode=arch=compute_{},code=sm_{}", clean, clean)
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -211,11 +211,9 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
     let ctx = Context::resolve();
 
     if !docker::has_docker() {
-        return Err(
-            "Docker is required for `fdl nccl build`.\n\
+        return Err("Docker is required for `fdl nccl build`.\n\
              Install Docker: https://docs.docker.com/engine/install/"
-                .into(),
-        );
+            .into());
     }
 
     let tag = resolve_tag(&ctx, opts.tag)?;
@@ -248,7 +246,10 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
     println!();
 
     if opts.dry_run {
-        println!("  [dry-run] Would build NCCL {} for {} via Docker.", tag, archs);
+        println!(
+            "  [dry-run] Would build NCCL {} for {} via Docker.",
+            tag, archs
+        );
         println!("  This typically takes 5-15 minutes.");
         return Ok(());
     }
@@ -283,7 +284,12 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
 // Docker build
 // ---------------------------------------------------------------------------
 
-fn build_docker(version: &str, gencode: &str, image_tag: &str, max_jobs: usize) -> Result<(), String> {
+fn build_docker(
+    version: &str,
+    gencode: &str,
+    image_tag: &str,
+    max_jobs: usize,
+) -> Result<(), String> {
     // Write Dockerfile to temp location.
     let tmp_dir = std::env::temp_dir();
     let dockerfile_path = tmp_dir.join("flodl-nccl-builder.Dockerfile");
@@ -344,9 +350,7 @@ fn extract_artifacts(image_tag: &str, install_path: &PathBuf) -> Result<(), Stri
         let cp_status = docker::docker_run(&[
             "cp",
             &format!("{}:/usr/local/nccl/{}", container_id, sub),
-            install_path
-                .to_str()
-                .ok_or("install path not UTF-8")?,
+            install_path.to_str().ok_or("install path not UTF-8")?,
         ])?;
         if !cp_status.success() {
             last_err = Some(format!(

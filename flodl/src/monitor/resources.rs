@@ -104,7 +104,10 @@ impl ResourceSample {
                         Some(total) if alloc > total => alloc - total,
                         _ => 0,
                     };
-                    let util = gpu.util_percent.map(|u| format!(" ({:.0}%)", u)).unwrap_or_default();
+                    let util = gpu
+                        .util_percent
+                        .map(|u| format!(" ({:.0}%)", u))
+                        .unwrap_or_default();
                     parts.push(format!(
                         "GPU{}: {} / {}{}",
                         gpu.device_index,
@@ -232,7 +235,11 @@ impl ResourceSampler {
         let prev_cpu = read_cpu_times();
         let gpus = detect_gpu_statics();
         let gpu_poller = Self::start_gpu_poller(&gpus);
-        Self { prev_cpu, gpus, gpu_poller }
+        Self {
+            prev_cpu,
+            gpus,
+            gpu_poller,
+        }
     }
 
     /// Start a background thread that polls NVML utilization at
@@ -245,7 +252,10 @@ impl ResourceSampler {
         }
         let physical: Vec<u8> = gpus.iter().map(|g| g.physical_index).collect();
         let accum = Arc::new(Mutex::new(GpuUtilAccum {
-            samples: physical.iter().map(|_| VecDeque::with_capacity(GPU_UTIL_WINDOW)).collect(),
+            samples: physical
+                .iter()
+                .map(|_| VecDeque::with_capacity(GPU_UTIL_WINDOW))
+                .collect(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let accum2 = accum.clone();
@@ -294,9 +304,8 @@ impl ResourceSampler {
                 let d_total = current.total.saturating_sub(prev.total);
                 let d_idle = current.idle.saturating_sub(prev.idle);
                 if d_total > 0 {
-                    s.cpu_percent = Some(
-                        (d_total.saturating_sub(d_idle) as f32 / d_total as f32) * 100.0,
-                    );
+                    s.cpu_percent =
+                        Some((d_total.saturating_sub(d_idle) as f32 / d_total as f32) * 100.0);
                 }
             }
             self.prev_cpu = Some(current);
@@ -349,15 +358,14 @@ impl ResourceSampler {
             // Querying them from a process without a context would
             // CREATE one (pinning VRAM); gate on context presence.
             if crate::tensor::gpu_has_primary_context(i as i32)
-                && let Ok(alloc) = crate::tensor::gpu_allocated_bytes_idx(i as i32) {
-                    gpu.vram_allocated_bytes = Some(alloc);
-                }
+                && let Ok(alloc) = crate::tensor::gpu_allocated_bytes_idx(i as i32)
+            {
+                gpu.vram_allocated_bytes = Some(alloc);
+            }
             // Background average if available, else instant NVML sample
-            gpu.util_percent = util_averages.get(i).copied().flatten()
-                .or_else(|| {
-                    crate::tensor::gpu_utilization_idx(g.physical_index as i32)
-                        .map(|u| u as f32)
-                });
+            gpu.util_percent = util_averages.get(i).copied().flatten().or_else(|| {
+                crate::tensor::gpu_utilization_idx(g.physical_index as i32).map(|u| u as f32)
+            });
             s.gpus.push(gpu);
         }
 

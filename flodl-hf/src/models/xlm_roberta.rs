@@ -33,8 +33,8 @@ use flodl::nn::{Dropout, GeluApprox, Linear};
 use flodl::{DType, Device, Graph, Result, TensorError, Variable};
 
 use crate::models::roberta::{
-    roberta_backbone_flow, roberta_masked_lm_graph, RobertaClassificationHead, RobertaConfig,
-    RobertaModel,
+    RobertaClassificationHead, RobertaConfig, RobertaModel, roberta_backbone_flow,
+    roberta_masked_lm_graph,
 };
 
 /// XLM-RoBERTa hyperparameters.
@@ -128,16 +128,16 @@ impl XlmRobertaConfig {
         let num_labels = parse_num_labels(&v, id2label.as_deref());
         let architectures = parse_architectures(&v);
         Ok(XlmRobertaConfig {
-            vocab_size:              required_i64(&v, "vocab_size")?,
-            hidden_size:             required_i64(&v, "hidden_size")?,
-            num_hidden_layers:       required_i64(&v, "num_hidden_layers")?,
-            num_attention_heads:     required_i64(&v, "num_attention_heads")?,
-            intermediate_size:       required_i64(&v, "intermediate_size")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
+            hidden_size: required_i64(&v, "hidden_size")?,
+            num_hidden_layers: required_i64(&v, "num_hidden_layers")?,
+            num_attention_heads: required_i64(&v, "num_attention_heads")?,
+            intermediate_size: required_i64(&v, "intermediate_size")?,
             max_position_embeddings: required_i64(&v, "max_position_embeddings")?,
-            type_vocab_size:         optional_i64(&v, "type_vocab_size", 1),
-            pad_token_id:            optional_i64(&v, "pad_token_id", 1),
-            layer_norm_eps:               optional_f64(&v, "layer_norm_eps", 1e-5),
-            hidden_dropout_prob:          optional_f64(&v, "hidden_dropout_prob", 0.1),
+            type_vocab_size: optional_i64(&v, "type_vocab_size", 1),
+            pad_token_id: optional_i64(&v, "pad_token_id", 1),
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-5),
+            hidden_dropout_prob: optional_f64(&v, "hidden_dropout_prob", 0.1),
             attention_probs_dropout_prob: optional_f64(&v, "attention_probs_dropout_prob", 0.1),
             hidden_act: optional_hidden_act(&v, "hidden_act", "gelu")?,
             num_labels,
@@ -170,7 +170,10 @@ impl XlmRobertaConfig {
         m.insert("vocab_size".into(), self.vocab_size.into());
         m.insert("hidden_size".into(), self.hidden_size.into());
         m.insert("num_hidden_layers".into(), self.num_hidden_layers.into());
-        m.insert("num_attention_heads".into(), self.num_attention_heads.into());
+        m.insert(
+            "num_attention_heads".into(),
+            self.num_attention_heads.into(),
+        );
         m.insert("intermediate_size".into(), self.intermediate_size.into());
         m.insert(
             "max_position_embeddings".into(),
@@ -179,7 +182,10 @@ impl XlmRobertaConfig {
         m.insert("type_vocab_size".into(), self.type_vocab_size.into());
         m.insert("pad_token_id".into(), self.pad_token_id.into());
         m.insert("layer_norm_eps".into(), self.layer_norm_eps.into());
-        m.insert("hidden_dropout_prob".into(), self.hidden_dropout_prob.into());
+        m.insert(
+            "hidden_dropout_prob".into(),
+            self.hidden_dropout_prob.into(),
+        );
         m.insert(
             "attention_probs_dropout_prob".into(),
             self.attention_probs_dropout_prob.into(),
@@ -252,10 +258,7 @@ impl XlmRobertaModel {
     ///
     /// [`from_pretrained`](Self::from_pretrained) lives under the
     /// `hub` feature in [`crate::hub`].
-    pub fn on_device_without_pooler(
-        config: &XlmRobertaConfig,
-        device: Device,
-    ) -> Result<Graph> {
+    pub fn on_device_without_pooler(config: &XlmRobertaConfig, device: Device) -> Result<Graph> {
         let rc: RobertaConfig = config.into();
         RobertaModel::on_device_without_pooler(&rc, device)
     }
@@ -263,10 +266,10 @@ impl XlmRobertaModel {
 
 // ── Task heads ───────────────────────────────────────────────────────────
 
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead,
-};
 pub use crate::task_heads::{Answer, TokenPrediction};
+use crate::task_heads::{
+    ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead, check_num_labels,
+};
 
 /// XLM-RoBERTa graphs take three `forward_multi` inputs — `input_ids`,
 /// `token_type_ids`, and an extended attention mask — in that order.
@@ -306,18 +309,21 @@ pub type XlmRobertaForSequenceClassification = ClassificationHead<XlmRobertaConf
 impl ClassificationHead<XlmRobertaConfig> {
     /// Build the full graph (backbone without pooler + two-layer
     /// classification head) on `device` without loading any weights.
-    pub fn on_device(
-        config: &XlmRobertaConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &XlmRobertaConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let rc: RobertaConfig = config.into();
         let graph = roberta_backbone_flow(&rc, device, /*with_pooler=*/ false)?
-            .through(RobertaClassificationHead::on_device(&rc, num_labels, device)?)
+            .through(RobertaClassificationHead::on_device(
+                &rc, num_labels, device,
+            )?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &XlmRobertaConfig) -> Result<i64> {
@@ -340,11 +346,7 @@ impl ClassificationHead<XlmRobertaConfig> {
 pub type XlmRobertaForTokenClassification = TaggingHead<XlmRobertaConfig>;
 
 impl TaggingHead<XlmRobertaConfig> {
-    pub fn on_device(
-        config: &XlmRobertaConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &XlmRobertaConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let rc: RobertaConfig = config.into();
         let graph = roberta_backbone_flow(&rc, device, /*with_pooler=*/ false)?
@@ -352,7 +354,12 @@ impl TaggingHead<XlmRobertaConfig> {
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &XlmRobertaConfig) -> Result<i64> {
@@ -447,9 +454,7 @@ mod tests {
         assert_eq!(rc.pad_token_id, c.pad_token_id);
         assert!((rc.layer_norm_eps - c.layer_norm_eps).abs() < 1e-12);
         assert!((rc.hidden_dropout_prob - c.hidden_dropout_prob).abs() < 1e-12);
-        assert!(
-            (rc.attention_probs_dropout_prob - c.attention_probs_dropout_prob).abs() < 1e-12,
-        );
+        assert!((rc.attention_probs_dropout_prob - c.attention_probs_dropout_prob).abs() < 1e-12,);
     }
 
     /// `xlm-roberta-base` defaults: 250k vocab (the reason XLM-R
@@ -499,7 +504,8 @@ mod tests {
             "expected roberta.embeddings.word_embeddings.weight, got {keys:?}",
         );
         assert!(
-            keys.iter().any(|k| k.starts_with("roberta.encoder.layer.0.attention.self.query.")),
+            keys.iter()
+                .any(|k| k.starts_with("roberta.encoder.layer.0.attention.self.query.")),
             "expected roberta.encoder.* layer keys, got {keys:?}",
         );
         assert!(
@@ -545,10 +551,7 @@ mod tests {
     #[test]
     fn xlm_roberta_seqcls_head_has_two_layer_keys() {
         let config = XlmRobertaConfig::xlm_roberta_base();
-        let head = XlmRobertaForSequenceClassification::on_device(
-            &config, 3, Device::CPU,
-        )
-        .unwrap();
+        let head = XlmRobertaForSequenceClassification::on_device(&config, 3, Device::CPU).unwrap();
         let expected = expected_from_graph(head.graph());
         let keys: Vec<String> = expected.iter().map(|p| p.key.clone()).collect();
         assert!(keys.contains(&"classifier.dense.weight".to_string()));

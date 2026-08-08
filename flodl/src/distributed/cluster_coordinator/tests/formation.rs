@@ -8,11 +8,9 @@ use super::*;
 /// spin until some other part of the cohort dies.
 #[test]
 fn formation_deadline_errs_when_relays_never_dial() {
-    let (listener, _port) = ClusterCoordinator::bind(SocketAddr::new(
-        Ipv4Addr::LOCALHOST.into(),
-        0,
-    ))
-    .expect("bind succeeds");
+    let (listener, _port) =
+        ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            .expect("bind succeeds");
     let started = std::time::Instant::now();
     let Err(err) = ClusterCoordinator::start_from_listener(
         listener,
@@ -41,11 +39,8 @@ fn formation_deadline_errs_when_relays_never_dial() {
 /// rank 1 dials, keeping the error's seed/offender roles deterministic.
 #[test]
 fn formation_refuses_mixed_model_signatures_by_name() {
-    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(
-        Ipv4Addr::LOCALHOST.into(),
-        0,
-    ))
-    .expect("bind succeeds");
+    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+        .expect("bind succeeds");
     let (seeded_tx, seeded_rx) = std::sync::mpsc::channel::<()>();
     let seeder = std::thread::spawn(move || {
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
@@ -89,11 +84,8 @@ fn formation_refuses_mixed_model_signatures_by_name() {
 /// helpers announce none.)
 #[test]
 fn formation_accepts_matching_model_signatures() {
-    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(
-        Ipv4Addr::LOCALHOST.into(),
-        0,
-    ))
-    .expect("bind succeeds");
+    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+        .expect("bind succeeds");
     let mut relays = Vec::new();
     for rank in 0..2u32 {
         relays.push(std::thread::spawn(move || {
@@ -121,11 +113,8 @@ fn formation_accepts_matching_model_signatures() {
 /// name the partial coverage.
 #[test]
 fn formation_deadline_errs_on_partial_coverage() {
-    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(
-        Ipv4Addr::LOCALHOST.into(),
-        0,
-    ))
-    .expect("bind succeeds");
+    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+        .expect("bind succeeds");
     // A single-rank relay for rank 0 that dials, handshakes, then just
     // holds its stream open (parks well past the coord's verdict).
     let holder = fake_rank(port, 0, 3, TEST_SALT, |_stream, _salt| {

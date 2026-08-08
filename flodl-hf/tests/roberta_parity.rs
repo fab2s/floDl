@@ -40,8 +40,9 @@ use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};
 fn roberta_parity_vs_pytorch_live() {
     let dev = Device::CPU;
 
-    let bytes = std::fs::read(Path::new(FIXTURE))
-        .unwrap_or_else(|e| panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity roberta` to regenerate)"));
+    let bytes = std::fs::read(Path::new(FIXTURE)).unwrap_or_else(|e| {
+        panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity roberta` to regenerate)")
+    });
     let st = SafeTensors::deserialize(&bytes).expect("parse parity fixture");
 
     let ids = st.tensor("inputs.input_ids").unwrap();
@@ -50,10 +51,12 @@ fn roberta_parity_vs_pytorch_live() {
     let hidden_ref = st.tensor("outputs.last_hidden_state").unwrap();
 
     let input_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(), false,
+        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(),
+        false,
     );
     let token_type_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&tt), &shape_i64(&tt), dev).unwrap(), false,
+        Tensor::from_i64(&parse_i64(&tt), &shape_i64(&tt), dev).unwrap(),
+        false,
     );
     let mask_flat_f32: Vec<f32> = parse_i64(&mk).iter().map(|&x| x as f32).collect();
     let mask_flat = Tensor::from_f32(&mask_flat_f32, &shape_i64(&mk), dev).unwrap();
@@ -68,7 +71,11 @@ fn roberta_parity_vs_pytorch_live() {
     let out = graph
         .forward_multi(&[input_ids, token_type_ids, attention_mask])
         .unwrap();
-    assert_eq!(out.shape(), hidden_ref_shape, "last_hidden_state shape mismatch");
+    assert_eq!(
+        out.shape(),
+        hidden_ref_shape,
+        "last_hidden_state shape mismatch"
+    );
 
     let actual = out.data().to_f32_vec().unwrap();
     let diff = max_abs_diff(&actual, &hidden_ref_data);

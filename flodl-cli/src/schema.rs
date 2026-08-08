@@ -17,8 +17,15 @@ use crate::schema_cache;
 /// Directories that never contain valid schema caches — skip them to
 /// keep scans fast on large repos.
 const SKIP_DIRS: &[&str] = &[
-    ".git", "target", "node_modules", "libtorch", "runs",
-    ".cargo", "site", "docs", ".claude",
+    ".git",
+    "target",
+    "node_modules",
+    "libtorch",
+    "runs",
+    ".cargo",
+    "site",
+    "docs",
+    ".claude",
 ];
 
 /// One cached schema discovered on disk.
@@ -74,29 +81,31 @@ pub fn discover_caches(project_root: &Path) -> Vec<CacheEntry> {
 
 fn walk(dir: &Path, out: &mut Vec<CacheEntry>) {
     if let Some(name) = dir.file_name().and_then(|n| n.to_str())
-        && SKIP_DIRS.contains(&name) {
-            return;
-        }
+        && SKIP_DIRS.contains(&name)
+    {
+        return;
+    }
 
     let cache_dir = dir.join(".fdl").join("schema-cache");
     if cache_dir.is_dir()
-        && let Ok(entries) = fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                out.push(CacheEntry {
-                    cmd_name: stem.to_string(),
-                    cmd_dir: dir.to_path_buf(),
-                    cache_path: path,
-                    source_config: find_source_config(dir),
-                });
+        && let Ok(entries) = fs::read_dir(&cache_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
             }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            out.push(CacheEntry {
+                cmd_name: stem.to_string(),
+                cmd_dir: dir.to_path_buf(),
+                cache_path: path,
+                source_config: find_source_config(dir),
+            });
         }
+    }
 
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -133,9 +142,10 @@ pub fn clear_caches(project_root: &Path, filter: Option<&str>) -> Result<Vec<Pat
 
     for entry in &caches {
         if let Some(name) = filter
-            && entry.cmd_name != name {
-                continue;
-            }
+            && entry.cmd_name != name
+        {
+            continue;
+        }
         fs::remove_file(&entry.cache_path)
             .map_err(|e| format!("cannot remove {}: {e}", entry.cache_path.display()))?;
         removed.push(entry.cache_path.clone());
@@ -183,9 +193,10 @@ pub fn refresh_caches(
 
     for entry in &caches {
         if let Some(name) = filter
-            && entry.cmd_name != name {
-                continue;
-            }
+            && entry.cmd_name != name
+        {
+            continue;
+        }
 
         let outcome = refresh_one(entry);
         results.push(RefreshResult {
@@ -206,10 +217,12 @@ pub struct RefreshResult {
 
 fn refresh_one(entry: &CacheEntry) -> Result<(), String> {
     let config = crate::config::load_command(&entry.cmd_dir)?;
-    let entry_cmd = config
-        .entry
-        .as_deref()
-        .ok_or_else(|| format!("no `entry:` declared in {}/fdl.yml", entry.cmd_dir.display()))?;
+    let entry_cmd = config.entry.as_deref().ok_or_else(|| {
+        format!(
+            "no `entry:` declared in {}/fdl.yml",
+            entry.cmd_dir.display()
+        )
+    })?;
     let schema = schema_cache::probe(entry_cmd, &entry.cmd_dir, config.docker.as_deref())?;
     schema_cache::write_cache(&entry.cache_path, &schema)
 }

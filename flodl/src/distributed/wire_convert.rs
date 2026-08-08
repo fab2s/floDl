@@ -8,12 +8,8 @@
 //! touched several files. Keeping all of it here means one place to read
 //! the protocol and one place to edit when a message changes.
 
-use crate::distributed::ddp_run::{
-    ControlMsg, EpochMetrics, EpochPlan, MetricsMsg, TimingMsg,
-};
-use crate::distributed::wire::{
-    ControlMsgWire, EpochMetricsWire, MetricsMsgWire, TimingMsgWire,
-};
+use crate::distributed::ddp_run::{ControlMsg, EpochMetrics, EpochPlan, MetricsMsg, TimingMsg};
+use crate::distributed::wire::{ControlMsgWire, EpochMetricsWire, MetricsMsgWire, TimingMsgWire};
 use crate::tensor::{Result, TensorError};
 
 /// Convert an in-process `TimingMsg` into the bincode-serializable
@@ -50,9 +46,7 @@ pub(crate) fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             post_norm,
             pre_norm,
         },
-        TimingMsg::Exiting { rank } => TimingMsgWire::Exiting {
-            rank: rank as u64,
-        },
+        TimingMsg::Exiting { rank } => TimingMsgWire::Exiting { rank: rank as u64 },
         TimingMsg::LrUpdate { rank, lr } => TimingMsgWire::LrUpdate {
             rank: rank as u64,
             lr,
@@ -65,15 +59,11 @@ pub(crate) fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             rank: rank as u64,
             kind,
         },
-        TimingMsg::SnapshotReady { rank } => TimingMsgWire::SnapshotReady {
+        TimingMsg::SnapshotReady { rank } => TimingMsgWire::SnapshotReady { rank: rank as u64 },
+        TimingMsg::NewNcclIdGenerated { rank, uid_bytes } => TimingMsgWire::NewNcclIdGenerated {
             rank: rank as u64,
+            uid_bytes,
         },
-        TimingMsg::NewNcclIdGenerated { rank, uid_bytes } => {
-            TimingMsgWire::NewNcclIdGenerated {
-                rank: rank as u64,
-                uid_bytes,
-            }
-        }
         TimingMsg::EvalResult {
             rank,
             schedule_id,
@@ -155,28 +145,29 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
         ControlMsgWire::DeclareDead { .. } => Ok(Some(ControlMsg::DeclareDead)),
         ControlMsgWire::NewNcclSession { .. } => Ok(Some(ControlMsg::NewNcclSession)),
         ControlMsgWire::RequestNewNcclId => Ok(Some(ControlMsg::RequestNewNcclId)),
-        ControlMsgWire::StageAdvisory { counts, segments } => {
-            Ok(Some(ControlMsg::StageAdvisory {
-                counts: counts.into_iter().map(|c| c as usize).collect(),
-                segments: segments
-                    .into_iter()
-                    .map(|(epoch, spans)| {
-                        (
-                            epoch as usize,
-                            spans
-                                .into_iter()
-                                .map(|(o, s)| (o as usize, s as usize))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            }))
-        }
+        ControlMsgWire::StageAdvisory { counts, segments } => Ok(Some(ControlMsg::StageAdvisory {
+            counts: counts.into_iter().map(|c| c as usize).collect(),
+            segments: segments
+                .into_iter()
+                .map(|(epoch, spans)| {
+                    (
+                        epoch as usize,
+                        spans
+                            .into_iter()
+                            .map(|(o, s)| (o as usize, s as usize))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        })),
         ControlMsgWire::Throttle => Ok(Some(ControlMsg::Throttle)),
         ControlMsgWire::SetGlobalStep { global_step } => {
             Ok(Some(ControlMsg::SetGlobalStep(global_step as usize)))
         }
-        ControlMsgWire::Checkpoint { version, target_rank } => {
+        ControlMsgWire::Checkpoint {
+            version,
+            target_rank,
+        } => {
             // `u64::MAX` is reserved for v2 controller-as-checkpointer
             // (CPU-async mode where the coord holds the canonical
             // averaged tensors). In v1 the coord must never dispatch
@@ -227,12 +218,13 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
                 .unwrap_or(crate::distributed::checkpoint_meta::SaveReason::GracefulShutdown);
             Ok(Some(ControlMsg::ShutdownWithSave { reason }))
         }
-        ControlMsgWire::EpochAggregated(metrics_wire) => {
-            Ok(Some(ControlMsg::EpochAggregated(Box::new((*metrics_wire).into()))))
-        }
-        ControlMsgWire::EvalBroadcast { epoch, metric } => Ok(Some(
-            ControlMsg::EvalBroadcast { epoch: epoch as usize, metric },
-        )),
+        ControlMsgWire::EpochAggregated(metrics_wire) => Ok(Some(ControlMsg::EpochAggregated(
+            Box::new((*metrics_wire).into()),
+        ))),
+        ControlMsgWire::EvalBroadcast { epoch, metric } => Ok(Some(ControlMsg::EvalBroadcast {
+            epoch: epoch as usize,
+            metric,
+        })),
         ControlMsgWire::SaveConsensusModel { target_rank } => {
             if target_rank == u64::MAX {
                 return Err(TensorError::new(

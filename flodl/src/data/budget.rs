@@ -71,11 +71,7 @@ pub(crate) fn anchored_ram_budget(available: u64, held_bytes: u64, ram_max_usage
 /// carve-out `available` never drops when the GPU allocates, so adding
 /// `in_use` back would inflate — [`unified_overlap_confirmed`] is the
 /// gate that establishes overlap before any of this runs.
-pub(crate) fn unified_host_available(
-    available: u64,
-    gpu_reservation: u64,
-    gpu_in_use: u64,
-) -> u64 {
+pub(crate) fn unified_host_available(available: u64, gpu_reservation: u64, gpu_in_use: u64) -> u64 {
     available.saturating_sub(gpu_reservation.saturating_sub(gpu_in_use))
 }
 
@@ -140,8 +136,7 @@ pub(crate) fn apu_budget_sizeable(
 
 /// The message [`check_apu_sizing`] refuses with. One text, so the
 /// construction-time error and the runtime fallback below cannot drift.
-const UNSIZEABLE_APU: &str =
-    "this is an integrated (APU) GPU on a multi-socket machine, where each package \
+const UNSIZEABLE_APU: &str = "this is an integrated (APU) GPU on a multi-socket machine, where each package \
      carries its own memory pool and its own aperture. Host-RAM budgets read \
      system-wide totals, so flodl cannot size them correctly here and would \
      over-commit memory. Set an explicit GPU RAM share (a fraction of MemTotal) to \
@@ -152,8 +147,7 @@ fn device_budget_sizeable(device: Device, gpu_ram_share: Option<f64>) -> bool {
     if !device.is_cuda() {
         return true;
     }
-    let integrated =
-        crate::tensor::gpu_is_integrated(device.index() as i32) == Some(true);
+    let integrated = crate::tensor::gpu_is_integrated(device.index() as i32) == Some(true);
     apu_budget_sizeable(integrated, crate::sys::cpu_package_count(), gpu_ram_share)
 }
 
@@ -203,7 +197,10 @@ pub(crate) fn unified_overlap_confirmed(device: Device) -> bool {
 }
 
 fn probe_overlap(device: Device) -> Result<bool> {
-    let opts = TensorOptions { dtype: crate::tensor::DType::Float32, device };
+    let opts = TensorOptions {
+        dtype: crate::tensor::DType::Float32,
+        device,
+    };
     // Warm up first: the CUDA context and the caching allocator's first
     // segment are themselves large allocations, and folding them into
     // the measurement would read as "overlap" on any machine.
@@ -425,8 +422,7 @@ pub(crate) fn prefetch_depth_from_vram(
 
     let idx = device.index() as i32;
     // The probe returns (used, total) — used first, not free.
-    let (used, total) = crate::tensor::gpu_memory_info_idx(idx)
-        .unwrap_or((u64::MAX, 0));
+    let (used, total) = crate::tensor::gpu_memory_info_idx(idx).unwrap_or((u64::MAX, 0));
 
     depth_from_probe(used, total, max_usage, activation_reserve, batch_bytes)
 }
@@ -551,7 +547,11 @@ mod tests {
         // figure is INVARIANT as the GPU pool fills. Subtracting the
         // bare aperture instead collapses it to zero (the bug).
         let others = 8950 * MIB; // OS + other processes, constant
-        for (gpu, host) in [(0u64, 0u64), (7500 * MIB, 1500 * MIB), (APERTURE, 3350 * MIB)] {
+        for (gpu, host) in [
+            (0u64, 0u64),
+            (7500 * MIB, 1500 * MIB),
+            (APERTURE, 3350 * MIB),
+        ] {
             let available = MEM_TOTAL - others - gpu - host;
             let got = unified_host_available(available, APERTURE, gpu) + host;
             let want = MEM_TOTAL - others - APERTURE;
@@ -576,12 +576,18 @@ mod tests {
     #[test]
     fn reservation_is_zero_on_a_discrete_part_even_with_a_knob_set() {
         assert_eq!(gpu_ram_reservation(false, APERTURE, MEM_TOTAL, None), 0);
-        assert_eq!(gpu_ram_reservation(false, APERTURE, MEM_TOTAL, Some(0.5)), 0);
+        assert_eq!(
+            gpu_ram_reservation(false, APERTURE, MEM_TOTAL, Some(0.5)),
+            0
+        );
     }
 
     #[test]
     fn reservation_defaults_to_the_reported_aperture() {
-        assert_eq!(gpu_ram_reservation(true, APERTURE, MEM_TOTAL, None), APERTURE);
+        assert_eq!(
+            gpu_ram_reservation(true, APERTURE, MEM_TOTAL, None),
+            APERTURE
+        );
     }
 
     #[test]
@@ -609,7 +615,10 @@ mod tests {
         assert!(!apu_budget_sizeable(true, Some(2), None));
         assert!(apu_budget_sizeable(false, Some(2), None), "discrete part");
         assert!(apu_budget_sizeable(true, Some(1), None), "single socket");
-        assert!(apu_budget_sizeable(true, Some(2), Some(0.5)), "knob resolves it");
+        assert!(
+            apu_budget_sizeable(true, Some(2), Some(0.5)),
+            "knob resolves it"
+        );
         // A share of 0.0 is a real answer, not "unset".
         assert!(apu_budget_sizeable(true, Some(2), Some(0.0)));
     }
@@ -645,7 +654,10 @@ mod tests {
         // feed over that cost 45% of delivered wall on the rig, to protect
         // 32KB out of 473MB physically free.
         let cap = (PASCAL_TOTAL as f64 * 0.90) as usize;
-        assert!(PASCAL_USED as usize > cap, "premise: the model alone is over the cap");
+        assert!(
+            PASCAL_USED as usize > cap,
+            "premise: the model alone is over the cap"
+        );
 
         let depth = depth_from_probe(PASCAL_USED, PASCAL_TOTAL, 0.90, 0, OLMO_BATCH_BYTES);
         assert_eq!(depth, DOUBLE_BUFFER);
@@ -653,7 +665,11 @@ mod tests {
         // And the floor holds even when a caller still passes the peak, so a
         // missed call site degrades to "pipelined" rather than "synchronous".
         let with_reserve = depth_from_probe(
-            PASCAL_USED, PASCAL_TOTAL, 0.90, OLMO_ACTIVATION_PEAK, OLMO_BATCH_BYTES,
+            PASCAL_USED,
+            PASCAL_TOTAL,
+            0.90,
+            OLMO_ACTIVATION_PEAK,
+            OLMO_BATCH_BYTES,
         );
         assert_eq!(with_reserve, DOUBLE_BUFFER);
     }
@@ -666,9 +682,16 @@ mod tests {
         let used = 3 << 30; // 3GiB resident, ~2.3GiB under the cap
         let honest = depth_from_probe(used, PASCAL_TOTAL, 0.90, 0, OLMO_BATCH_BYTES);
         let double_counted = depth_from_probe(
-            used, PASCAL_TOTAL, 0.90, OLMO_ACTIVATION_PEAK, OLMO_BATCH_BYTES,
+            used,
+            PASCAL_TOTAL,
+            0.90,
+            OLMO_ACTIVATION_PEAK,
+            OLMO_BATCH_BYTES,
         );
-        assert!(honest > 100_000, "honest probe should afford the whole chunk: {honest}");
+        assert!(
+            honest > 100_000,
+            "honest probe should afford the whole chunk: {honest}"
+        );
         assert!(
             double_counted < honest / 2,
             "charging the peak twice must visibly shrink the budget: {double_counted} vs {honest}",

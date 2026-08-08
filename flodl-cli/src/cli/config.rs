@@ -3,14 +3,11 @@
 use std::env;
 use std::process::ExitCode;
 
-use flodl_cli::{
-    cluster, config, dispatch, gpus, overlay, prebuild, run, schema_cache,
-};
+use dispatch::{WalkOutcome, walk_commands};
 use flodl_cli::cli_error;
-use dispatch::{walk_commands, WalkOutcome};
+use flodl_cli::{cluster, config, dispatch, gpus, overlay, prebuild, run, schema_cache};
 
 use crate::print_usage;
-
 
 // ---------------------------------------------------------------------------
 // fdl.yaml dispatch
@@ -38,7 +35,6 @@ pub(crate) fn load_project_config(
         }
     }
 }
-
 
 /// Dispatch an unknown top-level token through the unified `commands:`
 /// graph declared in fdl.yml. Handles arbitrary nesting: each step either
@@ -102,9 +98,7 @@ pub(crate) fn dispatch_config(
                 // need the topology (e.g. running a non-cluster test
                 // command under a cluster-aware overlay). Surface as a
                 // warning so misconfigurations stay visible.
-                eprintln!(
-                    "warning: cluster-test envelope export failed: {e}"
-                );
+                eprintln!("warning: cluster-test envelope export failed: {e}");
             }
         }
     }
@@ -177,13 +171,14 @@ pub(crate) fn dispatch_config(
                 // No YAML cluster, no --gpus, but the command opted into
                 // cluster mode. Print a one-line hint if N>=2 GPUs visible.
                 if let Ok(n) = gpus::local_gpu_count()
-                    && n >= 2 {
-                        eprintln!(
-                            "flodl: {n} GPUs visible but cluster mode is off; \
+                    && n >= 2
+                {
+                    eprintln!(
+                        "flodl: {n} GPUs visible but cluster mode is off; \
                              running single-device on GPU 0. Use --gpus all \
                              for multi-GPU."
-                        );
-                    }
+                    );
+                }
                 None
             }
         }
@@ -198,9 +193,10 @@ pub(crate) fn dispatch_config(
         // window it did not open. Recursive children are excluded --
         // there the local run IS the point.
         if !cluster::is_recursive_invocation()
-            && let Some(hint) = cluster::unused_join_window_hint(&project, cmd) {
-                eprintln!("fdl: warning: {hint}");
-            }
+            && let Some(hint) = cluster::unused_join_window_hint(&project, cmd)
+        {
+            eprintln!("fdl: warning: {hint}");
+        }
         if let Some(spec) = gpus_spec {
             let devs = match spec.resolve() {
                 Ok(d) => d,
@@ -246,12 +242,12 @@ pub(crate) fn dispatch_config(
         // handled by the normal dispatch path below (cargo run in
         // Docker against the local `.active`).
         if !no_prebuild
-            && let Err(e) = prebuild::prebuild_remotes(
-                &project_root, &cmd_cwd, &cluster, cmd, &controller,
-            ) {
-                cli_error!("{e}");
-                return ExitCode::FAILURE;
-            }
+            && let Err(e) =
+                prebuild::prebuild_remotes(&project_root, &cmd_cwd, &cluster, cmd, &controller)
+        {
+            cli_error!("{e}");
+            return ExitCode::FAILURE;
+        }
         // Cluster mode: set env vars on this process so the user binary
         // (spawned by the normal dispatch below) detects launcher role
         // and fans out via flodl::distributed::launcher. Fall through —
@@ -299,9 +295,13 @@ pub(crate) fn dispatch_config(
             tail,
             cmd_dir,
             cluster_chain: _,
-        } => {
-            run::exec_command(&cmd_config, preset.as_deref(), &tail, &cmd_dir, &project_root)
-        }
+        } => run::exec_command(
+            &cmd_config,
+            preset.as_deref(),
+            &tail,
+            &cmd_dir,
+            &project_root,
+        ),
         WalkOutcome::RefreshSchema {
             config,
             cmd_dir,
@@ -395,7 +395,10 @@ pub(crate) fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> Exit
     let base = match config::find_config(&cwd) {
         Some(p) => p,
         None => {
-            cli_error!("no fdl.yml found in {} or parent directories", cwd.display());
+            cli_error!(
+                "no fdl.yml found in {} or parent directories",
+                cwd.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -421,8 +424,7 @@ pub(crate) fn cmd_config_show(tail: &[String], active_env: Option<&str>) -> Exit
                 .to_string()
         })
         .collect();
-    let values: Vec<serde_yaml_ng::Value> =
-        layers.iter().map(|(_, v)| v.clone()).collect();
+    let values: Vec<serde_yaml_ng::Value> = layers.iter().map(|(_, v)| v.clone()).collect();
 
     let annotated = overlay::merge_layers_annotated(&values);
     print!("{}", overlay::render_annotated_yaml(&annotated, &labels));

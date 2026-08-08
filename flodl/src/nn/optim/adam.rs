@@ -10,8 +10,8 @@ use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
-    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    read_f64_le, read_i64_le, read_tensor_state, read_u32_le, write_f64_le, write_i64_le,
+    write_tensor_state, write_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -61,7 +61,12 @@ impl Adam {
 
     /// Create a builder for Adam with per-group learning rates.
     pub fn with_groups() -> AdamBuilder {
-        AdamBuilder { beta1: 0.9, beta2: 0.999, eps: 1e-8, groups: vec![] }
+        AdamBuilder {
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            groups: vec![],
+        }
     }
 
     /// Current learning rate (base LR, or first group's LR).
@@ -87,7 +92,10 @@ impl AdamBuilder {
     }
 
     /// Set epsilon for numerical stability (default: 1e-8).
-    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+    pub fn eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
 
     /// Add a parameter group with its own learning rate.
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
@@ -106,7 +114,10 @@ impl AdamBuilder {
             let start = all_params.len();
             all_params.extend(vars);
             let end = all_params.len();
-            groups.push(GroupMeta { lr, range: start..end });
+            groups.push(GroupMeta {
+                lr,
+                range: start..end,
+            });
         }
 
         let n = all_params.len();
@@ -125,7 +136,9 @@ impl AdamBuilder {
 }
 
 impl Optimizer for Adam {
-    fn lr(&self) -> f64 { self.lr }
+    fn lr(&self) -> f64 {
+        self.lr
+    }
     fn step(&mut self) -> Result<()> {
         self.adam_update(0.0)
     }
@@ -175,7 +188,10 @@ impl Adam {
             let effective_groups: Vec<(f64, std::ops::Range<usize>)> = if self.groups.is_empty() {
                 vec![(self.lr, 0..self.params.len())]
             } else {
-                self.groups.iter().map(|g| (g.lr, g.range.clone())).collect()
+                self.groups
+                    .iter()
+                    .map(|g| (g.lr, g.range.clone()))
+                    .collect()
             };
 
             for (lr, range) in &effective_groups {
@@ -209,9 +225,18 @@ impl Adam {
                 if !p_tensors.is_empty() {
                     // Single fused kernel for all params in this group
                     crate::tensor::Tensor::fused_adamw_(
-                        &p_tensors, &g_tensors, &m_tensors, &v_tensors,
-                        *lr, self.beta1, self.beta2, self.eps,
-                        weight_decay, &step_vals, None, None,
+                        &p_tensors,
+                        &g_tensors,
+                        &m_tensors,
+                        &v_tensors,
+                        *lr,
+                        self.beta1,
+                        self.beta2,
+                        self.eps,
+                        weight_decay,
+                        &step_vals,
+                        None,
+                        None,
                     )?;
                 }
             }
@@ -221,7 +246,9 @@ impl Adam {
 }
 
 impl Stateful for Adam {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::Adam }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::Adam
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
@@ -240,7 +267,9 @@ impl Stateful for Adam {
         let count = read_u32_le(r)? as usize;
         if count != self.params.len() {
             return Err(crate::tensor::TensorError::new(&format!(
-                "Adam: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+                "Adam: param count mismatch: checkpoint={} optimizer={}",
+                count,
+                self.params.len()
             )));
         }
         self.lr = read_f64_le(r)?;
@@ -282,7 +311,13 @@ impl AdamW {
 
     /// Create a builder for AdamW with per-group learning rates.
     pub fn with_groups(weight_decay: f64) -> AdamWBuilder {
-        AdamWBuilder { beta1: 0.9, beta2: 0.999, eps: 1e-8, weight_decay, groups: vec![] }
+        AdamWBuilder {
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay,
+            groups: vec![],
+        }
     }
 
     /// Current learning rate.
@@ -309,7 +344,10 @@ impl AdamWBuilder {
     }
 
     /// Set epsilon for numerical stability (default: 1e-8).
-    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+    pub fn eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
 
     /// Add a parameter group with its own learning rate.
     pub fn group(mut self, params: &[Parameter], lr: f64) -> Self {
@@ -328,7 +366,10 @@ impl AdamWBuilder {
             let start = all_params.len();
             all_params.extend(vars);
             let end = all_params.len();
-            groups.push(GroupMeta { lr, range: start..end });
+            groups.push(GroupMeta {
+                lr,
+                range: start..end,
+            });
         }
 
         let n = all_params.len();
@@ -350,7 +391,9 @@ impl AdamWBuilder {
 }
 
 impl Optimizer for AdamW {
-    fn lr(&self) -> f64 { self.adam.lr }
+    fn lr(&self) -> f64 {
+        self.adam.lr
+    }
     fn step(&mut self) -> Result<()> {
         self.adam.adam_update(self.weight_decay)
     }
@@ -377,7 +420,9 @@ impl Optimizer for AdamW {
 }
 
 impl Stateful for AdamW {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::AdamW }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::AdamW
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_f64_le(w, self.weight_decay)?;
@@ -392,8 +437,8 @@ impl Stateful for AdamW {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{make_param, state_tmp};
+    use super::*;
     use crate::tensor::Tensor;
 
     #[test]
@@ -437,10 +482,7 @@ mod tests {
                 .unwrap()
         };
 
-        let p_warm = crate::nn::Parameter::new(
-            Tensor::from_f32(&init, &shape, dev).unwrap(),
-            "w",
-        );
+        let p_warm = crate::nn::Parameter::new(Tensor::from_f32(&init, &shape, dev).unwrap(), "w");
         let mut opt_warm = Adam::new(std::slice::from_ref(&p_warm), 0.01);
         for _ in 0..5 {
             loss_of(&p_warm).backward().unwrap();
@@ -450,10 +492,8 @@ mod tests {
 
         // A truly fresh optimizer over a param at the SAME (warmed) values.
         let warmed = p_warm.variable.data().to_f32_vec().unwrap();
-        let p_fresh = crate::nn::Parameter::new(
-            Tensor::from_f32(&warmed, &shape, dev).unwrap(),
-            "w",
-        );
+        let p_fresh =
+            crate::nn::Parameter::new(Tensor::from_f32(&warmed, &shape, dev).unwrap(), "w");
         let mut opt_fresh = Adam::new(std::slice::from_ref(&p_fresh), 0.01);
 
         opt_warm.reset_state();
@@ -502,13 +542,23 @@ mod tests {
         let p2_after = p2.variable.data().to_f32_vec().unwrap();
 
         // p1 should change substantially (high LR), p2 barely moves (tiny LR)
-        let p1_delta: f64 = p1_before.iter().zip(&p1_after)
-            .map(|(a, b)| (a - b).abs() as f64).sum();
-        let p2_delta: f64 = p2_before.iter().zip(&p2_after)
-            .map(|(a, b)| (a - b).abs() as f64).sum();
+        let p1_delta: f64 = p1_before
+            .iter()
+            .zip(&p1_after)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum();
+        let p2_delta: f64 = p2_before
+            .iter()
+            .zip(&p2_after)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum();
 
-        assert!(p1_delta > p2_delta * 1e6,
-            "high-LR group should move much more: p1_delta={}, p2_delta={}", p1_delta, p2_delta);
+        assert!(
+            p1_delta > p2_delta * 1e6,
+            "high-LR group should move much more: p1_delta={}, p2_delta={}",
+            p1_delta,
+            p2_delta
+        );
     }
 
     #[test]
@@ -549,9 +599,7 @@ mod tests {
         let p2 = make_param("w2", &[3, 2]);
         p1.freeze().unwrap();
 
-        let mut opt = Adam::with_groups()
-            .group(&[p1, p2.clone()], 0.01)
-            .build();
+        let mut opt = Adam::with_groups().group(&[p1, p2.clone()], 0.01).build();
 
         let x = Variable::new(
             Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3], crate::tensor::test_device()).unwrap(),
@@ -648,8 +696,10 @@ mod tests {
     #[test]
     fn test_fused_adam_numerical_correctness() {
         // Known param/grad/m/v, verify against hand-computed expected values
-        let param = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], crate::tensor::test_device()).unwrap();
-        let grad = Tensor::from_f32(&[0.1, 0.2, 0.3, 0.4], &[4], crate::tensor::test_device()).unwrap();
+        let param =
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4], crate::tensor::test_device()).unwrap();
+        let grad =
+            Tensor::from_f32(&[0.1, 0.2, 0.3, 0.4], &[4], crate::tensor::test_device()).unwrap();
         let m = Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap();
         let v = Tensor::zeros(&[4], crate::tensor::test_opts()).unwrap();
 
@@ -659,7 +709,9 @@ mod tests {
         let eps = 1e-8;
         let step: i64 = 1;
 
-        param.adam_step(&grad, &m, &v, lr, beta1, beta2, eps, 0.0, step).unwrap();
+        param
+            .adam_step(&grad, &m, &v, lr, beta1, beta2, eps, 0.0, step)
+            .unwrap();
 
         // After step 1 with zero initial moments:
         // m = 0.1 * grad, v = 0.001 * grad^2
@@ -675,21 +727,36 @@ mod tests {
 
         // m = (1-beta1)*grad = 0.1 * [0.1, 0.2, 0.3, 0.4]
         for (i, &g) in [0.1f32, 0.2, 0.3, 0.4].iter().enumerate() {
-            assert!((m_data[i] - 0.1 * g).abs() < 1e-6,
-                "m[{}]: got {}, expected {}", i, m_data[i], 0.1 * g);
+            assert!(
+                (m_data[i] - 0.1 * g).abs() < 1e-6,
+                "m[{}]: got {}, expected {}",
+                i,
+                m_data[i],
+                0.1 * g
+            );
         }
 
         // v = (1-beta2)*grad^2 = 0.001 * [0.01, 0.04, 0.09, 0.16]
         for (i, &g) in [0.1f32, 0.2, 0.3, 0.4].iter().enumerate() {
-            assert!((v_data[i] - 0.001 * g * g).abs() < 1e-9,
-                "v[{}]: got {}, expected {}", i, v_data[i], 0.001 * g * g);
+            assert!(
+                (v_data[i] - 0.001 * g * g).abs() < 1e-9,
+                "v[{}]: got {}, expected {}",
+                i,
+                v_data[i],
+                0.001 * g * g
+            );
         }
 
         // Each param element should have decreased by approximately lr
         let orig = [1.0f32, 2.0, 3.0, 4.0];
         for (i, &o) in orig.iter().enumerate() {
-            assert!((p_data[i] - (o - lr as f32)).abs() < 1e-5,
-                "p[{}]: got {}, expected ~{}", i, p_data[i], o - lr as f32);
+            assert!(
+                (p_data[i] - (o - lr as f32)).abs() < 1e-5,
+                "p[{}]: got {}, expected ~{}",
+                i,
+                p_data[i],
+                o - lr as f32
+            );
         }
     }
 
@@ -703,7 +770,9 @@ mod tests {
         let lr = 0.001;
         let wd = 0.01;
 
-        param.adam_step(&grad, &m, &v, lr, 0.9, 0.999, 1e-8, wd, 1).unwrap();
+        param
+            .adam_step(&grad, &m, &v, lr, 0.9, 0.999, 1e-8, wd, 1)
+            .unwrap();
 
         let p_data = param.to_f32_vec().unwrap();
         // Weight decay: p *= (1 - lr * wd) = (1 - 0.00001)
@@ -716,7 +785,12 @@ mod tests {
         // Weight decay asymmetry: param[1] decays more (larger value)
         let decay_0 = 1.0 - p_data[0] as f64;
         let decay_1 = 2.0 - p_data[1] as f64;
-        assert!(decay_1 > decay_0, "larger param should decay more: d0={}, d1={}", decay_0, decay_1);
+        assert!(
+            decay_1 > decay_0,
+            "larger param should decay more: d0={}, d1={}",
+            decay_0,
+            decay_1
+        );
     }
 
     #[test]
@@ -728,7 +802,9 @@ mod tests {
         let v = Tensor::zeros(&[1], crate::tensor::test_opts()).unwrap();
 
         for step in 1..=10 {
-            param.adam_step(&grad, &m, &v, 0.01, 0.9, 0.999, 1e-8, 0.0, step).unwrap();
+            param
+                .adam_step(&grad, &m, &v, 0.01, 0.9, 0.999, 1e-8, 0.0, step)
+                .unwrap();
         }
 
         // After 10 steps with constant gradient=1:
@@ -737,8 +813,11 @@ mod tests {
         let p_data = param.to_f32_vec().unwrap();
 
         // m = 1 - 0.9^10 ≈ 0.6513
-        assert!((m_data[0] - 0.6513).abs() < 0.01,
-            "m after 10 steps: got {}", m_data[0]);
+        assert!(
+            (m_data[0] - 0.6513).abs() < 0.01,
+            "m after 10 steps: got {}",
+            m_data[0]
+        );
         // v should be non-zero (accumulating)
         assert!(v.to_f32_vec().unwrap()[0] > 0.0, "v should accumulate");
         // param should have decreased
@@ -801,8 +880,10 @@ mod tests {
         opt.step().unwrap();
         let after_second = p.variable.data().to_f32_vec().unwrap();
 
-        assert_eq!(after_first, after_second,
-            "second step without backward should not change params");
+        assert_eq!(
+            after_first, after_second,
+            "second step without backward should not change params"
+        );
     }
 
     #[test]
@@ -841,7 +922,8 @@ mod tests {
                 (b_after[i] - ref_after[i]).abs() < 1e-6,
                 "late-unfrozen update must match a fresh first step: \
                  got {}, expected {}",
-                b_after[i], ref_after[i]
+                b_after[i],
+                ref_after[i]
             );
         }
         assert_eq!(opt.steps, vec![5, 1], "per-param step counts");
@@ -852,7 +934,8 @@ mod tests {
         let dev = crate::tensor::test_device();
         let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
         let mut opt = Adam::new(std::slice::from_ref(&p), 0.02);
-        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        p.variable
+            .set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
         opt.step().unwrap();
 
         let path = state_tmp("adam_roundtrip.optim");
@@ -910,7 +993,10 @@ mod tests {
             .load_state_file(&path)
             .expect_err("pre-header file must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("migrate_optim_state_file"), "unexpected: {msg}");
+        assert!(
+            msg.contains("migrate_optim_state_file"),
+            "unexpected: {msg}"
+        );
         assert!(msg.contains("Adam"), "unexpected: {msg}");
         let _ = std::fs::remove_file(&path);
     }
@@ -974,11 +1060,12 @@ mod tests {
         // verbatim branch: the migrated file is exactly a 12-byte FDLO header
         // followed by the old payload byte-for-byte. Raw `save_state` writes
         // that pre-header payload, so it faithfully stands in for an old file.
-        use super::super::{migrate_optim_state_file, StateKind, SGD};
+        use super::super::{SGD, StateKind, migrate_optim_state_file};
         let dev = crate::tensor::test_device();
         let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(), "w");
         let mut sgd = SGD::new(std::slice::from_ref(&p), 0.05, 0.9);
-        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2, 0.3], &[3], dev).unwrap());
+        p.variable
+            .set_grad(Tensor::from_f32(&[0.1, 0.2, 0.3], &[3], dev).unwrap());
         sgd.step().unwrap(); // populate the velocity buffer
 
         let mut old = Vec::new();
@@ -991,7 +1078,8 @@ mod tests {
 
         let migrated = std::fs::read(&dst).unwrap();
         assert_eq!(
-            &migrated[12..], &old[..],
+            &migrated[12..],
+            &old[..],
             "SGD payload must migrate verbatim under the 12-byte FDLO header"
         );
 
@@ -1008,11 +1096,12 @@ mod tests {
     fn test_migrate_verbatim_rmsprop_roundtrips() {
         // Same verbatim branch, a different payload shape (alpha/eps/momentum
         // + v/buf tensors) to confirm the copy is shape-agnostic.
-        use super::super::{migrate_optim_state_file, StateKind, RMSprop};
+        use super::super::{RMSprop, StateKind, migrate_optim_state_file};
         let dev = crate::tensor::test_device();
         let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
         let mut opt = RMSprop::new(std::slice::from_ref(&p), 0.01);
-        p.variable.set_grad(Tensor::from_f32(&[0.3, -0.1], &[2], dev).unwrap());
+        p.variable
+            .set_grad(Tensor::from_f32(&[0.3, -0.1], &[2], dev).unwrap());
         opt.step().unwrap();
 
         let mut old = Vec::new();
@@ -1024,7 +1113,11 @@ mod tests {
         migrate_optim_state_file(&src, &dst, StateKind::RMSprop).unwrap();
 
         let migrated = std::fs::read(&dst).unwrap();
-        assert_eq!(&migrated[12..], &old[..], "RMSprop payload must migrate verbatim");
+        assert_eq!(
+            &migrated[12..],
+            &old[..],
+            "RMSprop payload must migrate verbatim"
+        );
 
         let mut opt2 = RMSprop::new(std::slice::from_ref(&p), 0.99);
         opt2.load_state_file(&dst).unwrap();
@@ -1039,7 +1132,7 @@ mod tests {
         // Genuine in-place (src == dst) conversion of an OLD file: the source
         // must be fully read before the atomic rename replaces it. (The
         // existing double-migrate test only covers the already-headed refusal.)
-        use super::super::{migrate_optim_state_file, StateKind};
+        use super::super::{StateKind, migrate_optim_state_file};
         let dev = crate::tensor::test_device();
         let path = state_tmp("adam_in_place.optim");
         std::fs::write(&path, old_format_adam_bytes(dev)).unwrap();
@@ -1049,7 +1142,11 @@ mod tests {
         let p = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[2], dev).unwrap(), "w");
         let mut opt = Adam::new(std::slice::from_ref(&p), 0.5);
         opt.load_state_file(&path).unwrap();
-        assert_eq!(opt.steps, vec![7], "in-place migrate must preserve the payload");
+        assert_eq!(
+            opt.steps,
+            vec![7],
+            "in-place migrate must preserve the payload"
+        );
         assert!((opt.lr - 0.02).abs() < 1e-12);
         // No stray .tmp left behind.
         assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
@@ -1062,7 +1159,7 @@ mod tests {
         // Adagrad/RAdam/NAdam gained Stateful only under the FDLO header, so
         // there is no pre-header file to convert — asking is a loud error, not
         // a silent no-op that could emit a bogus "converted" file.
-        use super::super::{migrate_optim_state_file, StateKind};
+        use super::super::{StateKind, migrate_optim_state_file};
         let src = state_tmp("never_had_format_src.optim");
         let dst = state_tmp("never_had_format_dst.optim");
         std::fs::write(&src, [0u8; 16]).unwrap();
@@ -1074,7 +1171,10 @@ mod tests {
                 "unexpected error for {kind:?}: {err}"
             );
         }
-        assert!(!std::path::Path::new(&dst).exists(), "no output file on rejection");
+        assert!(
+            !std::path::Path::new(&dst).exists(),
+            "no output file on rejection"
+        );
         let _ = std::fs::remove_file(&src);
     }
 }

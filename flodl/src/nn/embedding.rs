@@ -1,10 +1,10 @@
 use std::sync::OnceLock;
 
 use crate::autograd::{self, Variable};
-use crate::tensor::{Result, Tensor, TensorOptions, DType, Device};
+use crate::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
-use super::parameter::Parameter;
 use super::Module;
+use super::parameter::Parameter;
 
 /// One-shot flag: first f32-indices call in the process emits a deprecation
 /// warning to stderr. The f32 fallback path in [`Embedding::forward`] will
@@ -66,7 +66,9 @@ impl Embedding {
     /// When `padding_idx` is `Some(i)`, the gradient of row `i` is masked to
     /// zero during backward — matching PyTorch `nn.Embedding(..., padding_idx=i)`.
     pub fn with_padding_idx(
-        num_embeddings: i64, embedding_dim: i64, padding_idx: Option<i64>,
+        num_embeddings: i64,
+        embedding_dim: i64,
+        padding_idx: Option<i64>,
     ) -> Result<Self> {
         Self::on_device_with_padding_idx(num_embeddings, embedding_dim, padding_idx, Device::CPU)
     }
@@ -74,19 +76,26 @@ impl Embedding {
     /// Create an embedding table on a specific device with an optional
     /// `padding_idx`.
     pub fn on_device_with_padding_idx(
-        num_embeddings: i64, embedding_dim: i64, padding_idx: Option<i64>, device: Device,
+        num_embeddings: i64,
+        embedding_dim: i64,
+        padding_idx: Option<i64>,
+        device: Device,
     ) -> Result<Self> {
         if let Some(p) = padding_idx
-            && (p < 0 || p >= num_embeddings) {
-                return Err(crate::tensor::TensorError::new(&format!(
-                    "padding_idx {p} out of range [0, {num_embeddings})"
-                )));
-            }
+            && (p < 0 || p >= num_embeddings)
+        {
+            return Err(crate::tensor::TensorError::new(&format!(
+                "padding_idx {p} out of range [0, {num_embeddings})"
+            )));
+        }
 
         let weight = Variable::new(
             Tensor::randn(
                 &[num_embeddings, embedding_dim],
-                TensorOptions { dtype: DType::Float32, device },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device,
+                },
             )?,
             true,
         );
@@ -102,7 +111,9 @@ impl Embedding {
 }
 
 impl Module for Embedding {
-    fn name(&self) -> &str { "embedding" }
+    fn name(&self) -> &str {
+        "embedding"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // at::embedding accepts any-shape i64 indices and returns
@@ -190,12 +201,18 @@ impl EmbeddingBag {
 
     /// Create an embedding bag on a specific device.
     pub fn on_device(
-        num_embeddings: i64, embedding_dim: i64, mode: i64, device: Device,
+        num_embeddings: i64,
+        embedding_dim: i64,
+        mode: i64,
+        device: Device,
     ) -> Result<Self> {
         let weight = Variable::new(
             Tensor::randn(
                 &[num_embeddings, embedding_dim],
-                TensorOptions { dtype: DType::Float32, device },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device,
+                },
             )?,
             true,
         );
@@ -222,7 +239,9 @@ impl EmbeddingBag {
 }
 
 impl Module for EmbeddingBag {
-    fn name(&self) -> &str { "embedding_bag" }
+    fn name(&self) -> &str {
+        "embedding_bag"
+    }
 
     /// Uniform-bag forward: input is 2-D `[num_bags, bag_size]`.
     ///
@@ -284,14 +303,22 @@ mod tests {
         // bag0 = w[0]+w[1]+w[2] for each of 3 dims
         for d in 0..3 {
             let expected = w[0 * 3 + d] + w[1 * 3 + d] + w[2 * 3 + d];
-            assert!((vals[0 * 3 + d] - expected).abs() < 1e-5,
-                "bag0 dim {d}: got {}, expected {}", vals[0 * 3 + d], expected);
+            assert!(
+                (vals[0 * 3 + d] - expected).abs() < 1e-5,
+                "bag0 dim {d}: got {}, expected {}",
+                vals[0 * 3 + d],
+                expected
+            );
         }
         // bag1 = w[3]+w[4]
         for d in 0..3 {
             let expected = w[3 * 3 + d] + w[4 * 3 + d];
-            assert!((vals[1 * 3 + d] - expected).abs() < 1e-5,
-                "bag1 dim {d}: got {}, expected {}", vals[1 * 3 + d], expected);
+            assert!(
+                (vals[1 * 3 + d] - expected).abs() < 1e-5,
+                "bag1 dim {d}: got {}, expected {}",
+                vals[1 * 3 + d],
+                expected
+            );
         }
     }
 
@@ -342,7 +369,10 @@ mod tests {
         let v1 = out.data().to_f32_vec().unwrap();
         let v2 = out_bag.data().to_f32_vec().unwrap();
         for (a, b) in v1.iter().zip(v2.iter()) {
-            assert!((a - b).abs() < 1e-6, "forward vs forward_bag mismatch: {a} != {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "forward vs forward_bag mismatch: {a} != {b}"
+            );
         }
     }
 
@@ -390,8 +420,12 @@ mod tests {
             let expected = (0..4)
                 .map(|i| w[i * 2 + d])
                 .fold(f32::NEG_INFINITY, f32::max);
-            assert!((vals[d] - expected).abs() < 1e-5,
-                "max dim {d}: got {}, expected {}", vals[d], expected);
+            assert!(
+                (vals[d] - expected).abs() < 1e-5,
+                "max dim {d}: got {}, expected {}",
+                vals[d],
+                expected
+            );
         }
     }
 
@@ -438,10 +472,7 @@ mod tests {
 
         // Use index 0 (PAD) in the forward input — its row still appears in
         // the forward output, but its gradient row must be zero.
-        let input = Variable::new(
-            Tensor::from_i64(&[0, 0, 1, 2], &[4], dev).unwrap(),
-            false,
-        );
+        let input = Variable::new(Tensor::from_i64(&[0, 0, 1, 2], &[4], dev).unwrap(), false);
         let out = emb.forward(&input).unwrap();
         assert_eq!(out.shape(), vec![4, 3]);
 
@@ -465,10 +496,7 @@ mod tests {
     fn embedding_with_padding_idx_none_equivalent() {
         let dev = test_device();
         let emb = Embedding::on_device_with_padding_idx(8, 4, None, dev).unwrap();
-        let input = Variable::new(
-            Tensor::from_i64(&[0, 1, 2, 3], &[4], dev).unwrap(),
-            false,
-        );
+        let input = Variable::new(Tensor::from_i64(&[0, 1, 2, 3], &[4], dev).unwrap(), false);
         let out = emb.forward(&input).unwrap();
         assert_eq!(out.shape(), vec![4, 4]);
         let loss = out.sum().unwrap();
@@ -479,7 +507,10 @@ mod tests {
         let gv = grad.to_f32_vec().unwrap();
         for row in 0..4 {
             let row_sum: f32 = gv[row * 4..(row + 1) * 4].iter().map(|v| v.abs()).sum();
-            assert!(row_sum > 0.0, "row {row} should have nonzero grad when padding disabled");
+            assert!(
+                row_sum > 0.0,
+                "row {row} should have nonzero grad when padding disabled"
+            );
         }
     }
 
@@ -492,16 +523,20 @@ mod tests {
         let dev = test_device();
         let emb = Embedding::on_device(4, 3, dev).unwrap();
 
-        let input = Variable::new(
-            Tensor::from_i64(&[0, 1], &[2], dev).unwrap(),
-            false,
-        );
-        emb.forward(&input).unwrap().sum().unwrap().backward().unwrap();
+        let input = Variable::new(Tensor::from_i64(&[0, 1], &[2], dev).unwrap(), false);
+        emb.forward(&input)
+            .unwrap()
+            .sum()
+            .unwrap()
+            .backward()
+            .unwrap();
         let grad = emb.weight.variable.grad().unwrap();
         let gv = grad.to_f32_vec().unwrap();
         let row0_sum: f32 = gv[0..3].iter().map(|v| v.abs()).sum();
-        assert!(row0_sum > 0.0,
-            "default constructor must NOT mask row 0 gradient, got {row0_sum}");
+        assert!(
+            row0_sum > 0.0,
+            "default constructor must NOT mask row 0 gradient, got {row0_sum}"
+        );
     }
 
     /// Deprecated f32-index fallback must keep working until it is removed.

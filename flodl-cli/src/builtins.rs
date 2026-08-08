@@ -682,23 +682,17 @@ pub fn registry() -> &'static [BuiltinSpec] {
         },
         BuiltinSpec {
             path: &["probe"],
-            description: Some(
-                "Cluster readiness probe (GPU + libtorch + data mount)",
-            ),
+            description: Some("Cluster readiness probe (GPU + libtorch + data mount)"),
             schema_fn: Some(ProbeArgs::schema),
         },
         BuiltinSpec {
             path: &["status"],
-            description: Some(
-                "Live cluster run status (membership, lifecycle phase)",
-            ),
+            description: Some("Live cluster run status (membership, lifecycle phase)"),
             schema_fn: Some(StatusArgs::schema),
         },
         BuiltinSpec {
             path: &["start"],
-            description: Some(
-                "Fire the start switch of a staging cluster run",
-            ),
+            description: Some("Fire the start switch of a staging cluster run"),
             schema_fn: Some(StartArgs::schema),
         },
         BuiltinSpec {
@@ -708,16 +702,12 @@ pub fn registry() -> &'static [BuiltinSpec] {
         },
         BuiltinSpec {
             path: &["join"],
-            description: Some(
-                "Join a cluster run's window as a self-deployed worker",
-            ),
+            description: Some("Join a cluster run's window as a self-deployed worker"),
             schema_fn: Some(JoinArgs::schema),
         },
         BuiltinSpec {
             path: &["join-config"],
-            description: Some(
-                "Provision a walk-in farm: overlay, credentials, worker yml",
-            ),
+            description: Some("Provision a walk-in farm: overlay, credentials, worker yml"),
             schema_fn: Some(JoinConfigArgs::schema),
         },
         BuiltinSpec {
@@ -819,17 +809,12 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-
-
     #[test]
     fn registry_has_no_duplicate_paths() {
         let mut seen = HashSet::new();
         for s in registry() {
             let key = s.path.join(" ");
-            assert!(
-                seen.insert(key.clone()),
-                "duplicate registry path: {key}"
-            );
+            assert!(seen.insert(key.clone()), "duplicate registry path: {key}");
         }
     }
 
@@ -837,8 +822,10 @@ mod tests {
     fn hidden_entries_have_no_description() {
         for s in registry() {
             if s.path == ["version"] {
-                assert!(s.description.is_none(),
-                    "`version` is hidden but carries a description");
+                assert!(
+                    s.description.is_none(),
+                    "`version` is hidden but carries a description"
+                );
             }
         }
     }
@@ -847,15 +834,16 @@ mod tests {
     fn every_parent_has_at_least_one_child() {
         let parents: HashSet<&str> = registry()
             .iter()
-            .filter(|s| s.path.len() == 1 && s.schema_fn.is_none()
-                && s.description.is_some())
+            .filter(|s| s.path.len() == 1 && s.schema_fn.is_none() && s.description.is_some())
             .map(|s| s.path[0])
             .collect();
 
         // `completions`, `autocomplete` are leaves with no schema — exclude
         // them by checking that parents have at least one 2-path child.
         for parent in &parents {
-            let has_child = registry().iter().any(|s| s.path.len() == 2 && s.path[0] == *parent);
+            let has_child = registry()
+                .iter()
+                .any(|s| s.path.len() == 2 && s.path[0] == *parent);
             if !has_child {
                 // `completions` / `autocomplete` / `version` end up here by
                 // virtue of having no children; they are leaf built-ins.
@@ -871,10 +859,26 @@ mod tests {
         // here. Keeping the list local (rather than introspecting main.rs)
         // documents the coupling explicitly.
         let dispatched = [
-            "setup", "libtorch", "nccl", "diagnose", "probe", "status",
-            "start", "publish", "join", "join-config", "api-ref", "init",
-            "add", "install", "skill", "schema", "completions",
-            "autocomplete", "config", "version",
+            "setup",
+            "libtorch",
+            "nccl",
+            "diagnose",
+            "probe",
+            "status",
+            "start",
+            "publish",
+            "join",
+            "join-config",
+            "api-ref",
+            "init",
+            "add",
+            "install",
+            "skill",
+            "schema",
+            "completions",
+            "autocomplete",
+            "config",
+            "version",
         ];
         for name in &dispatched {
             assert!(
@@ -892,10 +896,25 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "setup", "libtorch", "nccl", "init", "add", "diagnose",
-                "probe", "status", "start", "publish", "join",
-                "join-config", "install", "skill", "api-ref", "config",
-                "schema", "completions", "autocomplete",
+                "setup",
+                "libtorch",
+                "nccl",
+                "init",
+                "add",
+                "diagnose",
+                "probe",
+                "status",
+                "start",
+                "publish",
+                "join",
+                "join-config",
+                "install",
+                "skill",
+                "api-ref",
+                "config",
+                "schema",
+                "completions",
+                "autocomplete",
             ]
         );
     }

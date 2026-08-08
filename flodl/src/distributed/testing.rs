@@ -64,23 +64,18 @@ pub fn discover_test_cluster() -> Option<FullCluster> {
 }
 
 fn parse_env_cluster(raw: &str) -> FullCluster {
-    let bytes = crate::distributed::cluster::hex_decode(raw.trim())
-        .unwrap_or_else(|e| {
-            panic!(
-                "{ENV_TESTING_CLUSTER_JSON} hex-decode failed: {e}. \
+    let bytes = crate::distributed::cluster::hex_decode(raw.trim()).unwrap_or_else(|e| {
+        panic!(
+            "{ENV_TESTING_CLUSTER_JSON} hex-decode failed: {e}. \
                  The value must be a hex-encoded canonical-JSON cluster \
                  envelope (as written by fdl-cli when --env activates \
                  an overlay with a cluster: block)."
-            )
-        });
+        )
+    });
     let val: serde_json::Value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| {
-            panic!("{ENV_TESTING_CLUSTER_JSON} JSON parse failed: {e}")
-        });
+        .unwrap_or_else(|e| panic!("{ENV_TESTING_CLUSTER_JSON} JSON parse failed: {e}"));
     FullCluster::from_value(&val)
-        .unwrap_or_else(|e| {
-            panic!("{ENV_TESTING_CLUSTER_JSON} schema violation: {e}")
-        })
+        .unwrap_or_else(|e| panic!("{ENV_TESTING_CLUSTER_JSON} schema violation: {e}"))
 }
 
 fn autodetect_local_gpus() -> Option<usize> {

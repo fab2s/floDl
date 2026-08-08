@@ -103,7 +103,10 @@ fn host_frame_tampered_payload_fails_hmac() {
     buf[last] ^= 0xFF;
     let mut cursor = &buf[..];
     let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
-    assert!(err.to_string().contains("HMAC verification failed"), "got: {err}");
+    assert!(
+        err.to_string().contains("HMAC verification failed"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -170,7 +173,10 @@ fn tampered_payload_fails_hmac() {
     *buf.last_mut().unwrap() ^= 0xFF;
     let mut cursor = &buf[..];
     let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
-    assert!(err.to_string().contains("HMAC verification failed"), "got: {err}");
+    assert!(
+        err.to_string().contains("HMAC verification failed"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -187,7 +193,11 @@ fn bad_magic_fails_loudly() {
 fn read_from_empty_is_clean_eof() {
     let buf: Vec<u8> = Vec::new();
     let mut cursor = &buf[..];
-    assert!(MuxRecord::read_from(&mut cursor, &SALT_A).unwrap().is_none());
+    assert!(
+        MuxRecord::read_from(&mut cursor, &SALT_A)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -237,7 +247,13 @@ fn len_framed_empty_blob_round_trips() {
 
 #[test]
 fn len_framed_multiple_in_sequence() {
-    let blobs = [vec![1u8], vec![2, 2], vec![3, 3, 3], Vec::new(), vec![4; 100]];
+    let blobs = [
+        vec![1u8],
+        vec![2, 2],
+        vec![3, 3, 3],
+        Vec::new(),
+        vec![4; 100],
+    ];
     let mut buf = Vec::new();
     for b in &blobs {
         write_len_framed(&mut buf, b).unwrap();
@@ -303,11 +319,19 @@ fn record_is_written_atomically_single_write() {
     // partial frame and desyncs the stream — the bug that wedged the
     // cluster-coordinator CPU cycle tests. Both record kinds + the
     // length-framed loopback helper must each issue exactly one write.
-    let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
-    MuxRecord::data(3, vec![1, 2, 3, 4, 5]).write_to(&mut w, &SALT_A).unwrap();
+    let mut w = CountingWriter {
+        buf: Vec::new(),
+        writes: 0,
+    };
+    MuxRecord::data(3, vec![1, 2, 3, 4, 5])
+        .write_to(&mut w, &SALT_A)
+        .unwrap();
     assert_eq!(w.writes, 1, "Data record must be one atomic write");
 
-    let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+    let mut w = CountingWriter {
+        buf: Vec::new(),
+        writes: 0,
+    };
     MuxRecord::control(RelayControlMsg::Hello {
         host: "h".into(),
         ranks: vec![0, 1],
@@ -317,7 +341,10 @@ fn record_is_written_atomically_single_write() {
     .unwrap();
     assert_eq!(w.writes, 1, "Control record must be one atomic write");
 
-    let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+    let mut w = CountingWriter {
+        buf: Vec::new(),
+        writes: 0,
+    };
     write_len_framed(&mut w, &[9, 9, 9]).unwrap();
     assert_eq!(w.writes, 1, "len-framed blob must be one atomic write");
 }
@@ -333,7 +360,10 @@ fn data_plane_records_stream_header_then_payload() {
         MuxRecord::host_frame(vec![7, 8, 9]),
         MuxRecord::broadcast(vec![4, 5]),
     ] {
-        let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+        let mut w = CountingWriter {
+            buf: Vec::new(),
+            writes: 0,
+        };
         rec.write_to(&mut w, &SALT_A).unwrap();
         assert_eq!(w.writes, 2, "header write + payload write");
         let got = MuxRecord::read_from(&mut w.buf.as_slice(), &SALT_A)
@@ -359,38 +389,32 @@ fn opaque_payload_is_not_parsed() {
     }
 }
 
-    // ---- payload ceiling ----------------------------------------------------
+// ---- payload ceiling ----------------------------------------------------
 
-    /// The length fields are unauthenticated until the MAC verifies; a
-    /// claimed length past the frame ceiling must be rejected before the
-    /// reader commits to buffering it.
-    #[test]
-    fn oversized_len_framed_blob_is_rejected() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        bytes.extend_from_slice(&[0u8; 16]); // some body bytes, never enough
-        let mut cursor = std::io::Cursor::new(bytes);
-        let err = try_read_len_framed(&mut cursor).unwrap_err();
-        assert!(
-            err.to_string().contains("frame ceiling"),
-            "got: {err}"
-        );
-    }
+/// The length fields are unauthenticated until the MAC verifies; a
+/// claimed length past the frame ceiling must be rejected before the
+/// reader commits to buffering it.
+#[test]
+fn oversized_len_framed_blob_is_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 16]); // some body bytes, never enough
+    let mut cursor = std::io::Cursor::new(bytes);
+    let err = try_read_len_framed(&mut cursor).unwrap_err();
+    assert!(err.to_string().contains("frame ceiling"), "got: {err}");
+}
 
-    #[test]
-    fn oversized_mux_record_is_rejected() {
-        // Header: magic | version | kind | rank | payload_len | auth_tag.
-        let mut hdr = Vec::new();
-        hdr.extend_from_slice(&MUX_RECORD_MAGIC.to_le_bytes());
-        hdr.extend_from_slice(&MUX_PROTOCOL_VERSION.to_le_bytes());
-        hdr.push(0); // REC_DATA
-        hdr.extend_from_slice(&0u32.to_le_bytes()); // rank
-        hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // hostile length
-        hdr.extend_from_slice(&0u64.to_le_bytes()); // bogus tag
-        let mut cursor = std::io::Cursor::new(hdr);
-        let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
-        assert!(
-            err.to_string().contains("frame ceiling"),
-            "got: {err}"
-        );
-    }
+#[test]
+fn oversized_mux_record_is_rejected() {
+    // Header: magic | version | kind | rank | payload_len | auth_tag.
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(&MUX_RECORD_MAGIC.to_le_bytes());
+    hdr.extend_from_slice(&MUX_PROTOCOL_VERSION.to_le_bytes());
+    hdr.push(0); // REC_DATA
+    hdr.extend_from_slice(&0u32.to_le_bytes()); // rank
+    hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // hostile length
+    hdr.extend_from_slice(&0u64.to_le_bytes()); // bogus tag
+    let mut cursor = std::io::Cursor::new(hdr);
+    let err = MuxRecord::read_from(&mut cursor, &SALT_A).unwrap_err();
+    assert!(err.to_string().contains("frame ceiling"), "got: {err}");
+}

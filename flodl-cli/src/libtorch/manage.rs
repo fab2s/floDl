@@ -20,8 +20,7 @@ pub fn remove_variant(root: &Path, variant: &str) -> Result<(), String> {
     let variant_dir = root.join(format!("libtorch/{}", variant));
 
     // Check if this is the active variant
-    let was_active = detect::read_active(root)
-        .is_some_and(|info| info.path == variant);
+    let was_active = detect::read_active(root).is_some_and(|info| info.path == variant);
 
     // Remove the directory
     fs::remove_dir_all(&variant_dir)

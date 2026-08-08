@@ -6,8 +6,7 @@ use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
-    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le,
+    read_f64_le, read_tensor_state, read_u32_le, write_f64_le, write_tensor_state, write_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -60,7 +59,11 @@ impl SGD {
 
     /// Create a builder for SGD with per-group learning rates.
     pub fn with_groups(momentum: f64) -> SGDBuilder {
-        SGDBuilder { momentum, weight_decay: 0.0, groups: vec![] }
+        SGDBuilder {
+            momentum,
+            weight_decay: 0.0,
+            groups: vec![],
+        }
     }
 
     /// Current learning rate (base LR, or first group's LR).
@@ -109,7 +112,10 @@ impl SGDBuilder {
             let start = all_params.len();
             all_params.extend(vars);
             let end = all_params.len();
-            groups.push(GroupMeta { lr, range: start..end });
+            groups.push(GroupMeta {
+                lr,
+                range: start..end,
+            });
         }
 
         let velocity = vec![None; all_params.len()];
@@ -125,7 +131,9 @@ impl SGDBuilder {
 }
 
 impl Optimizer for SGD {
-    fn lr(&self) -> f64 { self.lr }
+    fn lr(&self) -> f64 {
+        self.lr
+    }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -201,7 +209,9 @@ impl Optimizer for SGD {
 }
 
 impl Stateful for SGD {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::Sgd }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::Sgd
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
@@ -219,7 +229,9 @@ impl Stateful for SGD {
         let count = read_u32_le(r)? as usize;
         if count != self.params.len() {
             return Err(crate::tensor::TensorError::new(&format!(
-                "SGD: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+                "SGD: param count mismatch: checkpoint={} optimizer={}",
+                count,
+                self.params.len()
             )));
         }
         self.lr = read_f64_le(r)?;
@@ -242,19 +254,15 @@ mod tests {
     #[test]
     fn test_sgd_parameter_groups_different_lr() {
         let dev = crate::tensor::test_device();
-        let p_fast = Parameter::new(
-            Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "fast");
-        let p_slow = Parameter::new(
-            Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "slow");
+        let p_fast = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "fast");
+        let p_slow = Parameter::new(Tensor::from_f32(&[1.0, 2.0], &[1, 2], dev).unwrap(), "slow");
 
         let mut opt = SGD::with_groups(0.0)
             .group(std::slice::from_ref(&p_fast), 1.0)
             .group(std::slice::from_ref(&p_slow), 0.001)
             .build();
 
-        let x = Variable::new(
-            Tensor::from_f32(&[1.0], &[1, 1], dev).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::from_f32(&[1.0], &[1, 1], dev).unwrap(), false);
         let y_fast = x.matmul(&p_fast.variable).unwrap();
         let y_slow = x.matmul(&p_slow.variable).unwrap();
         let loss = y_fast.add(&y_slow).unwrap().sum().unwrap();
@@ -266,14 +274,23 @@ mod tests {
         let fast_after = p_fast.variable.data().to_f32_vec().unwrap();
         let slow_after = p_slow.variable.data().to_f32_vec().unwrap();
 
-        let fast_delta: f64 = fast_before.iter().zip(&fast_after)
-            .map(|(a, b)| (a - b).abs() as f64).sum();
-        let slow_delta: f64 = slow_before.iter().zip(&slow_after)
-            .map(|(a, b)| (a - b).abs() as f64).sum();
+        let fast_delta: f64 = fast_before
+            .iter()
+            .zip(&fast_after)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum();
+        let slow_delta: f64 = slow_before
+            .iter()
+            .zip(&slow_after)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .sum();
 
-        assert!(fast_delta > slow_delta * 100.0,
+        assert!(
+            fast_delta > slow_delta * 100.0,
             "fast group (lr=1.0) should move much more than slow (lr=0.001): fast={}, slow={}",
-            fast_delta, slow_delta);
+            fast_delta,
+            slow_delta
+        );
     }
 
     #[test]
@@ -281,19 +298,15 @@ mod tests {
         let dev = crate::tensor::test_device();
 
         // Two identical params, same gradient, different LR via set_lr
-        let p_lo = Parameter::new(
-            Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "lo");
-        let p_hi = Parameter::new(
-            Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "hi");
+        let p_lo = Parameter::new(Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "lo");
+        let p_hi = Parameter::new(Tensor::from_f32(&[5.0], &[1], dev).unwrap(), "hi");
 
         let mut opt_lo = SGD::new(std::slice::from_ref(&p_lo), 0.001, 0.0);
         let mut opt_hi = SGD::new(std::slice::from_ref(&p_hi), 0.001, 0.0);
         opt_hi.set_lr(1.0);
 
         // Compute gradients for both
-        let x = Variable::new(
-            Tensor::from_f32(&[1.0], &[1], dev).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::from_f32(&[1.0], &[1], dev).unwrap(), false);
         let loss_lo = x.mul(&p_lo.variable).unwrap().sum().unwrap();
         loss_lo.backward().unwrap();
         let loss_hi = x.mul(&p_hi.variable).unwrap().sum().unwrap();
@@ -308,8 +321,11 @@ mod tests {
         let delta_lo = (5.0 - val_lo).abs();
         let delta_hi = (5.0 - val_hi).abs();
 
-        assert!(delta_hi > delta_lo * 100.0,
+        assert!(
+            delta_hi > delta_lo * 100.0,
             "set_lr(1.0) should produce much larger update than 0.001: hi={}, lo={}",
-            delta_hi, delta_lo);
+            delta_hi,
+            delta_lo
+        );
     }
 }

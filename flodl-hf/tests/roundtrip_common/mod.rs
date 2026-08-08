@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use hf_hub::api::sync::ApiBuilder;
-use safetensors::{tensor::TensorView, SafeTensors};
+use safetensors::{SafeTensors, tensor::TensorView};
 
 use flodl::Graph;
 use flodl_hf::export::export_hf_dir;
@@ -79,8 +79,7 @@ pub fn fetch_hf_config_json(repo_id: &str) -> String {
         .model(repo_id.to_string())
         .get("config.json")
         .unwrap_or_else(|e| panic!("fetch {repo_id}/config.json: {e}"));
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 /// Decode a safetensors `TensorView` into a flat `Vec<f32>` using the
@@ -221,12 +220,7 @@ pub fn run_roundtrip(graph: &Graph, repo_id: &str, family_label: &str) {
 ///
 /// The `config_json` string is what the caller would write to
 /// `config.json` — pass the family's `config.to_json_str()` output.
-pub fn run_export_roundtrip(
-    graph: &Graph,
-    config_json: &str,
-    repo_id: &str,
-    family_label: &str,
-) {
+pub fn run_export_roundtrip(graph: &Graph, config_json: &str, repo_id: &str, family_label: &str) {
     let out_dir = std::env::temp_dir().join(format!(
         "flodl_{family_label}_export_{}",
         std::process::id(),
@@ -234,8 +228,7 @@ pub fn run_export_roundtrip(
     // Defensive clean so a crashed prior run doesn't poison the test.
     let _ = std::fs::remove_dir_all(&out_dir);
 
-    export_hf_dir(graph, config_json, &out_dir)
-        .unwrap_or_else(|e| panic!("export_hf_dir: {e}"));
+    export_hf_dir(graph, config_json, &out_dir).unwrap_or_else(|e| panic!("export_hf_dir: {e}"));
 
     let model_path = out_dir.join("model.safetensors");
     let config_path = out_dir.join("config.json");
@@ -256,16 +249,20 @@ pub fn run_export_roundtrip(
     let config_v: serde_json::Value = serde_json::from_slice(&config_bytes)
         .unwrap_or_else(|e| panic!("{family_label}: config.json is not valid JSON: {e}"));
     assert!(
-        config_v.get("model_type").and_then(|x| x.as_str()).is_some(),
+        config_v
+            .get("model_type")
+            .and_then(|x| x.as_str())
+            .is_some(),
         "{family_label}: config.json missing `model_type` (HF AutoConfig dispatch key)",
     );
 
     // Model bytes bit-exact vs HF reference — same comparator as
     // `run_roundtrip`, just reading from the exported dir instead of
     // a bare tempfile.
-    let flodl_bytes = std::fs::read(&model_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", model_path.display()));
-    let flodl_st = SafeTensors::deserialize(&flodl_bytes).expect("parse exported model.safetensors");
+    let flodl_bytes =
+        std::fs::read(&model_path).unwrap_or_else(|e| panic!("read {}: {e}", model_path.display()));
+    let flodl_st =
+        SafeTensors::deserialize(&flodl_bytes).expect("parse exported model.safetensors");
 
     let hf_path = hf_safetensors_path(repo_id);
     let hf_bytes = std::fs::read(&hf_path)
@@ -282,9 +279,9 @@ pub fn run_export_roundtrip(
 
     let mut diffs: Vec<String> = Vec::new();
     for fk in &flodl_keys {
-        let hf_orig = hf_canonical
-            .get(fk)
-            .unwrap_or_else(|| panic!("{family_label}: exported key {fk:?} absent from HF reference"));
+        let hf_orig = hf_canonical.get(fk).unwrap_or_else(|| {
+            panic!("{family_label}: exported key {fk:?} absent from HF reference")
+        });
         let f_view = flodl_st.tensor(fk).unwrap();
         let h_view = hf_st.tensor(hf_orig).unwrap();
         assert_eq!(

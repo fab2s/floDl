@@ -212,16 +212,8 @@ impl ModelSchema {
     /// in the launcher process (no CUDA context touched).
     pub fn from_module<M: crate::nn::Module + ?Sized>(model: &M) -> Self {
         ModelSchema {
-            param_names: model
-                .parameters()
-                .iter()
-                .map(|p| p.name.clone())
-                .collect(),
-            buffer_names: model
-                .buffers()
-                .iter()
-                .map(|b| b.name.clone())
-                .collect(),
+            param_names: model.parameters().iter().map(|p| p.name.clone()).collect(),
+            buffer_names: model.buffers().iter().map(|b| b.name.clone()).collect(),
         }
     }
 
@@ -399,10 +391,7 @@ impl CheckpointMeta {
         // The meta is the bundle's commit marker — it must appear whole.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, content).map_err(|e| {
-            TensorError::new(&format!(
-                "CheckpointMeta: write {}: {e}",
-                tmp.display(),
-            ))
+            TensorError::new(&format!("CheckpointMeta: write {}: {e}", tmp.display(),))
         })?;
         std::fs::rename(&tmp, path).map_err(|e| {
             TensorError::new(&format!(
@@ -417,10 +406,7 @@ impl CheckpointMeta {
     /// schema version is newer than this binary supports.
     pub fn read_from_file(path: &std::path::Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            TensorError::new(&format!(
-                "CheckpointMeta: read {}: {e}",
-                path.display(),
-            ))
+            TensorError::new(&format!("CheckpointMeta: read {}: {e}", path.display(),))
         })?;
         let meta: Self = serde_json::from_str(&content).map_err(|e| {
             TensorError::new(&format!(
@@ -495,10 +481,7 @@ impl RankDeathRecord {
             ))
         })?;
         std::fs::write(path, content).map_err(|e| {
-            TensorError::new(&format!(
-                "RankDeathRecord: write {}: {e}",
-                path.display(),
-            ))
+            TensorError::new(&format!("RankDeathRecord: write {}: {e}", path.display(),))
         })
     }
 }
@@ -567,7 +550,9 @@ impl CheckpointBundle {
         p.set_extension("");
         let name = format!(
             "{}.rank{rank}.death.json",
-            p.file_name().and_then(|s| s.to_str()).unwrap_or("checkpoint"),
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("checkpoint"),
         );
         p.set_file_name(name);
         p
@@ -579,10 +564,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "flodl_meta_{label}_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("flodl_meta_{label}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -590,10 +572,7 @@ mod tests {
     #[test]
     fn sidecar_path_from_stem_appends_meta_json() {
         let p = CheckpointMeta::sidecar_path("/tmp/run/ckpt_final");
-        assert_eq!(
-            p,
-            std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json")
-        );
+        assert_eq!(p, std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json"));
     }
 
     #[test]
@@ -633,10 +612,7 @@ mod tests {
     #[test]
     fn sidecar_path_from_fdl_strips_extension() {
         let p = CheckpointMeta::sidecar_path("/tmp/run/ckpt_final.fdl");
-        assert_eq!(
-            p,
-            std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json")
-        );
+        assert_eq!(p, std::path::PathBuf::from("/tmp/run/ckpt_final.meta.json"));
     }
 
     #[test]
@@ -644,13 +620,7 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let path = dir.join("ckpt.meta.json");
 
-        let meta = CheckpointMeta::new(
-            3,
-            7500,
-            12,
-            4,
-            SaveReason::MaxFailureExceeded,
-        );
+        let meta = CheckpointMeta::new(3, 7500, 12, 4, SaveReason::MaxFailureExceeded);
         meta.write_to_file(&path).unwrap();
 
         let loaded = CheckpointMeta::read_from_file(&path).unwrap();
@@ -772,14 +742,8 @@ mod tests {
             calibration_count: 42,
             trend_history: Some(vec![0.01, 0.015, 0.02, 0.025, 0.03]),
         };
-        let meta = CheckpointMeta::new(
-            3,
-            7500,
-            12,
-            3,
-            SaveReason::GracefulShutdown,
-        )
-        .with_elche_state(state.clone());
+        let meta = CheckpointMeta::new(3, 7500, 12, 3, SaveReason::GracefulShutdown)
+            .with_elche_state(state.clone());
         meta.write_to_file(&path).unwrap();
 
         let loaded = CheckpointMeta::read_from_file(&path).unwrap();
@@ -837,7 +801,10 @@ mod tests {
             original.report_timing(&[5.0, 7.0, 6.0], &[8, 8, 8], 0.5);
         }
         let snap = original.to_state();
-        assert!(snap.anchor_rank.is_some(), "calibrated run elects an anchor");
+        assert!(
+            snap.anchor_rank.is_some(),
+            "calibrated run elects an anchor"
+        );
         assert!(
             snap.smoothed_ms_per_batch.iter().any(|&v| v > 0.0),
             "calibrated run has positive smoothed readings"
@@ -860,7 +827,10 @@ mod tests {
             restored.to_state().smoothed_ms_per_batch,
             snap.smoothed_ms_per_batch
         );
-        assert!(restored.is_calibrated(), "restored from positive-reading snap");
+        assert!(
+            restored.is_calibrated(),
+            "restored from positive-reading snap"
+        );
     }
 
     // Cross-size resume is a config-coherence bug, not a soft case —
@@ -899,14 +869,8 @@ mod tests {
             calibration_count: 99,
             trend_history: Some(vec![0.01, 0.02, 0.03]),
         };
-        let meta = CheckpointMeta::new(
-            7,
-            42_000,
-            201,
-            3,
-            SaveReason::GracefulShutdown,
-        )
-        .with_elche_state(elche_state.clone());
+        let meta = CheckpointMeta::new(7, 42_000, 201, 3, SaveReason::GracefulShutdown)
+            .with_elche_state(elche_state.clone());
 
         let config = ClusterCoordinatorConfig::new(
             ApplyPolicy::Cadence,
@@ -1039,7 +1003,10 @@ mod tests {
         let legacy = r#"{"seed":42,"batch_size":32,"per_epoch":[]}"#;
         let cov: CoverageBlock =
             serde_json::from_str(legacy).expect("a pre-splits coverage block still loads");
-        assert_eq!(cov.epoch_splits, 1, "absent means the epoch was a whole pass");
+        assert_eq!(
+            cov.epoch_splits, 1,
+            "absent means the epoch was a whole pass"
+        );
         assert_eq!(cov.seed, 42);
         assert_eq!(cov.batch_size, 32);
     }

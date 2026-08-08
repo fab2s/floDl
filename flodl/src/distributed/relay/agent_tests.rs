@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::distributed::controller::{
-    f32_slice_to_payload_bytes, read_round_frame, sum_frames, write_round_frame,
-    RoundFrame, RoundKind, TensorPayload, DTYPE_BF16, DTYPE_F32,
+    DTYPE_BF16, DTYPE_F32, RoundFrame, RoundKind, TensorPayload, f32_slice_to_payload_bytes,
+    read_round_frame, sum_frames, write_round_frame,
 };
 use crate::distributed::relay::mux::read_len_framed;
 use std::io::{Read, Write};
@@ -38,8 +38,7 @@ fn start_mux(
     upstream: TcpStream,
 ) -> (Arc<AtomicBool>, Vec<JoinHandle<()>>) {
     let shutdown = Arc::new(AtomicBool::new(false));
-    let threads =
-        spawn_mux(kind, rank_streams, upstream, SALT, Arc::clone(&shutdown)).unwrap();
+    let threads = spawn_mux(kind, rank_streams, upstream, SALT, Arc::clone(&shutdown)).unwrap();
     (shutdown, threads)
 }
 
@@ -104,7 +103,9 @@ fn mux_forwards_rank_blob_to_controller_tagged() {
     let (shutdown, threads) = start_mux(ChannelKind::Control, vec![(2, rank_relay)], relay_up);
 
     write_len_framed(&mut rank_client, &[1, 2, 3, 4]).unwrap();
-    let rec = MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap();
+    let rec = MuxRecord::read_from(&mut controller, &SALT)
+        .unwrap()
+        .unwrap();
     assert_eq!(rec, MuxRecord::data(2, vec![1, 2, 3, 4]));
 
     shutdown.store(true, Ordering::SeqCst);
@@ -149,7 +150,10 @@ fn mux_demuxes_two_ranks_both_directions() {
     write_len_framed(&mut c1, &[0xB1, 0xB2]).unwrap();
     let mut got: HashMap<u32, Vec<u8>> = HashMap::new();
     for _ in 0..2 {
-        match MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap() {
+        match MuxRecord::read_from(&mut controller, &SALT)
+            .unwrap()
+            .unwrap()
+        {
             MuxRecord::Data { rank, payload } => {
                 got.insert(rank, payload);
             }
@@ -187,7 +191,9 @@ fn mux_emits_rank_exit_on_disconnect() {
     let (_shutdown, threads) = start_mux(ChannelKind::Control, vec![(5, rank_relay)], relay_up);
 
     drop(rank_client); // rank process gone
-    let rec = MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap();
+    let rec = MuxRecord::read_from(&mut controller, &SALT)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         rec,
         MuxRecord::control(RelayControlMsg::RankExit { rank: 5 })
@@ -213,7 +219,10 @@ fn mux_rank_exit_then_survivors_keep_flowing() {
     let mut saw_exit = false;
     let mut saw_data1 = false;
     for _ in 0..2 {
-        match MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap() {
+        match MuxRecord::read_from(&mut controller, &SALT)
+            .unwrap()
+            .unwrap()
+        {
             MuxRecord::Control(RelayControlMsg::RankExit { rank: 0 }) => saw_exit = true,
             MuxRecord::Data { rank: 1, payload } => {
                 assert_eq!(payload, vec![0x42]);
@@ -298,7 +307,9 @@ fn spawn_fake_controller(
             MuxRecord::read_from(&mut up, &SALT).unwrap().unwrap()
         {
             data_tx.send((rank, payload.clone())).unwrap();
-            MuxRecord::data(rank, payload).write_to(&mut up, &SALT).unwrap();
+            MuxRecord::data(rank, payload)
+                .write_to(&mut up, &SALT)
+                .unwrap();
         }
         // Drain until the relay tears down.
         while let Ok(Some(_)) = MuxRecord::read_from(&mut up, &SALT) {}
@@ -397,7 +408,13 @@ fn relay_channel_data_channel_end_to_end() {
 
 /// Establish a 2-rank data-channel mux and return the pieces the fold
 /// tests drive: rank clients, controller end, shutdown flag, threads.
-fn start_fold_pair() -> (TcpStream, TcpStream, TcpStream, Arc<AtomicBool>, Vec<JoinHandle<()>>) {
+fn start_fold_pair() -> (
+    TcpStream,
+    TcpStream,
+    TcpStream,
+    Arc<AtomicBool>,
+    Vec<JoinHandle<()>>,
+) {
     let (c0, r0) = loopback_pair();
     let (c1, r1) = loopback_pair();
     c0.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -416,7 +433,10 @@ fn fold_sums_local_ranks_into_one_host_frame() {
     // element-wise sum and the summed mass — never a divide.
     write_len_framed(&mut c0, &frame_blob(&frame(&[1.0, 2.0], 3.0))).unwrap();
     write_len_framed(&mut c1, &frame_blob(&frame(&[10.0, 20.0], 1.0))).unwrap();
-    match MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap() {
+    match MuxRecord::read_from(&mut controller, &SALT)
+        .unwrap()
+        .unwrap()
+    {
         MuxRecord::HostFrame { payload } => {
             let folded = parse_frame(&payload);
             assert_eq!(frame_vals(&folded), vec![11.0, 22.0]);
@@ -465,7 +485,10 @@ fn fold_rank_exit_folds_the_remainder() {
     let mut saw_exit = false;
     let mut folded: Option<RoundFrame> = None;
     for _ in 0..2 {
-        match MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap() {
+        match MuxRecord::read_from(&mut controller, &SALT)
+            .unwrap()
+            .unwrap()
+        {
             MuxRecord::Control(RelayControlMsg::RankExit { rank: 0 }) => saw_exit = true,
             MuxRecord::HostFrame { payload } => folded = Some(parse_frame(&payload)),
             other => panic!("unexpected record {other:?}"),
@@ -495,7 +518,10 @@ fn fold_declare_dead_unblocks_the_barrier() {
         .write_to(&mut controller, &SALT)
         .unwrap();
 
-    match MuxRecord::read_from(&mut controller, &SALT).unwrap().unwrap() {
+    match MuxRecord::read_from(&mut controller, &SALT)
+        .unwrap()
+        .unwrap()
+    {
         MuxRecord::HostFrame { payload } => {
             let folded = parse_frame(&payload);
             assert_eq!(frame_vals(&folded), vec![9.0]);
@@ -624,9 +650,9 @@ fn elided_deposits_merge_with_full_ones_in_any_order() {
         // (deposit order, expected sum operands) — sum_frames is
         // order-insensitive, the fold must be too.
         let orders: Vec<Vec<&RoundFrame>> = vec![
-            vec![&elided, &f0],       // elided seed → promoted to zeros
-            vec![&f0, &elided],       // full seed stays verbatim (no promotion)
-            vec![&f0, &elided, &f2],  // promotion fires AFTER an elided pass
+            vec![&elided, &f0],      // elided seed → promoted to zeros
+            vec![&f0, &elided],      // full seed stays verbatim (no promotion)
+            vec![&f0, &elided, &f2], // promotion fires AFTER an elided pass
         ];
         for order in orders {
             let ranks: Vec<u32> = (0..order.len() as u32).collect();
@@ -666,9 +692,7 @@ fn incremental_fold_rejects_dtype_mix_loudly() {
     let (tx, _rx) = mpsc::sync_channel(4);
     ctx.deposit(0, &frame_blob(&frame(&[1.0, 2.0], 1.0)), &tx)
         .unwrap();
-    let err = ctx
-        .deposit(1, &frame_blob(&bf16_frame), &tx)
-        .unwrap_err();
+    let err = ctx.deposit(1, &frame_blob(&bf16_frame), &tx).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("dtype") && msg.contains("bf16_wire"),
@@ -682,7 +706,8 @@ fn incremental_fold_rejects_dtype_mix_loudly() {
 fn incremental_fold_rejects_double_deposit() {
     let ctx = FoldCtx::new(vec![0, 1], SALT);
     let (tx, _rx) = mpsc::sync_channel(4);
-    ctx.deposit(0, &frame_blob(&frame(&[1.0], 1.0)), &tx).unwrap();
+    ctx.deposit(0, &frame_blob(&frame(&[1.0], 1.0)), &tx)
+        .unwrap();
     let err = ctx
         .deposit(0, &frame_blob(&frame(&[2.0], 1.0)), &tx)
         .unwrap_err();

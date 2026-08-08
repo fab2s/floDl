@@ -11,7 +11,7 @@ use std::path::Path;
 
 use safetensors::SafeTensors;
 
-use flodl::nn::{cast_parameters, Module};
+use flodl::nn::{Module, cast_parameters};
 use flodl::{DType, Device, Tensor, Variable};
 use flodl_hf::models::deberta_v2::DebertaV2ForTokenClassification;
 
@@ -28,8 +28,11 @@ use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};
 fn deberta_v2_tokencls_parity_vs_pytorch_live() {
     let dev = Device::CPU;
 
-    let bytes = std::fs::read(Path::new(FIXTURE))
-        .unwrap_or_else(|e| panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity deberta-v2-tokencls` to regenerate)"));
+    let bytes = std::fs::read(Path::new(FIXTURE)).unwrap_or_else(|e| {
+        panic!(
+            "reading {FIXTURE}: {e} (run `fdl flodl-hf parity deberta-v2-tokencls` to regenerate)"
+        )
+    });
     let st = SafeTensors::deserialize(&bytes).expect("parse parity fixture");
 
     let ids = st.tensor("inputs.input_ids").unwrap();
@@ -37,12 +40,14 @@ fn deberta_v2_tokencls_parity_vs_pytorch_live() {
     let ref_logits = st.tensor("outputs.logits").unwrap();
 
     let input_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(), false,
+        Tensor::from_i64(&parse_i64(&ids), &shape_i64(&ids), dev).unwrap(),
+        false,
     );
 
     let mask_f32_data: Vec<f32> = parse_i64(&mk).iter().map(|&x| x as f32).collect();
     let attention_mask = Variable::new(
-        Tensor::from_f32(&mask_f32_data, &shape_i64(&mk), dev).unwrap(), false,
+        Tensor::from_f32(&mask_f32_data, &shape_i64(&mk), dev).unwrap(),
+        false,
     );
 
     let ref_data = parse_f32(&ref_logits);
@@ -52,7 +57,8 @@ fn deberta_v2_tokencls_parity_vs_pytorch_live() {
     cast_parameters(&head.graph().parameters(), DType::Float32).unwrap();
     head.graph().eval();
 
-    let out = head.graph()
+    let out = head
+        .graph()
         .forward_multi(&[input_ids, attention_mask])
         .unwrap();
     assert_eq!(out.shape(), ref_shape, "logits shape mismatch");

@@ -55,8 +55,7 @@ impl TwoBlobs {
             let center = class - 0.5; // class 0 → -0.5, class 1 → +0.5
             for j in 0..DIM {
                 // Deterministic jitter in (-0.25, 0.25).
-                let jitter =
-                    ((((i * 31 + j * 17) % 97) as f32) / 97.0 - 0.5) * 0.5;
+                let jitter = ((((i * 31 + j * 17) % 97) as f32) / 97.0 - 0.5) * 0.5;
                 xs.push(center + jitter);
             }
             ys.push(class);
@@ -112,15 +111,11 @@ fn main() -> Result<()> {
 
     let dataset: Arc<dyn BatchDataSet> = Arc::new(TwoBlobs::new(512)?);
 
-    let handle = Trainer::builder(
-        build_model,
-        |params| Adam::new(params, 1e-2),
-        train_step,
-    )
-    .dataset(dataset)
-    .batch_size(32)
-    .num_epochs(3)
-    .run()?;
+    let handle = Trainer::builder(build_model, |params| Adam::new(params, 1e-2), train_step)
+        .dataset(dataset)
+        .batch_size(32)
+        .num_epochs(3)
+        .run()?;
 
     let state = handle.join()?;
     // Launcher mode returns an empty TrainedState (ranks are separate

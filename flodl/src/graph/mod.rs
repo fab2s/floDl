@@ -19,29 +19,29 @@
 //! model.freeze("encoder")?;  // freeze by label path
 //! ```
 
-pub mod node;
-pub mod flow;
-pub mod loop_node;
-pub mod switch;
-pub mod gate;
-pub mod map;
-pub mod observe;
-pub mod trend;
-pub mod profile;
-pub mod dot;
-pub mod plot;
-pub mod router;
-pub mod halt;
-pub mod reshape;
-pub mod state;
-pub mod snapshot;
-pub mod tree;
-pub mod verbose;
-#[allow(clippy::module_inception)]
-mod graph;
 mod checkpoint;
 mod distributed;
+pub mod dot;
 mod execution;
+pub mod flow;
+pub mod gate;
+#[allow(clippy::module_inception)]
+mod graph;
+pub mod halt;
+pub mod loop_node;
+pub mod map;
+pub mod node;
+pub mod observe;
+pub mod plot;
+pub mod profile;
+pub mod reshape;
+pub mod router;
+pub mod snapshot;
+pub mod state;
+pub mod switch;
+pub mod tree;
+pub mod trend;
+pub mod verbose;
 
 /// Graph-side view of any [`Module`](crate::nn::Module): `.as_graph()`
 /// recovers the [`Graph`] behind a `dyn Module` when there is one.
@@ -68,21 +68,21 @@ impl<M: crate::nn::Module + ?Sized> GraphExt for M {
     }
 }
 
+pub use execution::{ActiveGraphEpochIterator, GraphEpochIterator};
 pub use flow::FlowBuilder;
+pub use graph::*;
+pub use halt::{LearnedHalt, ThresholdHalt};
 pub use loop_node::LoopBuilder;
 pub use map::MapBuilder;
-pub use trend::{Trend, TrendGroup};
-pub use profile::{Profile, NodeTiming, LevelTiming};
-pub use plot::format_duration;
-pub use router::{SoftmaxRouter, SigmoidRouter, FixedSelector, ArgmaxSelector};
-pub use halt::{ThresholdHalt, LearnedHalt};
-pub use reshape::Reshape;
-pub use state::StateAdd;
 pub use observe::Reduce;
-pub use tree::PathKind;
+pub use plot::format_duration;
+pub use profile::{LevelTiming, NodeTiming, Profile};
+pub use reshape::Reshape;
+pub use router::{ArgmaxSelector, FixedSelector, SigmoidRouter, SoftmaxRouter};
 pub use snapshot::ModelSnapshot;
-pub use graph::*;
-pub use execution::{ActiveGraphEpochIterator, GraphEpochIterator};
+pub use state::StateAdd;
+pub use tree::PathKind;
+pub use trend::{Trend, TrendGroup};
 
 /// Merge operation for combining split branches.
 pub enum MergeOp {

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use crate::nn::checkpoint::{MAGIC, VERSION, HASH_LEN, write_tensor_data, io_err};
+use crate::nn::checkpoint::{HASH_LEN, MAGIC, VERSION, io_err, write_tensor_data};
 use crate::tensor::{Device, Result, Tensor};
 
 use super::Graph;
@@ -50,14 +50,16 @@ impl ModelSnapshot {
 
         for (name, t) in &self.params {
             let name_bytes = name.as_bytes();
-            w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(name_bytes.len() as u32).to_le_bytes())
+                .map_err(io_err)?;
             w.write_all(name_bytes).map_err(io_err)?;
             write_tensor_data(w, t)?;
         }
 
         for (name, t) in &self.buffers {
             let name_bytes = name.as_bytes();
-            w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(name_bytes.len() as u32).to_le_bytes())
+                .map_err(io_err)?;
             w.write_all(name_bytes).map_err(io_err)?;
             write_tensor_data(w, t)?;
         }
@@ -128,9 +130,9 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::autograd::Variable;
-    use crate::nn::{Linear, Module};
     use crate::graph::FlowBuilder;
-    use crate::tensor::{test_device, Tensor, TensorOptions};
+    use crate::nn::{Linear, Module};
+    use crate::tensor::{Tensor, TensorOptions, test_device};
     use crate::worker::CpuWorker;
 
     fn build_test_graph() -> Result<Graph> {
@@ -157,8 +159,11 @@ mod tests {
         let snap = g.snapshot_cpu().unwrap();
 
         let names: Vec<&String> = snap.params.keys().collect();
-        assert!(names.iter().any(|n| n.contains("encoder")),
-            "param names should include tag prefix, got: {:?}", names);
+        assert!(
+            names.iter().any(|n| n.contains("encoder")),
+            "param names should include tag prefix, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -195,9 +200,8 @@ mod tests {
         let load_params: Vec<(String, crate::nn::Parameter)> = g.named_parameters();
         let load_buffers: Vec<(String, crate::nn::Buffer)> = g.named_buffers();
         let mut cursor = std::io::Cursor::new(&buf);
-        let report = crate::nn::load_checkpoint(
-            &mut cursor, &load_params, &load_buffers, None,
-        ).unwrap();
+        let report =
+            crate::nn::load_checkpoint(&mut cursor, &load_params, &load_buffers, None).unwrap();
 
         assert_eq!(report.loaded.len(), snap.params.len() + snap.buffers.len());
         assert!(report.missing.is_empty());
@@ -221,9 +225,7 @@ mod tests {
 
         // Load back
         let load_params: Vec<(String, crate::nn::Parameter)> = g.named_parameters();
-        let report = crate::nn::load_checkpoint_file(
-            path_str, &load_params, &[], None,
-        ).unwrap();
+        let report = crate::nn::load_checkpoint_file(path_str, &load_params, &[], None).unwrap();
         assert_eq!(report.loaded.len(), snap.params.len());
 
         std::fs::remove_file(path_str).ok();
@@ -235,10 +237,14 @@ mod tests {
 
         // Do a forward pass so params have data
         let x = Variable::new(
-            Tensor::randn(&[1, 2], TensorOptions {
-                dtype: crate::tensor::DType::Float32,
-                device: test_device(),
-            }).unwrap(),
+            Tensor::randn(
+                &[1, 2],
+                TensorOptions {
+                    dtype: crate::tensor::DType::Float32,
+                    device: test_device(),
+                },
+            )
+            .unwrap(),
             false,
         );
         let _ = g.forward(&x).unwrap();

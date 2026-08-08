@@ -53,7 +53,10 @@ impl Variable {
             data
         };
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
+            inner: Rc::new(RefCell::new(VariableInner {
+                data,
+                data_generation: 0,
+            })),
         }
     }
 
@@ -62,7 +65,10 @@ impl Variable {
     /// metadata from their inputs automatically).
     pub(crate) fn wrap(data: Tensor) -> Self {
         Variable {
-            inner: Rc::new(RefCell::new(VariableInner { data, data_generation: 0 })),
+            inner: Rc::new(RefCell::new(VariableInner {
+                data,
+                data_generation: 0,
+            })),
         }
     }
 

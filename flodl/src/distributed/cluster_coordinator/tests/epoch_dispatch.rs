@@ -6,7 +6,6 @@ use super::*;
 // Epoch dispatch
 // -----------------------------------------------------------------
 
-
 #[test]
 fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
     // End-to-end coverage half of the async resume contract (no network):
@@ -20,8 +19,7 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
     let world_size = 2;
     let total = 100usize;
 
-    let dir = std::env::temp_dir()
-        .join(format!("flodl_ckpt_resume_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("flodl_ckpt_resume_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("ckpt").to_string_lossy().into_owned();
 
@@ -109,7 +107,10 @@ fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
     assert!(handled, "coverage present → resume handled the kickoff");
     // Reconstructed pool holds only the holes. (Headless send_control fails and
     // rolls back the dispatch take, so `remaining` reflects the staged holes.)
-    let pool_b = coord_b.chunk_pools.get(&2).expect("epoch 2 pool reconstructed");
+    let pool_b = coord_b
+        .chunk_pools
+        .get(&2)
+        .expect("epoch 2 pool reconstructed");
     assert_eq!(pool_b.remaining(), 60);
     assert!(!pool_b.is_epoch_done());
     // Epochs 0,1 anchored as already aggregated; cohort placed at epoch 2.
@@ -181,7 +182,11 @@ fn advisory_spans_own_first_margins_last() {
 
     let spans0 = coord.advisory_spans_for_rank(0, 0);
     assert_eq!(spans0[0], (0, 50), "own span first");
-    assert_eq!(spans0[1], (96, 4), "then the other span's window-sized tail");
+    assert_eq!(
+        spans0[1],
+        (96, 4),
+        "then the other span's window-sized tail"
+    );
     assert_eq!(spans0.len(), 2);
 
     let spans1 = coord.advisory_spans_for_rank(0, 1);
@@ -213,14 +218,8 @@ fn predicted_epoch_spans_match_table_and_stop_at_run_end() {
     let coord = ClusterCoordinator::for_test(cfg);
 
     // Same geometry as the live table: equal spans + window tails.
-    assert_eq!(
-        coord.predicted_epoch_spans(1, 0),
-        vec![(0, 50), (96, 4)],
-    );
-    assert_eq!(
-        coord.predicted_epoch_spans(1, 1),
-        vec![(50, 50), (46, 4)],
-    );
+    assert_eq!(coord.predicted_epoch_spans(1, 0), vec![(0, 50), (96, 4)],);
+    assert_eq!(coord.predicted_epoch_spans(1, 1), vec![(50, 50), (46, 4)],);
     // Epoch 2 does not exist in a 2-epoch run.
     assert!(coord.predicted_epoch_spans(2, 0).is_empty());
 }
@@ -318,8 +317,8 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
             pre.decode::<ControlMsgWire>()?,
             ControlMsgWire::SetEpochCallbackRole { .. }
         ));
-        let frame = recv_frame(s, salt)?
-            .ok_or_else(|| TensorError::new("rank 0 EOF before StartEpoch"))?;
+        let frame =
+            recv_frame(s, salt)?.ok_or_else(|| TensorError::new("rank 0 EOF before StartEpoch"))?;
         assert_eq!(frame.kind, MsgKind::Control);
         let msg: ControlMsgWire = frame.decode()?;
         match msg {
@@ -340,8 +339,8 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
             pre.decode::<ControlMsgWire>()?,
             ControlMsgWire::SetEpochCallbackRole { .. }
         ));
-        let frame = recv_frame(s, salt)?
-            .ok_or_else(|| TensorError::new("rank 1 EOF before StartEpoch"))?;
+        let frame =
+            recv_frame(s, salt)?.ok_or_else(|| TensorError::new("rank 1 EOF before StartEpoch"))?;
         let msg: ControlMsgWire = frame.decode()?;
         match msg {
             ControlMsgWire::StartEpoch(plan) => {
@@ -356,8 +355,12 @@ fn dispatch_epoch_partitions_cover_dataset_no_overlap() {
         }
     });
 
-    r0.join().unwrap().expect("rank 0 receives StartEpoch (0, 5)");
-    r1.join().unwrap().expect("rank 1 receives StartEpoch (5, 5)");
+    r0.join()
+        .unwrap()
+        .expect("rank 0 receives StartEpoch (0, 5)");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 receives StartEpoch (5, 5)");
     coord_handle.join().unwrap().expect("coord finishes");
 }
 
@@ -457,7 +460,6 @@ fn dispatch_epoch_caches_plans_for_same_epoch() {
     coord_handle.join().unwrap().expect("coord finishes");
 }
 
-
 #[test]
 fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     // 2 ranks, Sync+Cpu. After each rank sends one Batch + SyncAck
@@ -486,14 +488,19 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
     );
 
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 0,
-            batch_ms: 10.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.5,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            },
+        )?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::RequestParams);
         // Sync (non-progressive) CPU broadcasts a hard barrier: the
@@ -505,13 +512,17 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         assert_eq!(throttle, ControlMsgWire::Throttle);
         // Mock the post-data-channel ack the worker-side bridge
         // emits after the CPU averaging round-trip completes.
-        send_timing(s, salt, TimingMsgWire::SyncAck {
-            rank: 0,
-            step_count: 2,
-            divergence: Some(0.05),
-            post_norm: None,
-            pre_norm: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::SyncAck {
+                rank: 0,
+                step_count: 2,
+                divergence: Some(0.05),
+                post_norm: None,
+                pre_norm: None,
+            },
+        )?;
         let msg2 = recv_control(s, salt)?;
         assert!(matches!(msg2, ControlMsgWire::Update { .. }));
         let msg3 = recv_control(s, salt)?;
@@ -519,25 +530,34 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         Ok(())
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 1,
-            batch_ms: 12.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.4,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            },
+        )?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::RequestParams);
         let throttle = recv_control(s, salt)?;
         assert_eq!(throttle, ControlMsgWire::Throttle);
-        send_timing(s, salt, TimingMsgWire::SyncAck {
-            rank: 1,
-            step_count: 2,
-            divergence: Some(0.05),
-            post_norm: None,
-            pre_norm: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::SyncAck {
+                rank: 1,
+                step_count: 2,
+                divergence: Some(0.05),
+                post_norm: None,
+                pre_norm: None,
+            },
+        )?;
         let msg2 = recv_control(s, salt)?;
         assert!(matches!(msg2, ControlMsgWire::Update { .. }));
         let msg3 = recv_control(s, salt)?;
@@ -545,8 +565,12 @@ fn sync_cpu_trigger_broadcasts_request_params_then_update() {
         Ok(())
     });
 
-    r0.join().unwrap().expect("rank 0 sees RequestParams + Update + SetGlobalStep");
-    r1.join().unwrap().expect("rank 1 sees RequestParams + Update + SetGlobalStep");
+    r0.join()
+        .unwrap()
+        .expect("rank 0 sees RequestParams + Update + SetGlobalStep");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 sees RequestParams + Update + SetGlobalStep");
     coord_handle.join().unwrap().expect("coord finishes");
 }
 
@@ -571,7 +595,10 @@ fn fold_next_chunk_returns_schedule_window_mid_epoch() {
         .el_che_mut_for_test()
         .report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
     let counts = coord.el_che_for_test().batch_counts().to_vec();
-    assert!(counts[0] > 0 && counts[1] > 0, "calibrated counts: {counts:?}");
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "calibrated counts: {counts:?}"
+    );
 
     // batch_size defaults to 1 → partition_size (samples) == batches.
     // Pool far larger than one window so the fold stays intra-epoch.
@@ -624,7 +651,10 @@ fn tail_dispatch_is_share_capped_not_proportional() {
     }
     let counts = coord.el_che_for_test().batch_counts().to_vec();
     let total: usize = counts.iter().sum();
-    assert!(counts[0] > 0 && counts[1] > 0 && total > 2, "counts: {counts:?}");
+    assert!(
+        counts[0] > 0 && counts[1] > 0 && total > 2,
+        "counts: {counts:?}"
+    );
 
     // batch_size defaults to 1 (samples == batches). Tail: one batch short
     // of a full window.
@@ -667,7 +697,12 @@ fn cadence_tail_plans_a_no_lone_one_window() {
     }
     let counts = coord.el_che_for_test().batch_counts().to_vec();
     let total: usize = counts.iter().sum();
-    let fast = counts.iter().enumerate().max_by_key(|&(_, &c)| c).unwrap().0;
+    let fast = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &c)| c)
+        .unwrap()
+        .0;
     assert!(total > world_size + 2, "counts: {counts:?}");
 
     // One batch short of a full window: the whole remainder is the final
@@ -692,11 +727,14 @@ fn cadence_tail_plans_a_no_lone_one_window() {
         "no rank at exactly 1 step: {sizes:?}",
     );
     assert!(
-        sizes[fast] >= sizes.iter().enumerate()
-            .filter(|&(r, _)| r != fast)
-            .map(|(_, &n)| n)
-            .max()
-            .unwrap_or(0),
+        sizes[fast]
+            >= sizes
+                .iter()
+                .enumerate()
+                .filter(|&(r, _)| r != fast)
+                .map(|(_, &n)| n)
+                .max()
+                .unwrap_or(0),
         "fast rank stays dominant: {sizes:?}",
     );
 }
@@ -756,12 +794,8 @@ fn snapshot_ready_populates_upload_marker_cpu_only() {
             assert_eq!(uploads.len(), world_size);
             // Both ranks emitted SnapshotReady → both slots populated.
             for (r, slot) in uploads.iter().enumerate() {
-                let ms = slot
-                    .unwrap_or_else(|| panic!("rank {r} missing upload marker"));
-                assert!(
-                    ms >= 0.0,
-                    "rank {r} upload_ms ({ms}) must be >= 0"
-                );
+                let ms = slot.unwrap_or_else(|| panic!("rank {r} missing upload marker"));
+                assert!(ms >= 0.0, "rank {r} upload_ms ({ms}) must be >= 0");
             }
             Ok(())
         },
@@ -773,27 +807,36 @@ fn snapshot_ready_populates_upload_marker_cpu_only() {
     // cycle.
     fn rank_body(rank: u64) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
         move |s, salt| {
-            send_timing(s, salt, TimingMsgWire::Batch {
-                rank,
-                batch_ms: 10.0, data_ms: 0.0,
-                step_count: 1,
-                param_norm: None,
-                batch_loss: 0.5,
-                sync_divergence: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // RequestParams
             // Inject a tiny delay so the captured upload_ms is
             // strictly positive on every clock (some CI clocks
             // return 0 for sub-microsecond elapseds).
             thread::sleep(Duration::from_millis(2));
             send_timing(s, salt, TimingMsgWire::SnapshotReady { rank })?;
-            send_timing(s, salt, TimingMsgWire::SyncAck {
-                rank,
-                step_count: 2,
-                divergence: Some(0.05),
-                post_norm: None,
-                pre_norm: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::SyncAck {
+                    rank,
+                    step_count: 2,
+                    divergence: Some(0.05),
+                    post_norm: None,
+                    pre_norm: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // Update
             let _ = recv_control(s, salt)?; // SetGlobalStep
             Ok(())
@@ -846,25 +889,34 @@ fn snapshot_ready_resets_between_cycles() {
     // Rank 0 emits SnapshotReady on BOTH cycles.
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
         for cycle in 0..2 {
-            send_timing(s, salt, TimingMsgWire::Batch {
-                rank: 0,
-                batch_ms: 10.0, data_ms: 0.0,
-                step_count: (cycle + 1) as u64,
-                param_norm: None,
-                batch_loss: 0.5,
-                sync_divergence: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank: 0,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
+                    step_count: (cycle + 1) as u64,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // RequestParams
             let _ = recv_control(s, salt)?; // Throttle (Sync non-progressive barrier)
             thread::sleep(Duration::from_millis(2));
             send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 0 })?;
-            send_timing(s, salt, TimingMsgWire::SyncAck {
-                rank: 0,
-                step_count: ((cycle + 1) * 2) as u64,
-                divergence: Some(0.05),
-                post_norm: None,
-                pre_norm: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::SyncAck {
+                    rank: 0,
+                    step_count: ((cycle + 1) * 2) as u64,
+                    divergence: Some(0.05),
+                    post_norm: None,
+                    pre_norm: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // Update
             let _ = recv_control(s, salt)?; // SetGlobalStep
         }
@@ -873,27 +925,36 @@ fn snapshot_ready_resets_between_cycles() {
     // Rank 1 emits SnapshotReady ONLY on cycle 1.
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
         for cycle in 0..2 {
-            send_timing(s, salt, TimingMsgWire::Batch {
-                rank: 1,
-                batch_ms: 12.0, data_ms: 0.0,
-                step_count: (cycle + 1) as u64,
-                param_norm: None,
-                batch_loss: 0.4,
-                sync_divergence: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank: 1,
+                    batch_ms: 12.0,
+                    data_ms: 0.0,
+                    step_count: (cycle + 1) as u64,
+                    param_norm: None,
+                    batch_loss: 0.4,
+                    sync_divergence: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // RequestParams
             let _ = recv_control(s, salt)?; // Throttle (Sync non-progressive barrier)
             thread::sleep(Duration::from_millis(2));
             if cycle == 0 {
                 send_timing(s, salt, TimingMsgWire::SnapshotReady { rank: 1 })?;
             }
-            send_timing(s, salt, TimingMsgWire::SyncAck {
-                rank: 1,
-                step_count: ((cycle + 1) * 2) as u64,
-                divergence: Some(0.05),
-                post_norm: None,
-                pre_norm: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::SyncAck {
+                    rank: 1,
+                    step_count: ((cycle + 1) * 2) as u64,
+                    divergence: Some(0.05),
+                    post_norm: None,
+                    pre_norm: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // Update
             let _ = recv_control(s, salt)?; // SetGlobalStep
         }
@@ -916,8 +977,7 @@ fn snapshot_ready_resets_between_cycles() {
 #[test]
 fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
     let world_size = 2;
-    let (sink_tx, sink_rx) =
-        mpsc::channel::<crate::distributed::ddp_run::EpochMetrics>();
+    let (sink_tx, sink_rx) = mpsc::channel::<crate::distributed::ddp_run::EpochMetrics>();
     let (port, coord_handle) = spawn_coord(
         world_size,
         move || cfg_sync_cpu(world_size).metrics_sink_tx(sink_tx),
@@ -949,23 +1009,24 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
     fn rank_body(rank: u64) -> impl Fn(&mut TcpStream, &SessionSalt) -> Result<()> {
         move |s, salt| {
             let mut scalars = std::collections::HashMap::new();
-            scalars.insert(
-                "custom_metric".to_string(),
-                (10.0 + rank as f64, 1u64),
-            );
-            send_metrics(s, salt, MetricsMsgWire {
-                rank,
-                epoch: 0,
-                avg_loss: 0.5 + 0.1 * rank as f64,
-                batches_processed: 4,
-                epoch_ms: 100.0,
-                samples_processed: 16,
-                share_complete_ms: 5.0,
-                compute_only_ms: 90.0,
-                data_starve_ms: 5.0,
-                scalars,
-                resources: None,
-            })?;
+            scalars.insert("custom_metric".to_string(), (10.0 + rank as f64, 1u64));
+            send_metrics(
+                s,
+                salt,
+                MetricsMsgWire {
+                    rank,
+                    epoch: 0,
+                    avg_loss: 0.5 + 0.1 * rank as f64,
+                    batches_processed: 4,
+                    epoch_ms: 100.0,
+                    samples_processed: 16,
+                    share_complete_ms: 5.0,
+                    compute_only_ms: 90.0,
+                    data_starve_ms: 5.0,
+                    scalars,
+                    resources: None,
+                },
+            )?;
             // Block on the broadcast — coord will send
             // `EpochAggregated` once every alive rank has reported.
             let msg = recv_control(s, salt)?;
@@ -977,13 +1038,9 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
                             wire.epoch
                         )));
                     }
-                    let got = wire
-                        .scalars
-                        .get("custom_metric")
-                        .copied()
-                        .ok_or_else(|| TensorError::new(
-                            "rank: custom_metric missing from broadcast scalars",
-                        ))?;
+                    let got = wire.scalars.get("custom_metric").copied().ok_or_else(|| {
+                        TensorError::new("rank: custom_metric missing from broadcast scalars")
+                    })?;
                     if (got - 10.5).abs() > 1e-9 {
                         return Err(TensorError::new(&format!(
                             "rank {rank}: broadcast custom_metric={got} (expected 10.5)",
@@ -995,15 +1052,11 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
                     let per_rank = wire
                         .per_rank
                         .get(rank as usize)
-                        .ok_or_else(|| TensorError::new(
-                            "rank: per_rank slot missing",
-                        ))?;
+                        .ok_or_else(|| TensorError::new("rank: per_rank slot missing"))?;
                     let per_rank_val = per_rank
                         .get("custom_metric")
                         .copied()
-                        .ok_or_else(|| TensorError::new(
-                            "rank: per_rank custom_metric missing",
-                        ))?;
+                        .ok_or_else(|| TensorError::new("rank: per_rank custom_metric missing"))?;
                     if (per_rank_val - (10.0 + rank as f64)).abs() > 1e-9 {
                         return Err(TensorError::new(&format!(
                             "rank {rank}: per_rank custom_metric={per_rank_val} \
@@ -1048,7 +1101,6 @@ fn epoch_aggregated_broadcast_and_sink_receive_aggregated_metrics() {
     );
 }
 
-
 // -----------------------------------------------------------------
 // CPU finalize state machine
 // -----------------------------------------------------------------
@@ -1084,24 +1136,33 @@ fn cpu_finalize_defers_until_all_sync_acks_arrived() {
 
     let barrier_for_r0 = Arc::clone(&barrier);
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, move |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 0,
-            batch_ms: 10.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.5,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            },
+        )?;
         let _ = recv_control(s, salt)?; // RequestParams
         // Rank 0 sends SyncAck immediately so coord goes into Pending
         // but still has rank 1 outstanding.
-        send_timing(s, salt, TimingMsgWire::SyncAck {
-            rank: 0,
-            step_count: 2,
-            divergence: Some(0.05),
-            post_norm: Some(1.0),
-            pre_norm: Some(1.05),
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::SyncAck {
+                rank: 0,
+                step_count: 2,
+                divergence: Some(0.05),
+                post_norm: Some(1.0),
+                pre_norm: Some(1.05),
+            },
+        )?;
         // Wait for the test thread (rank 1) to release the barrier
         // BEFORE rank 1 sends its SyncAck. Until then, coord must
         // stay in Pending.
@@ -1112,34 +1173,46 @@ fn cpu_finalize_defers_until_all_sync_acks_arrived() {
     });
     let barrier_for_r1 = Arc::clone(&barrier);
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, move |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 1,
-            batch_ms: 12.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.4,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            },
+        )?;
         let _ = recv_control(s, salt)?; // RequestParams
         // Hold the SyncAck briefly so the test's drive loop observes
         // `cpu_avg_pending_for_test=true && avg_count=0`. Use the
         // shared barrier with r0 so timing is deterministic.
         thread::sleep(Duration::from_millis(200));
         barrier_for_r1.wait();
-        send_timing(s, salt, TimingMsgWire::SyncAck {
-            rank: 1,
-            step_count: 2,
-            divergence: Some(0.06),
-            post_norm: Some(1.0),
-            pre_norm: Some(1.04),
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::SyncAck {
+                rank: 1,
+                step_count: 2,
+                divergence: Some(0.06),
+                post_norm: Some(1.0),
+                pre_norm: Some(1.04),
+            },
+        )?;
         let _ = recv_control(s, salt)?; // Update
         let _ = recv_control(s, salt)?; // SetGlobalStep
         Ok(())
     });
     r0.join().unwrap().expect("rank 0 path");
     r1.join().unwrap().expect("rank 1 path");
-    coord_handle.join().unwrap().expect("coord finalizes after both acks");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord finalizes after both acks");
 }
 
 #[test]
@@ -1182,22 +1255,31 @@ fn cpu_finalize_records_per_rank_lag_for_diagnostics() {
     );
     let body = |rank: u64| {
         move |s: &mut TcpStream, salt: &SessionSalt| -> Result<()> {
-            send_timing(s, salt, TimingMsgWire::Batch {
-                rank,
-                batch_ms: 10.0, data_ms: 0.0,
-                step_count: 1,
-                param_norm: None,
-                batch_loss: 0.5,
-                sync_divergence: None,
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::Batch {
+                    rank,
+                    batch_ms: 10.0,
+                    data_ms: 0.0,
+                    step_count: 1,
+                    param_norm: None,
+                    batch_loss: 0.5,
+                    sync_divergence: None,
+                },
+            )?;
             let _ = recv_control(s, salt)?; // RequestParams
-            send_timing(s, salt, TimingMsgWire::SyncAck {
-                rank,
-                step_count: 2,
-                divergence: Some(0.05),
-                post_norm: Some(1.0),
-                pre_norm: Some(1.05),
-            })?;
+            send_timing(
+                s,
+                salt,
+                TimingMsgWire::SyncAck {
+                    rank,
+                    step_count: 2,
+                    divergence: Some(0.05),
+                    post_norm: Some(1.0),
+                    pre_norm: Some(1.05),
+                },
+            )?;
             let _ = recv_control(s, salt)?; // Update
             let _ = recv_control(s, salt)?; // SetGlobalStep
             Ok(())
@@ -1207,9 +1289,11 @@ fn cpu_finalize_records_per_rank_lag_for_diagnostics() {
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, body(1));
     r0.join().unwrap().expect("rank 0 path");
     r1.join().unwrap().expect("rank 1 path");
-    coord_handle.join().unwrap().expect("coord captures per-rank lags");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord captures per-rank lags");
 }
-
 
 // -----------------------------------------------------------------
 // Epoch splits: an epoch is a slice of a pass, not the whole pass
@@ -1218,17 +1302,23 @@ fn cpu_finalize_records_per_rank_lag_for_diagnostics() {
 #[test]
 fn one_split_leaves_the_epoch_covering_the_whole_pass() {
     // The default. Every plan set must still tile all 100 picks.
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).total_samples(100).batch_size(1));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).total_samples(100).batch_size(1));
     assert_eq!(coord.epoch_samples(0), 100);
-    let covered: u64 = coord.plans_for_epoch(0).iter().map(|p| p.partition_size).sum();
+    let covered: u64 = coord
+        .plans_for_epoch(0)
+        .iter()
+        .map(|p| p.partition_size)
+        .sum();
     assert_eq!(covered, 100);
 }
 
 #[test]
 fn split_epochs_size_plans_to_the_slice_and_tile_the_pass() {
     let mut coord = ClusterCoordinator::for_test(
-        cfg_sync_cpu(2).total_samples(100).epoch_splits(4).batch_size(1),
+        cfg_sync_cpu(2)
+            .total_samples(100)
+            .epoch_splits(4)
+            .batch_size(1),
     );
     let mut total = 0u64;
     for event in 0..4 {
@@ -1238,7 +1328,10 @@ fn split_epochs_size_plans_to_the_slice_and_tile_the_pass() {
         // keeps ChunkPool partitioning [0, epoch_len) unchanged.
         let mut at = 0u64;
         for p in &plans {
-            assert_eq!(p.partition_offset, at, "event {event} offsets stay consecutive");
+            assert_eq!(
+                p.partition_offset, at,
+                "event {event} offsets stay consecutive"
+            );
             at += p.partition_size;
         }
         assert_eq!(at, 25, "event {event} plans tile its slice");
@@ -1252,14 +1345,20 @@ fn an_uneven_split_spreads_the_remainder_and_still_tiles() {
     // 100 picks over 7 events: 14 r 2, so the first two events carry one
     // extra pick each. No event may be starved and none may double up.
     let mut coord = ClusterCoordinator::for_test(
-        cfg_sync_cpu(2).total_samples(100).epoch_splits(7).batch_size(1),
+        cfg_sync_cpu(2)
+            .total_samples(100)
+            .epoch_splits(7)
+            .batch_size(1),
     );
     let sizes: Vec<usize> = (0..7).map(|e| coord.epoch_samples(e)).collect();
     assert_eq!(sizes, vec![15, 15, 14, 14, 14, 14, 14]);
     assert_eq!(sizes.iter().sum::<usize>(), 100);
     for (event, &want) in sizes.iter().enumerate() {
-        let covered: u64 =
-            coord.plans_for_epoch(event).iter().map(|p| p.partition_size).sum();
+        let covered: u64 = coord
+            .plans_for_epoch(event)
+            .iter()
+            .map(|p| p.partition_size)
+            .sum();
         assert_eq!(covered as usize, want, "event {event}");
     }
 }
@@ -1289,7 +1388,7 @@ fn resume_from_coverage_rejects_epoch_splits_mismatch() {
     .seed(7);
     let mut coord = ClusterCoordinator::for_test(cfg);
     coord.start_coverage = Some(CoverageBlock {
-        seed: 7, // same seed, so only the splits differ
+        seed: 7,         // same seed, so only the splits differ
         epoch_splits: 2, // recorded under a DIFFERENT slicing
         batch_size: 1,
         per_epoch: vec![EpochCoverage {
@@ -1300,8 +1399,14 @@ fn resume_from_coverage_rejects_epoch_splits_mismatch() {
     });
     let err = coord.resume_progressive_from_coverage().unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("epoch_splits 2"), "must name both values: {msg}");
-    assert!(msg.contains("epoch_splits 4"), "must name both values: {msg}");
+    assert!(
+        msg.contains("epoch_splits 2"),
+        "must name both values: {msg}"
+    );
+    assert!(
+        msg.contains("epoch_splits 4"),
+        "must name both values: {msg}"
+    );
 }
 
 // Matching splits resume normally — the guard must not fire on the
@@ -1337,7 +1442,9 @@ fn resume_from_coverage_accepts_matching_epoch_splits() {
         }],
     });
     assert!(
-        coord.resume_progressive_from_coverage().expect("matching splits resume"),
+        coord
+            .resume_progressive_from_coverage()
+            .expect("matching splits resume"),
         "a matching coverage block must reconstruct the pool",
     );
 }

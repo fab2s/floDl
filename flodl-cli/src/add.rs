@@ -33,8 +33,7 @@ const TEMPLATE_README: &str = include_str!("scaffold/README.md");
 const TEMPLATE_GITIGNORE: &str = include_str!("scaffold/.gitignore");
 
 /// Description written into the root `fdl.yml` `flodl-hf:` entry.
-const FDL_YML_HF_DESCRIPTION: &str =
-    "HuggingFace integration (BERT, RoBERTa, DistilBERT, ...)";
+const FDL_YML_HF_DESCRIPTION: &str = "HuggingFace integration (BERT, RoBERTa, DistilBERT, ...)";
 
 pub fn run(target: Option<&str>, playground: bool, install: bool) -> Result<(), String> {
     let target = target.ok_or(
@@ -54,8 +53,7 @@ pub fn run(target: Option<&str>, playground: bool, install: bool) -> Result<(), 
         }
     }
 
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("cannot read current directory: {e}"))?;
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read current directory: {e}"))?;
 
     // No flag: interactive prompt (or loud error on non-tty).
     let (do_playground, do_install) = if !playground && !install {
@@ -144,7 +142,9 @@ pub fn install_flodl_hf_at(cwd: &Path) -> Result<(), String> {
             println!();
             println!("Default features include the HuggingFace Hub loader and tokenizer.");
             println!("To switch to offline / vision-only flavors, edit the entry manually:");
-            println!("  flodl-hf = {{ version = \"={flodl_version}\", default-features = false, features = [...] }}");
+            println!(
+                "  flodl-hf = {{ version = \"={flodl_version}\", default-features = false, features = [...] }}"
+            );
             println!();
             println!("Run `fdl build` (or `cargo build`) to pull and compile the new dependency.");
         }
@@ -269,12 +269,14 @@ fn detect_project_mode(cwd: &Path) -> ProjectMode {
 fn render_fdl_yml(template: &str, mode: ProjectMode) -> String {
     match mode {
         ProjectMode::Docker => template.to_string(),
-        ProjectMode::Native => template
-            .lines()
-            .filter(|l| l.trim() != "docker: dev")
-            .collect::<Vec<&str>>()
-            .join("\n")
-            + "\n",
+        ProjectMode::Native => {
+            template
+                .lines()
+                .filter(|l| l.trim() != "docker: dev")
+                .collect::<Vec<&str>>()
+                .join("\n")
+                + "\n"
+        }
     }
 }
 
@@ -361,22 +363,18 @@ fn parse_flodl_dep(content: &str) -> Result<Option<String>, String> {
             return Ok(None);
         }
         if rhs.contains("git =") || rhs.contains("git=") {
-            return Err(
-                "flodl is declared as a git dependency. \
+            return Err("flodl is declared as a git dependency. \
                  fdl add flodl-hf needs a pinnable crates.io version. \
                  Switch to `flodl = \"X.Y.Z\"` first."
-                    .into(),
-            );
+                .into());
         }
         if rhs.contains("path =") || rhs.contains("path=") {
             // Path-only dep: read version from the referenced Cargo.toml.
             // For MVP, error with guidance.
-            return Err(
-                "flodl is declared as a path dependency only. \
+            return Err("flodl is declared as a path dependency only. \
                  Add an explicit `version = \"X.Y.Z\"` so fdl add can \
                  pin the matching flodl-hf release."
-                    .into(),
-            );
+                .into());
         }
     }
     Ok(None)
@@ -413,9 +411,10 @@ fn find_workspace_root(from: &Path) -> Option<PathBuf> {
         let candidate = dir.join("Cargo.toml");
         if candidate.exists()
             && let Ok(content) = fs::read_to_string(&candidate)
-                && content.lines().any(|l| l.trim() == "[workspace]") {
-                    return Some(candidate);
-                }
+            && content.lines().any(|l| l.trim() == "[workspace]")
+        {
+            return Some(candidate);
+        }
         if !dir.pop() {
             return None;
         }
@@ -565,7 +564,10 @@ commands:
     docker: hf-parity
 ";
         let out = render_fdl_yml(t, ProjectMode::Native);
-        assert!(!out.contains("    docker: dev\n"), "exact match stripped: {out}");
+        assert!(
+            !out.contains("    docker: dev\n"),
+            "exact match stripped: {out}"
+        );
         assert!(out.contains("hf-parity"), "other services preserved: {out}");
         assert!(
             out.contains("docker: dev isn't a literal"),
@@ -601,7 +603,10 @@ commands:
         let dir = temp_project("install-idem");
         install_flodl_hf_at(&dir).unwrap();
         let toml = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
-        assert!(toml.contains("flodl-hf = \"=0.5.2\""), "first install: {toml}");
+        assert!(
+            toml.contains("flodl-hf = \"=0.5.2\""),
+            "first install: {toml}"
+        );
 
         // Re-run: no-op, file unchanged.
         install_flodl_hf_at(&dir).unwrap();

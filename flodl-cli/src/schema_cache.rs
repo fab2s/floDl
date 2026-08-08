@@ -30,8 +30,15 @@ const CACHE_DIR: &str = ".fdl/schema-cache";
 /// output, caches, and data. Skipping `target` is the one that matters —
 /// it dwarfs the source tree.
 const SOURCE_SKIP_DIRS: &[&str] = &[
-    "target", ".fdl", ".git", "node_modules", "runs", "data", "baselines",
-    "libtorch", ".cargo",
+    "target",
+    ".fdl",
+    ".git",
+    "node_modules",
+    "runs",
+    "data",
+    "baselines",
+    "libtorch",
+    ".cargo",
 ];
 
 /// Hard ceiling on files examined. `fdl <cmd> -h` must never be slow, so a
@@ -124,8 +131,8 @@ pub fn write_cache(path: &Path, schema: &Schema) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
     }
-    let json = serde_json::to_string_pretty(schema)
-        .map_err(|e| format!("schema serialize: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(schema).map_err(|e| format!("schema serialize: {e}"))?;
     fs::write(path, json).map_err(|e| format!("cannot write {}: {}", path.display(), e))
 }
 
@@ -175,10 +182,7 @@ pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Resul
                 .ok()
                 .filter(|rel| !rel.as_os_str().is_empty())
             {
-                Some(rel) => format!(
-                    "cd {} && {inner}",
-                    posix_quote(&rel.to_string_lossy())
-                ),
+                Some(rel) => format!("cd {} && {inner}", posix_quote(&rel.to_string_lossy())),
                 None => inner,
             };
             let wrapped = format!(
@@ -304,10 +308,7 @@ mod tests {
                 ty: "string".into(),
                 description: Some("pick a model".into()),
                 default: Some(serde_json::json!("mlp")),
-                choices: Some(vec![
-                    serde_json::json!("mlp"),
-                    serde_json::json!("resnet"),
-                ]),
+                choices: Some(vec![serde_json::json!("mlp"), serde_json::json!("resnet")]),
                 short: Some("m".into()),
                 env: None,
                 completer: None,
@@ -375,8 +376,10 @@ mod tests {
             }
         }"#;
         fs::write(&path, body).unwrap();
-        assert!(read_cache(&path).is_none(),
-            "cache must not return a schema that fails validate_schema");
+        assert!(
+            read_cache(&path).is_none(),
+            "cache must not return a schema that fails validate_schema"
+        );
     }
 
     #[test]
@@ -461,10 +464,11 @@ JSON
         // cmd /C on a .sh yields empty stdout, which trips the same "no
         // JSON" error the test asserts, so it was green without ever
         // running the script.
-        let err = probe("sh junk.sh", tmp.path(), None)
-            .expect_err("non-json must fail");
-        assert!(err.contains("no JSON") || err.contains("valid JSON"),
-            "err was: {err}");
+        let err = probe("sh junk.sh", tmp.path(), None).expect_err("non-json must fail");
+        assert!(
+            err.contains("no JSON") || err.contains("valid JSON"),
+            "err was: {err}"
+        );
     }
 
     #[test]
@@ -478,9 +482,10 @@ cat <<'JSON'
 JSON
 "#;
         fs::write(&script, body).unwrap();
-        let err = probe("sh bad.sh", tmp.path(), None)
-            .expect_err("semantic fail must propagate");
-        assert!(err.contains("validation") || err.contains("reserved"),
-            "err was: {err}");
+        let err = probe("sh bad.sh", tmp.path(), None).expect_err("semantic fail must propagate");
+        assert!(
+            err.contains("validation") || err.contains("reserved"),
+            "err was: {err}"
+        );
     }
 }

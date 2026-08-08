@@ -28,111 +28,106 @@ impl ClusterCoordinator {
     /// beacon note inside), the `SyncNow` broadcast, re-arm slot
     /// resets, and the inline finish.
     pub(super) fn arm_nccl_cycle(&mut self) -> Result<()> {
-
-            // TRANSPORT-AWARE FEED: pull the window's chunk-completion
-            // metrics into the delivered accounting BEFORE the inline
-            // `finish_averaging_nccl` consumes the window report. The gate
-            // fired because every rank hit its window — their completion
-            // frames are already queued (per-connection FIFO: the final
-            // Batch report and the MetricsMsg ride the same relay
-            // stream), just not drained this tick (`tick` drains metrics
-            // AFTER the trigger). Without this, the delivered spans are
-            // stale/partial at feed time and NCCL had to fall back to a
-            // compute-only feed — blind to data/transport cost, leaving
-            // the fast rank ~45% idle at the barrier on x1-link rigs.
-            // Aggregation is NOT run here (pool removal would break the
-            // quiesced-tail ordering); it stays in `tick`.
-            //
-            // DETERMINISTIC WINDOW-COMPLETION WAIT (progressive Cadence
-            // only — Sync feeds compute-wall and has no window chunks to
-            // wait for). At gate-fire every mover has COMPLETED its
-            // window chunk (the gate requires `steps >= count`, or
-            // quiesced with nothing in flight), so each mover's
-            // completion frame is ALREADY SENT — queued or on the wire,
-            // trailing the final Batch report that fired the gate by
-            // microseconds on the same relay stream. Wait for the frames
-            // instead of guessing a settle time, keeping the heartbeat /
-            // dead-rank detector live so a rank that dies mid-wait is
-            // declared dead, drops out of the movers set via `is_dead`,
-            // and the predicate completes (a frame cannot be silently
-            // lost while its rank stays alive: TCP lost frame == broken
-            // connection == heartbeats stop == dead-rank fires).
-            //
-            // TERMINATION: bounded by relay latency when healthy; by
-            // `heartbeat_timeout_secs` (+2s slack) under rank failure;
-            // and when NO failure detector exists (`dead_ranks` ledger
-            // unset — headless coordinators, non-elastic runs, unit
-            // tests that never send completion frames) a missing frame
-            // cannot be attributed to death, so the wait is capped SHORT
-            // and the report's all-or-none falls back to a coherent
-            // compute-scale window. The cohort is barrier-parked while
-            // we wait — the only thing delayed is the reduce itself.
-            if self.progressive && matches!(self.policy, ApplyPolicy::Cadence) {
-                let ceiling = if self.dead_ranks.is_some() {
-                    Duration::from_secs(
-                        self.heartbeat_timeout_secs.saturating_add(2),
-                    )
-                } else {
-                    Duration::from_millis(100)
-                };
-                let wait_start = Instant::now();
-                let mut slow_wait_logged = false;
-                loop {
-                    self.drain_metrics();
-                    if self.movers_delivered_complete() {
-                        break;
-                    }
-                    if wait_start.elapsed() >= ceiling {
-                        crate::verbose!(
-                            "  ddp: window-completion wait hit its \
+        // TRANSPORT-AWARE FEED: pull the window's chunk-completion
+        // metrics into the delivered accounting BEFORE the inline
+        // `finish_averaging_nccl` consumes the window report. The gate
+        // fired because every rank hit its window — their completion
+        // frames are already queued (per-connection FIFO: the final
+        // Batch report and the MetricsMsg ride the same relay
+        // stream), just not drained this tick (`tick` drains metrics
+        // AFTER the trigger). Without this, the delivered spans are
+        // stale/partial at feed time and NCCL had to fall back to a
+        // compute-only feed — blind to data/transport cost, leaving
+        // the fast rank ~45% idle at the barrier on x1-link rigs.
+        // Aggregation is NOT run here (pool removal would break the
+        // quiesced-tail ordering); it stays in `tick`.
+        //
+        // DETERMINISTIC WINDOW-COMPLETION WAIT (progressive Cadence
+        // only — Sync feeds compute-wall and has no window chunks to
+        // wait for). At gate-fire every mover has COMPLETED its
+        // window chunk (the gate requires `steps >= count`, or
+        // quiesced with nothing in flight), so each mover's
+        // completion frame is ALREADY SENT — queued or on the wire,
+        // trailing the final Batch report that fired the gate by
+        // microseconds on the same relay stream. Wait for the frames
+        // instead of guessing a settle time, keeping the heartbeat /
+        // dead-rank detector live so a rank that dies mid-wait is
+        // declared dead, drops out of the movers set via `is_dead`,
+        // and the predicate completes (a frame cannot be silently
+        // lost while its rank stays alive: TCP lost frame == broken
+        // connection == heartbeats stop == dead-rank fires).
+        //
+        // TERMINATION: bounded by relay latency when healthy; by
+        // `heartbeat_timeout_secs` (+2s slack) under rank failure;
+        // and when NO failure detector exists (`dead_ranks` ledger
+        // unset — headless coordinators, non-elastic runs, unit
+        // tests that never send completion frames) a missing frame
+        // cannot be attributed to death, so the wait is capped SHORT
+        // and the report's all-or-none falls back to a coherent
+        // compute-scale window. The cohort is barrier-parked while
+        // we wait — the only thing delayed is the reduce itself.
+        if self.progressive && matches!(self.policy, ApplyPolicy::Cadence) {
+            let ceiling = if self.dead_ranks.is_some() {
+                Duration::from_secs(self.heartbeat_timeout_secs.saturating_add(2))
+            } else {
+                Duration::from_millis(100)
+            };
+            let wait_start = Instant::now();
+            let mut slow_wait_logged = false;
+            loop {
+                self.drain_metrics();
+                if self.movers_delivered_complete() {
+                    break;
+                }
+                if wait_start.elapsed() >= ceiling {
+                    crate::verbose!(
+                        "  ddp: window-completion wait hit its \
                              ceiling ({:?}) — feeding compute-scale \
                              this window (all-or-none fallback)",
-                            ceiling,
-                        );
-                        break;
-                    }
-                    self.drain_timing();
-                    self.check_dead_ranks();
-                    // Keep the OUTBOUND liveness beacon alive too. This
-                    // wait's ceiling deliberately outlasts rank-death
-                    // attribution (heartbeat_timeout + 2s), but the
-                    // coord→rank heartbeat is normally emitted from
-                    // tick() — which this loop blocks. Without this,
-                    // every HEALTHY rank's coord-liveness watchdog fires
-                    // at heartbeat_timeout (the beacon has been silent
-                    // longer than the deadline, since the ceiling
-                    // exceeds it by design) and the whole cohort
-                    // self-destructs mid-wait — observed as an
-                    // intermittent cadence wedge whenever a mover's
-                    // completion frame arrived late. Throttled to 1s
-                    // internally, so per-iteration is cheap.
-                    self.emit_coord_heartbeat();
-                    if !slow_wait_logged
-                        && wait_start.elapsed().as_secs_f64() > 1.0
-                    {
-                        slow_wait_logged = true;
-                        crate::verbose!(
-                            "  ddp: window-completion wait >1s — a \
+                        ceiling,
+                    );
+                    break;
+                }
+                self.drain_timing();
+                self.check_dead_ranks();
+                // Keep the OUTBOUND liveness beacon alive too. This
+                // wait's ceiling deliberately outlasts rank-death
+                // attribution (heartbeat_timeout + 2s), but the
+                // coord→rank heartbeat is normally emitted from
+                // tick() — which this loop blocks. Without this,
+                // every HEALTHY rank's coord-liveness watchdog fires
+                // at heartbeat_timeout (the beacon has been silent
+                // longer than the deadline, since the ceiling
+                // exceeds it by design) and the whole cohort
+                // self-destructs mid-wait — observed as an
+                // intermittent cadence wedge whenever a mover's
+                // completion frame arrived late. Throttled to 1s
+                // internally, so per-iteration is cheap.
+                self.emit_coord_heartbeat();
+                if !slow_wait_logged && wait_start.elapsed().as_secs_f64() > 1.0 {
+                    slow_wait_logged = true;
+                    crate::verbose!(
+                        "  ddp: window-completion wait >1s — a \
                              mover's completion frame is late \
                              (watching heartbeats)",
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
+                    );
                 }
+                std::thread::sleep(Duration::from_millis(1));
             }
-            self.cycle.arm(Instant::now(), &self.last_step_count);
-            // Best-effort: a rank whose send failed has a broken
-            // connection — its heartbeats ride the same stream, so
-            // dead-rank detection fires shortly and the NCCL
-            // abort/rebuild path recovers the collective. Aborting the
-            // trigger here would kill the coordinator thread instead.
-            if let Err(e) = self.broadcast_control(&ControlMsgWire::SyncNow) {
-                eprintln!(
-                    "flodl ddp: SyncNow broadcast incomplete ({e}); \
+        }
+        self.cycle.arm(Instant::now(), &self.last_step_count);
+        // Best-effort: a rank whose send failed has a broken
+        // connection — its heartbeats ride the same stream, so
+        // dead-rank detection fires shortly and the NCCL
+        // abort/rebuild path recovers the collective. Aborting the
+        // trigger here would kill the coordinator thread instead.
+        if let Err(e) = self.broadcast_control(&ControlMsgWire::SyncNow) {
+            eprintln!(
+                "flodl ddp: SyncNow broadcast incomplete ({e}); \
                      relying on dead-rank recovery"
-                );
-            }
-            self.finish_averaging_nccl()?;
+            );
+        }
+        self.finish_averaging_nccl()?;
         Ok(())
     }
 
@@ -160,9 +155,7 @@ impl ClusterCoordinator {
         // 10x the heartbeat timeout (default 300s) dwarfs any real NCCL
         // AllReduce, so a healthy rig can never hit it. Mirrors
         // `poll_cpu_averaging`'s ceiling.
-        let ceiling = Duration::from_secs(
-            self.heartbeat_timeout_secs.saturating_mul(10).max(300),
-        );
+        let ceiling = Duration::from_secs(self.heartbeat_timeout_secs.saturating_mul(10).max(300));
         self.poll_nccl_reduce_stall_with(ceiling)
     }
 
@@ -193,12 +186,10 @@ impl ClusterCoordinator {
             );
             self.dump_stall_state(start.elapsed().as_secs_f64());
             self.cycle.started_at = None;
-            if let Err(e) = self
-                .dispatch_shutdown_with_save(crate::distributed::SaveReason::ReduceStall)
+            if let Err(e) =
+                self.dispatch_shutdown_with_save(crate::distributed::SaveReason::ReduceStall)
             {
-                crate::verbose!(
-                    "  ddp: ShutdownWithSave after NCCL reduce stall failed: {e}"
-                );
+                crate::verbose!("  ddp: ShutdownWithSave after NCCL reduce stall failed: {e}");
             }
         }
         Ok(())
@@ -234,8 +225,7 @@ impl ClusterCoordinator {
         if !matches!(self.backend, AverageBackend::Nccl) {
             return true;
         }
-        self.cycle.started_at.is_none()
-            || self.cycle.all_alive_acked(|r| self.is_dead(r))
+        self.cycle.started_at.is_none() || self.cycle.all_alive_acked(|r| self.is_dead(r))
     }
 
     /// NCCL-backend re-rendezvous initiation. Called from
@@ -253,9 +243,8 @@ impl ClusterCoordinator {
         if self.nccl_rendezvous_pending.is_some() {
             return Ok(());
         }
-        let survivors_ordered: Vec<usize> = (0..self.world_size)
-            .filter(|r| !self.is_dead(*r))
-            .collect();
+        let survivors_ordered: Vec<usize> =
+            (0..self.world_size).filter(|r| !self.is_dead(*r)).collect();
         if survivors_ordered.len() < 2 {
             crate::verbose!(
                 "  ddp: NCCL rendezvous skipped — fewer than 2 survivors \
@@ -332,8 +321,7 @@ impl ClusterCoordinator {
                 // Send before mutating state so a send failure leaves
                 // the previous pending entry intact for another retry
                 // on the next tick.
-                if let Err(e) = self
-                    .send_control(new_generator, &ControlMsgWire::RequestNewNcclId)
+                if let Err(e) = self.send_control(new_generator, &ControlMsgWire::RequestNewNcclId)
                 {
                     crate::verbose!(
                         "  ddp: NCCL rendezvous retry send to rank {} failed: {} \
@@ -360,15 +348,16 @@ impl ClusterCoordinator {
                      dispatching ShutdownWithSave"
                 );
                 self.nccl_rendezvous_pending = None;
-                if let Some(reason) = self.unrecoverable_reason().or(Some(
-                    crate::distributed::SaveReason::SingleSurvivor,
-                ))
-                    && let Err(e) = self.dispatch_shutdown_with_save(reason) {
-                        crate::verbose!(
-                            "  ddp: ShutdownWithSave after rendezvous exhaustion failed: {}",
-                            e,
-                        );
-                    }
+                if let Some(reason) = self
+                    .unrecoverable_reason()
+                    .or(Some(crate::distributed::SaveReason::SingleSurvivor))
+                    && let Err(e) = self.dispatch_shutdown_with_save(reason)
+                {
+                    crate::verbose!(
+                        "  ddp: ShutdownWithSave after rendezvous exhaustion failed: {}",
+                        e,
+                    );
+                }
             }
         }
     }
@@ -387,12 +376,7 @@ impl ClusterCoordinator {
     /// (deterministic).
     pub(super) fn pick_uid_generator(&self, survivors_ordered: &[usize]) -> usize {
         // Tier 1: prefer a local survivor.
-        if let Some(&local) = self
-            .local_ranks
-            .iter()
-            .filter(|r| !self.is_dead(**r))
-            .min()
-        {
+        if let Some(&local) = self.local_ranks.iter().filter(|r| !self.is_dead(**r)).min() {
             return local;
         }
         // Tier 2: fastest network survivor (per-batch wall time,
@@ -430,9 +414,7 @@ impl ClusterCoordinator {
         // ledger — additional deaths during the rendezvous wait must
         // be reflected in the broadcast so we don't ship a
         // NewNcclSession to an already-dead rank.
-        let survivors: Vec<usize> = (0..self.world_size)
-            .filter(|r| !self.is_dead(*r))
-            .collect();
+        let survivors: Vec<usize> = (0..self.world_size).filter(|r| !self.is_dead(*r)).collect();
         if survivors.len() < 2 {
             return Err(TensorError::new(
                 "cluster_coordinator: NewNcclSession broadcast aborted; \

@@ -6,8 +6,8 @@
 //!
 //! Run: `cargo run --example mixed_precision`
 
-use flodl::*;
 use flodl::Monitor;
+use flodl::*;
 
 fn main() -> Result<()> {
     manual_seed(42);
@@ -76,7 +76,11 @@ fn main() -> Result<()> {
         monitor.log(epoch, t.elapsed(), &model);
 
         if steps_taken == 0 {
-            println!("epoch {}: all steps skipped (inf grads), scale={:.0}", epoch, scaler.scale_factor());
+            println!(
+                "epoch {}: all steps skipped (inf grads), scale={:.0}",
+                epoch,
+                scaler.scale_factor()
+            );
         }
     }
 

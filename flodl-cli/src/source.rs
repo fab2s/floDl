@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SshConfig;
 use crate::prepare::Fail;
-use crate::spec::{parse_ssh_target, split_scheme, SshTarget};
+use crate::spec::{SshTarget, parse_ssh_target, split_scheme};
 
 /// Paths the fetch skips, and `--delete` leaves an excluded path on the
 /// receiver alone, which is what keeps a local build alive across a
@@ -181,7 +181,10 @@ impl Manifest {
             ),
         )
         .map_err(|e| {
-            Fail::Permanent(format!("cannot write the run manifest {}: {e}", path.display()))
+            Fail::Permanent(format!(
+                "cannot write the run manifest {}: {e}",
+                path.display()
+            ))
         })
     }
 
@@ -190,7 +193,9 @@ impl Manifest {
         match std::fs::remove_file(tree.join(MANIFEST_FILE)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Fail::Permanent(format!("cannot clear the run manifest: {e}"))),
+            Err(e) => Err(Fail::Permanent(format!(
+                "cannot clear the run manifest: {e}"
+            ))),
         }
     }
 }
@@ -222,9 +227,9 @@ pub fn parse(spec: &str) -> Result<Source, Fail> {
             }
             Ok(Source::Local(PathBuf::from(rest)))
         }
-        (Some("rsync"), rest) => parse_ssh_target(rest).map(Source::Rsync).map_err(|why| {
-            Fail::Permanent(format!("invalid source `{spec}` — {why}. {forms}"))
-        }),
+        (Some("rsync"), rest) => parse_ssh_target(rest)
+            .map(Source::Rsync)
+            .map_err(|why| Fail::Permanent(format!("invalid source `{spec}` — {why}. {forms}"))),
         // `git+file://` is a local repository or mirror, and it is also
         // what makes this resolver testable without a network.
         (Some(scheme), rest)
@@ -266,9 +271,14 @@ fn parse_git(scheme: &str, rest: &str, spec: &str, forms: &str) -> Result<Source
         )));
     }
     if path.is_empty() {
-        return Err(Fail::Permanent(format!("source `{spec}` names no repository. {forms}")));
+        return Err(Fail::Permanent(format!(
+            "source `{spec}` names no repository. {forms}"
+        )));
     }
-    Ok(Source::Git { url: format!("{transport}://{path}"), git_ref: git_ref.to_string() })
+    Ok(Source::Git {
+        url: format!("{transport}://{path}"),
+        git_ref: git_ref.to_string(),
+    })
 }
 
 /// Put the tree at `dest`, preserving mtimes. Idempotent by
@@ -285,7 +295,10 @@ pub fn materialize(
     notes: &mut Vec<String>,
 ) -> Result<(), Fail> {
     std::fs::create_dir_all(dest).map_err(|e| {
-        Fail::Permanent(format!("cannot create source directory {}: {e}", dest.display()))
+        Fail::Permanent(format!(
+            "cannot create source directory {}: {e}",
+            dest.display()
+        ))
     })?;
     match source {
         Source::Local(path) => {
@@ -296,17 +309,31 @@ pub fn materialize(
                     path.display(),
                 )));
             }
-            run_rsync(&rsync_argv(&format!("{}/", path.display()), dest, None, None), dest)?;
-            notes.push(format!("source: copied {} into {}", path.display(), dest.display()));
+            run_rsync(
+                &rsync_argv(&format!("{}/", path.display()), dest, None, None),
+                dest,
+            )?;
+            notes.push(format!(
+                "source: copied {} into {}",
+                path.display(),
+                dest.display()
+            ));
         }
         Source::Rsync(target) => {
             let argv = rsync_argv(&format!("{}/", target.remote), dest, Some(target), ssh);
             run_rsync(&argv, dest)?;
-            notes.push(format!("source: pulled {} into {}", target.remote, dest.display()));
+            notes.push(format!(
+                "source: pulled {} into {}",
+                target.remote,
+                dest.display()
+            ));
         }
         Source::Git { url, git_ref } => {
             run_git(url, git_ref, dest)?;
-            notes.push(format!("source: checked out {url} at {git_ref} in {}", dest.display()));
+            notes.push(format!(
+                "source: checked out {url} at {git_ref} in {}",
+                dest.display()
+            ));
         }
     }
     Ok(())
@@ -406,14 +433,7 @@ fn run_git(url: &str, git_ref: &str, dest: &Path) -> Result<(), Fail> {
     git(&["init", "--quiet", &dest_s], "initialise")?;
     // Shallow: a node builds a tree, it does not browse history.
     let fetch = git_output(&[
-        "-C",
-        &dest_s,
-        "fetch",
-        "--quiet",
-        "--depth",
-        "1",
-        url,
-        git_ref,
+        "-C", &dest_s, "fetch", "--quiet", "--depth", "1", url, git_ref,
     ]);
     match fetch {
         Ok(()) => {}
@@ -439,7 +459,18 @@ fn run_git(url: &str, git_ref: &str, dest: &Path) -> Result<(), Fail> {
     // --force: the tree is fdl's to manage, so a previous spec's files
     // give way. It does not touch what is untracked, which is what keeps
     // the local `target/` (and its incremental state) alive.
-    git(&["-C", &dest_s, "checkout", "--quiet", "--detach", "--force", "FETCH_HEAD"], "check out")?;
+    git(
+        &[
+            "-C",
+            &dest_s,
+            "checkout",
+            "--quiet",
+            "--detach",
+            "--force",
+            "FETCH_HEAD",
+        ],
+        "check out",
+    )?;
     Ok(())
 }
 
@@ -459,7 +490,11 @@ fn git_output(args: &[&str]) -> Result<(), String> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if stderr.is_empty() { format!("exited {}", out.status) } else { stderr })
+    Err(if stderr.is_empty() {
+        format!("exited {}", out.status)
+    } else {
+        stderr
+    })
 }
 
 /// The environment a build recipe gets: the same names an `fdl.yml`
@@ -493,7 +528,9 @@ pub fn build_env(libtorch: Option<&(PathBuf, String)>) -> Vec<(String, String)> 
         // majority spelling, not a third one.)
         (
             "FDL_GPU_FEATURE".to_string(),
-            vendor.map(|v| v.cargo_feature().to_string()).unwrap_or_default(),
+            vendor
+                .map(|v| v.cargo_feature().to_string())
+                .unwrap_or_default(),
         ),
         // Build scripts and the linker both want to find the libs, and
         // on ROCm the ordering is the difference between a working
@@ -536,7 +573,10 @@ pub fn build(
             path.display(),
         )));
     }
-    Ok(Built { bin: path, cwd: dir })
+    Ok(Built {
+        bin: path,
+        cwd: dir,
+    })
 }
 
 /// Run the recipe for the compile alone, no artifact check — the shape
@@ -617,19 +657,31 @@ mod tests {
 
     #[test]
     fn every_shipped_spelling_parses() {
-        assert_eq!(parse("file:///srv/train").unwrap(), Source::Local("/srv/train".into()));
+        assert_eq!(
+            parse("file:///srv/train").unwrap(),
+            Source::Local("/srv/train".into())
+        );
         assert_eq!(
             parse("rsync://flodl@exa:/home/op/train").unwrap(),
-            Source::Rsync(SshTarget { remote: "flodl@exa:/home/op/train".into(), port: None }),
+            Source::Rsync(SshTarget {
+                remote: "flodl@exa:/home/op/train".into(),
+                port: None
+            }),
         );
         assert_eq!(
             parse("rsync://exa:2222/home/op/train").unwrap(),
-            Source::Rsync(SshTarget { remote: "exa:/home/op/train".into(), port: Some(2222) }),
+            Source::Rsync(SshTarget {
+                remote: "exa:/home/op/train".into(),
+                port: Some(2222)
+            }),
         );
         // The documented grammar's own product, port and scp colon both:
         assert_eq!(
             parse("rsync://exa:2222:/home/op/train").unwrap(),
-            Source::Rsync(SshTarget { remote: "exa:/home/op/train".into(), port: Some(2222) }),
+            Source::Rsync(SshTarget {
+                remote: "exa:/home/op/train".into(),
+                port: Some(2222)
+            }),
         );
         assert_eq!(
             parse("git+https://github.com/flodl-labs/flodl#0.7.0").unwrap(),
@@ -672,7 +724,11 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "fdl@example.com")
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "--quiet"]);
         std::fs::write(origin.join("main.rs"), "// one").unwrap();
@@ -687,7 +743,10 @@ mod tests {
         let url = format!("git+file://{}", origin.display());
         let at_v1 = parse(&format!("{url}#v1")).unwrap();
         materialize(&at_v1, &dest, None, &mut Vec::new()).unwrap();
-        assert_eq!(std::fs::read_to_string(dest.join("main.rs")).unwrap(), "// one");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("main.rs")).unwrap(),
+            "// one"
+        );
 
         // A build output is untracked, so moving refs must not sweep it
         // away — that is what keeps the loop incremental here too.
@@ -696,8 +755,14 @@ mod tests {
 
         let at_v2 = parse(&format!("{url}#v2")).unwrap();
         materialize(&at_v2, &dest, None, &mut Vec::new()).unwrap();
-        assert_eq!(std::fs::read_to_string(dest.join("main.rs")).unwrap(), "// two");
-        assert!(dest.join("target/release/train").is_file(), "the checkout swept the build");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("main.rs")).unwrap(),
+            "// two"
+        );
+        assert!(
+            dest.join("target/release/train").is_file(),
+            "the checkout swept the build"
+        );
 
         // A ref that does not exist must fail rather than land on
         // whatever the remote's default branch happens to be.
@@ -709,13 +774,13 @@ mod tests {
     #[test]
     fn a_broken_spec_is_permanent_and_names_the_forms() {
         for spec in [
-            "/srv/train",                          // no transport
-            "file://srv/train",                    // relative file url
-            "smb://server/share",                  // scheme we do not ship
-            "rsync://exa",                         // no remote path
-            "git+https://github.com/me/train",     // no ref: a floating default branch
-            "git+https://github.com/me/train#",    // empty ref
-            "git+ssh://#0.7.0",                    // no repository
+            "/srv/train",                       // no transport
+            "file://srv/train",                 // relative file url
+            "smb://server/share",               // scheme we do not ship
+            "rsync://exa",                      // no remote path
+            "git+https://github.com/me/train",  // no ref: a floating default branch
+            "git+https://github.com/me/train#", // empty ref
+            "git+ssh://#0.7.0",                 // no repository
         ] {
             let err = parse(spec).unwrap_err();
             assert!(err.is_permanent(), "{spec} should be permanent: {err:?}");
@@ -764,15 +829,29 @@ mod tests {
             identity_file: Some("/etc/flodl/join_key".into()),
             options: vec!["StrictHostKeyChecking=accept-new".into()],
         };
-        let target = SshTarget { remote: "op@exa:/srv/train".into(), port: Some(2222) };
-        let argv = rsync_argv("op@exa:/srv/train/", Path::new("/t"), Some(&target), Some(&ssh));
-        let e = argv.iter().position(|a| a == "-e").expect("-e for a remote source");
+        let target = SshTarget {
+            remote: "op@exa:/srv/train".into(),
+            port: Some(2222),
+        };
+        let argv = rsync_argv(
+            "op@exa:/srv/train/",
+            Path::new("/t"),
+            Some(&target),
+            Some(&ssh),
+        );
+        let e = argv
+            .iter()
+            .position(|a| a == "-e")
+            .expect("-e for a remote source");
         let cmd = &argv[e + 1];
         // The port comes from the SOURCE spec, not the tunnel block: they
         // can be different hosts.
         assert!(cmd.contains("-p 2222"), "got: {cmd}");
         assert!(cmd.contains("-i /etc/flodl/join_key"), "got: {cmd}");
-        assert!(cmd.contains("-o StrictHostKeyChecking=accept-new"), "got: {cmd}");
+        assert!(
+            cmd.contains("-o StrictHostKeyChecking=accept-new"),
+            "got: {cmd}"
+        );
         assert!(cmd.contains("-o BatchMode=yes"), "got: {cmd}");
     }
 
@@ -816,8 +895,14 @@ mod tests {
             dest.join("sub/target/release/train").is_file(),
             "the refetch deleted a nested build",
         );
-        assert!(!dest.join("gone.txt").exists(), "--delete must drop a removed file");
-        let copied = std::fs::metadata(dest.join("sub/lib.rs")).unwrap().modified().unwrap();
+        assert!(
+            !dest.join("gone.txt").exists(),
+            "--delete must drop a removed file"
+        );
+        let copied = std::fs::metadata(dest.join("sub/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap();
         let drift = copied.duration_since(old).unwrap_or_default();
         assert!(
             drift < std::time::Duration::from_secs(2),
@@ -829,8 +914,7 @@ mod tests {
     #[test]
     fn a_cwd_outside_the_fetched_tree_is_permanent() {
         let tree = std::env::temp_dir().join("fdl-src-no-such-tree");
-        let err = build(&tree, Some("nope"), Some("true"), "x", &[], &mut Vec::new())
-            .unwrap_err();
+        let err = build(&tree, Some("nope"), Some("true"), "x", &[], &mut Vec::new()).unwrap_err();
         assert!(err.is_permanent(), "got: {err:?}");
         assert!(err.message().contains("inside the tree"), "got: {err:?}");
     }
@@ -840,7 +924,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fdl-src-build-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let err = build(&dir, None, Some("exit 3"), "bin", &[], &mut Vec::new()).unwrap_err();
-        assert!(!err.is_permanent(), "a compile error must not stop the box: {err:?}");
+        assert!(
+            !err.is_permanent(),
+            "a compile error must not stop the box: {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -850,8 +937,15 @@ mod tests {
         // recipe write somewhere else.
         let dir = std::env::temp_dir().join(format!("fdl-src-nobin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let err = build(&dir, None, Some("true"), "target/release/x", &[], &mut Vec::new())
-            .unwrap_err();
+        let err = build(
+            &dir,
+            None,
+            Some("true"),
+            "target/release/x",
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(err.is_permanent(), "got: {err:?}");
         assert!(err.message().contains("bin:"), "got: {err:?}");
         let _ = std::fs::remove_dir_all(&dir);

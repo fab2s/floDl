@@ -33,9 +33,9 @@ use crate::log;
 use crate::tensor::Device;
 use crate::{Result, TensorError};
 
-use super::wire::SessionSalt;
 use super::NcclUniqueId;
 use super::rendezvous::TcpRendezvous;
+use super::wire::SessionSalt;
 
 /// Environment variable carrying the hex-encoded JSON envelope.
 ///
@@ -281,8 +281,7 @@ pub struct WorkerBlock {
 /// # }
 /// ```
 pub fn cluster_data_path() -> Result<Option<std::path::PathBuf>> {
-    Ok(LocalCluster::from_env()?
-        .and_then(|c| c.data_path().map(std::path::PathBuf::from)))
+    Ok(LocalCluster::from_env()?.and_then(|c| c.data_path().map(std::path::PathBuf::from)))
 }
 
 impl LocalCluster {
@@ -354,7 +353,9 @@ impl LocalCluster {
             .ok_or_else(|| TensorError::new("cluster: controller.host (string) required"))?
             .to_string();
         if controller_host.trim().is_empty() {
-            return Err(TensorError::new("cluster: controller.host must be non-empty"));
+            return Err(TensorError::new(
+                "cluster: controller.host must be non-empty",
+            ));
         }
         let controller_port_u64 = controller_val
             .get("port")
@@ -410,9 +411,8 @@ impl LocalCluster {
         // behavior, and HMACs against an all-zero key still authenticate
         // intra-cluster as long as every participant agrees.
         let salt = match obj.get("salt").and_then(Value::as_str) {
-            Some(s) => super::wire::salt_from_hex(s).map_err(|e| {
-                TensorError::new(&format!("cluster: salt: {e}"))
-            })?,
+            Some(s) => super::wire::salt_from_hex(s)
+                .map_err(|e| TensorError::new(&format!("cluster: salt: {e}")))?,
             None => [0u8; super::wire::SESSION_SALT_BYTES],
         };
 
@@ -517,15 +517,19 @@ impl LocalCluster {
         // (the first one SET wins), so on a ROCm build checking only the
         // CUDA spelling would miss the mask that scoped the child.
         let mask_vars: &[&str] = match crate::sys::build_vendor() {
-            Some(flodl_hw::GpuVendor::Amd) => {
-                &["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"]
-            }
+            Some(flodl_hw::GpuVendor::Amd) => &[
+                "HIP_VISIBLE_DEVICES",
+                "ROCR_VISIBLE_DEVICES",
+                "CUDA_VISIBLE_DEVICES",
+            ],
             _ => &["CUDA_VISIBLE_DEVICES"],
         };
         if let Some(visible) = mask_vars.iter().find_map(|k| std::env::var(k).ok())
-            && !visible.is_empty() && !visible.contains(',') {
-                return Ok((worker.ranks[idx], Device::CUDA(0)));
-            }
+            && !visible.is_empty()
+            && !visible.contains(',')
+        {
+            return Ok((worker.ranks[idx], Device::CUDA(0)));
+        }
         Ok((worker.ranks[idx], Device::CUDA(worker.local_devices[idx])))
     }
 
@@ -568,11 +572,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         )));
     }
 
-    let local_devices = parse_local_devices(
-        obj.get("local_devices"),
-        &name,
-        ranks.len(),
-    )?;
+    let local_devices = parse_local_devices(obj.get("local_devices"), &name, ranks.len())?;
 
     let nccl_socket_ifname = obj
         .get("nccl_socket_ifname")
@@ -594,10 +594,7 @@ fn parse_worker(v: &Value) -> Result<WorkerBlock> {
         })?
         .to_string();
 
-    let arch = obj
-        .get("arch")
-        .and_then(Value::as_str)
-        .map(String::from);
+    let arch = obj.get("arch").and_then(Value::as_str).map(String::from);
 
     let data_path = obj
         .get("data_path")
@@ -700,9 +697,8 @@ fn parse_usize_array(v: Option<&Value>, label: &str) -> Result<Vec<usize>> {
             let n = e
                 .as_u64()
                 .ok_or_else(|| TensorError::new(&format!("{label}: non-integer entry")))?;
-            usize::try_from(n).map_err(|_| {
-                TensorError::new(&format!("{label}: value {n} does not fit in usize"))
-            })
+            usize::try_from(n)
+                .map_err(|_| TensorError::new(&format!("{label}: value {n} does not fit in usize")))
         })
         .collect()
 }

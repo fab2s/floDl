@@ -41,10 +41,12 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use flodl::nn::{Dropout, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter};
-use flodl::{scaled_dot_product_attention, Device, Result, Variable};
+use flodl::nn::{
+    Dropout, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter,
+};
 #[cfg(test)]
 use flodl::{DType, Tensor, TensorOptions};
+use flodl::{Device, Result, Variable, scaled_dot_product_attention};
 
 use crate::path::prefix_params;
 
@@ -57,14 +59,14 @@ use crate::path::prefix_params;
 /// See the module-level doc for the slot-by-slot mapping table.
 #[derive(Debug, Clone, Copy)]
 pub struct LayerNaming {
-    pub query:           &'static str,
-    pub key:             &'static str,
-    pub value:           &'static str,
-    pub attn_output:     &'static str,
+    pub query: &'static str,
+    pub key: &'static str,
+    pub value: &'static str,
+    pub attn_output: &'static str,
     pub attn_layer_norm: &'static str,
-    pub ffn_up:          &'static str,
-    pub ffn_down:        &'static str,
-    pub ffn_layer_norm:  &'static str,
+    pub ffn_up: &'static str,
+    pub ffn_down: &'static str,
+    pub ffn_layer_norm: &'static str,
 }
 
 impl LayerNaming {
@@ -72,26 +74,26 @@ impl LayerNaming {
     /// this layout exactly — the family prefix (`bert.*` vs `roberta.*`)
     /// is applied outside the layer via `FlowBuilder::tag(...)`.
     pub const BERT: Self = Self {
-        query:           "attention.self.query",
-        key:             "attention.self.key",
-        value:           "attention.self.value",
-        attn_output:     "attention.output.dense",
+        query: "attention.self.query",
+        key: "attention.self.key",
+        value: "attention.self.value",
+        attn_output: "attention.output.dense",
         attn_layer_norm: "attention.output.LayerNorm",
-        ffn_up:          "intermediate.dense",
-        ffn_down:        "output.dense",
-        ffn_layer_norm:  "output.LayerNorm",
+        ffn_up: "intermediate.dense",
+        ffn_down: "output.dense",
+        ffn_layer_norm: "output.LayerNorm",
     };
 
     /// DistilBERT encoder-layer key suffixes.
     pub const DISTILBERT: Self = Self {
-        query:           "attention.q_lin",
-        key:             "attention.k_lin",
-        value:           "attention.v_lin",
-        attn_output:     "attention.out_lin",
+        query: "attention.q_lin",
+        key: "attention.k_lin",
+        value: "attention.v_lin",
+        attn_output: "attention.out_lin",
         attn_layer_norm: "sa_layer_norm",
-        ffn_up:          "ffn.lin1",
-        ffn_down:        "ffn.lin2",
-        ffn_layer_norm:  "output_layer_norm",
+        ffn_up: "ffn.lin1",
+        ffn_down: "ffn.lin2",
+        ffn_layer_norm: "output_layer_norm",
     };
 
     /// ALBERT encoder-layer key suffixes. Differs from [`Self::BERT`]
@@ -106,14 +108,14 @@ impl LayerNaming {
     /// uses `num_hidden_groups=1` and `inner_group_num=1`, sharing one
     /// transformer block across all `num_hidden_layers` applications).
     pub const ALBERT: Self = Self {
-        query:           "attention.query",
-        key:             "attention.key",
-        value:           "attention.value",
-        attn_output:     "attention.dense",
+        query: "attention.query",
+        key: "attention.key",
+        value: "attention.value",
+        attn_output: "attention.dense",
         attn_layer_norm: "attention.LayerNorm",
-        ffn_up:          "ffn",
-        ffn_down:        "ffn_output",
-        ffn_layer_norm:  "full_layer_layer_norm",
+        ffn_up: "ffn",
+        ffn_down: "ffn_output",
+        ffn_layer_norm: "full_layer_layer_norm",
     };
 }
 
@@ -192,30 +194,35 @@ impl TransformerLayer {
         assert!(
             config.hidden_size % config.num_attention_heads == 0,
             "hidden_size ({}) must be divisible by num_attention_heads ({})",
-            config.hidden_size, config.num_attention_heads,
+            config.hidden_size,
+            config.num_attention_heads,
         );
         let head_dim = config.hidden_size / config.num_attention_heads;
         Ok(TransformerLayer {
-            query:            Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            key:              Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            value:            Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            attn_output:      Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            attn_layer_norm:  LayerNorm::on_device_with_eps(
-                config.hidden_size, config.layer_norm_eps, device,
+            query: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            key: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            value: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            attn_output: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            attn_layer_norm: LayerNorm::on_device_with_eps(
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
             )?,
             attn_out_dropout: Dropout::new(config.hidden_dropout_prob),
             attn_dropout_prob: config.attention_probs_dropout_prob,
-            training:         Cell::new(true),
-            num_heads:        config.num_attention_heads,
+            training: Cell::new(true),
+            num_heads: config.num_attention_heads,
             head_dim,
 
-            ffn_up:           Linear::on_device(config.hidden_size, config.intermediate_size, device)?,
-            activation:       GELU::with_approximate(config.hidden_act),
-            ffn_down:         Linear::on_device(config.intermediate_size, config.hidden_size, device)?,
-            ffn_layer_norm:   LayerNorm::on_device_with_eps(
-                config.hidden_size, config.layer_norm_eps, device,
+            ffn_up: Linear::on_device(config.hidden_size, config.intermediate_size, device)?,
+            activation: GELU::with_approximate(config.hidden_act),
+            ffn_down: Linear::on_device(config.intermediate_size, config.hidden_size, device)?,
+            ffn_layer_norm: LayerNorm::on_device_with_eps(
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
             )?,
-            ffn_dropout:      Dropout::new(config.hidden_dropout_prob),
+            ffn_dropout: Dropout::new(config.hidden_dropout_prob),
 
             naming,
         })
@@ -230,27 +237,41 @@ impl TransformerLayer {
         let batch = shape[0];
         let seq = shape[1];
 
-        let q = self.query.forward(input)?
+        let q = self
+            .query
+            .forward(input)?
             .reshape(&[batch, seq, self.num_heads, self.head_dim])?
             .transpose(1, 2)?;
-        let k = self.key.forward(input)?
+        let k = self
+            .key
+            .forward(input)?
             .reshape(&[batch, seq, self.num_heads, self.head_dim])?
             .transpose(1, 2)?;
-        let v = self.value.forward(input)?
+        let v = self
+            .value
+            .forward(input)?
             .reshape(&[batch, seq, self.num_heads, self.head_dim])?
             .transpose(1, 2)?;
 
-        let dropout_p = if self.training.get() { self.attn_dropout_prob } else { 0.0 };
+        let dropout_p = if self.training.get() {
+            self.attn_dropout_prob
+        } else {
+            0.0
+        };
         let mask_data = attention_mask.map(|m| m.data());
         let context = scaled_dot_product_attention(
-            &q, &k, &v,
+            &q,
+            &k,
+            &v,
             mask_data.as_ref(),
             dropout_p,
-            /*is_causal=*/false,
-            /*scale=*/None,
+            /*is_causal=*/ false,
+            /*scale=*/ None,
         )?;
-        let attn_flat = context.transpose(1, 2)?
-            .reshape(&[batch, seq, self.num_heads * self.head_dim])?;
+        let attn_flat =
+            context
+                .transpose(1, 2)?
+                .reshape(&[batch, seq, self.num_heads * self.head_dim])?;
 
         let attn_proj = self.attn_output.forward(&attn_flat)?;
         let attn_dropped = self.attn_out_dropout.forward(&attn_proj)?;
@@ -264,7 +285,9 @@ impl TransformerLayer {
 }
 
 impl Module for TransformerLayer {
-    fn name(&self) -> &str { "transformer_layer" }
+    fn name(&self) -> &str {
+        "transformer_layer"
+    }
 
     /// Unmasked forward, used by tests and diagnostics. The graph drives
     /// the masked path via [`NamedInputModule::forward_named`].
@@ -275,18 +298,26 @@ impl Module for TransformerLayer {
     fn parameters(&self) -> Vec<Parameter> {
         let n = self.naming;
         let mut out = Vec::new();
-        out.extend(prefix_params(n.query,           self.query.parameters()));
-        out.extend(prefix_params(n.key,             self.key.parameters()));
-        out.extend(prefix_params(n.value,           self.value.parameters()));
-        out.extend(prefix_params(n.attn_output,     self.attn_output.parameters()));
-        out.extend(prefix_params(n.attn_layer_norm, self.attn_layer_norm.parameters()));
-        out.extend(prefix_params(n.ffn_up,          self.ffn_up.parameters()));
-        out.extend(prefix_params(n.ffn_down,        self.ffn_down.parameters()));
-        out.extend(prefix_params(n.ffn_layer_norm,  self.ffn_layer_norm.parameters()));
+        out.extend(prefix_params(n.query, self.query.parameters()));
+        out.extend(prefix_params(n.key, self.key.parameters()));
+        out.extend(prefix_params(n.value, self.value.parameters()));
+        out.extend(prefix_params(n.attn_output, self.attn_output.parameters()));
+        out.extend(prefix_params(
+            n.attn_layer_norm,
+            self.attn_layer_norm.parameters(),
+        ));
+        out.extend(prefix_params(n.ffn_up, self.ffn_up.parameters()));
+        out.extend(prefix_params(n.ffn_down, self.ffn_down.parameters()));
+        out.extend(prefix_params(
+            n.ffn_layer_norm,
+            self.ffn_layer_norm.parameters(),
+        ));
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.training.set(training);
@@ -323,46 +354,91 @@ mod tests {
 
     #[test]
     fn bert_naming_emits_bert_suffixes() {
-        let layer = TransformerLayer::on_device(
-            &mini_config(), LayerNaming::BERT, Device::CPU,
-        ).unwrap();
+        let layer =
+            TransformerLayer::on_device(&mini_config(), LayerNaming::BERT, Device::CPU).unwrap();
         let names: Vec<String> = layer.parameters().into_iter().map(|p| p.name).collect();
         // Spot-check a few — full layout is pinned via the
         // bert_parity.rs integration test.
-        assert!(names.iter().any(|n| n == "attention.self.query.weight"),      "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.self.query.bias"),        "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.output.dense.weight"),    "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.output.LayerNorm.weight"),"got: {names:?}");
-        assert!(names.iter().any(|n| n == "intermediate.dense.weight"),        "got: {names:?}");
-        assert!(names.iter().any(|n| n == "output.dense.weight"),              "got: {names:?}");
-        assert!(names.iter().any(|n| n == "output.LayerNorm.weight"),          "got: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "attention.self.query.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "attention.self.query.bias"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "attention.output.dense.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "attention.output.LayerNorm.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "intermediate.dense.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "output.dense.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "output.LayerNorm.weight"),
+            "got: {names:?}"
+        );
     }
 
     #[test]
     fn distilbert_naming_emits_distilbert_suffixes() {
-        let layer = TransformerLayer::on_device(
-            &mini_config(), LayerNaming::DISTILBERT, Device::CPU,
-        ).unwrap();
+        let layer =
+            TransformerLayer::on_device(&mini_config(), LayerNaming::DISTILBERT, Device::CPU)
+                .unwrap();
         let names: Vec<String> = layer.parameters().into_iter().map(|p| p.name).collect();
-        assert!(names.iter().any(|n| n == "attention.q_lin.weight"),       "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.k_lin.weight"),       "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.v_lin.weight"),       "got: {names:?}");
-        assert!(names.iter().any(|n| n == "attention.out_lin.weight"),     "got: {names:?}");
-        assert!(names.iter().any(|n| n == "sa_layer_norm.weight"),         "got: {names:?}");
-        assert!(names.iter().any(|n| n == "ffn.lin1.weight"),              "got: {names:?}");
-        assert!(names.iter().any(|n| n == "ffn.lin2.weight"),              "got: {names:?}");
-        assert!(names.iter().any(|n| n == "output_layer_norm.weight"),     "got: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "attention.q_lin.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "attention.k_lin.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "attention.v_lin.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "attention.out_lin.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "sa_layer_norm.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ffn.lin1.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ffn.lin2.weight"),
+            "got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "output_layer_norm.weight"),
+            "got: {names:?}"
+        );
     }
 
     #[test]
     fn parameter_count_identical_across_namings() {
         // Same structure, different suffixes — parameter count must match.
-        let bert = TransformerLayer::on_device(
-            &mini_config(), LayerNaming::BERT, Device::CPU,
-        ).unwrap();
-        let distil = TransformerLayer::on_device(
-            &mini_config(), LayerNaming::DISTILBERT, Device::CPU,
-        ).unwrap();
+        let bert =
+            TransformerLayer::on_device(&mini_config(), LayerNaming::BERT, Device::CPU).unwrap();
+        let distil =
+            TransformerLayer::on_device(&mini_config(), LayerNaming::DISTILBERT, Device::CPU)
+                .unwrap();
         assert_eq!(bert.parameters().len(), distil.parameters().len());
         // 4 Linear × (w+b) + 2 LayerNorm × (w+b) + 2 Linear (FFN) × (w+b) = 16
         assert_eq!(bert.parameters().len(), 16);
@@ -370,16 +446,19 @@ mod tests {
 
     #[test]
     fn forward_runs_end_to_end() {
-        let layer = TransformerLayer::on_device(
-            &mini_config(), LayerNaming::BERT, Device::CPU,
-        ).unwrap();
+        let layer =
+            TransformerLayer::on_device(&mini_config(), LayerNaming::BERT, Device::CPU).unwrap();
         layer.set_training(false);
         let x = Variable::new(
             Tensor::zeros(
                 &[2, 4, 8],
-                TensorOptions { dtype: DType::Float32, device: Device::CPU },
-            ).unwrap(),
-            /*requires_grad=*/false,
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device: Device::CPU,
+                },
+            )
+            .unwrap(),
+            /*requires_grad=*/ false,
         );
         let out = layer.forward(&x).unwrap();
         assert_eq!(out.data().shape(), vec![2, 4, 8]);
@@ -410,8 +489,12 @@ mod tests {
         let zero_mask = Variable::new(
             Tensor::zeros(
                 &[batch, 1, 1, seq],
-                TensorOptions { dtype: DType::Float32, device: dev },
-            ).unwrap(),
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device: dev,
+                },
+            )
+            .unwrap(),
             false,
         );
         let mut refs = HashMap::new();
@@ -463,7 +546,11 @@ mod tests {
 
         let a: Vec<f32> = unmasked.data().to_f32_vec().unwrap();
         let b: Vec<f32> = masked.data().to_f32_vec().unwrap();
-        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max);
         assert!(
             max_diff > 1e-4,
             "masking a position must change attention output; max_diff={max_diff}",

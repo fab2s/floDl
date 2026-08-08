@@ -54,7 +54,11 @@ fn test_map_backward() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -104,10 +108,7 @@ fn test_input_multiple() {
 
 #[test]
 fn test_input_error_count_mismatch() {
-    let graph = FlowBuilder::from(Identity)
-        .input(&["ctx"])
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).input(&["ctx"]).build().unwrap();
 
     // forward() with single input should fail (expects 2: main + ctx)
     let x = Variable::new(from_f32(&[1.0], &[1, 1]), false);
@@ -116,15 +117,14 @@ fn test_input_error_count_mismatch() {
 
 // --- Graph set_training test ---
 
-
 #[test]
 fn test_map_over_tag() {
     // Tag a tensor, then map over it from a different stream position
     let graph = FlowBuilder::from(Identity)
         .tag("features")
-        .through(Doubler)        // stream is now 2x
+        .through(Doubler) // stream is now 2x
         .map(Doubler)
-        .over("features")        // map over original (1x), not current stream (2x)
+        .over("features") // map over original (1x), not current stream (2x)
         .build()
         .unwrap();
 
@@ -134,10 +134,10 @@ fn test_map_over_tag() {
     // .over("features") maps Doubler over the tagged value (original x)
     // Doubler: x + x = 2x, applied element-wise along dim 0
     assert_eq!(y.shape(), vec![2, 2]);
-    assert!((data[0] - 2.0).abs() < 1e-5);  // 1.0 * 2
-    assert!((data[1] - 4.0).abs() < 1e-5);  // 2.0 * 2
-    assert!((data[2] - 6.0).abs() < 1e-5);  // 3.0 * 2
-    assert!((data[3] - 8.0).abs() < 1e-5);  // 4.0 * 2
+    assert!((data[0] - 2.0).abs() < 1e-5); // 1.0 * 2
+    assert!((data[1] - 4.0).abs() < 1e-5); // 2.0 * 2
+    assert!((data[2] - 6.0).abs() < 1e-5); // 3.0 * 2
+    assert!((data[3] - 8.0).abs() < 1e-5); // 4.0 * 2
 }
 
 #[test]
@@ -202,7 +202,10 @@ fn test_map_slices_gradient() {
         .build()
         .unwrap();
 
-    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]), true);
+    let x = Variable::new(
+        from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]),
+        true,
+    );
     let y = graph.forward(&x).unwrap();
     assert_eq!(y.shape(), vec![2, 6]); // 3 * 2 slices = 6
     let loss = y.sum().unwrap();
@@ -210,7 +213,11 @@ fn test_map_slices_gradient() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -223,7 +230,10 @@ fn test_map_slices_not_divisible_error() {
         .unwrap();
 
     // [2, 4] with slices(3) — 4 not divisible by 3
-    let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]), false);
+    let x = Variable::new(
+        from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]),
+        false,
+    );
     assert!(graph.forward(&x).is_err());
 }
 
@@ -237,4 +247,3 @@ fn test_map_slices_not_divisible_error() {
 // assert that set_scheduler drives the optimizer LR through step(), that
 // training_step advances once per step(), and that lr_scale is applied
 // multiplicatively.
-

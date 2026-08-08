@@ -337,9 +337,10 @@ pub fn list_variants(root: &Path) -> Vec<String> {
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 if entry.path().join("lib").is_dir()
-                    && let Some(name) = entry.file_name().to_str() {
-                        variants.push(format!("{}/{}", subdir, name));
-                    }
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    variants.push(format!("{}/{}", subdir, name));
+                }
             }
         }
     }
@@ -356,8 +357,7 @@ pub fn is_valid_variant(root: &Path, variant: &str) -> bool {
 /// Set the active libtorch variant by writing `<root>/libtorch/.active`.
 pub fn set_active(root: &Path, variant: &str) -> Result<(), String> {
     let lt_dir = root.join("libtorch");
-    fs::create_dir_all(&lt_dir)
-        .map_err(|e| format!("cannot create libtorch/: {}", e))?;
+    fs::create_dir_all(&lt_dir).map_err(|e| format!("cannot create libtorch/: {}", e))?;
     fs::write(lt_dir.join(".active"), format!("{}\n", variant))
         .map_err(|e| format!("cannot write libtorch/.active: {}", e))
 }
@@ -386,12 +386,13 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("fdl-libtorch-resolver-{}-{}", nanos, seq));
+            let dir = std::env::temp_dir().join(format!("fdl-libtorch-resolver-{}-{}", nanos, seq));
             fs::create_dir_all(&dir).expect("create scratch");
             Self(dir)
         }
-        fn path(&self) -> &std::path::Path { &self.0 }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -411,13 +412,15 @@ mod tests {
         fs::write(
             v1.join(".arch"),
             "torch=1.0\ncuda=1.0\narchs=0.0\nsource=precompiled\n",
-        ).unwrap();
+        )
+        .unwrap();
         let v2 = s.path().join("libtorch/builds/v2");
         fs::create_dir_all(v2.join("lib")).unwrap();
         fs::write(
             v2.join(".arch"),
             "torch=2.0\ncuda=2.0\narchs=1.0\nsource=build\n",
-        ).unwrap();
+        )
+        .unwrap();
         s
     }
 
@@ -460,7 +463,9 @@ mod tests {
                 .iter()
                 .find(|l| l.contains("LD_LIBRARY_PATH="))
                 .expect("recipe must set LD_LIBRARY_PATH");
-            let rocm = ld.find("$ROCM_PATH/lib").expect("system ROCm must be on the path");
+            let rocm = ld
+                .find("$ROCM_PATH/lib")
+                .expect("system ROCm must be on the path");
             let libtorch = ld.find(lib).expect("libtorch must be on the path");
             assert!(rocm < libtorch, "system ROCm must come first, got {ld}");
             assert!(
@@ -486,7 +491,10 @@ mod tests {
         // trailing colon that would otherwise put CWD on the loader path.
         for vendor in [Some(GpuVendor::Amd), Some(GpuVendor::Nvidia), None] {
             let lines = ld_library_path_lines(vendor, "/opt/lt/lib");
-            let ld = lines.iter().find(|l| l.contains("LD_LIBRARY_PATH=")).unwrap();
+            let ld = lines
+                .iter()
+                .find(|l| l.contains("LD_LIBRARY_PATH="))
+                .unwrap();
             assert!(
                 ld.contains("${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"),
                 "{vendor:?}: {ld}"
@@ -505,12 +513,11 @@ mod tests {
     fn read_active_default_pointer() {
         let _guard = env_lock();
         // SAFETY: serialized via env_lock().
-        unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
+        unsafe {
+            std::env::remove_var("FDL_LIBTORCH_CASE");
+        }
         let root = make_root();
-        fs::write(
-            root.path().join("libtorch/.active"),
-            "precompiled/v1\n",
-        ).unwrap();
+        fs::write(root.path().join("libtorch/.active"), "precompiled/v1\n").unwrap();
         let info = read_active(root.path()).expect("read_active");
         assert_eq!(info.path, "precompiled/v1");
         assert_eq!(info.torch_version.as_deref(), Some("1.0"));
@@ -520,19 +527,17 @@ mod tests {
     fn fdl_libtorch_case_selects_alternate_pointer() {
         let _guard = env_lock();
         let root = make_root();
-        fs::write(
-            root.path().join("libtorch/.active"),
-            "builds/v2\n",
-        ).unwrap();
-        fs::write(
-            root.path().join("libtorch/.active.alt"),
-            "precompiled/v1\n",
-        ).unwrap();
+        fs::write(root.path().join("libtorch/.active"), "builds/v2\n").unwrap();
+        fs::write(root.path().join("libtorch/.active.alt"), "precompiled/v1\n").unwrap();
         // SAFETY: serialized via env_lock().
-        unsafe { std::env::set_var("FDL_LIBTORCH_CASE", "alt"); }
+        unsafe {
+            std::env::set_var("FDL_LIBTORCH_CASE", "alt");
+        }
         let info = read_active(root.path()).expect("read_active");
         // SAFETY: serialized via env_lock().
-        unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
+        unsafe {
+            std::env::remove_var("FDL_LIBTORCH_CASE");
+        }
         assert_eq!(info.path, "precompiled/v1");
         assert_eq!(info.torch_version.as_deref(), Some("1.0"));
     }
@@ -541,18 +546,21 @@ mod tests {
     fn fdl_libtorch_case_missing_file_returns_none_loudly() {
         let _guard = env_lock();
         let root = make_root();
-        fs::write(
-            root.path().join("libtorch/.active"),
-            "builds/v2\n",
-        ).unwrap();
+        fs::write(root.path().join("libtorch/.active"), "builds/v2\n").unwrap();
         // No `.active.nonexistent` file.
         // SAFETY: serialized via env_lock().
-        unsafe { std::env::set_var("FDL_LIBTORCH_CASE", "nonexistent"); }
+        unsafe {
+            std::env::set_var("FDL_LIBTORCH_CASE", "nonexistent");
+        }
         let info = read_active(root.path());
         // SAFETY: serialized via env_lock().
-        unsafe { std::env::remove_var("FDL_LIBTORCH_CASE"); }
-        assert!(info.is_none(),
-            "explicit case with missing file must not silently fall back to .active");
+        unsafe {
+            std::env::remove_var("FDL_LIBTORCH_CASE");
+        }
+        assert!(
+            info.is_none(),
+            "explicit case with missing file must not silently fall back to .active"
+        );
     }
 
     #[test]
@@ -561,9 +569,8 @@ mod tests {
         let root = make_root();
         let pointer = root.path().join("libtorch/.active.alt");
         fs::write(&pointer, "builds/v2\n").unwrap();
-        let info = read_active_from(
-            &pointer, &root.path().join("libtorch"),
-        ).expect("read_active_from");
+        let info =
+            read_active_from(&pointer, &root.path().join("libtorch")).expect("read_active_from");
         assert_eq!(info.path, "builds/v2");
         assert_eq!(info.archs.as_deref(), Some("1.0"));
     }
@@ -593,8 +600,8 @@ pub fn unmet_loader_requirements(variant_dir: &Path) -> Vec<String> {
     let Ok(out) = std::process::Command::new("ldd").arg(&core).output() else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     parse_unmet_versions(&text)
 }
 
@@ -608,8 +615,12 @@ pub(crate) fn parse_unmet_versions(ldd_output: &str) -> Vec<String> {
         if !line.contains("not found") {
             continue;
         }
-        let Some(rest) = line.split("version `").nth(1) else { continue };
-        let Some(sym) = rest.split('\'').next() else { continue };
+        let Some(rest) = line.split("version `").nth(1) else {
+            continue;
+        };
+        let Some(sym) = rest.split('\'').next() else {
+            continue;
+        };
         if !seen.iter().any(|s| s == sym) {
             seen.push(sym.to_string());
         }

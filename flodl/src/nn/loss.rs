@@ -34,10 +34,15 @@ pub fn mse_loss(pred: &Variable, target: &Variable) -> Result<Variable> {
 pub fn cross_entropy_loss(pred: &Variable, target: &Variable) -> Result<Variable> {
     let pred_shape = pred.shape();
     if pred_shape.len() != 2 {
-        return Err(TensorError::new("cross_entropy_loss: pred must be 2D [batch, classes]"));
+        return Err(TensorError::new(
+            "cross_entropy_loss: pred must be 2D [batch, classes]",
+        ));
     }
     let result = pred.data().cross_entropy_loss(
-        &target.data(), 1, -100, 0.0, // Mean, ignore_index=-100, no smoothing
+        &target.data(),
+        1,
+        -100,
+        0.0, // Mean, ignore_index=-100, no smoothing
     )?;
     Ok(Variable::wrap(result))
 }
@@ -148,8 +153,11 @@ pub fn ctc_loss(
     blank: i64,
 ) -> Result<Variable> {
     let result = log_probs.data().ctc_loss(
-        &targets.data(), &input_lengths.data(), &target_lengths.data(),
-        blank, 1, // Mean
+        &targets.data(),
+        &input_lengths.data(),
+        &target_lengths.data(),
+        blank,
+        1, // Mean
     )?;
     Ok(Variable::wrap(result))
 }
@@ -163,12 +171,7 @@ pub fn ctc_loss(
 /// `target`: class indices `[N]` (Int64).
 /// `alpha`: weighting factor (default: 0.25).
 /// `gamma`: focusing parameter (default: 2.0).
-pub fn focal_loss(
-    pred: &Variable,
-    target: &Variable,
-    alpha: f64,
-    gamma: f64,
-) -> Result<Variable> {
+pub fn focal_loss(pred: &Variable, target: &Variable, alpha: f64, gamma: f64) -> Result<Variable> {
     // Focal loss via cross-entropy: compute -log(p_t), then weight by (1-p_t)^gamma
     let log_p = pred.log_softmax(-1)?;
     let p = log_p.exp()?;
@@ -196,8 +199,16 @@ pub fn triplet_margin_loss(
     negative: &Variable,
     margin: f64,
 ) -> Result<Variable> {
-    let d_pos = anchor.sub(positive)?.pow_scalar(2.0)?.sum_dim(1, false)?.sqrt()?;
-    let d_neg = anchor.sub(negative)?.pow_scalar(2.0)?.sum_dim(1, false)?.sqrt()?;
+    let d_pos = anchor
+        .sub(positive)?
+        .pow_scalar(2.0)?
+        .sum_dim(1, false)?
+        .sqrt()?;
+    let d_neg = anchor
+        .sub(negative)?
+        .pow_scalar(2.0)?
+        .sum_dim(1, false)?
+        .sqrt()?;
     let diff = d_pos.sub(&d_neg)?.add_scalar(margin)?;
     // Match the input dtype (zeros_like inherits dtype+device+shape) so a
     // Float64 loss stays Float64 rather than relying on implicit promotion
@@ -236,11 +247,7 @@ pub fn cosine_embedding_loss(
 /// `loss = x` when label=1; `max(0, margin - x)` when label=-1.
 ///
 /// Both `input` and `label` must be Float (same dtype).
-pub fn hinge_embedding_loss(
-    input: &Variable,
-    label: &Variable,
-    margin: f64,
-) -> Result<Variable> {
+pub fn hinge_embedding_loss(input: &Variable, label: &Variable, margin: f64) -> Result<Variable> {
     let margin_minus_x = input.neg()?.add_scalar(margin)?;
     let zero = Variable::wrap(Tensor::zeros_like(&input.data())?);
     let loss_neg = margin_minus_x.maximum(&zero)?;
@@ -295,8 +302,10 @@ mod tests {
     fn test_nll_loss() {
         let log_probs = Tensor::from_f32(
             &[-0.5, -1.5, -2.5, -1.0, -0.5, -2.0],
-            &[2, 3], test_device(),
-        ).unwrap();
+            &[2, 3],
+            test_device(),
+        )
+        .unwrap();
         let targets = Tensor::from_i64(&[0, 1], &[2], test_device()).unwrap();
         let input = Variable::new(log_probs, false);
         let target = Variable::new(targets, false);
@@ -306,10 +315,8 @@ mod tests {
 
     #[test]
     fn test_focal_loss() {
-        let logits = Tensor::from_f32(
-            &[2.0, 0.5, -1.0, -0.5, 1.5, 0.3],
-            &[2, 3], test_device(),
-        ).unwrap();
+        let logits =
+            Tensor::from_f32(&[2.0, 0.5, -1.0, -0.5, 1.5, 0.3], &[2, 3], test_device()).unwrap();
         let targets = Tensor::from_i64(&[0, 1], &[2], test_device()).unwrap();
         let pred = Variable::new(logits, false);
         let target = Variable::new(targets, false);
@@ -321,9 +328,18 @@ mod tests {
     fn test_triplet_margin_loss() {
         // Distance to positive ~ 0.14, to negative ~ 1.41, margin = 2.0
         // loss = max(0, 0.14 - 1.41 + 2.0) = 0.73
-        let a = Variable::new(Tensor::from_f32(&[1.0, 0.0], &[1, 2], test_device()).unwrap(), false);
-        let p = Variable::new(Tensor::from_f32(&[0.9, 0.1], &[1, 2], test_device()).unwrap(), false);
-        let n = Variable::new(Tensor::from_f32(&[0.0, 1.0], &[1, 2], test_device()).unwrap(), false);
+        let a = Variable::new(
+            Tensor::from_f32(&[1.0, 0.0], &[1, 2], test_device()).unwrap(),
+            false,
+        );
+        let p = Variable::new(
+            Tensor::from_f32(&[0.9, 0.1], &[1, 2], test_device()).unwrap(),
+            false,
+        );
+        let n = Variable::new(
+            Tensor::from_f32(&[0.0, 1.0], &[1, 2], test_device()).unwrap(),
+            false,
+        );
         let loss = triplet_margin_loss(&a, &p, &n, 2.0).unwrap();
         assert!(loss.item().unwrap() > 0.0);
     }
@@ -338,9 +354,8 @@ mod tests {
         // Float32 path (triplet == the 0.727... the Float32 test asserts).
         use crate::tensor::DType;
         let dev = test_device();
-        let f64v = |d: &[f64], s: &[i64]| {
-            Variable::new(Tensor::from_f64(d, s, dev).unwrap(), false)
-        };
+        let f64v =
+            |d: &[f64], s: &[i64]| Variable::new(Tensor::from_f64(d, s, dev).unwrap(), false);
 
         let a = f64v(&[1.0, 0.0], &[1, 2]);
         let p = f64v(&[0.9, 0.1], &[1, 2]);
@@ -369,8 +384,14 @@ mod tests {
 
     #[test]
     fn test_poisson_nll_loss() {
-        let input = Variable::new(Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(), false);
-        let target = Variable::new(Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(), false);
+        let input = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(),
+            false,
+        );
+        let target = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(),
+            false,
+        );
         let loss = poisson_nll_loss(&input, &target, true).unwrap();
         assert!(loss.item().unwrap() > 0.0);
     }
@@ -378,10 +399,12 @@ mod tests {
     #[test]
     fn test_mse_loss() {
         let pred = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(), true,
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(),
+            true,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.5, 2.5, 3.5], &[3], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.5, 2.5, 3.5], &[3], test_device()).unwrap(),
+            false,
         );
         let loss = mse_loss(&pred, &target).unwrap();
         // mean((0.5)^2) = 0.25
@@ -391,10 +414,12 @@ mod tests {
     #[test]
     fn test_mse_loss_zero() {
         let pred = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 2.0], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = mse_loss(&pred, &target).unwrap();
         assert!(loss.item().unwrap().abs() < 1e-6);
@@ -408,7 +433,8 @@ mod tests {
             true,
         );
         let targets = Variable::new(
-            Tensor::from_i64(&[0, 2], &[2], test_device()).unwrap(), false,
+            Tensor::from_i64(&[0, 2], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         // Confident correct predictions -> loss near 0
@@ -423,7 +449,8 @@ mod tests {
             false,
         );
         let targets = Variable::new(
-            Tensor::from_i64(&[0, 2], &[2], test_device()).unwrap(), false,
+            Tensor::from_i64(&[0, 2], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         // Wrong predictions -> high loss
@@ -437,7 +464,8 @@ mod tests {
             true,
         );
         let targets = Variable::new(
-            Tensor::from_i64(&[0, 1], &[2], test_device()).unwrap(), false,
+            Tensor::from_i64(&[0, 1], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         loss.backward().unwrap();
@@ -447,10 +475,12 @@ mod tests {
     #[test]
     fn test_bce_loss() {
         let pred = Variable::new(
-            Tensor::from_f32(&[0.9, 0.1, 0.8, 0.2], &[4], test_device()).unwrap(), false,
+            Tensor::from_f32(&[0.9, 0.1, 0.8, 0.2], &[4], test_device()).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[4], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[4], test_device()).unwrap(),
+            false,
         );
         let loss = bce_loss(&pred, &target).unwrap();
         // High-confidence correct predictions -> low loss
@@ -461,10 +491,12 @@ mod tests {
     fn test_bce_with_logits_loss() {
         // Positive logits for label=1, negative for label=0
         let pred = Variable::new(
-            Tensor::from_f32(&[5.0, -5.0, 5.0, -5.0], &[4], test_device()).unwrap(), true,
+            Tensor::from_f32(&[5.0, -5.0, 5.0, -5.0], &[4], test_device()).unwrap(),
+            true,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[4], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[4], test_device()).unwrap(),
+            false,
         );
         let loss = bce_with_logits_loss(&pred, &target).unwrap();
         assert!(loss.item().unwrap() < 0.1);
@@ -473,10 +505,12 @@ mod tests {
     #[test]
     fn test_bce_with_logits_gradient() {
         let pred = Variable::new(
-            Tensor::from_f32(&[0.5, -0.5], &[2], test_device()).unwrap(), true,
+            Tensor::from_f32(&[0.5, -0.5], &[2], test_device()).unwrap(),
+            true,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.0, 0.0], &[2], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 0.0], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = bce_with_logits_loss(&pred, &target).unwrap();
         loss.backward().unwrap();
@@ -486,10 +520,12 @@ mod tests {
     #[test]
     fn test_l1_loss() {
         let pred = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], test_device()).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.5, 2.5, 3.5], &[3], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.5, 2.5, 3.5], &[3], test_device()).unwrap(),
+            false,
         );
         let loss = l1_loss(&pred, &target).unwrap();
         // mean(|0.5|) = 0.5
@@ -499,10 +535,12 @@ mod tests {
     #[test]
     fn test_smooth_l1_loss() {
         let pred = Variable::new(
-            Tensor::from_f32(&[1.0, 5.0], &[2], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0, 5.0], &[2], test_device()).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.5, 2.0], &[2], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.5, 2.0], &[2], test_device()).unwrap(),
+            false,
         );
         let loss = smooth_l1_loss(&pred, &target, 1.0).unwrap();
         // |0.5| < 1.0 -> 0.5*0.25/1.0 = 0.125; |3.0| >= 1.0 -> 3.0 - 0.5 = 2.5
@@ -513,10 +551,12 @@ mod tests {
     #[test]
     fn test_smooth_l1_loss_negative_beta() {
         let pred = Variable::new(
-            Tensor::from_f32(&[1.0], &[1], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0], &[1], test_device()).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[2.0], &[1], test_device()).unwrap(), false,
+            Tensor::from_f32(&[2.0], &[1], test_device()).unwrap(),
+            false,
         );
         assert!(smooth_l1_loss(&pred, &target, -1.0).is_err());
     }
@@ -524,11 +564,13 @@ mod tests {
     #[test]
     fn test_kl_div_loss() {
         // log_softmax output as input
-        let logits = Tensor::from_f32(&[2.0, 1.0, 0.1, 0.5, 1.5, 0.3], &[2, 3], test_device()).unwrap();
+        let logits =
+            Tensor::from_f32(&[2.0, 1.0, 0.1, 0.5, 1.5, 0.3], &[2, 3], test_device()).unwrap();
         let log_probs = Variable::new(logits.log_softmax(1).unwrap(), false);
         // Uniform target distribution
         let target = Variable::new(
-            Tensor::from_f32(&[1.0/3.0; 6], &[2, 3], test_device()).unwrap(), false,
+            Tensor::from_f32(&[1.0 / 3.0; 6], &[2, 3], test_device()).unwrap(),
+            false,
         );
         let loss = kl_div_loss(&log_probs, &target).unwrap();
         // KL divergence >= 0
@@ -540,19 +582,15 @@ mod tests {
         let dev = test_device();
         // T=5 timesteps, N=1 batch, C=4 classes (including blank=0)
         let log_probs = Variable::new(
-            Tensor::randn(&[5, 1, 4], test_opts()).unwrap()
-                .log_softmax(2).unwrap(),
+            Tensor::randn(&[5, 1, 4], test_opts())
+                .unwrap()
+                .log_softmax(2)
+                .unwrap(),
             false,
         );
-        let targets = Variable::new(
-            Tensor::from_i64(&[1, 2, 3], &[1, 3], dev).unwrap(), false,
-        );
-        let input_lengths = Variable::new(
-            Tensor::from_i64(&[5], &[1], dev).unwrap(), false,
-        );
-        let target_lengths = Variable::new(
-            Tensor::from_i64(&[3], &[1], dev).unwrap(), false,
-        );
+        let targets = Variable::new(Tensor::from_i64(&[1, 2, 3], &[1, 3], dev).unwrap(), false);
+        let input_lengths = Variable::new(Tensor::from_i64(&[5], &[1], dev).unwrap(), false);
+        let target_lengths = Variable::new(Tensor::from_i64(&[3], &[1], dev).unwrap(), false);
         let loss = ctc_loss(&log_probs, &targets, &input_lengths, &target_lengths, 0).unwrap();
         assert!(loss.item().unwrap() > 0.0);
     }
@@ -560,8 +598,14 @@ mod tests {
     #[test]
     fn test_cosine_embedding_loss_similar() {
         let dev = test_device();
-        let x1 = Variable::new(Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(), false);
-        let x2 = Variable::new(Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(), false);
+        let x1 = Variable::new(
+            Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(),
+            false,
+        );
+        let x2 = Variable::new(
+            Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(),
+            false,
+        );
         let label = Variable::new(Tensor::from_f32(&[1.0], &[1], dev).unwrap(), false);
         let loss = cosine_embedding_loss(&x1, &x2, &label, 0.0).unwrap();
         // Identical vectors, label=1 -> loss = 1 - cos(0) = 0
@@ -571,8 +615,14 @@ mod tests {
     #[test]
     fn test_cosine_embedding_loss_dissimilar() {
         let dev = test_device();
-        let x1 = Variable::new(Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(), false);
-        let x2 = Variable::new(Tensor::from_f32(&[-1.0, 0.0, 0.0], &[1, 3], dev).unwrap(), false);
+        let x1 = Variable::new(
+            Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3], dev).unwrap(),
+            false,
+        );
+        let x2 = Variable::new(
+            Tensor::from_f32(&[-1.0, 0.0, 0.0], &[1, 3], dev).unwrap(),
+            false,
+        );
         let label = Variable::new(Tensor::from_f32(&[-1.0], &[1], dev).unwrap(), false);
         let loss = cosine_embedding_loss(&x1, &x2, &label, 0.0).unwrap();
         // Opposite vectors, label=-1, margin=0 -> max(0, cos(pi) - 0) = max(0, -1) = 0
@@ -628,10 +678,12 @@ mod tests {
     fn test_poisson_nll_loss_no_log() {
         let dev = test_device();
         let input = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(), false,
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(),
+            false,
         );
         let target = Variable::new(
-            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(), false,
+            Tensor::from_f32(&[1.0, 2.0, 3.0], &[3], dev).unwrap(),
+            false,
         );
         let loss = poisson_nll_loss(&input, &target, false).unwrap();
         assert!(loss.item().unwrap().is_finite());
@@ -644,13 +696,20 @@ mod tests {
             Tensor::from_f32(&[2.0, 0.5, -1.0, -0.5, 1.5, 0.3], &[2, 3], dev).unwrap(),
             false,
         );
-        let targets = Variable::new(
-            Tensor::from_i64(&[0, 1], &[2], dev).unwrap(), false,
-        );
+        let targets = Variable::new(Tensor::from_i64(&[0, 1], &[2], dev).unwrap(), false);
         // gamma=0, alpha=1 should approximate cross-entropy
-        let fl = focal_loss(&logits, &targets, 1.0, 0.0).unwrap().item().unwrap();
-        let ce = cross_entropy_loss(&logits, &targets).unwrap().item().unwrap();
-        assert!((fl - ce).abs() < 1e-4, "focal(gamma=0, alpha=1) = {fl} != ce = {ce}");
+        let fl = focal_loss(&logits, &targets, 1.0, 0.0)
+            .unwrap()
+            .item()
+            .unwrap();
+        let ce = cross_entropy_loss(&logits, &targets)
+            .unwrap()
+            .item()
+            .unwrap();
+        assert!(
+            (fl - ce).abs() < 1e-4,
+            "focal(gamma=0, alpha=1) = {fl} != ce = {ce}"
+        );
     }
 
     #[test]

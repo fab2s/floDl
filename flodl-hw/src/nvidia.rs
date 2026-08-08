@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::GpuInfo;
 use crate::report::{GpuSurvey, NoteKind};
 use crate::vendor::{GpuArch, GpuVendor};
-use crate::GpuInfo;
 
 /// Cheap, subprocess-free check for "is there an NVIDIA driver here".
 ///

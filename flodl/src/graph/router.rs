@@ -37,7 +37,9 @@ impl SoftmaxRouter {
 }
 
 impl Module for SoftmaxRouter {
-    fn name(&self) -> &str { "softmax_router" }
+    fn name(&self) -> &str {
+        "softmax_router"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let out = self.proj.forward(input)?;
@@ -87,7 +89,9 @@ impl SigmoidRouter {
 }
 
 impl Module for SigmoidRouter {
-    fn name(&self) -> &str { "sigmoid_router" }
+    fn name(&self) -> &str {
+        "sigmoid_router"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.proj.forward(input)?.sigmoid()
@@ -122,12 +126,16 @@ pub struct FixedSelector {
 impl FixedSelector {
     /// Create a selector that always routes to `index` (0-based branch).
     pub fn new(index: usize) -> Self {
-        FixedSelector { index: index as f32 }
+        FixedSelector {
+            index: index as f32,
+        }
     }
 }
 
 impl Module for FixedSelector {
-    fn name(&self) -> &str { "fixed_selector" }
+    fn name(&self) -> &str {
+        "fixed_selector"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(Variable::new(
@@ -170,7 +178,9 @@ impl ArgmaxSelector {
 }
 
 impl Module for ArgmaxSelector {
-    fn name(&self) -> &str { "argmax_selector" }
+    fn name(&self) -> &str {
+        "argmax_selector"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let logits = self.proj.forward(input)?;

@@ -2,16 +2,15 @@
 
 use std::process::ExitCode;
 
-use flodl_cli::{builtins, context, libtorch, util};
-use flodl_cli::cli_error;
 use builtins::{
     LibtorchActivateArgs, LibtorchBuildArgs, LibtorchDownloadArgs, LibtorchListArgs,
     LibtorchRemoveArgs,
 };
 use context::Context;
+use flodl_cli::cli_error;
+use flodl_cli::{builtins, context, libtorch, util};
 
 use crate::parse_sub;
-
 
 // ---------------------------------------------------------------------------
 // libtorch dispatch

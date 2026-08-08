@@ -3,12 +3,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::detect;
 use crate::context::Context;
-use crate::util::http;
 use crate::util::archive;
+use crate::util::http;
 use crate::util::system;
 use crate::util::system::GpuVendor;
-use super::detect;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -214,7 +214,11 @@ fn relink_bundled_libomp(lib_dir: &Path) {
 
     let mut patched = 0usize;
     for f in &dylibs {
-        let out = match std::process::Command::new("otool").arg("-L").arg(f).output() {
+        let out = match std::process::Command::new("otool")
+            .arg("-L")
+            .arg(f)
+            .output()
+        {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => continue,
         };
@@ -384,10 +388,7 @@ fn variant_for_gpus(gpus: &[system::GpuInfo]) -> &'static VariantSpec {
     // A libtorch build serves exactly one vendor, so a mixed box has to
     // pick. NVIDIA wins: in a box holding both, the AMD part is usually
     // an APU's integrated GPU and the NVIDIA one the training card.
-    let amd: Vec<_> = gpus
-        .iter()
-        .filter(|g| g.vendor == GpuVendor::Amd)
-        .collect();
+    let amd: Vec<_> = gpus.iter().filter(|g| g.vendor == GpuVendor::Amd).collect();
     let has_nvidia = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia);
     if !amd.is_empty() {
         if has_nvidia {
@@ -472,9 +473,7 @@ pub fn rocm_archs() -> &'static str {
 /// ROCm version resolver; until then, oldest-serves-most. A host that
 /// wants the exact match asks for it: `fdl libtorch download --rocm 7.1`.
 fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
-    let (covered, uncovered): (Vec<_>, Vec<_>) = amd
-        .iter()
-        .partition(|g| g.covered_by(ROCM_ARCHS));
+    let (covered, uncovered): (Vec<_>, Vec<_>) = amd.iter().partition(|g| g.covered_by(ROCM_ARCHS));
 
     let describe = |gs: &[&&system::GpuInfo]| {
         gs.iter()
@@ -501,7 +500,10 @@ fn rocm_variant_for(amd: &[&system::GpuInfo]) -> &'static VariantSpec {
             ROCM_ARCHS,
         );
     }
-    println!("  Detected AMD GPU(s) ({}). Using ROCm 7.0.", describe(&covered));
+    println!(
+        "  Detected AMD GPU(s) ({}). Using ROCm 7.0.",
+        describe(&covered)
+    );
     &ROCM70_SPEC
 }
 
@@ -540,7 +542,8 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, Str
     let install_path = if let Some(ref p) = opts.custom_path {
         p.clone()
     } else {
-        ctx.root.join(format!("libtorch/precompiled/{}", spec.dir_name))
+        ctx.root
+            .join(format!("libtorch/precompiled/{}", spec.dir_name))
     };
 
     let variant_id = format!("precompiled/{}", spec.dir_name);
@@ -743,8 +746,7 @@ impl Drop for Staging {
 }
 
 fn move_contents(src: &Path, dest: &Path) -> Result<(), String> {
-    let entries = fs::read_dir(src)
-        .map_err(|e| format!("cannot read {}: {}", src.display(), e))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("cannot read {}: {}", src.display(), e))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("read_dir error: {}", e))?;
@@ -766,8 +768,7 @@ fn move_contents(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
+    fs::create_dir_all(dest).map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
 
     for entry in fs::read_dir(src).map_err(|e| format!("read {}: {}", src.display(), e))? {
         let entry = entry.map_err(|e| format!("read_dir error: {}", e))?;
@@ -960,8 +961,7 @@ libtorch/lib/libtorch_cpu.dylib:
         );
         assert!(absolute_libomp_refs(&patched).is_empty(), "{patched}");
         // `@rpath` spelling too, in case upstream fixes it their way.
-        let upstream_fixed =
-            OTOOL_LIBTORCH_CPU.replace("/opt/homebrew/opt/libomp/lib/", "@rpath/");
+        let upstream_fixed = OTOOL_LIBTORCH_CPU.replace("/opt/homebrew/opt/libomp/lib/", "@rpath/");
         assert!(absolute_libomp_refs(&upstream_fixed).is_empty());
     }
 
@@ -970,8 +970,7 @@ libtorch/lib/libtorch_cpu.dylib:
         // The Homebrew prefix is not universal (Intel Macs use
         // /usr/local, and a custom prefix is legal), so the match is on
         // the library, not on the directory upstream happened to use.
-        let intel = OTOOL_LIBTORCH_CPU
-            .replace("/opt/homebrew/opt", "/usr/local/opt");
+        let intel = OTOOL_LIBTORCH_CPU.replace("/opt/homebrew/opt", "/usr/local/opt");
         assert_eq!(
             absolute_libomp_refs(&intel),
             vec!["/usr/local/opt/libomp/lib/libomp.dylib".to_string()],
@@ -1064,10 +1063,7 @@ libtorch/lib/libtorch_cpu.dylib:
 
     #[test]
     fn a_partly_covered_amd_set_still_routes_to_rocm() {
-        let v = variant_for_gpus(&[
-            gpu(GpuVendor::Amd, "gfx942"),
-            gpu(GpuVendor::Amd, "gfx803"),
-        ]);
+        let v = variant_for_gpus(&[gpu(GpuVendor::Amd, "gfx942"), gpu(GpuVendor::Amd, "gfx803")]);
         assert_eq!(v.arch_variant, "rocm7.0");
     }
 

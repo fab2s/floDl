@@ -3,11 +3,8 @@
 
 use std::collections::BTreeMap;
 
-
 use super::cluster::{DdpConfig, OutputConfig, TrainingConfig};
-use super::schema::{
-    CommandConfig, CommandKind, CommandSpec, Schema,
-};
+use super::schema::{CommandConfig, CommandKind, CommandSpec, Schema};
 
 /// Reserved flags that strict mode always tolerates in the user's tail.
 /// These are fdl-level universals (help/version) or opt-ins every
@@ -35,10 +32,7 @@ pub fn schema_to_args_spec(schema: &Schema) -> crate::args::parser::ArgsSpec {
         .iter()
         .map(|(long, spec)| OptionDecl {
             long: long.clone(),
-            short: spec
-                .short
-                .as_deref()
-                .and_then(|s| s.chars().next()),
+            short: spec.short.as_deref().and_then(|s| s.chars().next()),
             takes_value: spec.ty != "bool",
             // Every value-taking option is allowed to appear bare in
             // strict mode. fdl does not second-guess whether the binary
@@ -75,10 +69,7 @@ pub fn schema_to_args_spec(schema: &Schema) -> crate::args::parser::ArgsSpec {
             name: a.name.clone(),
             required: false,
             variadic: a.variadic,
-            choices: a
-                .choices
-                .as_ref()
-                .map(|cs| strict_choices_to_strings(cs)),
+            choices: a.choices.as_ref().map(|cs| strict_choices_to_strings(cs)),
         })
         .collect();
     // Catch-all so fdl-side validation never rejects positionals: like

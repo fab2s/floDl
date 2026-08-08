@@ -20,9 +20,15 @@ impl Context {
     /// to `~/.flodl/`.
     pub fn resolve() -> Self {
         if let Some(project_root) = find_project_root() {
-            Context { root: project_root, is_project: true }
+            Context {
+                root: project_root,
+                is_project: true,
+            }
         } else {
-            Context { root: global_root(), is_project: false }
+            Context {
+                root: global_root(),
+                is_project: false,
+            }
         }
     }
 
@@ -36,7 +42,10 @@ impl Context {
     /// (libtorch, the fetched source tree) belong under the root fdl
     /// manages on that one box. The two are named apart on purpose.
     pub fn global() -> Self {
-        Context { root: global_root(), is_project: false }
+        Context {
+            root: global_root(),
+            is_project: false,
+        }
     }
 
     /// Force a specific root (for --path overrides).
@@ -72,9 +81,10 @@ fn find_project_root() -> Option<PathBuf> {
         let cargo_toml = dir.join("Cargo.toml");
         if cargo_toml.exists()
             && let Ok(contents) = fs::read_to_string(&cargo_toml)
-                && contents.contains("flodl") {
-                    return Some(dir);
-                }
+            && contents.contains("flodl")
+        {
+            return Some(dir);
+        }
         if !dir.pop() {
             return None;
         }

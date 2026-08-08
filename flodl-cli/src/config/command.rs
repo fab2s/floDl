@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::loading::{CONFIG_NAMES, EXAMPLE_SUFFIXES, try_copy_example};
-use super::schema::{validate_schema, CommandConfig};
+use super::schema::{CommandConfig, validate_schema};
 
 /// Load a command config from a sub-directory.
 ///
@@ -50,22 +50,21 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
             }
         }
     }
-    let base_path = base_path
-        .ok_or_else(|| format!("no fdl.yml found in {}", dir.display()))?;
+    let base_path = base_path.ok_or_else(|| format!("no fdl.yml found in {}", dir.display()))?;
 
     // Layered load: base chain + optional env overlay chain. Both sides
     // run through `resolve_chain` so `inherit-from:` composes the same
     // way for nested commands as for the project root.
     let mut layers = crate::overlay::resolve_chain(&base_path)?;
     if let Some(name) = env
-        && let Some(p) = crate::overlay::find_env_file(&base_path, name) {
-            layers.extend(crate::overlay::resolve_chain(&p)?);
-        }
+        && let Some(p) = crate::overlay::find_env_file(&base_path, name)
+    {
+        layers.extend(crate::overlay::resolve_chain(&p)?);
+    }
     let mut seen = std::collections::HashSet::new();
     layers.retain(|(path, _)| seen.insert(path.clone()));
-    let merged = crate::overlay::merge_layers(
-        layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
-    );
+    let merged =
+        crate::overlay::merge_layers(layers.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
     // Re-serialize so `from_str`'s parser tracks line/col through
     // deserialize (`from_value` discards positional info). With
     // `deny_unknown_fields` on the config structs, unknown-key errors
@@ -96,10 +95,7 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
     // surface once it opts into the `--fdl-schema` contract. A cache that
     // is older than the command's fdl.yml is treated as stale and skipped
     // — the inline schema (if any) reasserts until a refresh happens.
-    let cmd_name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("_");
+    let cmd_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("_");
     let cache = crate::schema_cache::cache_path(dir, cmd_name);
     // Reference mtimes: everything whose edit could change the cached schema.
     //
@@ -132,22 +128,19 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
         // `--fdl-schema` simply falls through to the inline schema (or no
         // schema) — help still renders.
         let opts_into_compile = cfg.compile.unwrap_or(false);
-        let should_probe =
-            !crate::schema_cache::is_cargo_entry(entry) || opts_into_compile;
+        let should_probe = !crate::schema_cache::is_cargo_entry(entry) || opts_into_compile;
         if should_probe
-            && let Ok(probed) =
-                crate::schema_cache::probe(entry, dir, cfg.docker.as_deref())
-            {
-                // Best-effort cache write: if the dir is read-only, the
-                // schema still applies to this invocation, we just re-probe
-                // next time. Non-fatal.
-                let _ = crate::schema_cache::write_cache(&cache, &probed);
-                cfg.schema = Some(probed);
-            }
+            && let Ok(probed) = crate::schema_cache::probe(entry, dir, cfg.docker.as_deref())
+        {
+            // Best-effort cache write: if the dir is read-only, the
+            // schema still applies to this invocation, we just re-probe
+            // next time. Non-fatal.
+            let _ = crate::schema_cache::write_cache(&cache, &probed);
+            cfg.schema = Some(probed);
+        }
     }
 
     Ok(cfg)
 }
 
 // ── Strict-mode validation ──────────────────────────────────────────────
-

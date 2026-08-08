@@ -55,8 +55,8 @@
 use flodl::{Result, TensorError};
 
 use crate::models::albert::{
-    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering,
-    AlbertForSequenceClassification, AlbertForTokenClassification,
+    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering, AlbertForSequenceClassification,
+    AlbertForTokenClassification,
 };
 use crate::models::bert::{
     BertConfig, BertForMaskedLM, BertForQuestionAnswering, BertForSequenceClassification,
@@ -400,10 +400,7 @@ impl AutoModelForTokenClassification {
     /// tokenizer's encoding: `result[b][s]` is the top-1 prediction
     /// for batch entry `b`, position `s`.
     #[cfg(feature = "tokenizer")]
-    pub fn predict(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<crate::task_heads::TokenPrediction>>> {
+    pub fn predict(&self, texts: &[&str]) -> Result<Vec<Vec<crate::task_heads::TokenPrediction>>> {
         match self {
             Self::Bert(h) => h.predict(texts),
             Self::Roberta(h) => h.predict(texts),
@@ -456,11 +453,7 @@ impl AutoModelForQuestionAnswering {
     /// Answer one `(question, context)` pair. Returns the
     /// highest-scoring span over the context tokens.
     #[cfg(feature = "tokenizer")]
-    pub fn answer(
-        &self,
-        question: &str,
-        context: &str,
-    ) -> Result<crate::task_heads::Answer> {
+    pub fn answer(&self, question: &str, context: &str) -> Result<crate::task_heads::Answer> {
         match self {
             Self::Bert(h) => h.answer(question, context),
             Self::Roberta(h) => h.answer(question, context),
@@ -473,10 +466,7 @@ impl AutoModelForQuestionAnswering {
 
     /// Batched variant of [`answer`](Self::answer).
     #[cfg(feature = "tokenizer")]
-    pub fn answer_batch(
-        &self,
-        pairs: &[(&str, &str)],
-    ) -> Result<Vec<crate::task_heads::Answer>> {
+    pub fn answer_batch(&self, pairs: &[(&str, &str)]) -> Result<Vec<crate::task_heads::Answer>> {
         match self {
             Self::Bert(h) => h.answer_batch(pairs),
             Self::Roberta(h) => h.answer_batch(pairs),
@@ -558,11 +548,7 @@ impl AutoModelForMaskedLM {
     /// [`fill_mask`](crate::task_heads::MaskedLmHead::fill_mask) —
     /// the mask-token spelling comes from the head's config.
     #[cfg(feature = "tokenizer")]
-    pub fn fill_mask(
-        &self,
-        text: &str,
-        top_k: usize,
-    ) -> Result<Vec<Vec<(String, f32)>>> {
+    pub fn fill_mask(&self, text: &str, top_k: usize) -> Result<Vec<Vec<(String, f32)>>> {
         match self {
             Self::Bert(h) => h.fill_mask(text, top_k),
             Self::Roberta(h) => h.fill_mask(text, top_k),
@@ -696,7 +682,10 @@ mod tests {
             "hidden_size": 768
         }"#;
         let err = AutoConfig::from_json_str(json).unwrap_err().to_string();
-        assert!(err.contains("modernbert"), "error names offending type: {err}");
+        assert!(
+            err.contains("modernbert"),
+            "error names offending type: {err}"
+        );
         assert!(err.contains("bert"), "error lists supported: {err}");
         assert!(err.contains("roberta"), "error lists supported: {err}");
         assert!(err.contains("distilbert"), "error lists supported: {err}");
@@ -789,7 +778,9 @@ mod tests {
     /// confusing `model_type` missing error.
     #[test]
     fn auto_config_rejects_invalid_json() {
-        let err = AutoConfig::from_json_str("not json").unwrap_err().to_string();
+        let err = AutoConfig::from_json_str("not json")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("parse error"), "got: {err}");
     }
 }

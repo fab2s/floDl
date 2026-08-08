@@ -3,12 +3,11 @@
 use std::env;
 use std::process::ExitCode;
 
-use flodl_cli::{builtins, config, schema, style, util};
-use flodl_cli::cli_error;
 use builtins::{SchemaClearArgs, SchemaListArgs, SchemaRefreshArgs};
+use flodl_cli::cli_error;
+use flodl_cli::{builtins, config, schema, style, util};
 
 use crate::parse_sub;
-
 
 // ---------------------------------------------------------------------------
 // schema dispatch
@@ -44,7 +43,10 @@ pub(crate) fn dispatch_schema(args: &[String]) -> ExitCode {
 
 fn cmd_schema_list(json: bool) -> ExitCode {
     let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
+        cli_error!(
+            "no fdl.yml found in {} or parent directories",
+            env::current_dir().unwrap_or_default().display()
+        );
         return ExitCode::FAILURE;
     };
     let caches = schema::discover_caches(&root);
@@ -56,10 +58,7 @@ fn cmd_schema_list(json: bool) -> ExitCode {
             if i > 0 {
                 print!(",");
             }
-            let rel = c
-                .cache_path
-                .strip_prefix(&root)
-                .unwrap_or(&c.cache_path);
+            let rel = c.cache_path.strip_prefix(&root).unwrap_or(&c.cache_path);
             print!(
                 "{{\"name\":\"{}\",\"path\":\"{}\",\"status\":\"{}\"}}",
                 util::system::escape_json(&c.cmd_name),
@@ -100,7 +99,10 @@ fn cmd_schema_list(json: bool) -> ExitCode {
 
 fn cmd_schema_clear(filter: Option<&str>) -> ExitCode {
     let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
+        cli_error!(
+            "no fdl.yml found in {} or parent directories",
+            env::current_dir().unwrap_or_default().display()
+        );
         return ExitCode::FAILURE;
     };
     match schema::clear_caches(&root, filter) {
@@ -129,7 +131,10 @@ fn cmd_schema_clear(filter: Option<&str>) -> ExitCode {
 
 fn cmd_schema_refresh(filter: Option<&str>) -> ExitCode {
     let Some(root) = project_root_for_schema() else {
-        cli_error!("no fdl.yml found in {} or parent directories", env::current_dir().unwrap_or_default().display());
+        cli_error!(
+            "no fdl.yml found in {} or parent directories",
+            env::current_dir().unwrap_or_default().display()
+        );
         return ExitCode::FAILURE;
     };
     let results = match schema::refresh_caches(&root, filter) {

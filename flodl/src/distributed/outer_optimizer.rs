@@ -56,8 +56,7 @@ use crate::tensor::{Result, Tensor};
 /// each site owns its own instance (replicated momentum on NCCL). A boxed
 /// trait object keeps the factory off the [`crate::DdpBuilder`] type
 /// parameters (it is not generic in the user's model/optimizer).
-pub type OuterOptimizerFactory =
-    Arc<dyn Fn() -> Box<dyn OuterOptimizer> + Send + Sync>;
+pub type OuterOptimizerFactory = Arc<dyn Fn() -> Box<dyn OuterOptimizer> + Send + Sync>;
 
 /// A step applied to the work-weighted **consensus** between reduce and
 /// broadcast, transforming it into the new global parameters.
@@ -81,11 +80,7 @@ pub trait OuterOptimizer: Send {
     /// `consensus` as `prev_global`, so a well-behaved variant returns
     /// `consensus` unchanged (zero outer gradient) and seeds its momentum at
     /// zero.
-    fn outer_step(
-        &mut self,
-        prev_global: &[Tensor],
-        consensus: &[Tensor],
-    ) -> Result<Vec<Tensor>>;
+    fn outer_step(&mut self, prev_global: &[Tensor], consensus: &[Tensor]) -> Result<Vec<Tensor>>;
 
     /// Snapshot the checkpointable outer state (the slow momentum), one
     /// tensor per model parameter in `Module::parameters()` order, for
@@ -126,11 +121,7 @@ pub trait OuterOptimizer: Send {
 pub struct OuterAvg;
 
 impl OuterOptimizer for OuterAvg {
-    fn outer_step(
-        &mut self,
-        _prev_global: &[Tensor],
-        consensus: &[Tensor],
-    ) -> Result<Vec<Tensor>> {
+    fn outer_step(&mut self, _prev_global: &[Tensor], consensus: &[Tensor]) -> Result<Vec<Tensor>> {
         // Element-wise identity: return the consensus unchanged. The clones
         // are shallow (shared storage); the caller serializes them read-only
         // and never mutates, so sharing storage is safe here.
@@ -174,16 +165,16 @@ impl SlowMomentum {
     /// New SlowMo outer optimizer with slow learning rate `lr` and slow
     /// momentum `mu`. Typical SlowMo settings are `lr ≈ 1.0`, `mu ≈ 0.9`.
     pub fn new(lr: f64, mu: f64) -> Self {
-        SlowMomentum { lr, mu, velocity: Vec::new() }
+        SlowMomentum {
+            lr,
+            mu,
+            velocity: Vec::new(),
+        }
     }
 }
 
 impl OuterOptimizer for SlowMomentum {
-    fn outer_step(
-        &mut self,
-        prev_global: &[Tensor],
-        consensus: &[Tensor],
-    ) -> Result<Vec<Tensor>> {
+    fn outer_step(&mut self, prev_global: &[Tensor], consensus: &[Tensor]) -> Result<Vec<Tensor>> {
         let n = consensus.len();
         // A parameter-count change (only on a fresh / mismatched buffer)
         // restarts the momentum from zero. `mu * 0 + g == g`, so the first
@@ -253,16 +244,16 @@ impl NesterovMomentum {
     /// New DiLoCo outer optimizer with outer learning rate `lr` and outer
     /// momentum `mu`. Reference DiLoCo settings: `lr ≈ 0.7`, `mu ≈ 0.9`.
     pub fn new(lr: f64, mu: f64) -> Self {
-        NesterovMomentum { lr, mu, velocity: Vec::new() }
+        NesterovMomentum {
+            lr,
+            mu,
+            velocity: Vec::new(),
+        }
     }
 }
 
 impl OuterOptimizer for NesterovMomentum {
-    fn outer_step(
-        &mut self,
-        prev_global: &[Tensor],
-        consensus: &[Tensor],
-    ) -> Result<Vec<Tensor>> {
+    fn outer_step(&mut self, prev_global: &[Tensor], consensus: &[Tensor]) -> Result<Vec<Tensor>> {
         let n = consensus.len();
         let fresh = self.velocity.len() != n;
         let mut new_global = Vec::with_capacity(n);
@@ -471,7 +462,10 @@ mod tests {
         assert_eq!(c_out, control_frame, "Control frame must pass through");
 
         let p_out = stepper.process_frame(params_frame.clone()).unwrap();
-        assert_eq!(p_out, params_frame, "params frame must be byte-identical under OuterAvg");
+        assert_eq!(
+            p_out, params_frame,
+            "params frame must be byte-identical under OuterAvg"
+        );
 
         let b_out = stepper.process_frame(buffers_frame.clone()).unwrap();
         assert_eq!(b_out, buffers_frame, "buffers frame must pass through");
@@ -480,7 +474,10 @@ mod tests {
         // identity output.
         stepper.process_frame(control_frame).unwrap();
         let p_out2 = stepper.process_frame(params_frame.clone()).unwrap();
-        assert_eq!(p_out2, params_frame, "params still byte-identical second window");
+        assert_eq!(
+            p_out2, params_frame,
+            "params still byte-identical second window"
+        );
     }
 
     /// A bf16 params frame steps in f32 and re-serializes as bf16 — the
@@ -496,7 +493,10 @@ mod tests {
 
         let mut stepper = OuterStepper::new(Box::new(OuterAvg));
         let out = stepper.process_frame(params_frame.clone()).unwrap();
-        assert_eq!(out, params_frame, "OuterAvg identity is byte-exact in bf16 too");
+        assert_eq!(
+            out, params_frame,
+            "OuterAvg identity is byte-exact in bf16 too"
+        );
     }
 
     #[test]
@@ -517,7 +517,10 @@ mod tests {
             .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
             .unwrap();
         let w2v = w2[0].to_f32_vec().unwrap();
-        assert!((w2v[0] - 0.75).abs() < 1e-6 && (w2v[1] - 1.5).abs() < 1e-6, "got {w2v:?}");
+        assert!(
+            (w2v[0] - 0.75).abs() < 1e-6 && (w2v[1] - 1.5).abs() < 1e-6,
+            "got {w2v:?}"
+        );
 
         // Window 3: g=[0.05,0.1], v=0.9*[0.5,1.0]+g=[0.5,1.0],
         // step=[0.25,0.5], new=[0.75,1.5]-step=[0.5,1.0]. Confirms momentum
@@ -526,7 +529,10 @@ mod tests {
             .outer_step(&[t(&[0.75, 1.5], &[2])], &[t(&[0.7, 1.4], &[2])])
             .unwrap();
         let w3v = w3[0].to_f32_vec().unwrap();
-        assert!((w3v[0] - 0.5).abs() < 1e-6 && (w3v[1] - 1.0).abs() < 1e-6, "got {w3v:?}");
+        assert!(
+            (w3v[0] - 0.5).abs() < 1e-6 && (w3v[1] - 1.0).abs() < 1e-6,
+            "got {w3v:?}"
+        );
     }
 
     #[test]
@@ -554,13 +560,18 @@ mod tests {
         let mut p2 = tensors_to_round_frame(&[&t(&[1.0, 2.0], &[2])], DTYPE_F32).unwrap();
         p2.weight = 1.0;
         let p2_out = stepper.process_frame(p2).unwrap();
-        let stepped = round_frame_to_tensors(&p2_out).unwrap()[0].to_f32_vec().unwrap();
+        let stepped = round_frame_to_tensors(&p2_out).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
         assert!(
             (stepped[0] - 1.5).abs() < 1e-6 && (stepped[1] - 3.0).abs() < 1e-6,
             "second-window params stepped: got {stepped:?}"
         );
         let b2_out = stepper.process_frame(buffers.clone()).unwrap();
-        assert_eq!(b2_out, buffers, "buffers still pass through after a real step");
+        assert_eq!(
+            b2_out, buffers,
+            "buffers still pass through after a real step"
+        );
     }
 
     #[test]
@@ -577,26 +588,39 @@ mod tests {
         // (the resume is faithful, vs re-seeding velocity from zero).
         let mut warm = SlowMomentum::new(0.5, 0.9);
         // Two windows to build non-trivial momentum.
-        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])]).unwrap();
-        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])]).unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])])
+            .unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
+            .unwrap();
 
-        let saved = warm.checkpoint_state().expect("has momentum after stepping");
+        let saved = warm
+            .checkpoint_state()
+            .expect("has momentum after stepping");
         let mut resumed = SlowMomentum::new(0.5, 0.9);
         resumed.load_checkpoint_state(saved).unwrap();
 
         // Identical next step from identical inputs => momentum was carried.
         let prev = [t(&[0.75, 1.5], &[2])];
         let cons = [t(&[0.7, 1.4], &[2])];
-        let a = warm.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
-        let b = resumed.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        let a = warm.outer_step(&prev, &cons).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
+        let b = resumed.outer_step(&prev, &cons).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
         for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-            assert!((x - y).abs() < 1e-6, "param[{i}]: resumed {y} != warmed {x}");
+            assert!(
+                (x - y).abs() < 1e-6,
+                "param[{i}]: resumed {y} != warmed {x}"
+            );
         }
 
         // Sanity: a from-zero instance would differ on this step (proves the
         // round-trip carried real state, not nothing).
         let mut fresh = SlowMomentum::new(0.5, 0.9);
-        let c = fresh.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        let c = fresh.outer_step(&prev, &cons).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
         assert!(
             (a[0] - c[0]).abs() > 1e-6 || (a[1] - c[1]).abs() > 1e-6,
             "warmed and from-zero should differ, else the test is vacuous"
@@ -605,8 +629,14 @@ mod tests {
 
     #[test]
     fn nesterov_resets_inner_others_dont() {
-        assert!(NesterovMomentum::new(0.7, 0.9).resets_inner(), "DiLoCo resets inner");
-        assert!(!SlowMomentum::new(0.5, 0.7).resets_inner(), "SlowMo keeps inner continuous");
+        assert!(
+            NesterovMomentum::new(0.7, 0.9).resets_inner(),
+            "DiLoCo resets inner"
+        );
+        assert!(
+            !SlowMomentum::new(0.5, 0.7).resets_inner(),
+            "SlowMo keeps inner continuous"
+        );
         assert!(!OuterAvg.resets_inner(), "OuterAvg keeps inner continuous");
     }
 
@@ -629,7 +659,10 @@ mod tests {
             .outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
             .unwrap();
         let w2v = w2[0].to_f32_vec().unwrap();
-        assert!((w2v[0] - 0.525).abs() < 1e-6 && (w2v[1] - 1.05).abs() < 1e-6, "got {w2v:?}");
+        assert!(
+            (w2v[0] - 0.525).abs() < 1e-6 && (w2v[1] - 1.05).abs() < 1e-6,
+            "got {w2v:?}"
+        );
 
         // Window 3: prev=[0.525,1.05], consensus=[0.5,1.0]. g=[0.025,0.05].
         // v = 0.9*[0.5,1.0]+[0.025,0.05] = [0.475,0.95]. look_ahead =
@@ -640,21 +673,30 @@ mod tests {
             .outer_step(&[t(&[0.525, 1.05], &[2])], &[t(&[0.5, 1.0], &[2])])
             .unwrap();
         let w3v = w3[0].to_f32_vec().unwrap();
-        assert!((w3v[0] - 0.29875).abs() < 1e-5 && (w3v[1] - 0.5975).abs() < 1e-5, "got {w3v:?}");
+        assert!(
+            (w3v[0] - 0.29875).abs() < 1e-5 && (w3v[1] - 0.5975).abs() < 1e-5,
+            "got {w3v:?}"
+        );
     }
 
     #[test]
     fn nesterov_checkpoint_round_trip() {
         let mut warm = NesterovMomentum::new(0.5, 0.9);
-        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])]).unwrap();
-        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])]).unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[1.0, 2.0], &[2])])
+            .unwrap();
+        warm.outer_step(&[t(&[1.0, 2.0], &[2])], &[t(&[0.5, 1.0], &[2])])
+            .unwrap();
         let saved = warm.checkpoint_state().expect("has momentum");
         let mut resumed = NesterovMomentum::new(0.5, 0.9);
         resumed.load_checkpoint_state(saved).unwrap();
         let prev = [t(&[0.525, 1.05], &[2])];
         let cons = [t(&[0.5, 1.0], &[2])];
-        let a = warm.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
-        let b = resumed.outer_step(&prev, &cons).unwrap()[0].to_f32_vec().unwrap();
+        let a = warm.outer_step(&prev, &cons).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
+        let b = resumed.outer_step(&prev, &cons).unwrap()[0]
+            .to_f32_vec()
+            .unwrap();
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-6, "resumed {y} != warmed {x}");
         }

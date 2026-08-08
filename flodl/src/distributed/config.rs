@@ -29,9 +29,8 @@ use crate::data::BatchDataSet;
 use crate::nn::Module;
 
 use super::ddp_run::{
-    ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard,
-    EpochCallbackPolicy, EpochFn, EvalFn, EvalResultFn,
-    MetricsFn, SchedulerFn,
+    ApplyPolicy, AverageBackend, CheckpointFn, ConvergenceGuard, EpochCallbackPolicy, EpochFn,
+    EvalFn, EvalResultFn, MetricsFn, SchedulerFn,
 };
 use super::launcher::FullCluster;
 
@@ -327,23 +326,50 @@ impl ElCheConfig {
     // -- Chained setters --------------------------------------------------
 
     /// Override the mode.
-    pub fn mode(mut self, m: ElCheMode) -> Self { self.mode = m; self }
+    pub fn mode(mut self, m: ElCheMode) -> Self {
+        self.mode = m;
+        self
+    }
     /// Set the initial anchor.
-    pub fn anchor(mut self, n: usize) -> Self { self.anchor = n; self }
+    pub fn anchor(mut self, n: usize) -> Self {
+        self.anchor = n;
+        self
+    }
     /// Set the maximum anchor (auto-tune ceiling).
-    pub fn max_anchor(mut self, n: usize) -> Self { self.max_anchor = Some(n); self }
+    pub fn max_anchor(mut self, n: usize) -> Self {
+        self.max_anchor = Some(n);
+        self
+    }
     /// Set the minimum anchor (auto-tune floor).
-    pub fn min_anchor(mut self, n: usize) -> Self { self.min_anchor = Some(n); self }
+    pub fn min_anchor(mut self, n: usize) -> Self {
+        self.min_anchor = Some(n);
+        self
+    }
     /// Set the ElChe overhead target (fraction of compute time).
-    pub fn overhead_target(mut self, f: f64) -> Self { self.overhead_target = Some(f); self }
+    pub fn overhead_target(mut self, f: f64) -> Self {
+        self.overhead_target = Some(f);
+        self
+    }
     /// Set the maximum batch lead between fastest and slowest worker.
-    pub fn max_batch_diff(mut self, n: usize) -> Self { self.max_batch_diff = Some(n); self }
+    pub fn max_batch_diff(mut self, n: usize) -> Self {
+        self.max_batch_diff = Some(n);
+        self
+    }
     /// Allow ElChe to relax the anchor upward on stable convergence.
-    pub fn relax_up(mut self, on: bool) -> Self { self.relax_up = on; self }
+    pub fn relax_up(mut self, on: bool) -> Self {
+        self.relax_up = on;
+        self
+    }
     /// Set explicit per-rank partition ratios.
-    pub fn partition_ratios(mut self, r: Vec<f64>) -> Self { self.partition_ratios = Some(r); self }
+    pub fn partition_ratios(mut self, r: Vec<f64>) -> Self {
+        self.partition_ratios = Some(r);
+        self
+    }
     /// Enable the LR-aware meta-controller.
-    pub fn meta_controller(mut self, on: bool) -> Self { self.meta_controller = on; self }
+    pub fn meta_controller(mut self, on: bool) -> Self {
+        self.meta_controller = on;
+        self
+    }
     /// Override the convergence guard. Pass a [`Box<dyn ConvergenceGuard>`].
     pub fn convergence_guard<G>(mut self, g: G) -> Self
     where
@@ -353,21 +379,39 @@ impl ElCheConfig {
         self
     }
     /// Set the EASGD elastic-averaging weight (CpuAsync only).
-    pub fn easgd_alpha(mut self, a: f64) -> Self { self.easgd_alpha = Some(a); self }
+    pub fn easgd_alpha(mut self, a: f64) -> Self {
+        self.easgd_alpha = Some(a);
+        self
+    }
     /// Set the default convergence-guard divergence threshold.
-    pub fn divergence_threshold(mut self, t: f64) -> Self { self.divergence_threshold = Some(t); self }
+    pub fn divergence_threshold(mut self, t: f64) -> Self {
+        self.divergence_threshold = Some(t);
+        self
+    }
     /// Disable the convergence guard (overhead auto-tune drives cadence alone).
-    pub fn no_divergence_guard(mut self) -> Self { self.no_divergence_guard = true; self }
+    pub fn no_divergence_guard(mut self) -> Self {
+        self.no_divergence_guard = true;
+        self
+    }
     /// Set the CpuAsync streaming lookahead bound (max batches past the planned sync).
-    pub fn max_overshoot(mut self, n: usize) -> Self { self.max_overshoot = Some(n); self }
+    pub fn max_overshoot(mut self, n: usize) -> Self {
+        self.max_overshoot = Some(n);
+        self
+    }
     /// Set the consensus allocation-weighting exponent `γ` (see [`Self::gamma`]).
     /// `1.0` = plain work-weighting (default), `0.0` = unweighted average,
     /// `−1.0` = per-step-equal. Honored on both backends.
-    pub fn gamma(mut self, g: f64) -> Self { self.gamma = g; self }
+    pub fn gamma(mut self, g: f64) -> Self {
+        self.gamma = g;
+        self
+    }
     /// Ship the CPU-averaging plane's model traffic as bfloat16 (see
     /// [`Self::bf16_wire`]). Halves snapshots, fold traffic, and wire
     /// payloads; averaging still accumulates in f32.
-    pub fn bf16_wire(mut self, on: bool) -> Self { self.bf16_wire = on; self }
+    pub fn bf16_wire(mut self, on: bool) -> Self {
+        self.bf16_wire = on;
+        self
+    }
 }
 
 impl Default for ElCheConfig {
@@ -396,7 +440,13 @@ impl std::fmt::Debug for ElCheConfig {
             .field("relax_up", &self.relax_up)
             .field("partition_ratios", &self.partition_ratios)
             .field("meta_controller", &self.meta_controller)
-            .field("convergence_guard", &self.convergence_guard.as_ref().map(|_| "<dyn ConvergenceGuard>"))
+            .field(
+                "convergence_guard",
+                &self
+                    .convergence_guard
+                    .as_ref()
+                    .map(|_| "<dyn ConvergenceGuard>"),
+            )
             .field("easgd_alpha", &self.easgd_alpha)
             .field("divergence_threshold", &self.divergence_threshold)
             .field("no_divergence_guard", &self.no_divergence_guard)
@@ -692,17 +742,29 @@ impl<M: Module> TrainerConfig<M> {
     // -- Chained setters --------------------------------------------------
 
     /// Set the batch size.
-    pub fn batch_size(mut self, n: usize) -> Self { self.batch_size = n; self }
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n;
+        self
+    }
 
     /// Enable / disable the rank workers' device-resident sample pool
     /// (see [`Self::vram_pool`]).
-    pub fn with_vram_pool(mut self, enabled: bool) -> Self { self.vram_pool = enabled; self }
+    pub fn with_vram_pool(mut self, enabled: bool) -> Self {
+        self.vram_pool = enabled;
+        self
+    }
 
     /// Augmentation multiplicity (see [`Self::augment`]).
-    pub fn with_augment(mut self, k: usize) -> Self { self.augment = k.max(1); self }
+    pub fn with_augment(mut self, k: usize) -> Self {
+        self.augment = k.max(1);
+        self
+    }
 
     /// Slices per data pass (see [`Self::epoch_splits`]).
-    pub fn with_epoch_splits(mut self, n: usize) -> Self { self.epoch_splits = n.max(1); self }
+    pub fn with_epoch_splits(mut self, n: usize) -> Self {
+        self.epoch_splits = n.max(1);
+        self
+    }
 
     /// VRAM share for each rank's data plane (see [`Self::vram_max_usage`]).
     pub fn with_vram_max_usage(mut self, max_usage: f64) -> Self {
@@ -724,7 +786,6 @@ impl<M: Module> TrainerConfig<M> {
         self.gpu_ram_share = Some(share.max(0.0));
         self
     }
-
 
     /// Pinned RAM sample retention on rank workers (see
     /// [`Self::sample_cache`]).
@@ -748,10 +809,13 @@ impl<M: Module> TrainerConfig<M> {
     /// Delivery transform (see [`Self::transform`]).
     pub fn with_transform(
         mut self,
-        f: impl Fn(Vec<crate::tensor::Tensor>, &[crate::data::PickKey]) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
-            + Send
-            + Sync
-            + 'static,
+        f: impl Fn(
+            Vec<crate::tensor::Tensor>,
+            &[crate::data::PickKey],
+        ) -> crate::tensor::Result<Vec<crate::tensor::Tensor>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.transform = Some(crate::data::TransformFn::new(f));
         self
@@ -769,38 +833,83 @@ impl<M: Module> TrainerConfig<M> {
         self
     }
     /// Set the number of epochs.
-    pub fn num_epochs(mut self, n: usize) -> Self { self.num_epochs = n; self }
+    pub fn num_epochs(mut self, n: usize) -> Self {
+        self.num_epochs = n;
+        self
+    }
     /// Replace the nested ElChe config.
-    pub fn elche(mut self, cfg: ElCheConfig) -> Self { self.elche = cfg; self }
+    pub fn elche(mut self, cfg: ElCheConfig) -> Self {
+        self.elche = cfg;
+        self
+    }
     /// Set the gradient-clipping max norm.
-    pub fn max_grad_norm(mut self, n: f64) -> Self { self.max_grad_norm = Some(n); self }
+    pub fn max_grad_norm(mut self, n: f64) -> Self {
+        self.max_grad_norm = Some(n);
+        self
+    }
     /// Set the periodic checkpoint cadence (in epochs).
-    pub fn checkpoint_every(mut self, n: usize) -> Self { self.checkpoint_every = Some(n); self }
+    pub fn checkpoint_every(mut self, n: usize) -> Self {
+        self.checkpoint_every = Some(n);
+        self
+    }
     /// Set the cluster-mode checkpoint bundle stem (save side).
-    pub fn save_path(mut self, p: impl Into<String>) -> Self { self.save_path = Some(p.into()); self }
+    pub fn save_path(mut self, p: impl Into<String>) -> Self {
+        self.save_path = Some(p.into());
+        self
+    }
     /// Resume training from a previously-saved bundle stem.
-    pub fn resume_from(mut self, p: impl Into<String>) -> Self { self.resume_from = Some(p.into()); self }
+    pub fn resume_from(mut self, p: impl Into<String>) -> Self {
+        self.resume_from = Some(p.into());
+        self
+    }
     /// Arm a one-shot mid-run checkpoint at the given epoch. Pairs with
     /// [`Self::save_path`]. See [`Self::checkpoint_at_epoch`].
-    pub fn checkpoint_at_epoch(mut self, n: usize) -> Self { self.checkpoint_at_epoch = Some(n); self }
+    pub fn checkpoint_at_epoch(mut self, n: usize) -> Self {
+        self.checkpoint_at_epoch = Some(n);
+        self
+    }
 
     /// Register a checkpoint callback. Fires on the selected rank.
-    pub fn checkpoint_fn(mut self, f: CheckpointFn<M>) -> Self { self.checkpoint_fn = Some(f); self }
+    pub fn checkpoint_fn(mut self, f: CheckpointFn<M>) -> Self {
+        self.checkpoint_fn = Some(f);
+        self
+    }
     /// Register a per-epoch callback (inside each worker thread).
-    pub fn epoch_fn(mut self, f: EpochFn<M>) -> Self { self.epoch_fn = Some(f); self }
+    pub fn epoch_fn(mut self, f: EpochFn<M>) -> Self {
+        self.epoch_fn = Some(f);
+        self
+    }
     /// Register a host-side metrics callback.
-    pub fn metrics_fn(mut self, f: MetricsFn) -> Self { self.metrics_fn = Some(f); self }
+    pub fn metrics_fn(mut self, f: MetricsFn) -> Self {
+        self.metrics_fn = Some(f);
+        self
+    }
     /// Register the LR-scheduler factory.
-    pub fn scheduler_fn(mut self, f: SchedulerFn) -> Self { self.scheduler_fn = Some(f); self }
+    pub fn scheduler_fn(mut self, f: SchedulerFn) -> Self {
+        self.scheduler_fn = Some(f);
+        self
+    }
     /// Register the eval callback (paired with `eval_dataset`).
-    pub fn eval_fn(mut self, f: EvalFn<M>) -> Self { self.eval_fn = Some(f); self }
+    pub fn eval_fn(mut self, f: EvalFn<M>) -> Self {
+        self.eval_fn = Some(f);
+        self
+    }
     /// Set the held-out eval dataset.
-    pub fn eval_dataset(mut self, ds: Arc<dyn BatchDataSet>) -> Self { self.eval_dataset = Some(ds); self }
+    pub fn eval_dataset(mut self, ds: Arc<dyn BatchDataSet>) -> Self {
+        self.eval_dataset = Some(ds);
+        self
+    }
     /// Register the controller-side eval-result handler.
-    pub fn eval_result_fn(mut self, f: EvalResultFn) -> Self { self.eval_result_fn = Some(f); self }
+    pub fn eval_result_fn(mut self, f: EvalResultFn) -> Self {
+        self.eval_result_fn = Some(f);
+        self
+    }
     /// Set the eval cadence in epochs (see the `eval_every` field for
     /// the default when an `eval_fn` is registered without a cadence).
-    pub fn eval_every(mut self, n: usize) -> Self { self.eval_every = Some(n); self }
+    pub fn eval_every(mut self, n: usize) -> Self {
+        self.eval_every = Some(n);
+        self
+    }
 
     /// Emit up to `n` sub-epoch monitor reports per epoch, at reduce
     /// boundaries (see the `reports_per_epoch` field). `0` disables.
@@ -813,7 +922,11 @@ impl<M: Module> TrainerConfig<M> {
     /// capped at `max_bytes` (drop-oldest; `0` = the library default).
     pub fn record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
         self.record_log_dir = Some(dir.into());
-        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
+        self.max_log_size = if max_bytes == 0 {
+            None
+        } else {
+            Some(max_bytes)
+        };
         self
     }
     /// Override which rank fires per-epoch callbacks.
@@ -847,13 +960,18 @@ mod tests {
     #[test]
     fn elche_mode_split_round_trip() {
         for m in [
-            ElCheMode::NcclSync, ElCheMode::NcclCadence,
-            ElCheMode::CpuSync, ElCheMode::CpuCadence, ElCheMode::CpuAsync,
+            ElCheMode::NcclSync,
+            ElCheMode::NcclCadence,
+            ElCheMode::CpuSync,
+            ElCheMode::CpuCadence,
+            ElCheMode::CpuAsync,
         ] {
             let (p, b) = m.split();
             let expected_backend = match m {
                 ElCheMode::NcclSync | ElCheMode::NcclCadence => AverageBackend::Nccl,
-                ElCheMode::CpuSync | ElCheMode::CpuCadence | ElCheMode::CpuAsync => AverageBackend::Cpu,
+                ElCheMode::CpuSync | ElCheMode::CpuCadence | ElCheMode::CpuAsync => {
+                    AverageBackend::Cpu
+                }
             };
             assert_eq!(b, expected_backend, "{:?} backend split", m);
             let expected_policy = match m {

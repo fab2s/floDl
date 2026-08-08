@@ -31,8 +31,8 @@ pub mod record;
 pub mod record_log;
 pub mod record_store;
 pub mod resources;
-pub mod timeline;
 mod server;
+pub mod timeline;
 pub(crate) use server::dashboard_bind_is_loopback;
 
 use std::fmt::Write;
@@ -40,9 +40,12 @@ use std::time::{Duration, Instant};
 
 use crate::graph::Graph;
 
-pub use format::{format_eta, format_bytes, format_metric};
-pub use resources::{ResourceSample, ResourceSampler, GpuSnapshot};
-pub use timeline::{Timeline, TimelineBroadcast, TimelineEvent, EventKind, TimelineSample, GpuTimelineSample, RankTimelineSample, RankGpuSample, TimelineSummary};
+pub use format::{format_bytes, format_eta, format_metric};
+pub use resources::{GpuSnapshot, ResourceSample, ResourceSampler};
+pub use timeline::{
+    EventKind, GpuTimelineSample, RankGpuSample, RankTimelineSample, Timeline, TimelineBroadcast,
+    TimelineEvent, TimelineSample, TimelineSummary,
+};
 
 /// DDP metrics for a single GPU (throughput, batch split, shard size).
 #[derive(Debug, Clone, Default)]
@@ -92,7 +95,9 @@ pub trait Metrics {
     /// the coordinator's aggregated per-rank view; Graph-backed
     /// sources stay empty because a Graph reference only ever names
     /// a single device.
-    fn gpu_metrics(&self) -> Vec<GpuMetrics> { Vec::new() }
+    fn gpu_metrics(&self) -> Vec<GpuMetrics> {
+        Vec::new()
+    }
 }
 
 /// Plain metric slice: `&[("loss", val)]`.
@@ -187,14 +192,18 @@ impl Metrics for &crate::distributed::EpochMetrics {
     }
 
     fn gpu_metrics(&self) -> Vec<GpuMetrics> {
-        self.device_indices.iter().enumerate().map(|(i, &dev)| {
-            GpuMetrics {
-                device_index: dev,
-                throughput: self.per_rank_throughput.get(i).copied().unwrap_or(0.0),
-                chunk_ratio: self.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
-                shard_size: 0, // not tracked per-epoch in builder mode
-            }
-        }).collect()
+        self.device_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &dev)| {
+                GpuMetrics {
+                    device_index: dev,
+                    throughput: self.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                    chunk_ratio: self.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
+                    shard_size: 0, // not tracked per-epoch in builder mode
+                }
+            })
+            .collect()
     }
 }
 
@@ -273,9 +282,7 @@ impl Monitor {
         // launcher's dashboard sink never receives the frame, so the
         // string is just held in a static Mutex until process exit).
         if Self::in_cluster_mode() {
-            crate::distributed::cluster_dashboard_emit::stash_hardware(
-                hardware.clone(),
-            );
+            crate::distributed::cluster_dashboard_emit::stash_hardware(hardware.clone());
         }
         Self {
             total_epochs,
@@ -283,9 +290,7 @@ impl Monitor {
             start_time: Instant::now(),
             sampler: ResourceSampler::new(),
             server: None,
-            records: std::sync::Arc::new(std::sync::Mutex::new(
-                record_store::RecordStore::new(),
-            )),
+            records: std::sync::Arc::new(std::sync::Mutex::new(record_store::RecordStore::new())),
             save_html: None,
             svg_snapshot: None,
             metadata: None,
@@ -312,10 +317,7 @@ impl Monitor {
     /// per-rank envelope. Single-process / `Ddp::wrap`-thread has
     /// neither.
     fn in_cluster_mode() -> bool {
-        matches!(
-            crate::distributed::LocalCluster::from_env(),
-            Ok(Some(_))
-        )
+        matches!(crate::distributed::LocalCluster::from_env(), Ok(Some(_)))
     }
 
     /// `true` when this process is the launcher trampoline. The
@@ -327,10 +329,7 @@ impl Monitor {
     /// exclusive (per the `(FLODL_INTERNAL_FULL_CLUSTER_JSON, FLODL_INTERNAL_CLUSTER_JSON)`
     /// table in `launcher.rs`).
     fn in_launcher_process() -> bool {
-        std::env::var_os(
-            crate::distributed::launcher::ENV_FULL_CLUSTER_JSON,
-        )
-        .is_some()
+        std::env::var_os(crate::distributed::launcher::ENV_FULL_CLUSTER_JSON).is_some()
     }
 
     /// Suppress the terminal `"training complete in …"` line emitted
@@ -415,10 +414,7 @@ impl Monitor {
     /// `Self::serve` would otherwise no-op). Does not print the
     /// `dashboard: …` line — the sink prints `cluster dashboard: …`
     /// with the controller-host URL.
-    pub(crate) fn serve_local_unconditional(
-        &mut self,
-        port: u16,
-    ) -> std::io::Result<()> {
+    pub(crate) fn serve_local_unconditional(&mut self, port: u16) -> std::io::Result<()> {
         self.bind_dashboard_locally(port)
     }
 
@@ -447,7 +443,12 @@ impl Monitor {
     /// crosses a channel and `shutdown` is what drains it.
     fn records_snapshot(&self) -> Vec<serde_json::Value> {
         let store = self.records.lock().unwrap();
-        store.meta().into_iter().chain(store.all()).cloned().collect()
+        store
+            .meta()
+            .into_iter()
+            .chain(store.all())
+            .cloned()
+            .collect()
     }
 
     /// Shut the dashboard's HTTP server down + emit the SSE `complete`
@@ -557,9 +558,7 @@ impl Monitor {
             (None, None) => return,
         };
         if Self::in_cluster_mode() {
-            crate::distributed::cluster_dashboard_emit::stash_metadata(
-                merged.to_string(),
-            );
+            crate::distributed::cluster_dashboard_emit::stash_metadata(merged.to_string());
         }
         if let Some(ref srv) = self.server {
             srv.set_metadata(merged.to_string());
@@ -653,10 +652,7 @@ impl Monitor {
         self.graph_label = label.map(|s| s.to_string());
         self.graph_hash = hash.map(|s| s.to_string());
         if let Some(ref srv) = self.server {
-            srv.set_label_hash(
-                self.graph_label.clone(),
-                self.graph_hash.clone(),
-            );
+            srv.set_label_hash(self.graph_label.clone(), self.graph_hash.clone());
         }
     }
 
@@ -664,10 +660,7 @@ impl Monitor {
         self.graph_label = graph.label().map(|s| s.to_string());
         self.graph_hash = Some(graph.structural_hash().to_string());
         if let Some(ref srv) = self.server {
-            srv.set_label_hash(
-                self.graph_label.clone(),
-                self.graph_hash.clone(),
-            );
+            srv.set_label_hash(self.graph_label.clone(), self.graph_hash.clone());
         }
         self.capture_param_info(graph);
     }
@@ -677,10 +670,12 @@ impl Monitor {
         use crate::nn::Module;
 
         let params = graph.parameters();
-        let total: i64 = params.iter()
+        let total: i64 = params
+            .iter()
             .map(|p| p.variable.shape().iter().product::<i64>())
             .sum();
-        let trainable: i64 = params.iter()
+        let trainable: i64 = params
+            .iter()
             .filter(|p| !p.is_frozen())
             .map(|p| p.variable.shape().iter().product::<i64>())
             .sum();
@@ -747,13 +742,19 @@ impl Monitor {
         let mut line = String::with_capacity(256);
         let epoch_display = epoch + 1;
         let width = digit_count(self.total_epochs);
-        let _ = write!(line, "  epoch {:>w$}/{}", epoch_display, self.total_epochs, w = width);
+        let _ = write!(
+            line,
+            "  epoch {:>w$}/{}",
+            epoch_display,
+            self.total_epochs,
+            w = width
+        );
 
         for (name, val) in &metrics {
             let _ = write!(line, "  {}={}", name, format_metric(*val));
         }
 
-        let _ = write!(line, "  [{}",format_eta(duration_secs));
+        let _ = write!(line, "  [{}", format_eta(duration_secs));
 
         // ETA from the recent-epoch pace: mean of the last ≤5 epoch
         // durations, NOT the global elapsed/epochs average. The global
@@ -933,7 +934,13 @@ impl Monitor {
         let width = digit_count(self.total_epochs);
 
         for record in &self.epochs {
-            let _ = write!(b, "epoch {:>w$}/{}", record.epoch + 1, self.total_epochs, w = width);
+            let _ = write!(
+                b,
+                "epoch {:>w$}/{}",
+                record.epoch + 1,
+                self.total_epochs,
+                w = width
+            );
             for (name, val) in &record.metrics {
                 let _ = write!(b, "  {}={}", name, format_metric(*val));
             }
@@ -978,17 +985,32 @@ impl Monitor {
             for (_, val) in &record.metrics {
                 let _ = write!(b, ",{:.8}", val);
             }
-            let spill = match (record.resources.vram_allocated_bytes, record.resources.vram_total_bytes) {
+            let spill = match (
+                record.resources.vram_allocated_bytes,
+                record.resources.vram_total_bytes,
+            ) {
                 (Some(alloc), Some(total)) if alloc > total => (alloc - total).to_string(),
                 _ => String::new(),
             };
             let _ = write!(
                 b,
                 ",{},{},{},{},{}",
-                record.resources.cpu_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
-                record.resources.ram_used_bytes.map_or("".to_string(), |v| v.to_string()),
-                record.resources.gpu_util_percent.map_or("".to_string(), |v| format!("{:.1}", v)),
-                record.resources.vram_allocated_bytes.map_or("".to_string(), |v| v.to_string()),
+                record
+                    .resources
+                    .cpu_percent
+                    .map_or("".to_string(), |v| format!("{:.1}", v)),
+                record
+                    .resources
+                    .ram_used_bytes
+                    .map_or("".to_string(), |v| v.to_string()),
+                record
+                    .resources
+                    .gpu_util_percent
+                    .map_or("".to_string(), |v| format!("{:.1}", v)),
+                record
+                    .resources
+                    .vram_allocated_bytes
+                    .map_or("".to_string(), |v| v.to_string()),
                 spill,
             );
             b.push('\n');
@@ -1005,7 +1027,9 @@ impl Monitor {
         // Serialize all epochs to JSON array
         let mut data_json = String::from("[");
         for (i, record) in self.epochs.iter().enumerate() {
-            if i > 0 { data_json.push(','); }
+            if i > 0 {
+                data_json.push(',');
+            }
             let _ = write!(data_json, "{}", self.epoch_record_to_json(record));
         }
         data_json.push(']');
@@ -1021,7 +1045,9 @@ impl Monitor {
             let snap = self.records_snapshot();
             let mut s = String::from("[");
             for (i, rec) in snap.iter().enumerate() {
-                if i > 0 { s.push(','); }
+                if i > 0 {
+                    s.push(',');
+                }
                 let _ = write!(s, "{rec}");
             }
             s.push(']');
@@ -1058,10 +1084,15 @@ impl Monitor {
 
         let total_time = self.start_time.elapsed().as_secs_f64();
 
-        let hw_js = format!("\"{}\"", self.hardware.replace('\\', "\\\\").replace('"', "\\\""));
+        let hw_js = format!(
+            "\"{}\"",
+            self.hardware.replace('\\', "\\\\").replace('"', "\\\"")
+        );
 
         // GPU init from first epoch's resource data
-        let gpu_init_js = self.epochs.first()
+        let gpu_init_js = self
+            .epochs
+            .first()
             .filter(|e| e.resources.gpus.len() >= 2)
             .map(|e| Self::gpu_init_json(&e.resources.gpus))
             .unwrap_or_else(|| "null".to_string());
@@ -1086,14 +1117,19 @@ impl Monitor {
             hw_js,
             gpu_init_js,
         );
-        let archive_block = format!("<script>{}</script>", neutralize_script_close(&archive_consts));
+        let archive_block = format!(
+            "<script>{}</script>",
+            neutralize_script_close(&archive_consts)
+        );
 
         let template = include_str!("dashboard.html");
         // `replacen(.., 1)`: the archive constants belong ahead of the FIRST
         // script block only (see the same note in `server::serve_html`).
         let html = template
-            .replace("<title>floDl Training Dashboard</title>",
-                     "<title>floDl Training Report</title>")
+            .replace(
+                "<title>floDl Training Dashboard</title>",
+                "<title>floDl Training Report</title>",
+            )
             .replacen("<script>", &format!("{}\n<script>", archive_block), 1);
 
         Ok(html)
@@ -1110,19 +1146,25 @@ impl Monitor {
             first = false;
         }
         if let (Some(used), Some(total)) = (res.ram_used_bytes, res.ram_total_bytes) {
-            if !first { b.push(','); }
+            if !first {
+                b.push(',');
+            }
             let _ = write!(b, "\"ram_used\":{},\"ram_total\":{}", used, total);
             first = false;
         }
         if let Some(gpu) = res.gpu_util_percent
             && gpu.is_finite()
         {
-            if !first { b.push(','); }
+            if !first {
+                b.push(',');
+            }
             let _ = write!(b, "\"gpu\":{:.1}", gpu);
             first = false;
         }
         if let Some(alloc) = res.vram_allocated_bytes {
-            if !first { b.push(','); }
+            if !first {
+                b.push(',');
+            }
             let _ = write!(b, "\"vram_alloc\":{}", alloc);
             if let Some(total) = res.vram_total_bytes {
                 let _ = write!(b, ",\"vram_total\":{}", total);
@@ -1140,7 +1182,9 @@ impl Monitor {
         let hw = &res.gpus;
         let n = hw.len().max(ddp.len());
         for i in 0..n {
-            if i > 0 { b.push(','); }
+            if i > 0 {
+                b.push(',');
+            }
             b.push('{');
             let mut first = true;
             // Hardware data from GpuSnapshot
@@ -1180,7 +1224,9 @@ impl Monitor {
         use std::fmt::Write;
         let mut b = String::from("[");
         for (i, gpu) in gpus.iter().enumerate() {
-            if i > 0 { b.push(','); }
+            if i > 0 {
+                b.push(',');
+            }
             b.push('{');
             let _ = write!(b, "\"dev\":{}", gpu.device_index);
             if !gpu.name.is_empty() {
@@ -1199,7 +1245,9 @@ impl Monitor {
     fn write_metrics(b: &mut String, metrics: &[(String, f64)]) {
         b.push_str(",\"metrics\":{");
         for (i, (name, val)) in metrics.iter().enumerate() {
-            if i > 0 { b.push(','); }
+            if i > 0 {
+                b.push(',');
+            }
             if val.is_finite() {
                 let _ = write!(b, "\"{}\":{:.8}", name, val);
             } else {
@@ -1239,9 +1287,7 @@ impl Monitor {
         let _ = write!(
             b,
             "\"epoch\":{},\"total\":{},\"duration\":{:.4}",
-            epoch_display,
-            self.total_epochs,
-            record.duration_secs,
+            epoch_display, self.total_epochs, record.duration_secs,
         );
 
         if let Some(remaining) = eta
@@ -1261,7 +1307,9 @@ impl Monitor {
 
 /// Number of digits needed to display a number.
 fn digit_count(n: usize) -> usize {
-    if n == 0 { return 1; }
+    if n == 0 {
+        return 1;
+    }
     ((n as f64).log10().floor() as usize) + 1
 }
 
@@ -1316,13 +1364,24 @@ mod tests {
         let html = monitor.build_archive().unwrap();
 
         // The malicious payloads survive only in neutralized form.
-        assert!(html.contains("evil<\\/script><script>alert(1)<\\/script>"),
-            "label </script> not neutralized");
-        assert!(html.contains("meta<\\/script>"), "metadata </script> not neutralized");
+        assert!(
+            html.contains("evil<\\/script><script>alert(1)<\\/script>"),
+            "label </script> not neutralized"
+        );
+        assert!(
+            html.contains("meta<\\/script>"),
+            "metadata </script> not neutralized"
+        );
         // No raw breakout: the ONLY </script> occurrences are structural
         // closing tags, never immediately preceded by our payload text.
-        assert!(!html.contains("evil</script>"), "raw label breakout present");
-        assert!(!html.contains("meta</script>"), "raw metadata breakout present");
+        assert!(
+            !html.contains("evil</script>"),
+            "raw label breakout present"
+        );
+        assert!(
+            !html.contains("meta</script>"),
+            "raw metadata breakout present"
+        );
     }
 
     /// The baked archive is the portal's fallback level source: with no record
@@ -1362,8 +1421,18 @@ mod tests {
                 ],
             },
             gpu_metrics: vec![
-                GpuMetrics { device_index: 0, throughput: 35.2, chunk_ratio: 0.54, shard_size: 34 },
-                GpuMetrics { device_index: 1, throughput: 14.8, chunk_ratio: 0.46, shard_size: 30 },
+                GpuMetrics {
+                    device_index: 0,
+                    throughput: 35.2,
+                    chunk_ratio: 0.54,
+                    shard_size: 34,
+                },
+                GpuMetrics {
+                    device_index: 1,
+                    throughput: 14.8,
+                    chunk_ratio: 0.46,
+                    shard_size: 30,
+                },
             ],
         });
 
@@ -1380,14 +1449,35 @@ mod tests {
         for key in ["epoch", "total", "duration"] {
             assert!(!row[key].is_null(), "archive row lost {key}");
         }
-        for key in ["cpu", "ram_used", "ram_total", "gpu", "vram_alloc", "vram_total"] {
-            assert!(!row["resources"][key].is_null(), "archive resources lost {key}");
+        for key in [
+            "cpu",
+            "ram_used",
+            "ram_total",
+            "gpu",
+            "vram_alloc",
+            "vram_total",
+        ] {
+            assert!(
+                !row["resources"][key].is_null(),
+                "archive resources lost {key}"
+            );
         }
         assert_eq!(row["metrics"]["loss"], 0.25);
         // Two devices, so the page tiers into `root/gpu0` + `root/gpu1`.
         assert_eq!(row["gpus"].as_array().map(Vec::len), Some(2));
-        for key in ["dev", "name", "util", "vram_alloc", "vram_total", "throughput", "chunk"] {
-            assert!(!row["gpus"][0][key].is_null(), "archive gpu entry lost {key}");
+        for key in [
+            "dev",
+            "name",
+            "util",
+            "vram_alloc",
+            "vram_total",
+            "throughput",
+            "chunk",
+        ] {
+            assert!(
+                !row["gpus"][0][key].is_null(),
+                "archive gpu entry lost {key}"
+            );
         }
     }
 
@@ -1414,8 +1504,14 @@ mod tests {
 
         assert_eq!(monitor.history().len(), 1);
         let metrics = &monitor.history()[0].metrics;
-        assert!(metrics.iter().any(|(k, _)| k == "loss"), "missing graph metric 'loss'");
-        assert!(metrics.iter().any(|(k, _)| k == "lr"), "missing extra metric 'lr'");
+        assert!(
+            metrics.iter().any(|(k, _)| k == "loss"),
+            "missing graph metric 'loss'"
+        );
+        assert!(
+            metrics.iter().any(|(k, _)| k == "lr"),
+            "missing extra metric 'lr'"
+        );
 
         // loss should be the mean of 1.5 and 1.3
         let loss = metrics.iter().find(|(k, _)| k == "loss").unwrap().1;
@@ -1503,7 +1599,9 @@ mod tests {
         meta_first.watch(&build());
 
         for (order, monitor) in [("watch-first", &watch_first), ("meta-first", &meta_first)] {
-            let meta = monitor.metadata.as_ref()
+            let meta = monitor
+                .metadata
+                .as_ref()
                 .unwrap_or_else(|| panic!("{order}: no metadata published"));
             assert_eq!(
                 meta["lr"], 0.1,
@@ -1515,7 +1613,10 @@ mod tests {
                 meta["parameters"]["total"], 22,
                 "{order}: parameter counts must survive set_metadata",
             );
-            assert_eq!(meta["parameters"]["trainable"], 22, "{order}: trainable lost");
+            assert_eq!(
+                meta["parameters"]["trainable"], 22,
+                "{order}: trainable lost"
+            );
             assert_eq!(meta["parameters"]["frozen"], 0, "{order}: frozen lost");
         }
     }
@@ -1554,7 +1655,9 @@ mod tests {
         let mut m = Monitor::new(1);
         m.log(0, Duration::from_millis(1), &[("loss", 1.0)]);
         assert!(
-            m.build_archive().unwrap().contains("const ARCHIVE_THEME=null;"),
+            m.build_archive()
+                .unwrap()
+                .contains("const ARCHIVE_THEME=null;"),
             "an unconfigured archive must not pin a theme",
         );
 
@@ -1574,7 +1677,11 @@ mod tests {
         let mut m = Monitor::new(1);
         m.set_archive_theme("darkk");
         m.log(0, Duration::from_millis(1), &[("loss", 1.0)]);
-        assert!(m.build_archive().unwrap().contains("const ARCHIVE_THEME=null;"));
+        assert!(
+            m.build_archive()
+                .unwrap()
+                .contains("const ARCHIVE_THEME=null;")
+        );
     }
 
     /// A headless run must still bake its levels.
@@ -1586,7 +1693,10 @@ mod tests {
     #[test]
     fn a_headless_run_still_bakes_the_record_plane() {
         let mut monitor = Monitor::new(1);
-        assert!(monitor.server.is_none(), "no port: no server by construction");
+        assert!(
+            monitor.server.is_none(),
+            "no port: no server by construction"
+        );
 
         monitor.push_records(vec![
             serde_json::json!({"v":1,"ts":5,"kind":"meta","reductions":{"tokens":"sum"}}),
@@ -1603,10 +1713,16 @@ mod tests {
             .and_then(|(_, r)| r.split_once(";\n"))
             .map(|(d, _)| d)
             .expect("ARCHIVE_RECORDS absent");
-        assert!(recs.len() > 2, "headless archive must not be an empty array");
+        assert!(
+            recs.len() > 2,
+            "headless archive must not be an empty array"
+        );
         // meta first, so a consumer knows the roll-ups before reading a record.
         assert!(recs.starts_with("[{\"kind\":\"meta\"") || recs.contains("\"kind\":\"meta\""));
-        assert!(recs.contains("root/rank0"), "levels must survive into the archive");
+        assert!(
+            recs.contains("root/rank0"),
+            "levels must survive into the archive"
+        );
     }
 
     /// The archive must carry the record plane, and the page must read it under
@@ -1710,17 +1826,12 @@ mod tests {
                 "arch": null,
             }
         });
-        let hex = crate::distributed::cluster::hex_encode(
-            &serde_json::to_vec(&envelope).unwrap(),
-        );
+        let hex = crate::distributed::cluster::hex_encode(&serde_json::to_vec(&envelope).unwrap());
         let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
         crate::distributed::cluster::set_thread_local_rank_override(Some(0));
         crate::distributed::cluster::set_thread_hostname_override(Some("master"));
         unsafe {
-            std::env::set_var(
-                crate::distributed::cluster::ENV_CLUSTER_JSON,
-                &hex,
-            );
+            std::env::set_var(crate::distributed::cluster::ENV_CLUSTER_JSON, &hex);
         }
         let is_primary = Monitor::new(1).is_primary();
         // Clean up before asserting so a failing test doesn't leak
@@ -1753,17 +1864,12 @@ mod tests {
                 "arch": null,
             }
         });
-        let hex = crate::distributed::cluster::hex_encode(
-            &serde_json::to_vec(&envelope).unwrap(),
-        );
+        let hex = crate::distributed::cluster::hex_encode(&serde_json::to_vec(&envelope).unwrap());
         let _guard = crate::distributed::cluster::ENV_MUTEX.lock().unwrap();
         crate::distributed::cluster::set_thread_local_rank_override(Some(0));
         crate::distributed::cluster::set_thread_hostname_override(Some("worker"));
         unsafe {
-            std::env::set_var(
-                crate::distributed::cluster::ENV_CLUSTER_JSON,
-                &hex,
-            );
+            std::env::set_var(crate::distributed::cluster::ENV_CLUSTER_JSON, &hex);
         }
         let is_primary = Monitor::new(1).is_primary();
         unsafe {

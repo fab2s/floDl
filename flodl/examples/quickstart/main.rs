@@ -5,8 +5,8 @@
 //!
 //! Run: `cargo run --example quickstart`
 
-use flodl::*;
 use flodl::Monitor;
+use flodl::*;
 
 fn main() -> Result<()> {
     manual_seed(42);

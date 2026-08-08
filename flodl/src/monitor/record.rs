@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::metrics::EpochMetrics;
 
@@ -217,9 +217,7 @@ impl ResAcc {
     /// sample must leave `res` absent rather than repeat a stale reading, and
     /// "the accumulator is empty" states that directly.
     pub fn is_empty(&self) -> bool {
-        self.gpu_util.count() == 0
-            && self.vram_alloc.count() == 0
-            && self.vram_total.count() == 0
+        self.gpu_util.count() == 0 && self.vram_alloc.count() == 0 && self.vram_total.count() == 0
     }
 
     /// Drain the interval into a [`Res`], resetting for the next one.
@@ -435,7 +433,12 @@ impl NodeRecord {
     ) -> NodeRecord {
         let n = m.device_indices.len();
         let host_refs: Vec<&str> = (0..n)
-            .map(|r| hosts.and_then(|hs| hs.get(r)).map(String::as_str).unwrap_or(""))
+            .map(|r| {
+                hosts
+                    .and_then(|hs| hs.get(r))
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
             .collect();
         let leaves: Vec<Leaf> = (0..n)
             .map(|r| {
@@ -770,7 +773,10 @@ mod tests {
     #[test]
     fn mean_is_work_weighted() {
         // value 0 with work 3, value 1 with work 1 -> 0.25, not the plain 0.5.
-        assert_eq!(Reduction::Mean.reduce(&[(0.0, 3.0), (1.0, 1.0)]), Some(0.25));
+        assert_eq!(
+            Reduction::Mean.reduce(&[(0.0, 3.0), (1.0, 1.0)]),
+            Some(0.25)
+        );
     }
 
     #[test]
@@ -885,7 +891,11 @@ mod tests {
         // Structure: root -> {h1 -> rank0,rank1 ; h2 -> rank2}.
         assert_eq!(root.children.len(), 2);
         assert_eq!(root.work, 10.0);
-        let h1 = root.children.iter().find(|c| c.path.last().unwrap() == "h1").unwrap();
+        let h1 = root
+            .children
+            .iter()
+            .find(|c| c.path.last().unwrap() == "h1")
+            .unwrap();
         assert_eq!(h1.children.len(), 2);
         assert_eq!(h1.work, 5.0);
     }
@@ -925,8 +935,16 @@ mod tests {
         user.insert("throughput".into(), Reduction::Mean);
         let root = build_tree(
             &[
-                leaf(&["rank0"], 1.0, &[("samples_seen", 100.0), ("throughput", 10.0)]),
-                leaf(&["rank1"], 1.0, &[("samples_seen", 50.0), ("throughput", 6.0)]),
+                leaf(
+                    &["rank0"],
+                    1.0,
+                    &[("samples_seen", 100.0), ("throughput", 10.0)],
+                ),
+                leaf(
+                    &["rank1"],
+                    1.0,
+                    &[("samples_seen", 50.0), ("throughput", 6.0)],
+                ),
             ],
             &user,
         );
@@ -1077,7 +1095,11 @@ mod tests {
         // data_starve Max surfaces the worst rank.
         assert_eq!(m(&root, "data_starve"), Some(40.0));
         // device index carried onto the leaf.
-        let rank1 = root.children.iter().find(|c| c.path.last().unwrap() == "rank1").unwrap();
+        let rank1 = root
+            .children
+            .iter()
+            .find(|c| c.path.last().unwrap() == "rank1")
+            .unwrap();
         assert_eq!(rank1.device, Some(1));
         // loss reaches the leaves (was the epoch-row hole at every non-root
         // level) and rolls up to root by the same weighted mean — the rollup,
@@ -1096,10 +1118,18 @@ mod tests {
         em.per_rank_loss = vec![Some(0.2), None];
         let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert!((root.work - 1.0).abs() < 1e-12);
-        let rank1 = root.children.iter().find(|c| c.path.last().unwrap() == "rank1").unwrap();
+        let rank1 = root
+            .children
+            .iter()
+            .find(|c| c.path.last().unwrap() == "rank1")
+            .unwrap();
         assert!(!rank1.metrics.contains_key("loss"));
         // Only rank0 measured loss; the mean covers reporting children alone.
-        let rank0 = root.children.iter().find(|c| c.path.last().unwrap() == "rank0").unwrap();
+        let rank0 = root
+            .children
+            .iter()
+            .find(|c| c.path.last().unwrap() == "rank0")
+            .unwrap();
         assert_eq!(m(rank0, "loss"), Some(0.2));
         assert!((m(&root, "loss").unwrap() - 0.2).abs() < 1e-12);
     }
@@ -1111,7 +1141,11 @@ mod tests {
         let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
         // root -> hostA -> rank0 ; root -> hostB -> rank1
         assert_eq!(root.children.len(), 2);
-        let host_a = root.children.iter().find(|c| c.path.last().unwrap() == "hostA").unwrap();
+        let host_a = root
+            .children
+            .iter()
+            .find(|c| c.path.last().unwrap() == "hostA")
+            .unwrap();
         assert_eq!(host_a.children.len(), 1);
         assert_eq!(host_a.children[0].path, vec!["root", "hostA", "rank0"]);
     }
@@ -1127,8 +1161,7 @@ mod tests {
         let em = epoch_metrics_2ranks();
         let hosts = vec!["h1".to_string(), "h1".to_string()];
         let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
-        let paths: Vec<String> =
-            root.children.iter().map(|c| c.path.join("/")).collect();
+        let paths: Vec<String> = root.children.iter().map(|c| c.path.join("/")).collect();
         assert_eq!(paths, vec!["root/rank0", "root/rank1"]);
     }
 
@@ -1138,10 +1171,10 @@ mod tests {
     #[test]
     fn path_helpers_match_the_built_tree() {
         let cases: Vec<Vec<&str>> = vec![
-            vec!["h1"],                 // lone rank => root-only
-            vec!["h1", "h1"],           // single host => flat
-            vec!["h1", "h2"],           // multi host => host tier
-            vec!["", ""],               // hosts unknown => flat
+            vec!["h1"],       // lone rank => root-only
+            vec!["h1", "h1"], // single host => flat
+            vec!["h1", "h2"], // multi host => host tier
+            vec!["", ""],     // hosts unknown => flat
         ];
         for hosts in cases {
             let leaves: Vec<Leaf> = (0..hosts.len())
@@ -1155,8 +1188,9 @@ mod tests {
             let root = build_tree(&leaves, &Reductions::new());
             let mut built = Vec::new();
             collect_leaf_paths(&root, &mut built);
-            let expected: Vec<String> =
-                (0..hosts.len()).map(|r| rank_record_path(r, &hosts)).collect();
+            let expected: Vec<String> = (0..hosts.len())
+                .map(|r| rank_record_path(r, &hosts))
+                .collect();
             let mut expected_sorted = expected.clone();
             expected_sorted.sort();
             expected_sorted.dedup();
@@ -1184,7 +1218,11 @@ mod tests {
         em.scalars.insert("eval_acc".to_string(), 0.91);
         let root = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(m(&root, "loss"), Some(0.3), "avg_loss injected at root");
-        assert_eq!(m(&root, "eval_acc"), Some(0.91), "root-only scalar injected");
+        assert_eq!(
+            m(&root, "eval_acc"),
+            Some(0.91),
+            "root-only scalar injected"
+        );
         // Injection is root-only: a rank never reported these.
         assert_eq!(m(&root.children[0], "loss"), None);
         assert_eq!(m(&root.children[0], "eval_acc"), None);
@@ -1211,16 +1249,32 @@ mod tests {
         let root = NodeRecord::from_epoch_metrics(&em, Some(&hosts), &Reductions::new(), &[]);
         assert!(root.epoch_complete);
         assert!(root.children.iter().all(|h| h.epoch_complete));
-        assert!(root.children.iter().all(|h| h.children.iter().all(|r| r.epoch_complete)));
+        assert!(
+            root.children
+                .iter()
+                .all(|h| h.children.iter().all(|r| r.epoch_complete))
+        );
         // ...and it reaches the wire, while a window record omits it entirely.
         let recs = root.flat_records(1, None, Some(4));
         assert!(recs.iter().all(|r| r["epoch_complete"] == true));
-        assert!(recs.iter().all(|r| r.get("tick").is_none()), "no window index");
+        assert!(
+            recs.iter().all(|r| r.get("tick").is_none()),
+            "no window index"
+        );
         let window = build_tree(
-            &[Leaf { path: vec!["rank0".into()], work: 1.0, alive: true, ..Default::default() }],
+            &[Leaf {
+                path: vec!["rank0".into()],
+                work: 1.0,
+                alive: true,
+                ..Default::default()
+            }],
             &Reductions::new(),
         );
-        assert!(window.flat_records(1, Some(7), Some(4))[0].get("epoch_complete").is_none());
+        assert!(
+            window.flat_records(1, Some(7), Some(4))[0]
+                .get("epoch_complete")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1272,7 +1326,12 @@ mod tests {
         // An unsampled rank contributes no res at all rather than zeros.
         let bare = NodeRecord::from_epoch_metrics(&em, None, &Reductions::new(), &[]);
         assert_eq!(bare.res.gpu_util, None);
-        assert!(bare.children[0].to_record_json(0, None, None, Severity::Info).get("res").is_none());
+        assert!(
+            bare.children[0]
+                .to_record_json(0, None, None, Severity::Info)
+                .get("res")
+                .is_none()
+        );
     }
 
     /// The interval, not the last reading. This is the whole point of `ResAcc`:

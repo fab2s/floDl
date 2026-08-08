@@ -22,8 +22,16 @@ use crate::tensor::{Device, Result, Tensor, TensorError};
 
 /// CIFAR-10 class names in label order.
 pub const CLASS_NAMES: [&str; 10] = [
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck",
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
 ];
 
 const PIXELS_PER_IMAGE: usize = 3 * 32 * 32; // 3072
@@ -57,7 +65,9 @@ impl Cifar10 {
             if batch.len() != expected {
                 return Err(TensorError::new(&format!(
                     "CIFAR-10 batch {}: expected {} bytes, got {}",
-                    batch_idx, expected, batch.len()
+                    batch_idx,
+                    expected,
+                    batch.len()
                 )));
             }
 
@@ -161,13 +171,16 @@ impl Cifar10Disk {
         let mut starts = Vec::with_capacity(paths.len());
         let mut total = 0usize;
         for path in paths {
-            let recs =
-                crate::data::records::FixedStrideRecords::open(path, BYTES_PER_RECORD)?;
+            let recs = crate::data::records::FixedStrideRecords::open(path, BYTES_PER_RECORD)?;
             starts.push(total);
             total += recs.count();
             files.push(recs);
         }
-        Ok(Cifar10Disk { files, starts, total })
+        Ok(Cifar10Disk {
+            files,
+            starts,
+            total,
+        })
     }
 
     /// Open the 5 canonical training batches under `dir`
@@ -282,17 +295,27 @@ mod tests {
 
         // Image 0: R channel all 0 -> 0.0
         let img0 = cifar.images.select(0, 0).unwrap();
-        let r_pixel: f64 = img0.select(0, 0).unwrap() // R channel
-            .select(0, 0).unwrap() // row 0
-            .select(0, 0).unwrap() // col 0
-            .item().unwrap();
+        let r_pixel: f64 = img0
+            .select(0, 0)
+            .unwrap() // R channel
+            .select(0, 0)
+            .unwrap() // row 0
+            .select(0, 0)
+            .unwrap() // col 0
+            .item()
+            .unwrap();
         assert!((r_pixel - 0.0).abs() < 1e-6);
 
         // B channel all 255 -> 1.0
-        let b_pixel: f64 = img0.select(0, 2).unwrap() // B channel
-            .select(0, 0).unwrap()
-            .select(0, 0).unwrap()
-            .item().unwrap();
+        let b_pixel: f64 = img0
+            .select(0, 2)
+            .unwrap() // B channel
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .item()
+            .unwrap();
         assert!((b_pixel - 1.0).abs() < 1e-6);
     }
 
@@ -329,7 +352,15 @@ mod tests {
             let sample = disk.get(i).unwrap();
             assert_eq!(sample[0].shape(), &[3, 32, 32]);
             let bulk_img = parsed.images.select(0, i as i64).unwrap();
-            let diff: f64 = sample[0].sub(&bulk_img).unwrap().abs().unwrap().sum().unwrap().item().unwrap();
+            let diff: f64 = sample[0]
+                .sub(&bulk_img)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap();
             assert_eq!(diff, 0.0);
             let bulk_label: f64 = parsed.labels.select(0, i as i64).unwrap().item().unwrap();
             let disk_label: f64 = sample[1].item().unwrap();

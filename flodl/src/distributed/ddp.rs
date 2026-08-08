@@ -40,16 +40,15 @@
 //! ddp.all_reduce_gradients()?;
 //! ```
 
-use crate::autograd::Variable;
-use crate::graph::Graph;
-use crate::nn::{Buffer, Module, Optimizer, Parameter};
-use super::nccl::{NcclRankComm, ReduceOp};
-use super::rendezvous::TcpRendezvous;
 use super::config::TrainerConfig;
 use super::ddp_run::{DdpBuilder, DdpHandle};
 pub use super::el_che::ElChe;
+use super::nccl::{NcclRankComm, ReduceOp};
+use super::rendezvous::TcpRendezvous;
+use crate::autograd::Variable;
+use crate::graph::Graph;
+use crate::nn::{Buffer, Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
-
 
 /// Shared lock for serializing NCCL communicator creation across test modules.
 /// NCCL init is a collective operation that deadlocks if two tests try to
@@ -101,15 +100,16 @@ impl Ddp {
         }
         let comms = NcclRankComm::init_rank(global_rank, world_size, rdv.unique_id())?;
 
-        let params: Vec<Variable> = model
-            .parameters()
-            .into_iter()
-            .map(|p| p.variable)
-            .collect();
+        let params: Vec<Variable> = model.parameters().into_iter().map(|p| p.variable).collect();
         crate::distributed::ddp_run::ensure_trainable_params(params.len(), "Ddp::wrap")?;
         let buffers: Vec<Buffer> = model.buffers();
 
-        Ok(Ddp { comms, device, params, buffers })
+        Ok(Ddp {
+            comms,
+            device,
+            params,
+            buffers,
+        })
     }
 
     /// Build a `Ddp` from an existing per-rank NCCL communicator.
@@ -125,19 +125,16 @@ impl Ddp {
     /// Loud errors: `device` mismatch with the rank's bound CUDA device is
     /// the caller's responsibility — no runtime check (FFI-level guarantees
     /// already enforce same-device tensors per AllReduce).
-    pub fn from_comm(
-        comms: NcclRankComm,
-        model: &dyn Module,
-        device: Device,
-    ) -> Result<Self> {
-        let params: Vec<Variable> = model
-            .parameters()
-            .into_iter()
-            .map(|p| p.variable)
-            .collect();
+    pub fn from_comm(comms: NcclRankComm, model: &dyn Module, device: Device) -> Result<Self> {
+        let params: Vec<Variable> = model.parameters().into_iter().map(|p| p.variable).collect();
         crate::distributed::ddp_run::ensure_trainable_params(params.len(), "Ddp::from_comm")?;
         let buffers: Vec<Buffer> = model.buffers();
-        Ok(Ddp { comms, device, params, buffers })
+        Ok(Ddp {
+            comms,
+            device,
+            params,
+            buffers,
+        })
     }
 
     /// In-place AllReduce-average of parameters across all ranks (Local SGD).
@@ -303,7 +300,8 @@ impl Ddp {
         }
         let my_rank = self.comms.rank();
         let weight = batch_counts[my_rank] as f64 / total as f64;
-        let grads: Vec<Tensor> = self.params
+        let grads: Vec<Tensor> = self
+            .params
             .iter()
             .filter_map(|v| {
                 v.grad().inspect(|g| {
@@ -631,7 +629,9 @@ pub trait HasGraph {
 }
 
 impl HasGraph for Graph {
-    fn graph(&self) -> &Graph { self }
+    fn graph(&self) -> &Graph {
+        self
+    }
 }
 
 #[cfg(test)]

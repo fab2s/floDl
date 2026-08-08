@@ -122,18 +122,20 @@ impl ChunkPool {
     ///    out-ran its reservation; the boundary moves).
     pub fn take_chunk(&mut self, size: usize, rank: usize) -> Option<(usize, usize)> {
         if size > 0
-            && let Some((off, range_size)) = self.reclaimed.pop_front() {
-                let actual = size.min(range_size);
-                if actual < range_size {
-                    // Partial take: return the tail of the range for the
-                    // next caller.
-                    self.reclaimed.push_front((off + actual, range_size - actual));
-                }
-                self.dispatched[rank] += actual;
-                self.chunks_sent[rank] += 1;
-                self.outstanding[rank].push_back((off, actual));
-                return Some((off, actual));
+            && let Some((off, range_size)) = self.reclaimed.pop_front()
+        {
+            let actual = size.min(range_size);
+            if actual < range_size {
+                // Partial take: return the tail of the range for the
+                // next caller.
+                self.reclaimed
+                    .push_front((off + actual, range_size - actual));
             }
+            self.dispatched[rank] += actual;
+            self.chunks_sent[rank] += 1;
+            self.outstanding[rank].push_back((off, actual));
+            return Some((off, actual));
+        }
 
         // Own span front.
         let residue = self.residue(rank);
@@ -260,7 +262,9 @@ impl ChunkPool {
     /// Samples not yet assigned to any rank (every span's residue plus
     /// any forfeited ranges awaiting re-dispatch).
     pub fn remaining(&self) -> usize {
-        (0..self.spans.len()).map(|r| self.residue(r)).sum::<usize>()
+        (0..self.spans.len())
+            .map(|r| self.residue(r))
+            .sum::<usize>()
             + self.reclaimed.iter().map(|&(_, s)| s).sum::<usize>()
     }
 
@@ -381,7 +385,11 @@ impl ChunkPool {
     pub fn is_epoch_done(&self) -> bool {
         (0..self.spans.len()).all(|r| self.residue(r) == 0)
             && self.reclaimed.is_empty()
-            && self.dispatched.iter().zip(&self.completed).all(|(d, c)| c >= d)
+            && self
+                .dispatched
+                .iter()
+                .zip(&self.completed)
+                .all(|(d, c)| c >= d)
     }
 
     /// Epoch wall-clock time in milliseconds.
@@ -393,7 +401,6 @@ impl ChunkPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn chunk_pool_basic() {
@@ -449,7 +456,11 @@ mod tests {
         // peeled from the tail of rank 0's span (reservation truing).
         assert_eq!(pool.take_chunk(30, 1).unwrap(), (70, 30));
         assert_eq!(pool.take_chunk(20, 1).unwrap(), (50, 20));
-        assert_eq!(pool.reservation(0), (0, 50), "donor span shrank from the tail");
+        assert_eq!(
+            pool.reservation(0),
+            (0, 50),
+            "donor span shrank from the tail"
+        );
 
         // Rank 0 still consumes its (reduced) span front-to-back.
         assert_eq!(pool.take_chunk(60, 0).unwrap(), (0, 50));
@@ -515,8 +526,10 @@ mod tests {
                     for &(prev_off, prev_size) in &all_offsets {
                         let prev_end: usize = prev_off + prev_size;
                         let this_end = off + size;
-                        assert!(off >= prev_end || this_end <= prev_off,
-                            "overlap: ({off}, {size}) vs ({prev_off}, {prev_size})");
+                        assert!(
+                            off >= prev_end || this_end <= prev_off,
+                            "overlap: ({off}, {size}) vs ({prev_off}, {prev_size})"
+                        );
                     }
                     all_offsets.push((off, size));
                 }
@@ -718,7 +731,10 @@ mod tests {
         );
         assert_eq!(pool.in_flight(0), 0, "dead rank trained nothing");
         assert_eq!(pool.in_flight(1), 0, "survivor's chunks all completed");
-        assert!(pool.is_epoch_done(), "epoch completes after reclaim + drain");
+        assert!(
+            pool.is_epoch_done(),
+            "epoch completes after reclaim + drain"
+        );
     }
 
     #[test]
@@ -803,12 +819,13 @@ mod tests {
         while resumed.remaining() > 0 {
             for rank in 0..3 {
                 if let Some((o, s)) = resumed.take_chunk(15, rank)
-                    && s > 0 {
-                        for slot in covered.iter_mut().skip(o).take(s) {
-                            *slot += 1;
-                        }
-                        resumed.mark_completed(rank, s);
+                    && s > 0
+                {
+                    for slot in covered.iter_mut().skip(o).take(s) {
+                        *slot += 1;
                     }
+                    resumed.mark_completed(rank, s);
+                }
             }
         }
         assert!(resumed.is_epoch_done(), "resumed epoch completes");

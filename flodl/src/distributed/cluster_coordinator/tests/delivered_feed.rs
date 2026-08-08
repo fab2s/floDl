@@ -115,7 +115,11 @@ fn timing_feed_uses_delivered_when_window_complete() {
     let report = coord.build_window_report(0.0);
     assert!(report.delivered_coherent);
     let (ms, batches) = report.select_feed();
-    assert_eq!(ms, vec![80.0, 220.0], "complete window feeds delivered cost");
+    assert_eq!(
+        ms,
+        vec![80.0, 220.0],
+        "complete window feeds delivered cost"
+    );
     assert_eq!(batches, vec![4, 4]);
 }
 
@@ -124,13 +128,8 @@ fn timing_feed_sync_keeps_compute_scale() {
     // Sync is non-progressive: no delivered samples exist; the compute
     // feed is the contract even when stray delivered values are present.
     let mut coord = ClusterCoordinator::for_test(
-        ClusterCoordinatorConfig::new(
-            ApplyPolicy::Sync,
-            AverageBackend::Cpu,
-            2,
-            ElChe::new(2, 1),
-        )
-        .no_divergence_guard(),
+        ClusterCoordinatorConfig::new(ApplyPolicy::Sync, AverageBackend::Cpu, 2, ElChe::new(2, 1))
+            .no_divergence_guard(),
     );
     set_steps(&mut coord, &[1, 1]);
     set_wall(&mut coord, &[10.0, 20.0]);

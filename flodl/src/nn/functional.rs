@@ -1,6 +1,6 @@
-use crate::autograd::{Variable, NoGradGuard};
-use crate::tensor::{Result, Tensor};
 use super::Module;
+use crate::autograd::{NoGradGuard, Variable};
+use crate::tensor::{Result, Tensor};
 
 /// Gaussian blur as a [`Module`] for use in [`FlowBuilder`](crate::graph::FlowBuilder) graphs.
 ///
@@ -24,7 +24,9 @@ impl GaussianBlur {
 }
 
 impl Module for GaussianBlur {
-    fn name(&self) -> &str { "gaussian_blur" }
+    fn name(&self) -> &str {
+        "gaussian_blur"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         gaussian_blur_2d(input, self.sigma)
@@ -124,7 +126,12 @@ mod tests {
         // Blurred output should have lower variance than input
         let in_var = input.var().unwrap().item().unwrap();
         let out_var = output.var().unwrap().item().unwrap();
-        assert!(out_var < in_var, "blur should reduce variance: in={} out={}", in_var, out_var);
+        assert!(
+            out_var < in_var,
+            "blur should reduce variance: in={} out={}",
+            in_var,
+            out_var
+        );
     }
 
     #[test]
@@ -134,7 +141,10 @@ mod tests {
         let input = Variable::new(Tensor::randn(&[1, 3, 8, 8], opts).unwrap(), true);
         let output = gaussian_blur_2d(&input, 1.0).unwrap();
         // Output should not require grad (NoGradGuard prevents graph construction)
-        assert!(!output.requires_grad(), "blur output should not require grad");
+        assert!(
+            !output.requires_grad(),
+            "blur output should not require grad"
+        );
         assert!(output.is_leaf(), "blur output should be a leaf tensor");
     }
 
@@ -144,8 +154,10 @@ mod tests {
     /// repeated many times. RSS should stay roughly flat.
     #[test]
     fn test_gaussian_blur_no_ram_leak_leakcheck() {
-        if crate::tensor::test_device() != crate::tensor::Device::CPU { return; }
-        use crate::nn::{Linear, Module, Adam, Optimizer};
+        if crate::tensor::test_device() != crate::tensor::Device::CPU {
+            return;
+        }
+        use crate::nn::{Adam, Linear, Module, Optimizer};
 
         fn get_rss_kb() -> usize {
             std::fs::read_to_string("/proc/self/statm")

@@ -25,9 +25,7 @@ fn main() -> flodl::Result<()> {
     // This repo ships only `pytorch_model.bin` — run
     // `fdl flodl-hf convert nateraw/bert-base-uncased-emotion`
     // once before the first call.
-    let clf = BertForSequenceClassification::from_pretrained(
-        "nateraw/bert-base-uncased-emotion",
-    )?;
+    let clf = BertForSequenceClassification::from_pretrained("nateraw/bert-base-uncased-emotion")?;
 
     let texts = &[
         "I love this framework so much",

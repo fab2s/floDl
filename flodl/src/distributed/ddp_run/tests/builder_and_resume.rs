@@ -150,16 +150,11 @@ fn test_builder_missing_num_epochs_panics() {
 
 #[test]
 fn resume_from_loads_meta_and_seeds_coord_config() {
-    use crate::distributed::{
-        CheckpointBundle, CheckpointMeta, ElCheState, SaveReason,
-    };
-    use crate::distributed::el_che::Phase;
     use super::orchestrator::build_coord_config_from_builder;
+    use crate::distributed::el_che::Phase;
+    use crate::distributed::{CheckpointBundle, CheckpointMeta, ElCheState, SaveReason};
 
-    let dir = std::env::temp_dir().join(format!(
-        "flodl_resume_e2e_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("flodl_resume_e2e_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("ckpt").to_string_lossy().into_owned();
 
@@ -172,10 +167,8 @@ fn resume_from_loads_meta_and_seeds_coord_config() {
         calibration_count: 17,
         trend_history: Some(vec![0.005, 0.01, 0.02, 0.025]),
     };
-    let meta = CheckpointMeta::new(
-        4, 9_876, 33, 2, SaveReason::GracefulShutdown,
-    )
-    .with_elche_state(elche_state.clone());
+    let meta = CheckpointMeta::new(4, 9_876, 33, 2, SaveReason::GracefulShutdown)
+        .with_elche_state(elche_state.clone());
     let meta_path = CheckpointBundle::meta_path(&stem);
     meta.write_to_file(&meta_path).unwrap();
 
@@ -224,8 +217,8 @@ fn resume_from_loads_meta_and_seeds_coord_config() {
 fn resume_from_missing_meta_errors() {
     use super::orchestrator::build_coord_config_from_builder;
 
-    let user_config = DdpRunConfig::new()
-        .with_resume_from("/nonexistent/path/that/cannot/exist/ckpt");
+    let user_config =
+        DdpRunConfig::new().with_resume_from("/nonexistent/path/that/cannot/exist/ckpt");
     let result = build_coord_config_from_builder(
         ApplyPolicy::Cadence,
         AverageBackend::Cpu,
@@ -338,7 +331,8 @@ fn test_epoch_fn_called_per_epoch() {
 
     let mut seen = epochs_seen.lock().unwrap().clone();
     seen.sort();
-    let mut expected_epochs: Vec<usize> = (0..num_epochs).cycle().take(num_epochs * world).collect();
+    let mut expected_epochs: Vec<usize> =
+        (0..num_epochs).cycle().take(num_epochs * world).collect();
     expected_epochs.sort();
 
     assert_eq!(
@@ -401,7 +395,6 @@ fn test_worker_send_final_snapshot() {
 // Coordinator and were removed with it. Final-state collection on the
 // process path is covered under `cluster_coordinator/tests/`.
 
-
 // H13: ElCheConfig.max_overshoot must reach the coordinator config. It
 // was written into the config but never read by
 // build_coord_config_from_builder, so the coordinator always ran the
@@ -417,8 +410,13 @@ fn max_overshoot_plumbs_into_coord_config_and_pins_it() {
         ApplyPolicy::Async,
         AverageBackend::Cpu,
         &user_config,
-        None, None, None,
-        2, 100, 4, 1,
+        None,
+        None,
+        None,
+        2,
+        100,
+        4,
+        1,
     )
     .expect("build");
     assert_eq!(coord_config.overshoot_initial, 7);
@@ -439,8 +437,13 @@ fn unset_max_overshoot_leaves_auto_tune_defaults() {
         ApplyPolicy::Async,
         AverageBackend::Cpu,
         &user_config,
-        None, None, None,
-        2, 100, 4, 1,
+        None,
+        None,
+        None,
+        2,
+        100,
+        4,
+        1,
     )
     .expect("build");
     assert!(
@@ -465,8 +468,13 @@ fn epoch_splits_plumbs_into_coord_config() {
         ApplyPolicy::Async,
         AverageBackend::Cpu,
         &user_config,
-        None, None, None,
-        2, 100, 4, 1,
+        None,
+        None,
+        None,
+        2,
+        100,
+        4,
+        1,
     )
     .expect("build");
     assert_eq!(coord_config.epoch_splits, 20);
@@ -480,13 +488,17 @@ fn unset_epoch_splits_leaves_the_epoch_a_full_pass() {
         ApplyPolicy::Async,
         AverageBackend::Cpu,
         &DdpRunConfig::new(),
-        None, None, None,
-        2, 100, 4, 1,
+        None,
+        None,
+        None,
+        2,
+        100,
+        4,
+        1,
     )
     .expect("build");
     assert_eq!(coord_config.epoch_splits, 1);
 }
-
 
 // The bug this pins: `num_epochs` is the user's count of DATA PASSES, so a
 // split run must execute `num_epochs * epoch_splits` epochs. Without the
@@ -509,8 +521,8 @@ fn epoch_splits_multiply_the_epochs_actually_run() {
     )
     .dataset(Arc::new(TestDataset { n: 64 }))
     .batch_size(4)
-    .num_epochs(2)      // two passes over the data ...
-    .epoch_splits(4)    // ... delivered as four epochs each
+    .num_epochs(2) // two passes over the data ...
+    .epoch_splits(4) // ... delivered as four epochs each
     .backend(AverageBackend::Cpu)
     .epoch_fn(move |_epoch, _worker| {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

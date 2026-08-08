@@ -52,7 +52,13 @@ pub fn shape_i64(v: &TensorView<'_>) -> Vec<i64> {
 /// mismatch with a shape-naming message — silently truncating would
 /// hide a real shape regression.
 pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "shape mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "shape mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())

@@ -146,7 +146,11 @@ impl DnaAutoencoder {
         let decoder = FlowBuilder::from(Linear::new(latent_dim as i64, flat_dim as i64)?)
             .through(ReLU)
             .through(Reshape::new(vec![-1, 64, pooled_len as i64]))
-            .through(ConvTranspose1d::configure(64, 32, 2).with_stride(2).done()?)
+            .through(
+                ConvTranspose1d::configure(64, 32, 2)
+                    .with_stride(2)
+                    .done()?,
+            )
             .through(ReLU)
             .through(ConvTranspose1d::configure(32, 4, 2).with_stride(2).done()?)
             .tag("logits")

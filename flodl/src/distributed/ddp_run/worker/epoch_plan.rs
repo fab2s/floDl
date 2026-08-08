@@ -4,13 +4,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::autograd::Variable;
-use crate::tensor::cuda_stream::StreamGuard;
 use crate::nn::Module;
+use crate::tensor::cuda_stream::StreamGuard;
 use crate::tensor::{Result, Tensor, TensorError};
 
-use super::super::{
-    ControlMsg, EpochPlan, make_partition, pick_space,
-};
+use super::super::{ControlMsg, EpochPlan, make_partition, pick_space};
 use super::GpuWorker;
 
 /// Per-epoch training cursor, extracted from `run_epoch_plan`'s locals so the
@@ -94,7 +92,11 @@ impl<M: Module> GpuWorker<M> {
     /// to prevent NCCL deadlock while waiting between epochs.
     /// Returns `Some(plan)` for the next epoch, or `None` on Shutdown/disconnect.
     pub fn wait_for_epoch_plan(&mut self) -> Result<Option<EpochPlan>> {
-        crate::debug!("  ddp-worker: rank {} waiting for plan (step={})", self.rank, self.local_step);
+        crate::debug!(
+            "  ddp-worker: rank {} waiting for plan (step={})",
+            self.rank,
+            self.local_step
+        );
         let wait_start = Instant::now();
         loop {
             // Check if a plan was queued by dispatch_control (e.g. StartEpoch
@@ -102,20 +104,38 @@ impl<M: Module> GpuWorker<M> {
             // not just at entry, because dispatch_control may set it mid-loop.
             if let Some(plan) = self.pending_plan.take() {
                 let waited = wait_start.elapsed().as_secs_f64() * 1000.0;
-                crate::verbose!("  ddp-dispatch-diag: rank {} waited {:.0}ms (pending plan)", self.rank, waited);
-                crate::debug!("  ddp-worker: rank {} got plan (pending) epoch={}", self.rank, plan.epoch);
+                crate::verbose!(
+                    "  ddp-dispatch-diag: rank {} waited {:.0}ms (pending plan)",
+                    self.rank,
+                    waited
+                );
+                crate::debug!(
+                    "  ddp-worker: rank {} got plan (pending) epoch={}",
+                    self.rank,
+                    plan.epoch
+                );
                 return Ok(Some(plan));
             }
             match self.control_rx.recv() {
                 Ok(ControlMsg::StartEpoch(plan)) => {
                     let waited = wait_start.elapsed().as_secs_f64() * 1000.0;
-                    crate::verbose!("  ddp-dispatch-diag: rank {} waited {:.0}ms for StartEpoch", self.rank, waited);
-                    crate::debug!("  ddp-worker: rank {} got plan epoch={}", self.rank, plan.epoch);
+                    crate::verbose!(
+                        "  ddp-dispatch-diag: rank {} waited {:.0}ms for StartEpoch",
+                        self.rank,
+                        waited
+                    );
+                    crate::debug!(
+                        "  ddp-worker: rank {} got plan epoch={}",
+                        self.rank,
+                        plan.epoch
+                    );
                     return Ok(Some(plan));
                 }
                 Ok(ControlMsg::Shutdown) => return Ok(None),
                 Ok(msg) => {
-                    crate::debug!("  ddp-worker: rank {} wait_for_plan got {:?}", self.rank,
+                    crate::debug!(
+                        "  ddp-worker: rank {} wait_for_plan got {:?}",
+                        self.rank,
                         match &msg {
                             ControlMsg::SyncNow => "SyncNow",
                             ControlMsg::Throttle => "Throttle",
@@ -196,9 +216,12 @@ impl<M: Module> GpuWorker<M> {
     pub(crate) fn begin_epoch(&mut self, plan: &EpochPlan) -> Result<EpochState> {
         self.current_epoch = plan.epoch;
         self.partition = make_partition(
-            plan.partition_offset, plan.partition_size,
-            pick_space(self.dataset.len(), self.augment), plan.epoch,
-            self.epoch_splits, self.base_seed,
+            plan.partition_offset,
+            plan.partition_size,
+            pick_space(self.dataset.len(), self.augment),
+            plan.epoch,
+            self.epoch_splits,
+            self.base_seed,
         );
 
         let num_batches = self.partition.len() / self.batch_size;
@@ -234,12 +257,13 @@ impl<M: Module> GpuWorker<M> {
                 let _ = stream.synchronize();
             }
             if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx)
-                && let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx) {
-                    let overhead = (peak as usize).saturating_sub(baseline as usize);
-                    let batch_bytes = self.per_sample_bytes * self.batch_size;
-                    let activation = overhead.saturating_sub(batch_bytes);
-                    self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
-                }
+                && let Ok(baseline) = crate::tensor::gpu_active_bytes_idx(idx)
+            {
+                let overhead = (peak as usize).saturating_sub(baseline as usize);
+                let batch_bytes = self.per_sample_bytes * self.batch_size;
+                let activation = overhead.saturating_sub(batch_bytes);
+                self.activation_peak_bytes = self.activation_peak_bytes.max(activation);
+            }
             crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
 
@@ -290,9 +314,8 @@ impl<M: Module> GpuWorker<M> {
         //
         // If activation peak hasn't been measured yet, force depth=0 (sync
         // fallback) so the first chunk can calibrate safely.
-        let install_pool_budget = !self.vram_pool_budget_sent
-            && self.device.is_cuda()
-            && self.activation_peak_bytes > 0;
+        let install_pool_budget =
+            !self.vram_pool_budget_sent && self.device.is_cuda() && self.activation_peak_bytes > 0;
         let use_prefetch = if let Some(ref mut pw) = self.prefetch {
             if self.activation_peak_bytes == 0 && self.device.is_cuda() {
                 pw.set_prefetch_depth(0);
@@ -308,8 +331,11 @@ impl<M: Module> GpuWorker<M> {
                 // post-honest-resize probe (`loader.rs`, "probe accounts for
                 // step memory itself").
                 let vram_depth = crate::data::prefetch_depth_from_vram(
-                    self.per_sample_bytes, self.batch_size, self.device,
-                    self.vram_max_usage, 0,
+                    self.per_sample_bytes,
+                    self.batch_size,
+                    self.device,
+                    self.vram_max_usage,
+                    0,
                 );
                 let mut depth = vram_depth.min(num_batches);
                 // On the pool-install chunk the channel collapses to
@@ -320,8 +346,7 @@ impl<M: Module> GpuWorker<M> {
                 // probe sees pool bytes as used and the depth re-sizes
                 // honestly.
                 if install_pool_budget {
-                    depth =
-                        depth.min(crate::data::vram_pool::FLOW_RESERVE_BATCHES as usize);
+                    depth = depth.min(crate::data::vram_pool::FLOW_RESERVE_BATCHES as usize);
                 }
                 pw.set_prefetch_depth(depth);
                 // The governor's verdict is otherwise invisible: a depth of 0
@@ -333,8 +358,7 @@ impl<M: Module> GpuWorker<M> {
                 // sizing call above already spent one `cudaMemGetInfo`, and a
                 // diagnostic must not add a second to every chunk boundary.
                 let (used, total) = if crate::log::enabled(crate::log::Verbosity::Debug) {
-                    crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
-                        .unwrap_or((0, 0))
+                    crate::tensor::gpu_memory_info_idx(self.device.index() as i32).unwrap_or((0, 0))
                 } else {
                     (0, 0)
                 };
@@ -342,14 +366,22 @@ impl<M: Module> GpuWorker<M> {
                     "  ddp-worker: rank {} prefetch depth={} ring={} (vram_depth={} chunk={} \
                      batch={}KB activation_peak={}MB max_usage={:.2} \
                      used={}MB cap={}MB free={}MB){}",
-                    self.rank, depth, ring_slots, vram_depth, num_batches,
+                    self.rank,
+                    depth,
+                    ring_slots,
+                    vram_depth,
+                    num_batches,
                     (self.per_sample_bytes * self.batch_size) >> 10,
                     self.activation_peak_bytes >> 20,
                     self.vram_max_usage,
                     used >> 20,
                     ((total as f64 * self.vram_max_usage) as u64) >> 20,
                     total.saturating_sub(used) >> 20,
-                    if depth == 0 { " -> SYNC FALLBACK (data cost unoverlapped)" } else { "" },
+                    if depth == 0 {
+                        " -> SYNC FALLBACK (data cost unoverlapped)"
+                    } else {
+                        ""
+                    },
                 );
                 depth > 0
             }
@@ -364,20 +396,18 @@ impl<M: Module> GpuWorker<M> {
         // rate-matcher once a capacity tier is active). The channel
         // depth was collapsed to the reserve above, so both sides of
         // the install agree on who owns the free VRAM.
-        if install_pool_budget
-            && let Some(ref pw) = self.prefetch {
-                let batch_bytes = (self.per_sample_bytes * self.batch_size) as u64;
-                let reserve = crate::data::vram_pool::flow_reserve_bytes(
-                    pw.prefetch_depth() as u64,
-                    batch_bytes,
-                );
-                crate::debug!(
-                    "  ddp-worker: rank {} vram pool budget signal (reserve {}MB)",
-                    self.rank, reserve >> 20
-                );
-                pw.install_vram_pool_budget(reserve);
-                self.vram_pool_budget_sent = true;
-            }
+        if install_pool_budget && let Some(ref pw) = self.prefetch {
+            let batch_bytes = (self.per_sample_bytes * self.batch_size) as u64;
+            let reserve =
+                crate::data::vram_pool::flow_reserve_bytes(pw.prefetch_depth() as u64, batch_bytes);
+            crate::debug!(
+                "  ddp-worker: rank {} vram pool budget signal (reserve {}MB)",
+                self.rank,
+                reserve >> 20
+            );
+            pw.install_vram_pool_budget(reserve);
+            self.vram_pool_budget_sent = true;
+        }
 
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::EpochStart { epoch: plan.epoch });
@@ -429,10 +459,7 @@ impl<M: Module> GpuWorker<M> {
     /// The returned batch is **owned** and borrows nothing from the worker, so
     /// the cooperative tier can run the user's forward + backward against it
     /// while still calling `&mut self` worker methods.
-    pub(crate) fn next_batch_inner(
-        &mut self,
-        st: &mut EpochState,
-    ) -> Result<Option<Vec<Tensor>>> {
+    pub(crate) fn next_batch_inner(&mut self, st: &mut EpochState) -> Result<Option<Vec<Tensor>>> {
         // Loop bound re-read off the live partition each call, so a mid-epoch
         // `ExtendPartition` reshard is consumed before the shard completes.
         if st.batch_done >= self.partition.len() / self.batch_size {
@@ -474,8 +501,10 @@ impl<M: Module> GpuWorker<M> {
             let prefetched = loop {
                 let rx = st.batch_rx.as_ref().expect("prefetch path has a batch_rx");
                 match rx.recv_timeout(Duration::from_millis(10)) {
-                    Ok(batch) => break batch
-                        .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?,
+                    Ok(batch) => {
+                        break batch
+                            .map_err(|e| TensorError::new(&format!("prefetch error: {e}")))?;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         let ctl_start = Instant::now();
                         if self.handle_control()? {
@@ -497,7 +526,11 @@ impl<M: Module> GpuWorker<M> {
                                 st.plan_epoch,
                                 self.partition.len(),
                                 self.steps_since_avg,
-                                self.pending_plan.as_ref().map(|p| (p.epoch, p.partition_offset, p.partition_size)),
+                                self.pending_plan.as_ref().map(|p| (
+                                    p.epoch,
+                                    p.partition_offset,
+                                    p.partition_size
+                                )),
                             );
                         }
                     }
@@ -585,7 +618,8 @@ impl<M: Module> GpuWorker<M> {
             let batch = self.dataset.get_batch(&samples)?;
 
             let batch: Vec<Tensor> = if self.device.is_cuda() {
-                batch.into_iter()
+                batch
+                    .into_iter()
                     .map(|t| t.to_device(self.device))
                     .collect::<Result<Vec<_>>>()?
             } else {
@@ -621,12 +655,7 @@ impl<M: Module> GpuWorker<M> {
     /// in the cooperative tier). Runs under its own owned `compute_stream`
     /// guard so the param-norm and any control-driven collective see
     /// current-stream == compute_stream, exactly as the old epoch-scoped guard.
-    pub(crate) fn after_step(
-        &mut self,
-        st: &mut EpochState,
-        loss: f64,
-        ms: f64,
-    ) -> Result<()> {
+    pub(crate) fn after_step(&mut self, st: &mut EpochState, loss: f64, ms: f64) -> Result<()> {
         let _stream_guard = self.compute_stream.as_ref().map(StreamGuard::new);
         st.compute_ms_total += ms;
         st.total_loss += loss;
@@ -648,13 +677,14 @@ impl<M: Module> GpuWorker<M> {
             }
             let idx = self.device.index() as i32;
             if let Ok(peak) = crate::tensor::gpu_peak_active_bytes_idx(idx)
-                && let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx) {
-                    let overhead = (peak as usize).saturating_sub(current as usize);
-                    // Floor a completed measurement to 1 byte so a degenerate
-                    // reading cannot collide with the sentinel and re-arm
-                    // calibration every chunk.
-                    self.activation_peak_bytes = overhead.max(1);
-                }
+                && let Ok(current) = crate::tensor::gpu_active_bytes_idx(idx)
+            {
+                let overhead = (peak as usize).saturating_sub(current as usize);
+                // Floor a completed measurement to 1 byte so a degenerate
+                // reading cannot collide with the sentinel and re-arm
+                // calibration every chunk.
+                self.activation_peak_bytes = overhead.max(1);
+            }
             // Reset for ongoing monitoring in subsequent chunks.
             crate::tensor::gpu_reset_peak_stats_idx(idx);
         }
@@ -682,9 +712,19 @@ impl<M: Module> GpuWorker<M> {
             let other_ms = chunk_total_ms - prefetch_ms - st.compute_ms_total;
             crate::verbose!(
                 "  ddp-worker-diag: rank {} chunk={} batches | total={:.0}ms compute={:.0}ms prefetch_wait={:.0}ms other(sync/ctrl)={:.0}ms",
-                self.rank, st.batch_done, chunk_total_ms, st.compute_ms_total, prefetch_ms, other_ms,
+                self.rank,
+                st.batch_done,
+                chunk_total_ms,
+                st.compute_ms_total,
+                prefetch_ms,
+                other_ms,
             );
-            crate::debug!("  ddp-worker: rank {} epoch {} chunk done ({} batches)", self.rank, st.plan_epoch, st.batch_done);
+            crate::debug!(
+                "  ddp-worker: rank {} epoch {} chunk done ({} batches)",
+                self.rank,
+                st.plan_epoch,
+                st.batch_done
+            );
         }
 
         // Recompute batch count from current partition length so an
@@ -723,8 +763,12 @@ impl<M: Module> GpuWorker<M> {
             });
         }
         let _ = self.report_epoch(
-            avg_loss, num_batches, epoch_ms,
-            share_complete_ms, st.compute_ms_total, st.data_starve_ms_total,
+            avg_loss,
+            num_batches,
+            epoch_ms,
+            share_complete_ms,
+            st.compute_ms_total,
+            st.data_starve_ms_total,
         );
 
         Ok(())
@@ -780,9 +824,7 @@ impl<M: Module> GpuWorker<M> {
             .collect();
         match model_path.to_str() {
             Some(path_str) => {
-                if let Err(e) =
-                    crate::nn::save_checkpoint_file(path_str, &params, &buffers, None)
-                {
+                if let Err(e) = crate::nn::save_checkpoint_file(path_str, &params, &buffers, None) {
                     eprintln!(
                         "ddp-worker: rank {} model save to {path_str} failed: {e}",
                         self.rank,

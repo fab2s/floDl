@@ -13,7 +13,9 @@
 //! `num_labels` guard, softmax-and-sort for sequence classification,
 //! and the QA span-search algorithm.
 
-use flodl::{cross_entropy_loss, Buffer, Graph, HasGraph, Module, Parameter, Result, TensorError, Variable};
+use flodl::{
+    Buffer, Graph, HasGraph, Module, Parameter, Result, TensorError, Variable, cross_entropy_loss,
+};
 
 /// One extracted answer span from a
 /// `*ForQuestionAnswering::answer` / `::answer_batch` call.
@@ -110,10 +112,7 @@ pub(crate) fn argmax_f32(slice: &[f32]) -> (usize, f32) {
 /// dedicated regression branch (`problem_type == "regression"`, MSE) is
 /// not yet exposed - pass raw logits to [`flodl::mse_loss`] directly for
 /// that case.
-pub fn sequence_classification_loss(
-    logits: &Variable,
-    labels: &Variable,
-) -> Result<Variable> {
+pub fn sequence_classification_loss(logits: &Variable, labels: &Variable) -> Result<Variable> {
     let shape = logits.shape();
     if shape.len() != 2 {
         return Err(TensorError::new(&format!(
@@ -134,10 +133,7 @@ pub fn sequence_classification_loss(
 /// BIO-to-subword alignment rule. Matches HF Python's
 /// `CrossEntropyLoss(ignore_index=-100)` default, which flodl's
 /// [`cross_entropy_loss`] wires through natively.
-pub fn token_classification_loss(
-    logits: &Variable,
-    labels: &Variable,
-) -> Result<Variable> {
+pub fn token_classification_loss(logits: &Variable, labels: &Variable) -> Result<Variable> {
     let shape = logits.shape();
     if shape.len() != 3 {
         return Err(TensorError::new(&format!(
@@ -167,10 +163,7 @@ pub fn token_classification_loss(
 /// [`token_classification_loss`], but exposed under the HF-canonical
 /// name so callers of continued-pretraining / domain-adaptation paths
 /// find it by the name they know.
-pub fn masked_lm_loss(
-    logits: &Variable,
-    labels: &Variable,
-) -> Result<Variable> {
+pub fn masked_lm_loss(logits: &Variable, labels: &Variable) -> Result<Variable> {
     let shape = logits.shape();
     if shape.len() != 3 {
         return Err(TensorError::new(&format!(
@@ -212,9 +205,9 @@ pub fn question_answering_loss(
         )));
     }
     let start_logits = logits.narrow(-1, 0, 1)?.squeeze(-1)?;
-    let end_logits   = logits.narrow(-1, 1, 1)?.squeeze(-1)?;
+    let end_logits = logits.narrow(-1, 1, 1)?.squeeze(-1)?;
     let start_loss = cross_entropy_loss(&start_logits, start_positions)?;
-    let end_loss   = cross_entropy_loss(&end_logits, end_positions)?;
+    let end_loss = cross_entropy_loss(&end_logits, end_positions)?;
     start_loss.add(&end_loss)?.mul_scalar(0.5)
 }
 
@@ -226,7 +219,11 @@ pub(crate) fn logits_to_sorted_labels(
 ) -> Result<Vec<Vec<(String, f32)>>> {
     let probs = logits.softmax(-1)?;
     let shape = probs.shape();
-    assert_eq!(shape.len(), 2, "expected [batch, num_labels], got {shape:?}");
+    assert_eq!(
+        shape.len(),
+        2,
+        "expected [batch, num_labels], got {shape:?}"
+    );
     let batch = shape[0] as usize;
     let n = shape[1] as usize;
     assert_eq!(
@@ -317,7 +314,12 @@ pub(crate) fn extract_best_span(
             .inner()
             .decode(&span_ids, /*skip_special_tokens=*/ true)
             .map_err(|e| TensorError::new(&format!("qa decode: {e}")))?;
-        answers.push(Answer { text, start, end, score });
+        answers.push(Answer {
+            text,
+            start,
+            end,
+            score,
+        });
     }
     Ok(answers)
 }
@@ -410,17 +412,25 @@ impl<C: Clone> ClassificationHead<C> {
     }
 
     /// Borrow the underlying [`Graph`].
-    pub fn graph(&self) -> &Graph { &self.graph }
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
     /// Consume `self` and return the underlying [`Graph`]. Used by
     /// `fdl flodl-hf export --hub` after auto-dispatching on the
     /// upstream `architectures[0]` — the head wrapper isn't needed
     /// past the load, only the graph (with `source_config` already
     /// set by `from_pretrained_on_device`).
-    pub fn into_graph(self) -> Graph { self.graph }
+    pub fn into_graph(self) -> Graph {
+        self.graph
+    }
     /// Borrow the config this head was built from.
-    pub fn config(&self) -> &C { &self.config }
+    pub fn config(&self) -> &C {
+        &self.config
+    }
     /// Label names indexed by class id.
-    pub fn labels(&self) -> &[String] { &self.id2label }
+    pub fn labels(&self) -> &[String] {
+        &self.id2label
+    }
 
     /// Attach a tokenizer so [`predict`](Self::predict) can encode raw
     /// text. `from_pretrained` attaches one automatically.
@@ -435,10 +445,7 @@ impl<C: Clone> ClassificationHead<C> {
 impl<C: Clone + EncoderInputs> ClassificationHead<C> {
     /// Raw forward pass returning `[batch, num_labels]` logits. Does
     /// not change train / eval mode — caller's responsibility.
-    pub fn forward_encoded(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Variable> {
+    pub fn forward_encoded(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Variable> {
         let inputs = C::encoder_inputs(enc)?;
         self.graph.forward_multi(&inputs)
     }
@@ -477,7 +484,9 @@ impl<C: Clone + EncoderInputs> ClassificationHead<C> {
 }
 
 impl<C: Clone> HasGraph for ClassificationHead<C> {
-    fn graph(&self) -> &Graph { &self.graph }
+    fn graph(&self) -> &Graph {
+        &self.graph
+    }
 }
 
 /// Present the head as a [`Module`] so it can train through the unified
@@ -498,11 +507,21 @@ impl<C: Clone> Module for ClassificationHead<C> {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         self.graph.forward(input)
     }
-    fn parameters(&self) -> Vec<Parameter> { self.graph.parameters() }
-    fn buffers(&self) -> Vec<Buffer> { self.graph.buffers() }
-    fn name(&self) -> &str { "classification_head" }
-    fn set_training(&self, training: bool) { self.graph.set_training(training); }
-    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(&self.graph) }
+    fn parameters(&self) -> Vec<Parameter> {
+        self.graph.parameters()
+    }
+    fn buffers(&self) -> Vec<Buffer> {
+        self.graph.buffers()
+    }
+    fn name(&self) -> &str {
+        "classification_head"
+    }
+    fn set_training(&self, training: bool) {
+        self.graph.set_training(training);
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.graph)
+    }
 }
 
 // ── TaggingHead ──────────────────────────────────────────────────────────
@@ -534,12 +553,20 @@ impl<C: Clone> TaggingHead<C> {
         }
     }
 
-    pub fn graph(&self) -> &Graph { &self.graph }
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
     /// Consume `self` and return the underlying [`Graph`] (used by
     /// the auto-dispatching Hub-mode export path).
-    pub fn into_graph(self) -> Graph { self.graph }
-    pub fn config(&self) -> &C { &self.config }
-    pub fn labels(&self) -> &[String] { &self.id2label }
+    pub fn into_graph(self) -> Graph {
+        self.graph
+    }
+    pub fn config(&self) -> &C {
+        &self.config
+    }
+    pub fn labels(&self) -> &[String] {
+        &self.id2label
+    }
 
     #[cfg(feature = "tokenizer")]
     pub fn with_tokenizer(mut self, tok: crate::tokenizer::HfTokenizer) -> Self {
@@ -552,10 +579,7 @@ impl<C: Clone> TaggingHead<C> {
 impl<C: Clone + EncoderInputs> TaggingHead<C> {
     /// Raw forward pass returning `[batch, seq_len, num_labels]`
     /// logits. Does not change train / eval mode.
-    pub fn forward_encoded(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Variable> {
+    pub fn forward_encoded(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Variable> {
         let inputs = C::encoder_inputs(enc)?;
         self.graph.forward_multi(&inputs)
     }
@@ -565,10 +589,7 @@ impl<C: Clone + EncoderInputs> TaggingHead<C> {
     /// batch entry `b`, position `s`. `TokenPrediction::attends`
     /// mirrors the attention mask so callers can drop `[PAD]` entries
     /// without re-tokenising.
-    pub fn tag(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Vec<Vec<TokenPrediction>>> {
+    pub fn tag(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Vec<Vec<TokenPrediction>>> {
         let name = format!("{}ForTokenClassification::tag", C::FAMILY_NAME);
         let tok = require_tokenizer(self.tokenizer.as_ref(), &name)?;
         self.graph.eval();
@@ -625,7 +646,9 @@ impl<C: Clone + EncoderInputs> TaggingHead<C> {
 }
 
 impl<C: Clone> HasGraph for TaggingHead<C> {
-    fn graph(&self) -> &Graph { &self.graph }
+    fn graph(&self) -> &Graph {
+        &self.graph
+    }
 }
 
 // ── QaHead ───────────────────────────────────────────────────────────────
@@ -649,11 +672,17 @@ impl<C: Clone> QaHead<C> {
         }
     }
 
-    pub fn graph(&self) -> &Graph { &self.graph }
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
     /// Consume `self` and return the underlying [`Graph`] (used by
     /// the auto-dispatching Hub-mode export path).
-    pub fn into_graph(self) -> Graph { self.graph }
-    pub fn config(&self) -> &C { &self.config }
+    pub fn into_graph(self) -> Graph {
+        self.graph
+    }
+    pub fn config(&self) -> &C {
+        &self.config
+    }
 
     #[cfg(feature = "tokenizer")]
     pub fn with_tokenizer(mut self, tok: crate::tokenizer::HfTokenizer) -> Self {
@@ -667,10 +696,7 @@ impl<C: Clone + EncoderInputs> QaHead<C> {
     /// Raw forward pass returning `[batch, seq_len, 2]` logits. Start
     /// logits on slice `0` of the last axis, end logits on slice `1`.
     /// Does not change train / eval mode.
-    pub fn forward_encoded(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Variable> {
+    pub fn forward_encoded(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Variable> {
         let inputs = C::encoder_inputs(enc)?;
         self.graph.forward_multi(&inputs)
     }
@@ -693,10 +719,7 @@ impl<C: Clone + EncoderInputs> QaHead<C> {
     /// Run the graph on a pre-tokenised `(question, context)` batch
     /// and extract best spans. See the crate-internal
     /// `extract_best_span` helper for the per-row logit-to-span logic.
-    pub fn extract(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Vec<Answer>> {
+    pub fn extract(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Vec<Answer>> {
         let name = format!("{}ForQuestionAnswering::extract", C::FAMILY_NAME);
         let tok = require_tokenizer(self.tokenizer.as_ref(), &name)?;
         self.graph.eval();
@@ -718,7 +741,9 @@ impl<C: Clone + EncoderInputs> QaHead<C> {
 }
 
 impl<C: Clone> HasGraph for QaHead<C> {
-    fn graph(&self) -> &Graph { &self.graph }
+    fn graph(&self) -> &Graph {
+        &self.graph
+    }
 }
 
 // ── MaskedLmHead ─────────────────────────────────────────────────────────
@@ -742,11 +767,17 @@ impl<C: Clone> MaskedLmHead<C> {
         }
     }
 
-    pub fn graph(&self) -> &Graph { &self.graph }
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
     /// Consume `self` and return the underlying [`Graph`] (used by
     /// the auto-dispatching Hub-mode export path).
-    pub fn into_graph(self) -> Graph { self.graph }
-    pub fn config(&self) -> &C { &self.config }
+    pub fn into_graph(self) -> Graph {
+        self.graph
+    }
+    pub fn config(&self) -> &C {
+        &self.config
+    }
 
     #[cfg(feature = "tokenizer")]
     pub fn with_tokenizer(mut self, tok: crate::tokenizer::HfTokenizer) -> Self {
@@ -759,10 +790,7 @@ impl<C: Clone> MaskedLmHead<C> {
 impl<C: Clone + EncoderInputs> MaskedLmHead<C> {
     /// Raw forward pass returning `[batch, seq_len, vocab_size]`
     /// logits over the vocabulary. Does not change train / eval mode.
-    pub fn forward_encoded(
-        &self,
-        enc: &crate::tokenizer::EncodedBatch,
-    ) -> Result<Variable> {
+    pub fn forward_encoded(&self, enc: &crate::tokenizer::EncodedBatch) -> Result<Variable> {
         let inputs = C::encoder_inputs(enc)?;
         self.graph.forward_multi(&inputs)
     }
@@ -784,11 +812,7 @@ impl<C: Clone + EncoderInputs> MaskedLmHead<C> {
     /// probability. The mask-token spelling comes from
     /// `C::MASK_TOKEN` — `[MASK]` for BERT / DistilBERT, `<mask>`
     /// for RoBERTa.
-    pub fn fill_mask(
-        &self,
-        text: &str,
-        top_k: usize,
-    ) -> Result<Vec<Vec<(String, f32)>>> {
+    pub fn fill_mask(&self, text: &str, top_k: usize) -> Result<Vec<Vec<(String, f32)>>> {
         if top_k == 0 {
             return Err(TensorError::new("fill_mask: top_k must be > 0"));
         }
@@ -796,9 +820,7 @@ impl<C: Clone + EncoderInputs> MaskedLmHead<C> {
         let tok = require_tokenizer(self.tokenizer.as_ref(), &name)?;
         let mask_tok = C::MASK_TOKEN;
         let mask_id = tok.inner().token_to_id(mask_tok).ok_or_else(|| {
-            TensorError::new(&format!(
-                "fill_mask: tokenizer has no {mask_tok} token",
-            ))
+            TensorError::new(&format!("fill_mask: tokenizer has no {mask_tok} token",))
         })? as i64;
 
         self.graph.eval();
@@ -813,7 +835,12 @@ impl<C: Clone + EncoderInputs> MaskedLmHead<C> {
                 continue;
             }
             let row = probs.select(0, 0)?.select(0, pos as i64)?;
-            let (vals, idxs) = row.topk(top_k as i64, 0, /*largest=*/ true, /*sorted=*/ true)?;
+            let (vals, idxs) = row.topk(
+                top_k as i64,
+                0,
+                /*largest=*/ true,
+                /*sorted=*/ true,
+            )?;
             let score_vec = vals.to_f32_vec()?;
             let id_vec = idxs.to_i64_vec()?;
             let picks: Vec<(String, f32)> = id_vec
@@ -840,14 +867,18 @@ impl<C: Clone + EncoderInputs> MaskedLmHead<C> {
 }
 
 impl<C: Clone> HasGraph for MaskedLmHead<C> {
-    fn graph(&self) -> &Graph { &self.graph }
+    fn graph(&self) -> &Graph {
+        &self.graph
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flodl::{DType, Device, Tensor, TensorOptions};
-    fn cpu() -> Device { Device::CPU }
+    fn cpu() -> Device {
+        Device::CPU
+    }
 
     #[test]
     fn default_labels_generates_label_k_fallback() {
@@ -863,17 +894,11 @@ mod tests {
     }
 
     fn logits_2d(data: &[f32], rows: i64, cols: i64) -> Variable {
-        Variable::new(
-            Tensor::from_f32(data, &[rows, cols], cpu()).unwrap(),
-            true,
-        )
+        Variable::new(Tensor::from_f32(data, &[rows, cols], cpu()).unwrap(), true)
     }
 
     fn labels_1d(data: &[i64], n: i64) -> Variable {
-        Variable::new(
-            Tensor::from_i64(data, &[n], cpu()).unwrap(),
-            false,
-        )
+        Variable::new(Tensor::from_i64(data, &[n], cpu()).unwrap(), false)
     }
 
     #[test]
@@ -904,8 +929,8 @@ mod tests {
         // batch=2, seq=3, num_labels=2. Labels: [[0, -100, 1], [1, 0, -100]].
         // Position with -100 should not contribute to the loss.
         let logits_data = [
-            5.0, 0.0,   0.0, 0.0,   0.0, 5.0,   // batch 0
-            0.0, 5.0,   5.0, 0.0,   0.0, 0.0,   // batch 1
+            5.0, 0.0, 0.0, 0.0, 0.0, 5.0, // batch 0
+            0.0, 5.0, 5.0, 0.0, 0.0, 0.0, // batch 1
         ];
         let logits = Variable::new(
             Tensor::from_f32(&logits_data, &[2, 3, 2], cpu()).unwrap(),
@@ -920,7 +945,10 @@ mod tests {
         assert!(logits.grad().is_some(), "logits must receive grad");
         // All 4 non-ignored positions are confidently correct, so loss is tiny.
         let loss_val = loss.data().to_f32_vec().unwrap()[0];
-        assert!(loss_val < 0.1, "expected small loss (all correct), got {loss_val}");
+        assert!(
+            loss_val < 0.1,
+            "expected small loss (all correct), got {loss_val}"
+        );
     }
 
     #[test]
@@ -936,7 +964,10 @@ mod tests {
         // batch=2, seq=4. QA logits stack (start, end) on last dim.
         // Gold spans: batch 0 → (start=1, end=2), batch 1 → (start=0, end=3).
         // Logits peaked at the gold positions for both heads: loss ~0.
-        let opts = TensorOptions { dtype: DType::Float32, device: cpu() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: cpu(),
+        };
         let logits_flat = Tensor::zeros(&[2, 4, 2], opts).unwrap();
         // Write peaks via an inplace fill through addition: build from raw data instead.
         let raw: Vec<f32> = {
@@ -952,17 +983,17 @@ mod tests {
             v
         };
         drop(logits_flat);
-        let logits = Variable::new(
-            Tensor::from_f32(&raw, &[2, 4, 2], cpu()).unwrap(),
-            true,
-        );
+        let logits = Variable::new(Tensor::from_f32(&raw, &[2, 4, 2], cpu()).unwrap(), true);
         let starts = labels_1d(&[1, 0], 2);
-        let ends   = labels_1d(&[2, 3], 2);
+        let ends = labels_1d(&[2, 3], 2);
         let loss = question_answering_loss(&logits, &starts, &ends).unwrap();
         loss.backward().unwrap();
         assert!(logits.grad().is_some(), "logits must receive grad");
         let loss_val = loss.data().to_f32_vec().unwrap()[0];
-        assert!(loss_val < 0.01, "expected tiny loss at peaked logits, got {loss_val}");
+        assert!(
+            loss_val < 0.01,
+            "expected tiny loss at peaked logits, got {loss_val}"
+        );
     }
 
     #[test]
@@ -972,9 +1003,8 @@ mod tests {
         // all have their target class peaked, so loss is tiny.
         let logits_data = [
             // batch 0
-            0.0, 0.0, 5.0, 0.0,   0.0, 0.0, 0.0, 0.0,   5.0, 0.0, 0.0, 0.0,
-            // batch 1
-            0.0, 0.0, 0.0, 0.0,   0.0, 5.0, 0.0, 0.0,   0.0, 0.0, 0.0, 5.0,
+            0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, // batch 1
+            0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0,
         ];
         let logits = Variable::new(
             Tensor::from_f32(&logits_data, &[2, 3, 4], cpu()).unwrap(),
@@ -988,7 +1018,10 @@ mod tests {
         loss.backward().unwrap();
         assert!(logits.grad().is_some(), "logits must receive grad");
         let loss_val = loss.data().to_f32_vec().unwrap()[0];
-        assert!(loss_val < 0.1, "expected small loss (all targets peaked), got {loss_val}");
+        assert!(
+            loss_val < 0.1,
+            "expected small loss (all targets peaked), got {loss_val}"
+        );
     }
 
     #[test]
@@ -1006,7 +1039,7 @@ mod tests {
             true,
         );
         let starts = labels_1d(&[0, 1], 2);
-        let ends   = labels_1d(&[2, 2], 2);
+        let ends = labels_1d(&[2, 2], 2);
         assert!(question_answering_loss(&logits, &starts, &ends).is_ok());
 
         let bad = Variable::new(

@@ -64,9 +64,10 @@ pub fn run(
     // we must NOT recurse back into cluster mode on the remote side.
     if libtorch_path_override.is_none()
         && let Ok(env_name) = std::env::var("FDL_ENV")
-            && let Some(cluster) = load_cluster_for_env(&ctx, &env_name) {
-                return run_cluster(&cluster, json, skip_mount);
-            }
+        && let Some(cluster) = load_cluster_for_env(&ctx, &env_name)
+    {
+        return run_cluster(&cluster, json, skip_mount);
+    }
     // Single-host (local OR remote-being-probed). When `--data-path` is
     // passed explicitly, treat a missing path as an error; when absent
     // (falling back to DEFAULT_DATA_PATH), treat it as a warning.
@@ -118,7 +119,8 @@ fn run_cluster(cluster: &config::ClusterConfig, json: bool, skip_mount: bool) ->
                 // Convention: libtorch lives at `<worker.path>/libtorch/<worker.arch>`
                 // when the host declares an arch; else probe walks
                 // `<worker.path>/libtorch/.active` (single-host default).
-                worker.arch
+                worker
+                    .arch
                     .as_ref()
                     .map(|a| PathBuf::from(&worker.path).join("libtorch").join(a)),
                 worker.docker.clone(),
@@ -158,11 +160,7 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
     // PATH the SSH command returns "fdl: command not found" exit
     // 127, which the probe-result parser surfaces as an SSH error
     // for that host.
-    let mut remote_args: Vec<String> = vec![
-        "fdl".into(),
-        "probe".into(),
-        "--json".into(),
-    ];
+    let mut remote_args: Vec<String> = vec!["fdl".into(), "probe".into(), "--json".into()];
     // Only forward --data-path when the host declared one. Without it,
     // the remote falls back to DEFAULT_DATA_PATH and the probe treats a
     // missing path as a WARNING (convention default) rather than an
@@ -293,8 +291,8 @@ fn probe_remote_via_ssh(worker: &ClusterWorker, skip_mount: bool) -> ProbeReport
 /// the more common source of "probe says host X but cluster.yml says
 /// host Y" diagnostics).
 fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, String> {
-    let v: serde_json::Value = serde_json::from_str(json.trim())
-        .map_err(|e| format!("JSON parse: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("JSON parse: {e}"))?;
 
     let mut report = ProbeReport {
         host: worker.host.clone(),
@@ -323,7 +321,11 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
     if let Some(gpus) = v.get("gpus").and_then(|g| g.as_array()) {
         for g in gpus {
             let index = g.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-            let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = g
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let total_memory_mb = g.get("vram_mb").and_then(|v| v.as_u64()).unwrap_or(0);
             // `vendor` + `arch` are the vendor-plural pair. `sm` is the
             // legacy NVIDIA-only key, still read so a probe against an
@@ -360,26 +362,41 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
     }
 
     if let Some(lt) = v.get("libtorch")
-        && !lt.is_null() {
-            let path = lt.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let valid_dir = lt.get("valid_dir").and_then(|v| v.as_bool()).unwrap_or(false);
-            let info = LibtorchInfo {
-                path,
-                torch_version: lt.get("torch").and_then(|v| v.as_str()).map(String::from),
-                cuda_version: lt.get("cuda").and_then(|v| v.as_str()).map(String::from),
-                archs: lt.get("archs").and_then(|v| v.as_str()).map(String::from),
-                source: None,
-            };
-            let mut archs_match = Vec::new();
-            if let Some(am) = lt.get("archs_match").and_then(|v| v.as_array()) {
-                for entry in am {
-                    let gpu = entry.get("gpu").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-                    let covered = entry.get("covered").and_then(|v| v.as_bool()).unwrap_or(false);
-                    archs_match.push((gpu, covered));
-                }
+        && !lt.is_null()
+    {
+        let path = lt
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let valid_dir = lt
+            .get("valid_dir")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let info = LibtorchInfo {
+            path,
+            torch_version: lt.get("torch").and_then(|v| v.as_str()).map(String::from),
+            cuda_version: lt.get("cuda").and_then(|v| v.as_str()).map(String::from),
+            archs: lt.get("archs").and_then(|v| v.as_str()).map(String::from),
+            source: None,
+        };
+        let mut archs_match = Vec::new();
+        if let Some(am) = lt.get("archs_match").and_then(|v| v.as_array()) {
+            for entry in am {
+                let gpu = entry.get("gpu").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let covered = entry
+                    .get("covered")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                archs_match.push((gpu, covered));
             }
-            report.libtorch = LibtorchStatus { info: Some(info), valid_dir, archs_match };
         }
+        report.libtorch = LibtorchStatus {
+            info: Some(info),
+            valid_dir,
+            archs_match,
+        };
+    }
 
     if let Some(dp) = v.get("data_path") {
         if !dp.is_null() {
@@ -389,7 +406,10 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(worker.effective_data_path()));
             let exists = dp.get("exists").and_then(|v| v.as_bool()).unwrap_or(false);
-            let readable = dp.get("readable").and_then(|v| v.as_bool()).unwrap_or(false);
+            let readable = dp
+                .get("readable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let fs_type = dp.get("fs_type").and_then(|v| v.as_str()).map(String::from);
             report.data_path = DataPathStatus {
                 path,
@@ -404,21 +424,25 @@ fn parse_remote_json(json: &str, worker: &ClusterWorker) -> Result<ProbeReport, 
     }
 
     if let Some(nccl) = v.get("nccl")
-        && !nccl.is_null() {
-            let p = nccl.get("library_path").and_then(|v| v.as_str()).map(PathBuf::from);
-            report.nccl.library_path = p.clone();
-            if let Some(p) = p {
-                report.nccl.all_found.push(p);
-            }
-            // Prefer the remote's reported via_docker over the
-            // cluster.yml field — the controller already passed it in
-            // via --docker so the remote echo confirms what was used;
-            // they should match, and using the remote's keeps the
-            // round-trip a single source of truth.
-            if let Some(svc) = nccl.get("via_docker").and_then(|v| v.as_str()) {
-                report.nccl.via_docker = Some(svc.to_string());
-            }
+        && !nccl.is_null()
+    {
+        let p = nccl
+            .get("library_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        report.nccl.library_path = p.clone();
+        if let Some(p) = p {
+            report.nccl.all_found.push(p);
         }
+        // Prefer the remote's reported via_docker over the
+        // cluster.yml field — the controller already passed it in
+        // via --docker so the remote echo confirms what was used;
+        // they should match, and using the remote's keeps the
+        // round-trip a single source of truth.
+        if let Some(svc) = nccl.get("via_docker").and_then(|v| v.as_str()) {
+            report.nccl.via_docker = Some(svc.to_string());
+        }
+    }
 
     if let Some(issues) = v.get("issues").and_then(|v| v.as_array()) {
         for i in issues {
@@ -666,7 +690,11 @@ pub fn probe_local(
     // (~340 MB), while the CUDA archives bundle no libnccl at all, which
     // is exactly why that one is worth probing for and this one is not.
     let nccl = if !has_nvidia {
-        NcclStatus { library_path: None, all_found: vec![], via_docker: None }
+        NcclStatus {
+            library_path: None,
+            all_found: vec![],
+            via_docker: None,
+        }
     } else {
         check_nccl(via_docker, &mut issues)
     };
@@ -766,7 +794,11 @@ fn libtorch_status_from_info(
             Vec::new()
         }
     };
-    LibtorchStatus { info, valid_dir, archs_match }
+    LibtorchStatus {
+        info,
+        valid_dir,
+        archs_match,
+    }
 }
 
 /// Variant that takes an explicit libtorch path instead of walking
@@ -782,17 +814,14 @@ fn libtorch_status_from_info(
 ///    `arch:` to a different case-file subpath (e.g. `.active.blackwell`).
 /// 3. **Direct variant dir** (has `lib/libtorch.so` + optional
 ///    `.arch`) — used as-is.
-fn check_libtorch_at(
-    path: &Path,
-    gpus: &[GpuInfo],
-    issues: &mut Vec<String>,
-) -> LibtorchStatus {
+fn check_libtorch_at(path: &Path, gpus: &[GpuInfo], issues: &mut Vec<String>) -> LibtorchStatus {
     // Shape 2: a regular file whose name starts with `.active` is a
     // pointer to a variant subdir. Resolve relative to the file's
     // parent (the libtorch root). Note: `.active` itself is also a
     // file but Shape 1 catches it via dir-containing-.active above.
     if path.is_file()
-        && path.file_name()
+        && path
+            .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(".active"))
     {
@@ -821,14 +850,14 @@ fn check_libtorch_at(
     let info = detect::libtorch_info_from_dir(dir.display().to_string(), dir);
     let archs_match = detect::arch_coverage(&info, gpus, issues);
     push_loader_issue(dir, &info.path, issues);
-    LibtorchStatus { info: Some(info), valid_dir: true, archs_match }
+    LibtorchStatus {
+        info: Some(info),
+        valid_dir: true,
+        archs_match,
+    }
 }
 
-fn check_libtorch(
-    root: &Path,
-    gpus: &[GpuInfo],
-    issues: &mut Vec<String>,
-) -> LibtorchStatus {
+fn check_libtorch(root: &Path, gpus: &[GpuInfo], issues: &mut Vec<String>) -> LibtorchStatus {
     // `root` can be the project root OR the libtorch root (latter is
     // what `--libtorch-path /path/to/libtorch` resolves to when the
     // dir has `.active`). `read_active` expects the parent of
@@ -877,7 +906,11 @@ fn check_libtorch(
         }
     };
 
-    LibtorchStatus { info, valid_dir, archs_match }
+    LibtorchStatus {
+        info,
+        valid_dir,
+        archs_match,
+    }
 }
 
 fn check_data_path(
@@ -934,7 +967,13 @@ fn check_data_path(
         ));
     }
 
-    DataPathStatus { path, exists, readable, fs_type, skipped: false }
+    DataPathStatus {
+        path,
+        exists,
+        readable,
+        fs_type,
+        skipped: false,
+    }
 }
 
 /// Report a missing vendor toolkit for the ACTIVE libtorch variant.
@@ -997,7 +1036,12 @@ fn check_gpu_toolkit(info: Option<&LibtorchInfo>, warnings: &mut Vec<String>) {
     };
 
     if let Some(w) = gpu_toolkit_warning(
-        &info.path, Path::new(&root), root_env, headers, metapackages, feature,
+        &info.path,
+        Path::new(&root),
+        root_env,
+        headers,
+        metapackages,
+        feature,
     ) {
         warnings.push(w);
     }
@@ -1115,7 +1159,11 @@ fn check_nccl(via_docker: Option<String>, issues: &mut Vec<String>) -> NcclStatu
         );
     }
 
-    NcclStatus { library_path: found.first().cloned(), all_found: found, via_docker: None }
+    NcclStatus {
+        library_path: found.first().cloned(),
+        all_found: found,
+        via_docker: None,
+    }
 }
 
 /// What is mounted AT `path` exactly: `(source, fs_type)` from
@@ -1273,7 +1321,10 @@ fn print_report(r: &ProbeReport) {
             Some(p) => {
                 println!("  found    : {}", p.display());
                 if r.nccl.all_found.len() > 1 {
-                    println!("  others   : {} more (check for version skew)", r.nccl.all_found.len() - 1);
+                    println!(
+                        "  others   : {} more (check for version skew)",
+                        r.nccl.all_found.len() - 1
+                    );
                 }
             }
             None => println!("  (no libnccl.so* discovered)"),
@@ -1337,7 +1388,9 @@ fn report_to_json_object(r: &ProbeReport) -> String {
     // GPUs
     b.push_str(",\"gpus\":[");
     for (i, g) in r.gpus.iter().enumerate() {
-        if i > 0 { b.push(','); }
+        if i > 0 {
+            b.push(',');
+        }
         let _ = write!(
             b,
             "{{\"index\":{},\"name\":\"{}\",\"vendor\":\"{}\",\"arch\":\"{}\",\"sm\":\"{}\",\"vram_mb\":{}}}",
@@ -1375,7 +1428,9 @@ fn report_to_json_object(r: &ProbeReport) -> String {
             }
             b.push_str(",\"archs_match\":[");
             for (i, (gpu, ok)) in r.libtorch.archs_match.iter().enumerate() {
-                if i > 0 { b.push(','); }
+                if i > 0 {
+                    b.push(',');
+                }
                 let _ = write!(b, "{{\"gpu\":{},\"covered\":{}}}", gpu, ok);
             }
             b.push(']');
@@ -1432,13 +1487,17 @@ fn report_to_json_object(r: &ProbeReport) -> String {
     // Issues (errors) + warnings + verdict.
     b.push_str(",\"issues\":[");
     for (i, msg) in r.issues.iter().enumerate() {
-        if i > 0 { b.push(','); }
+        if i > 0 {
+            b.push(',');
+        }
         let _ = write!(b, "\"{}\"", system::escape_json(msg));
     }
     b.push(']');
     b.push_str(",\"warnings\":[");
     for (i, msg) in r.warnings.iter().enumerate() {
-        if i > 0 { b.push(','); }
+        if i > 0 {
+            b.push(',');
+        }
         let _ = write!(b, "\"{}\"", system::escape_json(msg));
     }
     b.push(']');
@@ -1466,8 +1525,12 @@ mod tests {
         // containers.)
         let root = PathBuf::from("/nonexistent/flodl-probe-test/rocm");
         let w = gpu_toolkit_warning(
-            "precompiled/rocm70", &root, "ROCM_PATH",
-            crate::util::requirements::ROCM_HEADERS, None, "rocm",
+            "precompiled/rocm70",
+            &root,
+            "ROCM_PATH",
+            crate::util::requirements::ROCM_HEADERS,
+            None,
+            "rocm",
         )
         .expect("absent toolkit must warn");
         for (header, _) in crate::util::requirements::ROCM_HEADERS {
@@ -1482,7 +1545,9 @@ mod tests {
         // windows at once; the spellings themselves are pinned where they
         // are decided, in `requirements::install_hint`.
         let packages = crate::util::requirements::packages_for(
-            &crate::util::requirements::ROCM_HEADERS.iter().collect::<Vec<_>>(),
+            &crate::util::requirements::ROCM_HEADERS
+                .iter()
+                .collect::<Vec<_>>(),
         );
         let hint = crate::util::requirements::install_hint(&packages);
         assert!(w.contains(&hint), "install line not `{hint}`: {w}");
@@ -1497,9 +1562,12 @@ mod tests {
         // the set, where the per-header names carry version placeholders.
         let root = PathBuf::from("/nonexistent/flodl-probe-test/cuda");
         let w = gpu_toolkit_warning(
-            "precompiled/cu128", &root, "CUDA_HOME",
+            "precompiled/cu128",
+            &root,
+            "CUDA_HOME",
             &[("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>")],
-            Some("cuda-toolkit libnccl-dev"), "cuda",
+            Some("cuda-toolkit libnccl-dev"),
+            "cuda",
         )
         .unwrap();
         assert!(w.contains("dev container is unaffected"), "{w}");
@@ -1509,7 +1577,10 @@ mod tests {
             "libnccl-dev".to_string(),
         ]);
         assert!(w.contains(&hint), "metapackage line not `{hint}`: {w}");
-        assert!(!w.contains("<M>-<m>"), "placeholders must not reach the user: {w}");
+        assert!(
+            !w.contains("<M>-<m>"),
+            "placeholders must not reach the user: {w}"
+        );
     }
 
     #[test]
@@ -1517,27 +1588,39 @@ mod tests {
         // A real include/ layout, because the requirements checker looks
         // under <root>/include (and the system dirs) exactly as the
         // compiler will.
-        let root = std::env::temp_dir()
-            .join(format!("fdl-probe-toolkit-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("fdl-probe-toolkit-{}", std::process::id()));
         std::fs::create_dir_all(root.join("include/hip")).unwrap();
         std::fs::write(root.join("include/hip/hip_runtime.h"), "//").unwrap();
 
         assert!(
             gpu_toolkit_warning(
-                "precompiled/rocm70", &root, "ROCM_PATH",
-                &[("hip/hip_runtime.h", "hip-dev")], None, "rocm",
+                "precompiled/rocm70",
+                &root,
+                "ROCM_PATH",
+                &[("hip/hip_runtime.h", "hip-dev")],
+                None,
+                "rocm",
             )
             .is_none(),
             "a present header must not warn"
         );
         let w = gpu_toolkit_warning(
-            "precompiled/rocm70", &root, "ROCM_PATH",
-            &[("hip/hip_runtime.h", "hip-dev"), ("rccl/rccl.h", "rccl-dev")],
-            None, "rocm",
+            "precompiled/rocm70",
+            &root,
+            "ROCM_PATH",
+            &[
+                ("hip/hip_runtime.h", "hip-dev"),
+                ("rccl/rccl.h", "rccl-dev"),
+            ],
+            None,
+            "rocm",
         )
         .expect("one missing header is still a warning");
         assert!(w.contains("rccl/rccl.h"), "{w}");
-        assert!(!w.contains("hip_runtime"), "must not list the header it found: {w}");
+        assert!(
+            !w.contains("hip_runtime"),
+            "must not list the header it found: {w}"
+        );
         assert!(!w.contains("hip-dev"), "nor the package it owns: {w}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1549,8 +1632,14 @@ mod tests {
         assert!(detect::variant_vendor("precompiled/cpu").is_none());
         assert!(detect::variant_vendor("precompiled/cpu-linux-aarch64").is_none());
         // And the vendors that DO imply a toolkit still resolve.
-        assert_eq!(detect::variant_vendor("precompiled/rocm70"), Some(GpuVendor::Amd));
-        assert_eq!(detect::variant_vendor("precompiled/cu128"), Some(GpuVendor::Nvidia));
+        assert_eq!(
+            detect::variant_vendor("precompiled/rocm70"),
+            Some(GpuVendor::Amd)
+        );
+        assert_eq!(
+            detect::variant_vendor("precompiled/cu128"),
+            Some(GpuVendor::Nvidia)
+        );
     }
 
     #[test]
@@ -1565,8 +1654,14 @@ mod tests {
             &mut warnings,
         );
         assert!(status.skipped);
-        assert!(issues.is_empty(), "skip_mount must suppress missing-path issue");
-        assert!(warnings.is_empty(), "skip_mount must suppress missing-path warning");
+        assert!(
+            issues.is_empty(),
+            "skip_mount must suppress missing-path issue"
+        );
+        assert!(
+            warnings.is_empty(),
+            "skip_mount must suppress missing-path warning"
+        );
     }
 
     #[test]
@@ -1631,7 +1726,10 @@ mod tests {
     fn nccl_via_docker_skips_host_scan() {
         let mut issues = Vec::new();
         let status = check_nccl(Some("cuda".into()), &mut issues);
-        assert!(issues.is_empty(), "docker-served NCCL must not produce errors");
+        assert!(
+            issues.is_empty(),
+            "docker-served NCCL must not produce errors"
+        );
         assert!(status.library_path.is_none());
         assert!(status.all_found.is_empty());
         assert_eq!(status.via_docker.as_deref(), Some("cuda"));
@@ -1643,22 +1741,40 @@ mod tests {
         let r0 = ProbeReport {
             host: "h".into(),
             gpus: vec![],
-            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
-            data_path: DataPathStatus {
-                path: PathBuf::new(), exists: false, readable: false, fs_type: None, skipped: true,
+            libtorch: LibtorchStatus {
+                info: None,
+                valid_dir: false,
+                archs_match: vec![],
             },
-            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            data_path: DataPathStatus {
+                path: PathBuf::new(),
+                exists: false,
+                readable: false,
+                fs_type: None,
+                skipped: true,
+            },
+            nccl: NcclStatus {
+                library_path: None,
+                all_found: vec![],
+                via_docker: None,
+            },
             issues: vec![],
             warnings: vec![],
         };
         assert!(r0.green());
 
         // Warning-only is still green (exit 0).
-        let r1 = ProbeReport { warnings: vec!["w".into()], ..clone_report(&r0) };
+        let r1 = ProbeReport {
+            warnings: vec!["w".into()],
+            ..clone_report(&r0)
+        };
         assert!(r1.green());
 
         // Error flips green to false.
-        let r2 = ProbeReport { issues: vec!["e".into()], ..clone_report(&r0) };
+        let r2 = ProbeReport {
+            issues: vec!["e".into()],
+            ..clone_report(&r0)
+        };
         assert!(!r2.green());
     }
 
@@ -1695,11 +1811,23 @@ mod tests {
         let r = ProbeReport {
             host: "h".into(),
             gpus: vec![],
-            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
-            data_path: DataPathStatus {
-                path: PathBuf::new(), exists: false, readable: false, fs_type: None, skipped: true,
+            libtorch: LibtorchStatus {
+                info: None,
+                valid_dir: false,
+                archs_match: vec![],
             },
-            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: Some("cuda".into()) },
+            data_path: DataPathStatus {
+                path: PathBuf::new(),
+                exists: false,
+                readable: false,
+                fs_type: None,
+                skipped: true,
+            },
+            nccl: NcclStatus {
+                library_path: None,
+                all_found: vec![],
+                via_docker: Some("cuda".into()),
+            },
             issues: vec![],
             warnings: vec!["data-path missing".into()],
         };
@@ -1724,12 +1852,23 @@ mod tests {
                 arch: GpuArch::Sm { major: 8, minor: 6 },
                 total_memory_mb: 1024,
             }],
-            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
-            data_path: DataPathStatus {
-                path: PathBuf::from("/mnt/na\ts"), exists: true, readable: true,
-                fs_type: Some("virtio\u{1}fs".into()), skipped: false,
+            libtorch: LibtorchStatus {
+                info: None,
+                valid_dir: false,
+                archs_match: vec![],
             },
-            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            data_path: DataPathStatus {
+                path: PathBuf::from("/mnt/na\ts"),
+                exists: true,
+                readable: true,
+                fs_type: Some("virtio\u{1}fs".into()),
+                skipped: false,
+            },
+            nccl: NcclStatus {
+                library_path: None,
+                all_found: vec![],
+                via_docker: None,
+            },
             issues: vec!["line1\nline2\ttabbed".into()],
             warnings: vec![],
         };
@@ -1748,8 +1887,8 @@ mod tests {
             "host: pascal\nlocal_devices: [0]\nnccl_socket_ifname: lo\npath: /opt/flodl",
         )
         .expect("minimal worker");
-        let report = parse_remote_json(r#"{"something":"else"}"#, &worker)
-            .expect("valid JSON parses");
+        let report =
+            parse_remote_json(r#"{"something":"else"}"#, &worker).expect("valid JSON parses");
         assert!(
             report.issues.iter().any(|i| i.contains("version skew")),
             "issues: {:?}",
@@ -1778,7 +1917,10 @@ mod tests {
                     index: 0,
                     vendor: GpuVendor::Nvidia,
                     name: "NVIDIA GeForce RTX 5060 Ti".into(),
-                    arch: GpuArch::Sm { major: 12, minor: 0 },
+                    arch: GpuArch::Sm {
+                        major: 12,
+                        minor: 0,
+                    },
                     total_memory_mb: 16311,
                 },
                 GpuInfo {
@@ -1789,19 +1931,36 @@ mod tests {
                     total_memory_mb: 16384,
                 },
             ],
-            libtorch: LibtorchStatus { info: None, valid_dir: false, archs_match: vec![] },
-            data_path: DataPathStatus {
-                path: PathBuf::from("/d"), exists: true, readable: true,
-                fs_type: None, skipped: false,
+            libtorch: LibtorchStatus {
+                info: None,
+                valid_dir: false,
+                archs_match: vec![],
             },
-            nccl: NcclStatus { library_path: None, all_found: vec![], via_docker: None },
+            data_path: DataPathStatus {
+                path: PathBuf::from("/d"),
+                exists: true,
+                readable: true,
+                fs_type: None,
+                skipped: false,
+            },
+            nccl: NcclStatus {
+                library_path: None,
+                all_found: vec![],
+                via_docker: None,
+            },
             issues: vec![],
             warnings: vec![],
         };
         let back = parse_remote_json(&report_to_json_object(&r), &wire_test_worker())
             .expect("emitted JSON parses");
         assert_eq!(back.gpus.len(), 2, "warnings: {:?}", back.warnings);
-        assert_eq!(back.gpus[0].arch, GpuArch::Sm { major: 12, minor: 0 });
+        assert_eq!(
+            back.gpus[0].arch,
+            GpuArch::Sm {
+                major: 12,
+                minor: 0
+            }
+        );
         assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);
         assert_eq!(back.gpus[1].arch, GpuArch::Gfx("gfx1030".into()));
         assert_eq!(back.gpus[1].vendor, GpuVendor::Amd);
@@ -1812,7 +1971,8 @@ mod tests {
     fn gpu_wire_reads_a_legacy_sm_only_remote() {
         // An older `fdl` on the remote emits `sm` and no `vendor`/`arch`.
         // It only ever ran on NVIDIA, so that is the right assumption.
-        let json = r#"{"host":"p","gpus":[{"index":0,"name":"A100","sm":"sm_80","vram_mb":81920}]}"#;
+        let json =
+            r#"{"host":"p","gpus":[{"index":0,"name":"A100","sm":"sm_80","vram_mb":81920}]}"#;
         let back = parse_remote_json(json, &wire_test_worker()).expect("parses");
         assert_eq!(back.gpus.len(), 1);
         assert_eq!(back.gpus[0].vendor, GpuVendor::Nvidia);

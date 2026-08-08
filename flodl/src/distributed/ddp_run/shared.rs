@@ -82,7 +82,10 @@ pub(crate) fn check_epoch_geometry(
         if divides {
             "exact".to_string()
         } else {
-            format!("up to {} picks/pass outside the last batch", splits * (batch_size - 1))
+            format!(
+                "up to {} picks/pass outside the last batch",
+                splits * (batch_size - 1)
+            )
         },
     );
     // A tail is re-drawn every pass, so multi-pass runs average it away
@@ -138,7 +141,8 @@ pub(crate) fn throughput_sizes(
     if total_tp <= 0.0 {
         return equal_sizes(ms.len(), total);
     }
-    let mut sizes: Vec<usize> = throughputs.iter()
+    let mut sizes: Vec<usize> = throughputs
+        .iter()
         .map(|t| ((t / total_tp) * total as f64).floor() as usize)
         .collect();
     // Distribute remainder to fastest ranks (highest throughput first).
@@ -147,9 +151,15 @@ pub(crate) fn throughput_sizes(
     if remaining > 0 {
         // Sort rank indices by throughput descending.
         let mut rank_order: Vec<usize> = (0..ms.len()).collect();
-        rank_order.sort_by(|&a, &b| throughputs[b].partial_cmp(&throughputs[a]).unwrap_or(std::cmp::Ordering::Equal));
+        rank_order.sort_by(|&a, &b| {
+            throughputs[b]
+                .partial_cmp(&throughputs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for &rank in &rank_order {
-            if remaining == 0 { break; }
+            if remaining == 0 {
+                break;
+            }
             sizes[rank] += 1;
             remaining -= 1;
         }
@@ -168,16 +178,23 @@ pub(crate) fn ratio_to_sizes(ratios: &[f64], total: usize) -> Vec<usize> {
     } else {
         vec![1.0 / ratios.len() as f64; ratios.len()]
     };
-    let mut sizes: Vec<usize> = norm.iter()
+    let mut sizes: Vec<usize> = norm
+        .iter()
         .map(|r| (r * total as f64).floor() as usize)
         .collect();
     let assigned: usize = sizes.iter().sum();
     let mut remaining = total.saturating_sub(assigned);
     if remaining > 0 {
         let mut rank_order: Vec<usize> = (0..ratios.len()).collect();
-        rank_order.sort_by(|&a, &b| norm[b].partial_cmp(&norm[a]).unwrap_or(std::cmp::Ordering::Equal));
+        rank_order.sort_by(|&a, &b| {
+            norm[b]
+                .partial_cmp(&norm[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for &rank in &rank_order {
-            if remaining == 0 { break; }
+            if remaining == 0 {
+                break;
+            }
             sizes[rank] += 1;
             remaining -= 1;
         }
@@ -217,8 +234,9 @@ pub(crate) fn aggregate_epoch_metrics(
     let mut rank_compute_only_ms: Vec<f64> = vec![0.0; world_size];
     let mut rank_data_starve_ms: Vec<f64> = vec![0.0; world_size];
     // Per-rank scalar accumulators: (sum, count) per key
-    let mut rank_scalars: Vec<std::collections::HashMap<String, (f64, usize)>> =
-        (0..world_size).map(|_| std::collections::HashMap::new()).collect();
+    let mut rank_scalars: Vec<std::collections::HashMap<String, (f64, usize)>> = (0..world_size)
+        .map(|_| std::collections::HashMap::new())
+        .collect();
 
     for m in msgs {
         let r = m.rank.min(world_size - 1);
@@ -277,7 +295,10 @@ pub(crate) fn aggregate_epoch_metrics(
             scalars
                 .iter()
                 .map(|(k, (sum, count))| {
-                    (k.clone(), if *count > 0 { sum / *count as f64 } else { 0.0 })
+                    (
+                        k.clone(),
+                        if *count > 0 { sum / *count as f64 } else { 0.0 },
+                    )
                 })
                 .collect()
         })
@@ -298,9 +319,10 @@ pub(crate) fn aggregate_epoch_metrics(
     }
     for (k, v) in &mut scalars {
         if let Some(w) = weights.get(k)
-            && *w > 0.0 {
-                *v /= *w;
-            }
+            && *w > 0.0
+        {
+            *v /= *w;
+        }
     }
 
     // Per-rank throughput (samples/ms) and batch share.
@@ -316,14 +338,20 @@ pub(crate) fn aggregate_epoch_metrics(
     //
     // Falls back to epoch_ms when share_complete_ms wasn't populated (legacy
     // call sites or test fixtures using the old MetricsMsg shape).
-    let per_rank_throughput: Vec<f64> = (0..world_size).map(|r| {
-        let denom = if rank_share_complete_ms[r] > 0.0 {
-            rank_share_complete_ms[r]
-        } else {
-            rank_time_ms[r]
-        };
-        if denom > 0.0 { rank_samples[r] as f64 / denom } else { 0.0 }
-    }).collect();
+    let per_rank_throughput: Vec<f64> = (0..world_size)
+        .map(|r| {
+            let denom = if rank_share_complete_ms[r] > 0.0 {
+                rank_share_complete_ms[r]
+            } else {
+                rank_time_ms[r]
+            };
+            if denom > 0.0 {
+                rank_samples[r] as f64 / denom
+            } else {
+                0.0
+            }
+        })
+        .collect();
     // Per-rank batch share comes from the balancer's smoothed view of its
     // own recent batch_counts allocation (`el_che.recent_batch_share()`),
     // not from samples consumed. Under progressive dispatch the latter is
@@ -341,10 +369,15 @@ pub(crate) fn aggregate_epoch_metrics(
     };
 
     EpochMetrics {
-        epoch, scalars, per_rank, avg_loss, epoch_ms,
+        epoch,
+        scalars,
+        per_rank,
+        avg_loss,
+        epoch_ms,
         per_rank_loss,
         per_rank_samples: rank_samples,
-        per_rank_throughput, per_rank_batch_share,
+        per_rank_throughput,
+        per_rank_batch_share,
         per_rank_share_complete_ms: rank_share_complete_ms,
         per_rank_compute_only_ms: rank_compute_only_ms,
         per_rank_data_starve_ms: rank_data_starve_ms,
@@ -354,28 +387,44 @@ pub(crate) fn aggregate_epoch_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_epoch_metrics, pick_space, window_cap_batches};
     use super::super::MetricsMsg;
+    use super::{aggregate_epoch_metrics, pick_space, window_cap_batches};
     use std::collections::HashMap;
 
     #[test]
     fn test_aggregate_epoch_metrics() {
         let mut scalars_r0 = HashMap::new();
         scalars_r0.insert("loss".to_string(), (3.0, 3_usize)); // mean = 1.0
-        scalars_r0.insert("acc".to_string(), (1.8, 3));         // mean = 0.6
+        scalars_r0.insert("acc".to_string(), (1.8, 3)); // mean = 0.6
 
         let mut scalars_r1 = HashMap::new();
         scalars_r1.insert("loss".to_string(), (4.0, 2_usize)); // mean = 2.0
-        scalars_r1.insert("acc".to_string(), (0.8, 2));         // mean = 0.4
+        scalars_r1.insert("acc".to_string(), (0.8, 2)); // mean = 0.4
 
         let msgs = vec![
             MetricsMsg {
-                rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 60,
-                epoch_ms: 1000.0, share_complete_ms: 1000.0, compute_only_ms: 1000.0, data_starve_ms: 0.0, samples_processed: 1920, scalars: scalars_r0,
+                rank: 0,
+                epoch: 0,
+                avg_loss: 0.5,
+                batches_processed: 60,
+                epoch_ms: 1000.0,
+                share_complete_ms: 1000.0,
+                compute_only_ms: 1000.0,
+                data_starve_ms: 0.0,
+                samples_processed: 1920,
+                scalars: scalars_r0,
             },
             MetricsMsg {
-                rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 40,
-                epoch_ms: 1200.0, share_complete_ms: 1200.0, compute_only_ms: 1200.0, data_starve_ms: 0.0, samples_processed: 1280, scalars: scalars_r1,
+                rank: 1,
+                epoch: 0,
+                avg_loss: 0.7,
+                batches_processed: 40,
+                epoch_ms: 1200.0,
+                share_complete_ms: 1200.0,
+                compute_only_ms: 1200.0,
+                data_starve_ms: 0.0,
+                samples_processed: 1280,
+                scalars: scalars_r1,
             },
         ];
 
@@ -428,32 +477,67 @@ mod tests {
         let msgs = vec![
             // Rank 0 chunk 1
             MetricsMsg {
-                rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 20,
-                epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
+                rank: 0,
+                epoch: 0,
+                avg_loss: 0.5,
+                batches_processed: 20,
+                epoch_ms: 300.0,
+                share_complete_ms: 300.0,
+                compute_only_ms: 300.0,
+                data_starve_ms: 0.0,
+                samples_processed: 640,
                 scalars: [("loss".to_string(), (2.0, 2_usize))].into(),
             },
             // Rank 0 chunk 2 (durations are per-chunk, NOT cumulative)
             MetricsMsg {
-                rank: 0, epoch: 0, avg_loss: 0.4, batches_processed: 20,
-                epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
+                rank: 0,
+                epoch: 0,
+                avg_loss: 0.4,
+                batches_processed: 20,
+                epoch_ms: 300.0,
+                share_complete_ms: 300.0,
+                compute_only_ms: 300.0,
+                data_starve_ms: 0.0,
+                samples_processed: 640,
                 scalars: [("loss".to_string(), (1.6, 2_usize))].into(),
             },
             // Rank 0 chunk 3
             MetricsMsg {
-                rank: 0, epoch: 0, avg_loss: 0.6, batches_processed: 20,
-                epoch_ms: 300.0, share_complete_ms: 300.0, compute_only_ms: 300.0, data_starve_ms: 0.0, samples_processed: 640,
+                rank: 0,
+                epoch: 0,
+                avg_loss: 0.6,
+                batches_processed: 20,
+                epoch_ms: 300.0,
+                share_complete_ms: 300.0,
+                compute_only_ms: 300.0,
+                data_starve_ms: 0.0,
+                samples_processed: 640,
                 scalars: [("loss".to_string(), (1.8, 2_usize))].into(),
             },
             // Rank 1 chunk 1
             MetricsMsg {
-                rank: 1, epoch: 0, avg_loss: 0.7, batches_processed: 20,
-                epoch_ms: 500.0, share_complete_ms: 500.0, compute_only_ms: 500.0, data_starve_ms: 0.0, samples_processed: 640,
+                rank: 1,
+                epoch: 0,
+                avg_loss: 0.7,
+                batches_processed: 20,
+                epoch_ms: 500.0,
+                share_complete_ms: 500.0,
+                compute_only_ms: 500.0,
+                data_starve_ms: 0.0,
+                samples_processed: 640,
                 scalars: [("loss".to_string(), (2.8, 2_usize))].into(),
             },
             // Rank 1 chunk 2
             MetricsMsg {
-                rank: 1, epoch: 0, avg_loss: 0.8, batches_processed: 20,
-                epoch_ms: 500.0, share_complete_ms: 500.0, compute_only_ms: 500.0, data_starve_ms: 0.0, samples_processed: 640,
+                rank: 1,
+                epoch: 0,
+                avg_loss: 0.8,
+                batches_processed: 20,
+                epoch_ms: 500.0,
+                share_complete_ms: 500.0,
+                compute_only_ms: 500.0,
+                data_starve_ms: 0.0,
+                samples_processed: 640,
                 scalars: [("loss".to_string(), (3.2, 2_usize))].into(),
             },
         ];
@@ -463,7 +547,11 @@ mod tests {
         let m = aggregate_epoch_metrics(0, &msgs, &dev_indices, &bc_share);
 
         // Must have exactly 2 entries (world_size), not 5 (one per msg)
-        assert_eq!(m.per_rank_throughput.len(), 2, "should have world_size entries");
+        assert_eq!(
+            m.per_rank_throughput.len(),
+            2,
+            "should have world_size entries"
+        );
         assert_eq!(m.per_rank_batch_share.len(), 2);
         assert_eq!(m.per_rank.len(), 2);
         assert_eq!(m.device_indices, vec![0, 1]);
@@ -540,7 +628,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("epoch_splits 50"), "unexpected: {msg}");
         assert!(msg.contains("train nothing"), "unexpected: {msg}");
-        assert!(msg.contains("at most 25"), "must name a usable bound: {msg}");
+        assert!(
+            msg.contains("at most 25"),
+            "must name a usable bound: {msg}"
+        );
     }
 
     #[test]

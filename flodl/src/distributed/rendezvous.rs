@@ -33,17 +33,15 @@
 
 use std::env;
 use std::io::Write;
-use std::net::TcpStream;
 #[cfg(test)]
 use std::net::TcpListener;
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use crate::{Device, Result, TensorError};
 
 use super::launcher::FullCluster;
-use super::wire::{
-    ControlFrame, MsgKind, RendezvousMsgWire, RendezvousRole, SessionSalt,
-};
+use super::wire::{ControlFrame, MsgKind, RendezvousMsgWire, RendezvousRole, SessionSalt};
 use super::{LocalCluster, NCCL_UNIQUE_ID_BYTES, NcclUniqueId, WorkerBlock};
 
 const HOSTNAME_MAX_LEN: usize = 255;
@@ -183,12 +181,9 @@ where
 
     // Bracket IPv6 literals: a bare `fe80::1` concatenated with `:port`
     // is ambiguous and fails `ToSocketAddrs`; `[fe80::1]:port` is correct.
-    let addr = crate::distributed::wire::join_host_port(
-        &cluster.controller.host,
-        cluster.controller.port,
-    );
-    let mut stream =
-        crate::distributed::wire::connect_with_retry(addr.as_str(), "rendezvous")?;
+    let addr =
+        crate::distributed::wire::join_host_port(&cluster.controller.host, cluster.controller.port);
+    let mut stream = crate::distributed::wire::connect_with_retry(addr.as_str(), "rendezvous")?;
     // Dialer-side cleartext guard: a public controller address means
     // this rank's frames cross an uncontrolled network unencrypted.
     if let Ok(peer) = stream.peer_addr() {
@@ -197,9 +192,7 @@ where
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-        .map_err(|e| {
-            TensorError::new(&format!("rendezvous: setting timeouts failed: {e}"))
-        })?;
+        .map_err(|e| TensorError::new(&format!("rendezvous: setting timeouts failed: {e}")))?;
 
     // Channel-select magic first: the controller's single-port mux
     // routes on it, and the rendezvous server validates it before the
@@ -231,7 +224,9 @@ where
             write_rendezvous_frame(
                 &mut stream,
                 salt,
-                &RendezvousMsgWire::Uid { uid_bytes: bytes.to_vec() },
+                &RendezvousMsgWire::Uid {
+                    uid_bytes: bytes.to_vec(),
+                },
             )?;
             bytes.to_vec()
         }
@@ -287,10 +282,7 @@ where
 /// through [`run_controller_rendezvous_aborting`] (the launcher always
 /// owns an abort flag now).
 #[cfg(test)]
-pub fn run_controller_rendezvous(
-    full: &FullCluster,
-    local_host_name: &str,
-) -> Result<()> {
+pub fn run_controller_rendezvous(full: &FullCluster, local_host_name: &str) -> Result<()> {
     run_controller_rendezvous_with(
         full,
         local_host_name,
@@ -356,8 +348,7 @@ fn run_controller_rendezvous_with(
         ));
     }
 
-    let controller_at =
-        format!("{}:{}", full.controller.host, full.controller.port);
+    let controller_at = format!("{}:{}", full.controller.host, full.controller.port);
     let designated_rank = pick_designated_rank(full, local_host_name);
     eprintln!(
         "cluster launcher: rendezvous server up on port {} \
@@ -457,9 +448,11 @@ fn run_controller_rendezvous_with(
             }
         };
         let (dataset_sig, global_rank, host_name) = match msg {
-            RendezvousMsgWire::Hello { dataset_sig, global_rank, host_name } => {
-                (dataset_sig, global_rank, host_name)
-            }
+            RendezvousMsgWire::Hello {
+                dataset_sig,
+                global_rank,
+                host_name,
+            } => (dataset_sig, global_rank, host_name),
             other => {
                 eprintln!(
                     "cluster launcher: rendezvous rejected connection from \
@@ -564,7 +557,9 @@ fn run_controller_rendezvous_with(
         write_rendezvous_frame(
             stream,
             &full.salt,
-            &RendezvousMsgWire::Uid { uid_bytes: uid_bytes.clone() },
+            &RendezvousMsgWire::Uid {
+                uid_bytes: uid_bytes.clone(),
+            },
         )?;
     }
 
@@ -593,9 +588,10 @@ fn rejected_cap_error(world_size: usize, accepted: usize) -> TensorError {
 pub fn pick_designated_rank(full: &FullCluster, local_host_name: &str) -> u32 {
     for worker in &full.workers {
         if worker.host == local_host_name
-            && let Some(&r) = worker.ranks.first() {
-                return r as u32;
-            }
+            && let Some(&r) = worker.ranks.first()
+        {
+            return r as u32;
+        }
     }
     full.workers
         .first()
@@ -618,13 +614,9 @@ fn write_rendezvous_frame<W: Write>(
     frame.write_to(w)
 }
 
-fn read_rendezvous_frame(
-    stream: &mut TcpStream,
-    salt: &SessionSalt,
-) -> Result<RendezvousMsgWire> {
-    let frame = ControlFrame::read_from(stream, salt)?.ok_or_else(|| {
-        TensorError::new("rendezvous: peer closed stream before sending frame")
-    })?;
+fn read_rendezvous_frame(stream: &mut TcpStream, salt: &SessionSalt) -> Result<RendezvousMsgWire> {
+    let frame = ControlFrame::read_from(stream, salt)?
+        .ok_or_else(|| TensorError::new("rendezvous: peer closed stream before sending frame"))?;
     if frame.kind != MsgKind::Rendezvous {
         return Err(TensorError::new(&format!(
             "rendezvous: expected MsgKind::Rendezvous, got {:?}",
@@ -633,7 +625,6 @@ fn read_rendezvous_frame(
     }
     frame.decode()
 }
-
 
 fn validate_socket_ifname(cluster: &LocalCluster, this_host: &WorkerBlock) -> Result<()> {
     if !cluster.spans_multiple_workers() {
@@ -842,16 +833,13 @@ mod tests {
         }
 
         // Controller server: orchestrator-only (no local worker).
-        let ctrl_handle = thread::spawn(move || {
-            run_controller_rendezvous(&full, "test-controller-host")
-        });
+        let ctrl_handle =
+            thread::spawn(move || run_controller_rendezvous(&full, "test-controller-host"));
 
         let rank_a_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("host-a"));
             crate::distributed::cluster::set_thread_local_rank_override(Some(0));
-            TcpRendezvous::establish(&env_a, sig, || {
-                Ok(NcclUniqueId::from_bytes(stub_uid_bytes))
-            })
+            TcpRendezvous::establish(&env_a, sig, || Ok(NcclUniqueId::from_bytes(stub_uid_bytes)))
         });
         let rank_b_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("host-b"));
@@ -864,13 +852,23 @@ mod tests {
         });
 
         let ctrl_res = ctrl_handle.join().expect("controller thread");
-        let rdv_a = rank_a_handle.join().expect("host-a thread").expect("host-a ok");
-        let rdv_b = rank_b_handle.join().expect("host-b thread").expect("host-b ok");
+        let rdv_a = rank_a_handle
+            .join()
+            .expect("host-a thread")
+            .expect("host-a ok");
+        let rdv_b = rank_b_handle
+            .join()
+            .expect("host-b thread")
+            .expect("host-b ok");
 
         if let Some(v) = prev_ifname {
-            unsafe { env::set_var(ENV_NCCL_SOCKET_IFNAME, v); }
+            unsafe {
+                env::set_var(ENV_NCCL_SOCKET_IFNAME, v);
+            }
         } else {
-            unsafe { env::remove_var(ENV_NCCL_SOCKET_IFNAME); }
+            unsafe {
+                env::remove_var(ENV_NCCL_SOCKET_IFNAME);
+            }
         }
 
         ctrl_res.expect("controller rendezvous ok");
@@ -953,7 +951,9 @@ mod tests {
         write_rendezvous_frame(
             &mut conn0b,
             &salt,
-            &RendezvousMsgWire::Uid { uid_bytes: stub_uid.to_vec() },
+            &RendezvousMsgWire::Uid {
+                uid_bytes: stub_uid.to_vec(),
+            },
         )
         .unwrap();
 
@@ -1002,23 +1002,18 @@ mod tests {
             env::set_var(ENV_NCCL_SOCKET_IFNAME, "lo");
         }
 
-        let ctrl_handle = thread::spawn(move || {
-            run_controller_rendezvous(&full, "test-controller-host")
-        });
+        let ctrl_handle =
+            thread::spawn(move || run_controller_rendezvous(&full, "test-controller-host"));
 
         let rank_a_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("host-a"));
             crate::distributed::cluster::set_thread_local_rank_override(Some(0));
-            TcpRendezvous::establish(&env_a, sig_a, || {
-                Ok(NcclUniqueId::from_bytes(stub_uid))
-            })
+            TcpRendezvous::establish(&env_a, sig_a, || Ok(NcclUniqueId::from_bytes(stub_uid)))
         });
         let rank_b_handle = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("host-b"));
             crate::distributed::cluster::set_thread_local_rank_override(Some(0));
-            TcpRendezvous::establish(&env_b, sig_b, || {
-                Ok(NcclUniqueId::from_bytes(stub_uid))
-            })
+            TcpRendezvous::establish(&env_b, sig_b, || Ok(NcclUniqueId::from_bytes(stub_uid)))
         });
 
         let ctrl_err = ctrl_handle.join().expect("controller thread");
@@ -1026,9 +1021,13 @@ mod tests {
         let rdv_b = rank_b_handle.join().expect("host-b thread");
 
         if let Some(v) = prev_ifname {
-            unsafe { env::set_var(ENV_NCCL_SOCKET_IFNAME, v); }
+            unsafe {
+                env::set_var(ENV_NCCL_SOCKET_IFNAME, v);
+            }
         } else {
-            unsafe { env::remove_var(ENV_NCCL_SOCKET_IFNAME); }
+            unsafe {
+                env::remove_var(ENV_NCCL_SOCKET_IFNAME);
+            }
         }
 
         let err = ctrl_err.expect_err("controller must reject sig mismatch");
@@ -1042,7 +1041,10 @@ mod tests {
         );
         // Both ranks fail too: the controller closed their streams
         // without sending Roles, so the read of the Role frame errors.
-        assert!(rdv_a.is_err() || rdv_b.is_err(), "at least one rank must fail");
+        assert!(
+            rdv_a.is_err() || rdv_b.is_err(),
+            "at least one rank must fail"
+        );
     }
 
     /// Helper: clone a LocalCluster but overwrite its salt. Lets tests
@@ -1139,7 +1141,8 @@ mod tests {
         unsafe {
             env::remove_var(ENV_NCCL_SOCKET_IFNAME);
         }
-        let err = validate_socket_ifname(&cluster, &this_host).expect_err("empty ifname must error");
+        let err =
+            validate_socket_ifname(&cluster, &this_host).expect_err("empty ifname must error");
         if let Some(v) = prev_ifname {
             unsafe {
                 env::set_var(ENV_NCCL_SOCKET_IFNAME, v);
@@ -1215,17 +1218,14 @@ mod tests {
 
         let _guard = ENV_MUTEX.lock().unwrap();
 
-        let ctrl_handle = thread::spawn(move || {
-            run_controller_rendezvous(&full, "test-controller-host")
-        });
+        let ctrl_handle =
+            thread::spawn(move || run_controller_rendezvous(&full, "test-controller-host"));
 
         let env_0 = slim();
         let rank_0 = thread::spawn(move || {
             crate::distributed::cluster::set_thread_hostname_override(Some("single-host"));
             crate::distributed::cluster::set_thread_local_rank_override(Some(0));
-            TcpRendezvous::establish(&env_0, sig, || {
-                Ok(NcclUniqueId::from_bytes(stub_uid_bytes))
-            })
+            TcpRendezvous::establish(&env_0, sig, || Ok(NcclUniqueId::from_bytes(stub_uid_bytes)))
         });
         let env_1 = slim();
         let rank_1 = thread::spawn(move || {
@@ -1288,5 +1288,4 @@ mod tests {
         assert_eq!(cluster_mapping(&c1), "node-a:0 -> r0");
         assert_eq!(cluster_mapping(&c2), "node-b:0 -> r1, node-b:1 -> r2");
     }
-
 }

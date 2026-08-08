@@ -40,13 +40,7 @@ pub trait DashboardSink: Send + Sync {
 
     /// Rank shipped the graph SVG. First non-empty arrival wins; the
     /// SVG is identical across ranks so subsequent are dropped.
-    fn set_svg(
-        &self,
-        rank: usize,
-        svg: String,
-        label: Option<String>,
-        hash: Option<String>,
-    );
+    fn set_svg(&self, rank: usize, svg: String, label: Option<String>, hash: Option<String>);
 
     /// Rank shipped the dashboard metadata blob (hyperparameters,
     /// config). Last-write-wins; the launcher dashboard serves whatever
@@ -67,10 +61,7 @@ pub trait DashboardSink: Send + Sync {
 
     /// Aggregated [`crate::distributed::ddp_run::EpochMetrics`] for the
     /// current epoch, ready for the dashboard's main tab.
-    fn push_epoch_metrics(
-        &self,
-        metrics: &crate::distributed::ddp_run::EpochMetrics,
-    );
+    fn push_epoch_metrics(&self, metrics: &crate::distributed::ddp_run::EpochMetrics);
 
     /// Sub-epoch monitor records for ONE reduce window: the flat,
     /// path-keyed JSONL records of the window's record tree (root first,
@@ -214,11 +205,7 @@ impl ClusterDashboardSink {
     /// `total_epochs` mirrors the [`Monitor::new`] argument; it sets
     /// the dashboard header's "epoch N/total" frame and the ETA
     /// denominator. Pass the user's `num_epochs`.
-    pub fn new(
-        cluster: Arc<FullCluster>,
-        controller_host: String,
-        total_epochs: usize,
-    ) -> Self {
+    pub fn new(cluster: Arc<FullCluster>, controller_host: String, total_epochs: usize) -> Self {
         let world_size = cluster.world_size();
         let mut mon = Monitor::new(total_epochs);
         // The launcher always serves the dashboard; in-process gating
@@ -301,7 +288,10 @@ impl ClusterDashboardSink {
             return None;
         }
         *done = true;
-        Some(crate::monitor::record::meta_record(&self.scalar_reductions, ts))
+        Some(crate::monitor::record::meta_record(
+            &self.scalar_reductions,
+            ts,
+        ))
     }
 
     /// Publish the declarations to the live record plane, once per run.
@@ -349,10 +339,7 @@ impl ClusterDashboardSink {
             .map(|r| crate::monitor::record::RankExtras {
                 // absent≠zero: an unsampled field stays None and is excluded
                 // from the rollup, never averaged in as 0.
-                res: acc
-                    .get_mut(r)
-                    .map(|a| a.take())
-                    .unwrap_or_default(),
+                res: acc.get_mut(r).map(|a| a.take()).unwrap_or_default(),
                 label: map[r]
                     .as_ref()
                     .and_then(|s| s.gpus.first())
@@ -483,20 +470,12 @@ impl DashboardSink for ClusterDashboardSink {
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "cluster dashboard: bind port {port} failed: {e}",
-                );
+                eprintln!("cluster dashboard: bind port {port} failed: {e}",);
             }
         }
     }
 
-    fn set_svg(
-        &self,
-        _rank: usize,
-        svg: String,
-        label: Option<String>,
-        hash: Option<String>,
-    ) {
+    fn set_svg(&self, _rank: usize, svg: String, label: Option<String>, hash: Option<String>) {
         let mut installed = self.svg_installed.lock().unwrap();
         if *installed {
             return; // first-arrival wins; SVG is identical across ranks
@@ -511,9 +490,7 @@ impl DashboardSink for ClusterDashboardSink {
         let value: serde_json::Value = match serde_json::from_str(&json) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!(
-                    "cluster dashboard: discarding malformed metadata JSON: {e}"
-                );
+                eprintln!("cluster dashboard: discarding malformed metadata JSON: {e}");
                 return;
             }
         };
@@ -622,21 +599,19 @@ impl DashboardSink for ClusterDashboardSink {
         }
         let mut feed = self.recent_events.lock().unwrap();
         feed.extend(records);
-        let overflow = feed.len().saturating_sub(crate::monitor::event_lane::MAX_EVENTS);
+        let overflow = feed
+            .len()
+            .saturating_sub(crate::monitor::event_lane::MAX_EVENTS);
         if overflow > 0 {
             feed.drain(0..overflow);
         }
     }
 
-    fn push_epoch_metrics(
-        &self,
-        metrics: &crate::distributed::ddp_run::EpochMetrics,
-    ) {
+    fn push_epoch_metrics(&self, metrics: &crate::distributed::ddp_run::EpochMetrics) {
         // Build a flat `(name, value)` metric vec including avg_loss +
         // every aggregated scalar. Sorted scalar keys give deterministic
         // ordering matching the rank-side log path.
-        let mut flat: Vec<(String, f64)> =
-            Vec::with_capacity(1 + metrics.scalars.len());
+        let mut flat: Vec<(String, f64)> = Vec::with_capacity(1 + metrics.scalars.len());
         flat.push(("loss".to_string(), metrics.avg_loss));
         let mut keys: Vec<&String> = metrics.scalars.keys().collect();
         keys.sort();
@@ -645,22 +620,12 @@ impl DashboardSink for ClusterDashboardSink {
         }
 
         // Per-rank GPU tabs from EpochMetrics' aggregated arrays.
-        let mut gpu_metrics: Vec<GpuMetrics> = Vec::with_capacity(
-            metrics.device_indices.len(),
-        );
+        let mut gpu_metrics: Vec<GpuMetrics> = Vec::with_capacity(metrics.device_indices.len());
         for (i, &dev) in metrics.device_indices.iter().enumerate() {
             gpu_metrics.push(GpuMetrics {
                 device_index: dev,
-                throughput: metrics
-                    .per_rank_throughput
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0.0),
-                chunk_ratio: metrics
-                    .per_rank_batch_share
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0.0),
+                throughput: metrics.per_rank_throughput.get(i).copied().unwrap_or(0.0),
+                chunk_ratio: metrics.per_rank_batch_share.get(i).copied().unwrap_or(0.0),
                 shard_size: 0, // not tracked per-epoch in cluster mode
             });
         }
@@ -698,7 +663,9 @@ impl DashboardSink for ClusterDashboardSink {
             let mut ram_total_sum = 0u64;
             for worker in &self.cluster.workers {
                 for &global_rank in &worker.ranks {
-                    let Some(Some(sample)) = map.get(global_rank) else { continue };
+                    let Some(Some(sample)) = map.get(global_rank) else {
+                        continue;
+                    };
                     // Take first non-empty rank per host, then break.
                     if let Some(cpu) = sample.cpu_percent {
                         cpu_sum += cpu as f64;
@@ -793,8 +760,8 @@ mod tests {
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("flodl-sinklog-{}-{name}", std::process::id()));
+            let p =
+                std::env::temp_dir().join(format!("flodl-sinklog-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
@@ -922,7 +889,9 @@ mod tests {
                 r.insert("tokens_seen".to_string(), Reduction::Sum);
                 r
             });
-        let meta = fresh.take_meta_record(7).expect("first call yields the meta");
+        let meta = fresh
+            .take_meta_record(7)
+            .expect("first call yields the meta");
         assert_eq!(meta["kind"], "meta");
         assert_eq!(meta["ts"], 7);
         assert_eq!(meta["reductions"]["tokens_seen"], "sum");
@@ -1043,7 +1012,10 @@ mod tests {
             vram_total_bytes: Some(8_000_000_000),
             ..Default::default()
         };
-        s.gpus.push(crate::monitor::GpuSnapshot { name: name.to_string(), ..Default::default() });
+        s.gpus.push(crate::monitor::GpuSnapshot {
+            name: name.to_string(),
+            ..Default::default()
+        });
         s.into()
     }
 
@@ -1057,8 +1029,14 @@ mod tests {
         let sink = ClusterDashboardSink::new(cluster2(), "exa".to_string(), 4)
             .with_record_log(Some(Arc::clone(&log)));
 
-        sink.push_resource_sample(0, sample_with_gpu(90.0, 5_000_000_000, "NVIDIA GeForce RTX 5060 Ti"));
-        sink.push_resource_sample(1, sample_with_gpu(50.0, 1_000_000_000, "NVIDIA GeForce GTX 1060"));
+        sink.push_resource_sample(
+            0,
+            sample_with_gpu(90.0, 5_000_000_000, "NVIDIA GeForce RTX 5060 Ti"),
+        );
+        sink.push_resource_sample(
+            1,
+            sample_with_gpu(50.0, 1_000_000_000, "NVIDIA GeForce GTX 1060"),
+        );
         sink.push_epoch_metrics(&epoch_metrics2());
         sink.shutdown();
 
@@ -1067,7 +1045,10 @@ mod tests {
         assert_eq!(root.len(), 1, "one epoch record at root");
         let r = &root[0];
         assert_eq!(r["epoch_complete"], true, "marked as an epoch boundary");
-        assert!(r.get("tick").is_none(), "an epoch record has no window index");
+        assert!(
+            r.get("tick").is_none(),
+            "an epoch record has no window index"
+        );
         assert_eq!(r["epoch"], 2);
         // loss rolls up from the per-rank leaves (0.2*750 + 0.4*250 over
         // 1000 = 0.25, agreeing with avg_loss) and the root-only user

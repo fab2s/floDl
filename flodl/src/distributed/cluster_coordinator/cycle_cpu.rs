@@ -31,87 +31,87 @@ impl ClusterCoordinator {
     /// opening the Pending window that `poll_cpu_averaging`
     /// finalizes.
     pub(super) fn arm_cpu_cycle(&mut self) -> Result<()> {
-            self.cycle.arm(Instant::now(), &self.last_step_count);
-            // Best-effort (see the SyncNow twin above): a rank whose
-            // RequestParams never arrived has a broken connection;
-            // heartbeat staleness declares it dead and
-            // `poll_cpu_averaging`'s is_dead exception completes the
-            // cycle without it.
-            if let Err(e) = self.broadcast_control(&ControlMsgWire::RequestParams) {
-                eprintln!(
-                    "flodl ddp: RequestParams broadcast incomplete ({e}); \
+        self.cycle.arm(Instant::now(), &self.last_step_count);
+        // Best-effort (see the SyncNow twin above): a rank whose
+        // RequestParams never arrived has a broken connection;
+        // heartbeat staleness declares it dead and
+        // `poll_cpu_averaging`'s is_dead exception completes the
+        // cycle without it.
+        if let Err(e) = self.broadcast_control(&ControlMsgWire::RequestParams) {
+            eprintln!(
+                "flodl ddp: RequestParams broadcast incomplete ({e}); \
                      relying on dead-rank recovery"
-                );
+            );
+        }
+        // Hard barrier for the non-progressive (Sync) path:
+        // after snapshotting, the fast rank blocks until the
+        // averaged `Update` lands, recreating NCCL's
+        // AllReduce-blocking semantics on the CPU backend.
+        // Without it the fast rank keeps training through the
+        // (TCP-latency) averaging window and laps the slow
+        // ranks, so the average degrades and convergence drops
+        // off NCCL parity. Released by the bridge's
+        // `ControlMsg::Update(avg)` (the worker's `Throttle`
+        // handler still services `RequestParams` while blocked,
+        // so the round that releases it can still complete).
+        //
+        // The gate is `!progressive`, not the policy enum: the
+        // Throttle is needed exactly when dispatch cannot starve
+        // the rank of work during the averaging window.
+        // Progressive Cadence dispatches `chunk == counts ==
+        // window`, so the reduce barrier in `dispatch_next_chunk`
+        // already withholds further work and the fast rank idles
+        // in `wait_for_epoch_plan` (still servicing
+        // `RequestParams`) — the Throttle would be redundant
+        // there. Non-progressive Sync has no inter-window
+        // dispatch to starve (whole epoch trained in one inner
+        // loop), so the Throttle IS its barrier. Async is always
+        // progressive and bounds lookahead via the overshoot
+        // budget instead.
+        if !self.progressive {
+            if let Err(e) = self.broadcast_control(&ControlMsgWire::Throttle) {
+                crate::verbose!("  ddp: Throttle broadcast incomplete: {e}");
             }
-            // Hard barrier for the non-progressive (Sync) path:
-            // after snapshotting, the fast rank blocks until the
-            // averaged `Update` lands, recreating NCCL's
-            // AllReduce-blocking semantics on the CPU backend.
-            // Without it the fast rank keeps training through the
-            // (TCP-latency) averaging window and laps the slow
-            // ranks, so the average degrades and convergence drops
-            // off NCCL parity. Released by the bridge's
-            // `ControlMsg::Update(avg)` (the worker's `Throttle`
-            // handler still services `RequestParams` while blocked,
-            // so the round that releases it can still complete).
-            //
-            // The gate is `!progressive`, not the policy enum: the
-            // Throttle is needed exactly when dispatch cannot starve
-            // the rank of work during the averaging window.
-            // Progressive Cadence dispatches `chunk == counts ==
-            // window`, so the reduce barrier in `dispatch_next_chunk`
-            // already withholds further work and the fast rank idles
-            // in `wait_for_epoch_plan` (still servicing
-            // `RequestParams`) — the Throttle would be redundant
-            // there. Non-progressive Sync has no inter-window
-            // dispatch to starve (whole epoch trained in one inner
-            // loop), so the Throttle IS its barrier. Async is always
-            // progressive and bounds lookahead via the overshoot
-            // budget instead.
-            if !self.progressive {
-                if let Err(e) = self.broadcast_control(&ControlMsgWire::Throttle) {
-                    crate::verbose!("  ddp: Throttle broadcast incomplete: {e}");
-                }
-                self.cycle.throttle_all();
-            }
-            // Reset per-rank upload markers so the new cycle's
-            // measurements aren't read against a stale prior cycle.
-            // NCCL path skips this — there's no SnapshotReady on
-            // the in-place collective so the slots stay None
-            // throughout.
-            self.cycle.reset_upload_markers();
-            // CpuAvgStart: open the Pending window. Closed in
-            // `finish_averaging_cpu` via the machine's `pending_since`
-            // so MSF / dashboard see the same `CpuAvgEnd
-            // { duration_ms }` payload shape on cluster runs.
-            //
-            // DELIBERATE SEMANTICS: this clock starts at the TRIGGER, so
-            // the derived sync_ms is the controller-perspective cost of
-            // the whole rendezvous — including each rank draining its
-            // in-flight batch (~1 batch, a stable additive term) and the
-            // snapshot transport from far ranks (the dominant term on a
-            // slow link, and exactly what the anchor must amortize). Do
-            // NOT narrow this to collect-complete → scatter-done: that
-            // would hide transport cost and under-grow the anchor for
-            // distant ranks.
-            //
-            // Defer `finish_averaging_cpu` until every rank's
-            // bridge SyncAck has populated the divergence slots
-            // (otherwise the guard reads all-Nones → zero, breaking
-            // divergence-driven cadence control on cycle 1).
-            // `poll_cpu_averaging` (called from `tick`) finalizes.
-            //
-            // No deadline: dropping a CPU averaging cycle is a
-            // correctness violation for Local SGD (per-rank drift
-            // accumulates super-linearly across missed rendezvous
-            // points). Liveness is a SEPARATE concern handled by
-            // the heartbeat fault detector; slow-but-alive ranks
-            // are absorbed by ElChe's per-rank wall /
-            // `batch_counts` rebalance on the next cycle.
-            self.cycle.begin_cpu_pending(Instant::now());
-            if let Some(ref tl) = self.timeline {
-                tl.event(crate::monitor::EventKind::CpuAvgStart);
-            }
+            self.cycle.throttle_all();
+        }
+        // Reset per-rank upload markers so the new cycle's
+        // measurements aren't read against a stale prior cycle.
+        // NCCL path skips this — there's no SnapshotReady on
+        // the in-place collective so the slots stay None
+        // throughout.
+        self.cycle.reset_upload_markers();
+        // CpuAvgStart: open the Pending window. Closed in
+        // `finish_averaging_cpu` via the machine's `pending_since`
+        // so MSF / dashboard see the same `CpuAvgEnd
+        // { duration_ms }` payload shape on cluster runs.
+        //
+        // DELIBERATE SEMANTICS: this clock starts at the TRIGGER, so
+        // the derived sync_ms is the controller-perspective cost of
+        // the whole rendezvous — including each rank draining its
+        // in-flight batch (~1 batch, a stable additive term) and the
+        // snapshot transport from far ranks (the dominant term on a
+        // slow link, and exactly what the anchor must amortize). Do
+        // NOT narrow this to collect-complete → scatter-done: that
+        // would hide transport cost and under-grow the anchor for
+        // distant ranks.
+        //
+        // Defer `finish_averaging_cpu` until every rank's
+        // bridge SyncAck has populated the divergence slots
+        // (otherwise the guard reads all-Nones → zero, breaking
+        // divergence-driven cadence control on cycle 1).
+        // `poll_cpu_averaging` (called from `tick`) finalizes.
+        //
+        // No deadline: dropping a CPU averaging cycle is a
+        // correctness violation for Local SGD (per-rank drift
+        // accumulates super-linearly across missed rendezvous
+        // points). Liveness is a SEPARATE concern handled by
+        // the heartbeat fault detector; slow-but-alive ranks
+        // are absorbed by ElChe's per-rank wall /
+        // `batch_counts` rebalance on the next cycle.
+        self.cycle.begin_cpu_pending(Instant::now());
+        if let Some(ref tl) = self.timeline {
+            tl.event(crate::monitor::EventKind::CpuAvgStart);
+        }
         Ok(())
     }
 
@@ -170,12 +170,10 @@ impl ClusterCoordinator {
                 );
                 self.dump_stall_state(start.elapsed().as_secs_f64());
                 self.cycle.abort_cpu_pending();
-                if let Err(e) = self.dispatch_shutdown_with_save(
-                    crate::distributed::SaveReason::ReduceStall,
-                ) {
-                    crate::verbose!(
-                        "  ddp: ShutdownWithSave after reduce stall failed: {e}"
-                    );
+                if let Err(e) =
+                    self.dispatch_shutdown_with_save(crate::distributed::SaveReason::ReduceStall)
+                {
+                    crate::verbose!("  ddp: ShutdownWithSave after reduce stall failed: {e}");
                 }
             }
         }
@@ -230,10 +228,11 @@ impl ClusterCoordinator {
         // broadcast -> all alive SyncAcks landed). Distinct from the
         // outer SyncEnd which also covers the post-finalize work.
         if let Some(start) = self.cycle.finish_cpu_pending()
-            && let Some(ref tl) = self.timeline {
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
-            }
+            && let Some(ref tl) = self.timeline
+        {
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
+        }
         self.finish_pending_checkpoint_meta();
         self.emit_sync_end();
         Ok(())

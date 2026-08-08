@@ -17,19 +17,18 @@
 //! This module is a single unit of removal: delete the file, drop the
 //! `mod compat;` line and its re-export block in `lib.rs`.
 
-use crate::nn::cuda_graph::{gpu_graph_capture, gpu_graph_pool_handle, GpuGraph, MemPoolId};
+use crate::nn::cuda_graph::{GpuGraph, MemPoolId, gpu_graph_capture, gpu_graph_pool_handle};
 use crate::tensor::cuda_event::GpuEvent as GpuEventInner;
 use crate::tensor::cuda_event::GpuEventFlags as GpuEventFlagsInner;
 use crate::tensor::cuda_stream::GpuStream as GpuStreamInner;
 use crate::tensor::{
-    current_gpu_device, gpu_active_bytes, gpu_active_bytes_idx, gpu_allocated_bytes,
-    gpu_allocated_bytes_idx, gpu_available, gpu_device_count, gpu_device_name,
+    Device, DeviceInfo, Result, current_gpu_device, gpu_active_bytes, gpu_active_bytes_idx,
+    gpu_allocated_bytes, gpu_allocated_bytes_idx, gpu_available, gpu_device_count, gpu_device_name,
     gpu_device_name_idx, gpu_devices, gpu_empty_cache, gpu_has_primary_context,
     gpu_manual_seed_all, gpu_memory_info, gpu_memory_info_idx, gpu_peak_active_bytes,
     gpu_peak_active_bytes_idx, gpu_peak_reserved_bytes, gpu_peak_reserved_bytes_idx,
     gpu_reset_peak_stats, gpu_reset_peak_stats_idx, gpu_smi_memory_info_idx, gpu_synchronize,
-    gpu_utilization, gpu_utilization_idx, set_current_gpu_device, usable_gpu_devices, Device,
-    DeviceInfo, Result,
+    gpu_utilization, gpu_utilization_idx, set_current_gpu_device, usable_gpu_devices,
 };
 
 /// Deprecated alias for [`crate::GpuStream`].
@@ -196,11 +195,7 @@ pub fn cuda_nvml_memory_info_idx(physical_index: i32) -> Option<(u64, u64)> {
 
 /// Deprecated alias for [`crate::gpu_graph_capture`].
 #[deprecated(note = "renamed to `gpu_graph_capture`")]
-pub fn cuda_graph_capture<F>(
-    warmup_runs: usize,
-    pool: Option<MemPoolId>,
-    f: F,
-) -> Result<GpuGraph>
+pub fn cuda_graph_capture<F>(warmup_runs: usize, pool: Option<MemPoolId>, f: F) -> Result<GpuGraph>
 where
     F: FnMut() -> Result<()>,
 {
@@ -232,9 +227,17 @@ mod tests {
     #[test]
     fn deprecated_type_aliases_resolve() {
         // Compile-time only: each alias must still name its replacement.
-        fn _assert_same(s: CudaStream) -> crate::GpuStream { s }
-        fn _assert_event(e: CudaEvent) -> crate::GpuEvent { e }
-        fn _assert_flags(f: CudaEventFlags) -> crate::GpuEventFlags { f }
-        fn _assert_graph(g: CudaGraph) -> crate::GpuGraph { g }
+        fn _assert_same(s: CudaStream) -> crate::GpuStream {
+            s
+        }
+        fn _assert_event(e: CudaEvent) -> crate::GpuEvent {
+            e
+        }
+        fn _assert_flags(f: CudaEventFlags) -> crate::GpuEventFlags {
+            f
+        }
+        fn _assert_graph(g: CudaGraph) -> crate::GpuGraph {
+            g
+        }
     }
 }

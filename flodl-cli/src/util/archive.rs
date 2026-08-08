@@ -41,14 +41,12 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
             .status()
             .is_err()
         {
-            return Err(
-                "unzip is required but not installed.\n\
+            return Err("unzip is required but not installed.\n\
                  \n\
                  \x20 Ubuntu/Debian:  sudo apt install unzip\n\
                  \x20 Fedora/RHEL:    sudo dnf install unzip\n\
                  \x20 macOS:          available by default"
-                    .into(),
-            );
+                .into());
         }
         Command::new("unzip")
             .args(["-q", "-o", zip_str, "-d", dest_str])

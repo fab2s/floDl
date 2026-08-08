@@ -31,9 +31,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::builtins::JoinArgs;
-use crate::config::{self, SshConfig, WorkerJoin, WorkerSource, DEFAULT_CONTROLLER_PORT};
+use crate::config::{self, DEFAULT_CONTROLLER_PORT, SshConfig, WorkerJoin, WorkerSource};
 use crate::context::Context;
-use crate::prepare::{self, DataSpec, Fail, Prepared, PrepareSpec, SourceSpec};
+use crate::prepare::{self, DataSpec, Fail, PrepareSpec, Prepared, SourceSpec};
 use crate::style;
 
 /// Agent bootstrap env var — must match flodl's
@@ -113,14 +113,15 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
     // cannot be checked here: it does not exist until the attempt has
     // fetched and compiled the tree.
     if let BinSource::Given(path) = &eff.bin
-        && !Path::new(path).is_file() {
-            crate::cli_error!(
-                "training binary not found: {path} — build it first and \
+        && !Path::new(path).is_file()
+    {
+        crate::cli_error!(
+            "training binary not found: {path} — build it first and \
                  point `--bin` (or fdl.yml `join.bin`) at it, or hand this \
                  box a `--source` to build",
-            );
-            return EXIT_PERMANENT;
-        }
+        );
+        return EXIT_PERMANENT;
+    }
 
     // Local active libtorch (honors FDL_LIBTORCH_CASE), anchored on the
     // project root the config walk found: its lib/ rides
@@ -283,11 +284,9 @@ fn resolve_effective(
     let block = block.unwrap_or_default();
 
     if cli.identity.is_some() && cli.ssh.is_none() && block.ssh.is_none() {
-        return Err(
-            "--identity is the tunnel's key file — it needs an ssh hop \
+        return Err("--identity is the tunnel's key file — it needs an ssh hop \
              (`--ssh` or fdl.yml `join.ssh`)"
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Tunnel hop: `--ssh [user@]host[:port]` replaces the block's
@@ -305,10 +304,7 @@ fn resolve_effective(
         }
         (None, Some(b)) => {
             if b.target.is_none() {
-                return Err(
-                    "fdl.yml join.ssh needs a `target:` (the tunnel host)"
-                        .to_string(),
-                );
+                return Err("fdl.yml join.ssh needs a `target:` (the tunnel host)".to_string());
             }
             Some(b)
         }
@@ -341,12 +337,21 @@ fn resolve_effective(
             // The compact `--source` flag carries only the transport, so
             // the rest keeps coming from the block unless its own flag
             // overrides it (same shape as `--ssh`).
-            cwd: cli.source_cwd.clone().or_else(|| b.as_ref().and_then(|b| b.cwd.clone())),
-            build: cli.source_build.clone().or_else(|| b.as_ref().and_then(|b| b.build.clone())),
+            cwd: cli
+                .source_cwd
+                .clone()
+                .or_else(|| b.as_ref().and_then(|b| b.cwd.clone())),
+            build: cli
+                .source_build
+                .clone()
+                .or_else(|| b.as_ref().and_then(|b| b.build.clone())),
             // No artifact anywhere is legal: a published tree carries a
             // run manifest that names it, and that manifest is the
             // authority when it is there.
-            bin: cli.source_bin.clone().or_else(|| b.as_ref().and_then(|b| b.bin.clone())),
+            bin: cli
+                .source_bin
+                .clone()
+                .or_else(|| b.as_ref().and_then(|b| b.bin.clone())),
         }),
         (None, Some(mut b)) => {
             if let Some(cwd) = cli.source_cwd.clone() {
@@ -382,23 +387,19 @@ fn resolve_effective(
 
     let bin = match (bin_path, source) {
         (Some(_), Some(_)) => {
-            return Err(
-                "`bin:` and `source:` both name this box's training binary \
+            return Err("`bin:` and `source:` both name this box's training binary \
                  — keep the one you mean. `bin:` runs a binary as given; \
                  `source:` fetches and builds one here"
-                    .to_string(),
-            );
+                .to_string());
         }
         (Some(path), None) => BinSource::Given(path),
         (None, Some(source)) => BinSource::Build(source),
         (None, None) => {
-            return Err(
-                "no training binary configured — pass `--bin <path>` (run \
+            return Err("no training binary configured — pass `--bin <path>` (run \
                  it as given) or `--source <spec>` (build it here), or set \
                  `join.bin` / `join.source` in fdl.yml. The binary is the \
                  protocol: it dials, joins, and runs this host's ranks"
-                    .to_string(),
-            );
+                .to_string());
         }
     };
 
@@ -451,12 +452,14 @@ fn resolve_effective(
 /// then; a present-but-broken project config is a loud error, not a
 /// silent fallback (the operator may be relying on `join.bin`).
 fn load_join_block() -> Result<(Option<WorkerJoin>, Option<PathBuf>), String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("cannot read the current directory: {e}"))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
     let Some(config_path) = config::find_project_config(&cwd) else {
         return Ok((None, None));
     };
-    let env_name = std::env::var("FDL_ENV").ok().filter(|s| !s.trim().is_empty());
+    let env_name = std::env::var("FDL_ENV")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let project = config::load_project_with_env(&config_path, env_name.as_deref())
         .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
     let root = config_path.parent().map(Path::to_path_buf);
@@ -495,15 +498,17 @@ fn parse_ssh_spec(spec: &str) -> Result<SshConfig, String> {
     };
     let (host, port) = match rest.rsplit_once(':') {
         Some((h, p)) => {
-            let port = p.parse::<u16>().map_err(|_| {
-                format!("invalid --ssh `{spec}` — expected [user@]host[:port]")
-            })?;
+            let port = p
+                .parse::<u16>()
+                .map_err(|_| format!("invalid --ssh `{spec}` — expected [user@]host[:port]"))?;
             (h, Some(port))
         }
         None => (rest, None),
     };
     if host.is_empty() {
-        return Err(format!("invalid --ssh `{spec}` — expected [user@]host[:port]"));
+        return Err(format!(
+            "invalid --ssh `{spec}` — expected [user@]host[:port]"
+        ));
     }
     Ok(SshConfig {
         target: Some(host.to_string()),
@@ -522,9 +527,9 @@ fn parse_devices(spec: &str) -> Result<Option<Vec<u8>>, String> {
     }
     spec.split(',')
         .map(|s| {
-            s.trim().parse::<u8>().map_err(|_| {
-                format!("invalid --devices `{spec}` — expected e.g. `0,1` or `all`")
-            })
+            s.trim()
+                .parse::<u8>()
+                .map_err(|_| format!("invalid --devices `{spec}` — expected e.g. `0,1` or `all`"))
         })
         .collect::<Result<Vec<u8>, String>>()
         .map(Some)
@@ -713,24 +718,15 @@ fn attempt(
             Some(digest) => match sig_cache {
                 Some((key, cached)) if *key == digest => cached.clone(),
                 _ => {
-                    let sig = model_sig_probe(
-                        &bin,
-                        bin_cwd.as_deref(),
-                        args,
-                        prepared.libtorch.as_ref(),
-                    );
+                    let sig =
+                        model_sig_probe(&bin, bin_cwd.as_deref(), args, prepared.libtorch.as_ref());
                     *sig_cache = Some((digest, sig.clone()));
                     sig
                 }
             },
             // The binary un-stat-able between resolution and here is a
             // race with a rebuild: probe uncached, next attempt keys.
-            None => model_sig_probe(
-                &bin,
-                bin_cwd.as_deref(),
-                args,
-                prepared.libtorch.as_ref(),
-            ),
+            None => model_sig_probe(&bin, bin_cwd.as_deref(), args, prepared.libtorch.as_ref()),
         }
     } else {
         None
@@ -740,12 +736,8 @@ fn attempt(
     let dial: (String, u16) = match &eff.ssh {
         Some(ssh) => {
             let local_port = pick_local_port().map_err(Fail::Transient)?;
-            let argv = build_tunnel_argv(
-                ssh,
-                local_port,
-                &eff.controller_host,
-                eff.controller_port,
-            );
+            let argv =
+                build_tunnel_argv(ssh, local_port, &eff.controller_host, eff.controller_port);
             eprintln!(
                 "fdl join: opening tunnel {} -> {}:{} (local port {local_port})",
                 ssh.target.as_deref().unwrap_or("?"),
@@ -779,7 +771,11 @@ fn attempt(
     // Preparation is the authority on libtorch: it either acquired a
     // variant or carried the active one through, and the label it settles
     // on is what the join hello announces.
-    let libtorch_label = prepared.libtorch.as_ref().map(|(_, l)| l.as_str()).unwrap_or("");
+    let libtorch_label = prepared
+        .libtorch
+        .as_ref()
+        .map(|(_, l)| l.as_str())
+        .unwrap_or("");
     let spec_hex = agent_spec_hex(
         eff,
         (&dial.0, dial.1),
@@ -805,9 +801,9 @@ fn attempt(
     // A given path was checked before the loop and a built one was just
     // written, so a spawn failure here is the file itself: not
     // executable, wrong architecture, bad interpreter.
-    let status = cmd.status().map_err(|e| {
-        Fail::Permanent(format!("run {}: {e}", bin.display()))
-    });
+    let status = cmd
+        .status()
+        .map_err(|e| Fail::Permanent(format!("run {}: {e}", bin.display())));
     if let Some(mut t) = tunnel.take() {
         let _ = t.kill();
         let _ = t.wait();
@@ -874,8 +870,10 @@ fn model_sig_probe(
 ) -> Option<String> {
     eprintln!(
         "{}",
-        style::dim("fdl join: probing the binary for its model signature \
-                    (--no-sig-probe skips this)"),
+        style::dim(
+            "fdl join: probing the binary for its model signature \
+                    (--no-sig-probe skips this)"
+        ),
     );
     let mut cmd = Command::new(bin);
     cmd.args(args)
@@ -996,8 +994,8 @@ fn model_sig_probe(
 /// the assignment, release. The tiny bind-to-ssh race is absorbed by
 /// the retry loop around each attempt.
 fn pick_local_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("reserve local tunnel port: {e}"))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("reserve local tunnel port: {e}"))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("reserve local tunnel port: {e}"))?
@@ -1170,13 +1168,7 @@ mod tests {
             ..no_flags()
         };
         let tail: Vec<String> = vec!["--epochs".into(), "3".into()];
-        let eff = resolve_effective(
-            &cli,
-            Some(&tail),
-            Some(full_block()),
-            "localbox",
-        )
-        .unwrap();
+        let eff = resolve_effective(&cli, Some(&tail), Some(full_block()), "localbox").unwrap();
         assert_eq!(eff.controller_host, "exa");
         assert_eq!(eff.controller_port, DEFAULT_CONTROLLER_PORT);
         assert!(!eff.controller_defaulted);
@@ -1186,7 +1178,10 @@ mod tests {
         assert_eq!(ssh.port, Some(22));
         // Compact --ssh keeps the block's options; --identity wins last.
         assert_eq!(ssh.identity_file.as_deref(), Some("/tmp/id"));
-        assert_eq!(ssh.options, vec!["StrictHostKeyChecking=accept-new".to_string()]);
+        assert_eq!(
+            ssh.options,
+            vec!["StrictHostKeyChecking=accept-new".to_string()]
+        );
         assert_eq!(eff.token.as_deref(), Some("bb".repeat(16).as_str()));
         assert_eq!(eff.bin, BinSource::Given("other/bin".into()));
         assert_eq!(eff.libtorch_spec.as_deref(), Some("cu128"));
@@ -1202,8 +1197,7 @@ mod tests {
 
     #[test]
     fn block_fills_everything_the_flags_left_unset() {
-        let eff =
-            resolve_effective(&no_flags(), None, Some(full_block()), "localbox").unwrap();
+        let eff = resolve_effective(&no_flags(), None, Some(full_block()), "localbox").unwrap();
         assert_eq!(eff.controller_host, "10.0.0.9");
         assert_eq!(eff.controller_port, 9000);
         let ssh = eff.ssh.as_ref().unwrap();
@@ -1249,7 +1243,10 @@ mod tests {
     fn naming_both_a_binary_and_a_source_is_a_loud_error() {
         // Not a precedence puzzle: a box handed both has no defensible
         // answer, so it must be told rather than guessed at.
-        let block = WorkerJoin { bin: Some("target/release/train".into()), ..source_block() };
+        let block = WorkerJoin {
+            bin: Some("target/release/train".into()),
+            ..source_block()
+        };
         let err = resolve_effective(&no_flags(), None, Some(block), "x").unwrap_err();
         assert!(err.contains("both name"), "got: {err}");
     }
@@ -1258,7 +1255,10 @@ mod tests {
     fn a_source_flag_keeps_the_blocks_other_source_fields() {
         // Same shape as the compact `--ssh`: the flag carries the
         // transport, the block still answers for the rest.
-        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let cli = JoinArgs {
+            source: Some("file:///mnt/rdl".into()),
+            ..no_flags()
+        };
         let eff = resolve_effective(&cli, None, Some(source_block()), "x").unwrap();
         assert_eq!(
             eff.bin,
@@ -1276,7 +1276,10 @@ mod tests {
         // The controller's published tree carries a run manifest, and that
         // manifest is the authority. Refusing here would make every worker
         // config repeat what the publish already said.
-        let cli = JoinArgs { source: Some("file:///mnt/rdl".into()), ..no_flags() };
+        let cli = JoinArgs {
+            source: Some("file:///mnt/rdl".into()),
+            ..no_flags()
+        };
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
         assert_eq!(
             eff.bin,
@@ -1306,7 +1309,10 @@ mod tests {
 
     #[test]
     fn defaults_are_loopback_hostname_and_all_devices() {
-        let cli = JoinArgs { bin: Some("t/bin".into()), ..no_flags() };
+        let cli = JoinArgs {
+            bin: Some("t/bin".into()),
+            ..no_flags()
+        };
         let eff = resolve_effective(&cli, None, None, "localbox").unwrap();
         assert_eq!(eff.controller_host, "127.0.0.1");
         assert_eq!(eff.controller_port, DEFAULT_CONTROLLER_PORT);
@@ -1327,13 +1333,8 @@ mod tests {
     fn an_explicit_empty_tail_clears_the_block_args() {
         // `fdl join --` = "this run takes no arguments" — it must
         // replace the block's list, not fall back to it.
-        let eff = resolve_effective(
-            &no_flags(),
-            Some(&[]),
-            Some(full_block()),
-            "localbox",
-        )
-        .unwrap();
+        let eff =
+            resolve_effective(&no_flags(), Some(&[]), Some(full_block()), "localbox").unwrap();
         assert!(eff.bin_args.is_empty());
     }
 
@@ -1365,7 +1366,10 @@ mod tests {
         let eff = resolve_effective(&cli, None, None, "x").unwrap();
         assert_eq!(eff.controller_host, "127.0.0.1");
         assert_eq!(eff.controller_port, DEFAULT_CONTROLLER_PORT);
-        assert!(!eff.controller_defaulted, "tunnel loopback is the convention");
+        assert!(
+            !eff.controller_defaulted,
+            "tunnel loopback is the convention"
+        );
     }
 
     #[test]
@@ -1385,7 +1389,10 @@ mod tests {
             parse_host_port("exa").unwrap(),
             ("exa".to_string(), DEFAULT_CONTROLLER_PORT),
         );
-        assert_eq!(parse_host_port("exa:9000").unwrap(), ("exa".to_string(), 9000));
+        assert_eq!(
+            parse_host_port("exa:9000").unwrap(),
+            ("exa".to_string(), 9000)
+        );
         assert!(parse_host_port(":9000").is_err());
         assert!(parse_host_port("exa:banana").is_err());
 
@@ -1414,8 +1421,7 @@ mod tests {
     /// args, or a missing file is not.
     #[test]
     fn probe_recipe_digest_binds_binary_identity_and_args() {
-        let dir = std::env::temp_dir()
-            .join(format!("fdl-sig-digest-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fdl-sig-digest-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("train");
         std::fs::write(&bin, b"v1").unwrap();
@@ -1423,8 +1429,7 @@ mod tests {
         let base = probe_recipe_digest(&bin, &args).unwrap();
         assert_eq!(probe_recipe_digest(&bin, &args).unwrap(), base);
         assert_ne!(
-            probe_recipe_digest(&bin, &["--model".to_string(), "resnet".to_string()])
-                .unwrap(),
+            probe_recipe_digest(&bin, &["--model".to_string(), "resnet".to_string()]).unwrap(),
             base,
             "args are part of the recipe (a re-publish must re-probe)"
         );
@@ -1458,9 +1463,7 @@ mod tests {
         // None and the message said "Text file busy", which reads like a
         // parsing bug and is not one. /bin/sh is never opened for writing.
         let sh = PathBuf::from("/bin/sh");
-        let run = |body: String| {
-            model_sig_probe(&sh, None, &["-c".to_string(), body], None)
-        };
+        let run = |body: String| model_sig_probe(&sh, None, &["-c".to_string(), body], None);
         let sig = "ab".repeat(32);
         assert_eq!(
             run(format!("echo main noise; echo '{MODEL_SIG_LINE}{sig}'")),
@@ -1468,10 +1471,7 @@ mod tests {
         );
         assert_eq!(run("exit 0".to_string()), None);
         assert_eq!(run("exit 3".to_string()), None);
-        assert_eq!(
-            run(format!("echo '{MODEL_SIG_LINE}not-hex-at-all'")),
-            None,
-        );
+        assert_eq!(run(format!("echo '{MODEL_SIG_LINE}not-hex-at-all'")), None,);
     }
 
     /// zero-dep on flodl by design, so the shape is asserted literally;
@@ -1492,14 +1492,13 @@ mod tests {
             run_id: Some("a1b2c3d4e5f60718".to_string()),
             ..Prepared::default()
         };
-        let hex =
-            agent_spec_hex(
-                &eff,
-                ("127.0.0.1", 40123),
-                "builds/sm61-sm120",
-                &prepared,
-                Some(&"cd".repeat(32)),
-            );
+        let hex = agent_spec_hex(
+            &eff,
+            ("127.0.0.1", 40123),
+            "builds/sm61-sm120",
+            &prepared,
+            Some(&"cd".repeat(32)),
+        );
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
@@ -1518,7 +1517,10 @@ mod tests {
         // Optional fields are OMITTED when unset, never null — flodl's
         // serde defaults own the fallbacks.
         let open = {
-            let cli = JoinArgs { bin: Some("t/bin".into()), ..no_flags() };
+            let cli = JoinArgs {
+                bin: Some("t/bin".into()),
+                ..no_flags()
+            };
             let eff = resolve_effective(&cli, None, None, "cloud-1").unwrap();
             agent_spec_hex(&eff, ("10.0.0.1", 1337), "", &Prepared::default(), None)
         };
@@ -1557,9 +1559,14 @@ mod tests {
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         // First -o value wins in OpenSSH: the user's override must
         // appear before flodl's default of the same key.
-        let user_pos = argv.iter().position(|a| a == "ServerAliveInterval=5").unwrap();
-        let default_pos =
-            argv.iter().position(|a| a == "ServerAliveInterval=30").unwrap();
+        let user_pos = argv
+            .iter()
+            .position(|a| a == "ServerAliveInterval=5")
+            .unwrap();
+        let default_pos = argv
+            .iter()
+            .position(|a| a == "ServerAliveInterval=30")
+            .unwrap();
         assert!(user_pos < default_pos);
         assert!(argv.contains(&"127.0.0.1:40123:127.0.0.1:1337".to_string()));
         assert_eq!(argv.last().map(String::as_str), Some("ctrl"));

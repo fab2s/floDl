@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use flodl::{checkpoint_keys, Device, Graph};
+use flodl::{Device, Graph, checkpoint_keys};
 use flodl_hf::export::{build_for_export, export_hf_dir};
 use flodl_hf::models::auto::{AutoConfig, AutoModel};
 use flodl_hf::models::distilbert::DistilBertForSequenceClassification;
@@ -85,8 +85,8 @@ fn bert_checkpoint_export_pipeline_soak_live() {
         .unwrap_or_else(|e| panic!("read sidecar {}: {e}", sidecar.display()));
     let config = AutoConfig::from_json_str(&sidecar_str).unwrap();
     assert_eq!(config.model_type(), "bert");
-    let keys = checkpoint_keys(&ckpt_str)
-        .unwrap_or_else(|e| panic!("checkpoint_keys({ckpt_str}): {e}"));
+    let keys =
+        checkpoint_keys(&ckpt_str).unwrap_or_else(|e| panic!("checkpoint_keys({ckpt_str}): {e}"));
     let has_pooler = keys_have_pooler(&keys);
     let graph_rebuilt: Graph =
         build_for_export(&config, has_pooler, Device::CPU).unwrap_or_else(|e| {
@@ -171,8 +171,9 @@ fn distilbert_seqcls_checkpoint_export_pipeline_soak_live() {
 
     // Step 1: head from_pretrained — sets source_config with the
     // normalised architectures (gap 1 fix).
-    let head = DistilBertForSequenceClassification::from_pretrained(repo)
-        .unwrap_or_else(|e| panic!("DistilBertForSequenceClassification::from_pretrained({repo}): {e}"));
+    let head = DistilBertForSequenceClassification::from_pretrained(repo).unwrap_or_else(|e| {
+        panic!("DistilBertForSequenceClassification::from_pretrained({repo}): {e}")
+    });
     let source = head
         .graph()
         .source_config()
@@ -213,8 +214,8 @@ fn distilbert_seqcls_checkpoint_export_pipeline_soak_live() {
     // HeadKind::SeqCls and produce a SeqCls graph.
     let sidecar_str = std::fs::read_to_string(&sidecar).unwrap();
     let config = AutoConfig::from_json_str(&sidecar_str).unwrap();
-    let keys = checkpoint_keys(&ckpt_str)
-        .unwrap_or_else(|e| panic!("checkpoint_keys({ckpt_str}): {e}"));
+    let keys =
+        checkpoint_keys(&ckpt_str).unwrap_or_else(|e| panic!("checkpoint_keys({ckpt_str}): {e}"));
     let has_pooler = keys_have_pooler(&keys);
     let rebuilt: Graph = build_for_export(&config, has_pooler, Device::CPU)
         .unwrap_or_else(|e| panic!("build_for_export from sidecar: {e}"));

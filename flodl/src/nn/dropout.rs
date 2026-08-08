@@ -25,11 +25,12 @@ impl Dropout {
             training: Cell::new(true),
         }
     }
-
 }
 
 impl Module for Dropout {
-    fn name(&self) -> &str { "dropout" }
+    fn name(&self) -> &str {
+        "dropout"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         if !self.training.get() || self.p == 0.0 {
@@ -68,7 +69,9 @@ impl Dropout2d {
 }
 
 impl Module for Dropout2d {
-    fn name(&self) -> &str { "dropout2d" }
+    fn name(&self) -> &str {
+        "dropout2d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         if !self.training.get() || self.p == 0.0 {
@@ -98,12 +101,17 @@ pub struct AlphaDropout {
 impl AlphaDropout {
     /// Create an alpha dropout module with drop probability `p`.
     pub fn new(p: f64) -> Self {
-        AlphaDropout { p, training: Cell::new(true) }
+        AlphaDropout {
+            p,
+            training: Cell::new(true),
+        }
     }
 }
 
 impl Module for AlphaDropout {
-    fn name(&self) -> &str { "alpha_dropout" }
+    fn name(&self) -> &str {
+        "alpha_dropout"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         if !self.training.get() || self.p == 0.0 {
@@ -150,7 +158,10 @@ mod tests {
     #[test]
     fn test_dropout2d_whole_channels_zeroed() {
         let d = Dropout2d::new(0.5);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 8, 4, 4], opts).unwrap(), false);
 
         let output = d.forward(&input).unwrap();
@@ -167,11 +178,21 @@ mod tests {
                 let first = channel[0];
                 // All elements in channel should be equal (either 0 or scale)
                 for &v in &channel {
-                    assert!((v - first).abs() < 1e-5,
-                        "channel [{},{}] not uniform: {} vs {}", b, c, v, first);
+                    assert!(
+                        (v - first).abs() < 1e-5,
+                        "channel [{},{}] not uniform: {} vs {}",
+                        b,
+                        c,
+                        v,
+                        first
+                    );
                 }
-                assert!(first.abs() < 1e-5 || (first - scale as f32).abs() < 1e-5,
-                    "channel value should be 0 or {}: got {}", scale, first);
+                assert!(
+                    first.abs() < 1e-5 || (first - scale as f32).abs() < 1e-5,
+                    "channel value should be 0 or {}: got {}",
+                    scale,
+                    first
+                );
             }
         }
     }
@@ -180,7 +201,10 @@ mod tests {
     fn test_dropout2d_eval_identity() {
         let d = Dropout2d::new(0.5);
         d.set_training(false);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[1, 3, 4, 4], opts).unwrap(), false);
 
         let output = d.forward(&input).unwrap();
@@ -192,7 +216,10 @@ mod tests {
     fn test_alpha_dropout_eval_identity() {
         let d = AlphaDropout::new(0.5);
         d.set_training(false);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 10], opts).unwrap(), false);
         let output = d.forward(&input).unwrap();
         let data = output.data().to_f32_vec().unwrap();
@@ -202,19 +229,28 @@ mod tests {
     #[test]
     fn test_alpha_dropout_training() {
         let d = AlphaDropout::new(0.5);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 100], opts).unwrap(), false);
         let output = d.forward(&input).unwrap();
         let data = output.data().to_f32_vec().unwrap();
         // Some values should differ from 1.0 (dropped elements get saturated)
         let changed = data.iter().filter(|&&v| (v - 1.0).abs() > 0.1).count();
-        assert!(changed > 0, "alpha dropout should modify some elements during training");
+        assert!(
+            changed > 0,
+            "alpha dropout should modify some elements during training"
+        );
     }
 
     #[test]
     fn test_dropout_training() {
         let d = Dropout::new(0.5);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 100], opts).unwrap(), false);
         let output = d.forward(&input).unwrap();
         let data = output.data().to_f32_vec().unwrap();
@@ -226,7 +262,10 @@ mod tests {
         // Nonzero values should be scaled by 1/(1-p) = 2
         for &v in &data {
             if v.abs() > 1e-5 {
-                assert!((v - 2.0).abs() < 1e-5, "nonzero values should be 2.0 (scaled), got {v}");
+                assert!(
+                    (v - 2.0).abs() < 1e-5,
+                    "nonzero values should be 2.0 (scaled), got {v}"
+                );
             }
         }
     }
@@ -235,7 +274,10 @@ mod tests {
     fn test_dropout_eval_identity() {
         let d = Dropout::new(0.5);
         d.set_training(false);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 10], opts).unwrap(), false);
         let output = d.forward(&input).unwrap();
         let data = output.data().to_f32_vec().unwrap();
@@ -245,7 +287,10 @@ mod tests {
     #[test]
     fn test_dropout_p_zero_is_identity() {
         let d = Dropout::new(0.0);
-        let opts = TensorOptions { dtype: DType::Float32, device: crate::tensor::test_device() };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: crate::tensor::test_device(),
+        };
         let input = Variable::new(Tensor::ones(&[2, 10], opts).unwrap(), false);
         let output = d.forward(&input).unwrap();
         let data = output.data().to_f32_vec().unwrap();

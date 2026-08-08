@@ -1,9 +1,9 @@
 //! Pure tensor operations: arithmetic, element-wise math, activations,
 //! reductions, comparisons, masking, sorting, and advanced indexing.
 
-use std::ptr;
+use super::{Result, Tensor, check_err, ffi_call};
 use flodl_sys::{self as ffi, FlodlTensor};
-use super::{Tensor, check_err, Result, ffi_call};
+use std::ptr;
 
 impl Tensor {
     // --- Arithmetic (chainable) ---
@@ -251,17 +251,36 @@ impl Tensor {
 
     /// Fused: beta * self + alpha * (mat1 @ mat2).
     pub fn addmm(&self, mat1: &Tensor, mat2: &Tensor, beta: f64, alpha: f64) -> Result<Tensor> {
-        ffi_call!(flodl_addmm, self.handle, mat1.handle, mat2.handle, beta, alpha)
+        ffi_call!(
+            flodl_addmm,
+            self.handle,
+            mat1.handle,
+            mat2.handle,
+            beta,
+            alpha
+        )
     }
 
     /// Fused: self + value * (tensor1 * tensor2).
     pub fn addcmul(&self, tensor1: &Tensor, tensor2: &Tensor, value: f64) -> Result<Tensor> {
-        ffi_call!(flodl_addcmul, self.handle, tensor1.handle, tensor2.handle, value)
+        ffi_call!(
+            flodl_addcmul,
+            self.handle,
+            tensor1.handle,
+            tensor2.handle,
+            value
+        )
     }
 
     /// Fused: self + value * (tensor1 / tensor2).
     pub fn addcdiv(&self, tensor1: &Tensor, tensor2: &Tensor, value: f64) -> Result<Tensor> {
-        ffi_call!(flodl_addcdiv, self.handle, tensor1.handle, tensor2.handle, value)
+        ffi_call!(
+            flodl_addcdiv,
+            self.handle,
+            tensor1.handle,
+            tensor2.handle,
+            value
+        )
     }
 
     // --- Activations ---
@@ -416,7 +435,13 @@ impl Tensor {
     /// Sum over multiple dimensions at once.
     pub fn sum_dims(&self, dims: &[i32], keepdim: bool) -> Result<Tensor> {
         let mut dims64: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
-        ffi_call!(flodl_sum_dims, self.handle, dims64.as_mut_ptr(), dims.len() as i32, keepdim as i32)
+        ffi_call!(
+            flodl_sum_dims,
+            self.handle,
+            dims64.as_mut_ptr(),
+            dims.len() as i32,
+            keepdim as i32
+        )
     }
 
     /// Cumulative product along a dimension.
@@ -433,7 +458,9 @@ impl Tensor {
     pub fn median_dim(&self, dim: i32, keepdim: bool) -> Result<(Tensor, Tensor)> {
         let mut vals: FlodlTensor = ptr::null_mut();
         let mut idxs: FlodlTensor = ptr::null_mut();
-        let err = unsafe { ffi::flodl_median_dim(self.handle, dim, keepdim as i32, &mut vals, &mut idxs) };
+        let err = unsafe {
+            ffi::flodl_median_dim(self.handle, dim, keepdim as i32, &mut vals, &mut idxs)
+        };
         check_err(err)?;
         Ok((Tensor::from_raw(vals), Tensor::from_raw(idxs)))
     }
@@ -463,7 +490,13 @@ impl Tensor {
         let mut output: FlodlTensor = ptr::null_mut();
         let mut inverse: FlodlTensor = ptr::null_mut();
         let err = unsafe {
-            ffi::flodl_unique(self.handle, sorted as i32, return_inverse as i32, &mut output, &mut inverse)
+            ffi::flodl_unique(
+                self.handle,
+                sorted as i32,
+                return_inverse as i32,
+                &mut output,
+                &mut inverse,
+            )
         };
         check_err(err)?;
         let inv = if inverse.is_null() {
@@ -481,7 +514,12 @@ impl Tensor {
         let mut output: FlodlTensor = ptr::null_mut();
         let mut inverse: FlodlTensor = ptr::null_mut();
         let err = unsafe {
-            ffi::flodl_unique_consecutive(self.handle, return_inverse as i32, &mut output, &mut inverse)
+            ffi::flodl_unique_consecutive(
+                self.handle,
+                return_inverse as i32,
+                &mut output,
+                &mut inverse,
+            )
         };
         check_err(err)?;
         let inv = if inverse.is_null() {
@@ -673,8 +711,13 @@ impl Tensor {
         let mut indices: FlodlTensor = ptr::null_mut();
         let err = unsafe {
             ffi::flodl_topk(
-                self.handle, k, dim, largest as i32, sorted as i32,
-                &mut values, &mut indices,
+                self.handle,
+                k,
+                dim,
+                largest as i32,
+                sorted as i32,
+                &mut values,
+                &mut indices,
             )
         };
         check_err(err)?;
@@ -686,7 +729,13 @@ impl Tensor {
         let mut values: FlodlTensor = ptr::null_mut();
         let mut indices: FlodlTensor = ptr::null_mut();
         let err = unsafe {
-            ffi::flodl_sort(self.handle, dim, descending as i32, &mut values, &mut indices)
+            ffi::flodl_sort(
+                self.handle,
+                dim,
+                descending as i32,
+                &mut values,
+                &mut indices,
+            )
         };
         check_err(err)?;
         Ok((Tensor::from_raw(values), Tensor::from_raw(indices)))
@@ -706,7 +755,13 @@ impl Tensor {
 
     /// Scatter-add: accumulate src into self at index positions along dim.
     pub fn scatter_add(&self, dim: i32, index: &Tensor, src: &Tensor) -> Result<Tensor> {
-        ffi_call!(flodl_scatter_add, self.handle, dim, index.handle, src.handle)
+        ffi_call!(
+            flodl_scatter_add,
+            self.handle,
+            dim,
+            index.handle,
+            src.handle
+        )
     }
 
     /// Scatter: write src values into self at index positions along dim (replaces, not adds).
@@ -741,9 +796,7 @@ impl Tensor {
     pub fn multinomial(&self, num_samples: i64, replacement: bool) -> Result<Tensor> {
         let mut handle: FlodlTensor = ptr::null_mut();
         let err = unsafe {
-            ffi::flodl_multinomial(
-                self.handle, num_samples, replacement as i32, &mut handle,
-            )
+            ffi::flodl_multinomial(self.handle, num_samples, replacement as i32, &mut handle)
         };
         check_err(err)?;
         Ok(Tensor::from_raw(handle))

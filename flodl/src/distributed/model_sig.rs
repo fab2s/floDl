@@ -67,16 +67,30 @@ mod tests {
 
     #[test]
     fn same_manifest_same_sig() {
-        let a = model_sig(&[param("w", &[3, 2]), param("b", &[2])], &[buffer("rm", &[2])]);
-        let b = model_sig(&[param("w", &[3, 2]), param("b", &[2])], &[buffer("rm", &[2])]);
+        let a = model_sig(
+            &[param("w", &[3, 2]), param("b", &[2])],
+            &[buffer("rm", &[2])],
+        );
+        let b = model_sig(
+            &[param("w", &[3, 2]), param("b", &[2])],
+            &[buffer("rm", &[2])],
+        );
         assert_eq!(a, b);
     }
 
     #[test]
     fn name_shape_and_dtype_all_bind() {
         let base = model_sig(&[param("w", &[3, 2])], &[]);
-        assert_ne!(base, model_sig(&[param("w2", &[3, 2])], &[]), "name must bind");
-        assert_ne!(base, model_sig(&[param("w", &[2, 3])], &[]), "shape must bind");
+        assert_ne!(
+            base,
+            model_sig(&[param("w2", &[3, 2])], &[]),
+            "name must bind"
+        );
+        assert_ne!(
+            base,
+            model_sig(&[param("w", &[2, 3])], &[]),
+            "shape must bind"
+        );
         let f64_w = Parameter::new(
             Tensor::zeros(
                 &[3, 2],

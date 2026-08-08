@@ -81,18 +81,17 @@ use crate::tensor::{Result, TensorError};
 
 mod agent;
 mod spawn;
-mod types;
 #[cfg(test)]
 mod tests;
+mod types;
 
 pub use agent::{AgentSpec, run_agent};
-pub use types::{SshConfig, FullCluster, FullController, FullWorker, JoinKnobs};
+pub use types::{FullCluster, FullController, FullWorker, JoinKnobs, SshConfig};
 
 use spawn::{
-    load_prebuild_envelope, supervise_children, ElasticSupervision,
-    build_ssh_spawn_command, cleanup_remote_hosts_parallel,
-    build_remote_agent_bash_command, build_slim_envelope_for, forward_lines,
-    AGENT_RANK_SENTINEL,
+    AGENT_RANK_SENTINEL, ElasticSupervision, build_remote_agent_bash_command,
+    build_slim_envelope_for, build_ssh_spawn_command, cleanup_remote_hosts_parallel, forward_lines,
+    load_prebuild_envelope, supervise_children,
 };
 
 /// Cohort inventory captured at world formation (admission order): one
@@ -109,7 +108,6 @@ static COHORT_INVENTORY: OnceLock<Vec<JoinedMember>> = OnceLock::new();
 pub fn cohort_inventory() -> Option<&'static [JoinedMember]> {
     COHORT_INVENTORY.get().map(|v| v.as_slice())
 }
-
 
 /// Environment variable carrying the *full* cluster topology to the
 /// launcher process. Set by fdl-cli; consumed only by [`dispatch`]. Not
@@ -322,13 +320,10 @@ pub fn exit_if_worker_role() {
 /// `set_var` invariant as fdl-cli's `prepare_cluster_env`.
 pub(crate) fn promote_programmatic_cluster(full: &FullCluster) -> bool {
     if !role_env_pristine() {
-        crate::debug!(
-            "cluster: role env already set; skipping programmatic cluster promotion"
-        );
+        crate::debug!("cluster: role env already set; skipping programmatic cluster promotion");
         return false;
     }
-    let hex =
-        crate::distributed::cluster::hex_encode(full.to_json().to_string().as_bytes());
+    let hex = crate::distributed::cluster::hex_encode(full.to_json().to_string().as_bytes());
     // SAFETY: caller contract above — main(), before any thread spawning.
     unsafe { std::env::set_var(ENV_FULL_CLUSTER_JSON, hex) };
     true
@@ -469,7 +464,6 @@ fn on_off(b: bool) -> &'static str {
     if b { "set" } else { "unset" }
 }
 
-
 /// One-cluster-run-per-process latch. The launcher-side infrastructure
 /// (rendezvous listener, relay processes, coordinator, controller) is
 /// built for exactly ONE training session: the rendezvous closes after
@@ -513,8 +507,7 @@ fn validate_tunnel_topology(
     local_host_name: &str,
     backend_is_nccl: bool,
 ) -> Result<bool> {
-    let tunneled: Vec<&FullWorker> =
-        full.workers.iter().filter(|w| w.tunnel).collect();
+    let tunneled: Vec<&FullWorker> = full.workers.iter().filter(|w| w.tunnel).collect();
     if tunneled.is_empty() {
         return Ok(false);
     }
@@ -554,9 +547,7 @@ fn validate_tunnel_topology(
 /// that is not exactly [`SESSION_SALT_BYTES`] of hex.
 ///
 /// [`SESSION_SALT_BYTES`]: crate::distributed::wire::SESSION_SALT_BYTES
-fn resolve_session_salt(
-    knobs: &JoinKnobs,
-) -> Result<crate::distributed::wire::SessionSalt> {
+fn resolve_session_salt(knobs: &JoinKnobs) -> Result<crate::distributed::wire::SessionSalt> {
     let discovery = knobs.discovery.unwrap_or(false);
     if knobs.tunnel_only.unwrap_or(false) && !discovery {
         return Err(TensorError::new(
@@ -574,23 +565,21 @@ fn resolve_session_salt(
     }
     match &knobs.token {
         Some(hex) => {
-            let bytes =
-                crate::distributed::cluster::hex_decode(hex.trim()).map_err(|e| {
-                    TensorError::new(&format!(
-                        "cluster launcher: controller.join.token hex-decode \
+            let bytes = crate::distributed::cluster::hex_decode(hex.trim()).map_err(|e| {
+                TensorError::new(&format!(
+                    "cluster launcher: controller.join.token hex-decode \
                          failed: {e}"
-                    ))
-                })?;
+                ))
+            })?;
             let want = crate::distributed::wire::SESSION_SALT_BYTES;
             let got = bytes.len();
-            <[u8; crate::distributed::wire::SESSION_SALT_BYTES]>::try_from(bytes)
-                .map_err(|_| {
-                    TensorError::new(&format!(
-                        "cluster launcher: controller.join.token must be \
+            <[u8; crate::distributed::wire::SESSION_SALT_BYTES]>::try_from(bytes).map_err(|_| {
+                TensorError::new(&format!(
+                    "cluster launcher: controller.join.token must be \
                          {want} bytes ({} hex chars), got {got} bytes",
-                        want * 2,
-                    ))
-                })
+                    want * 2,
+                ))
+            })
         }
         None => Ok(crate::distributed::wire::generate_session_salt()),
     }
@@ -612,7 +601,9 @@ fn derive_join_config(
 ) -> Result<crate::distributed::membership::JoinConfig> {
     let defaults = crate::distributed::membership::JoinConfig::default();
     let knobs = knobs.cloned().unwrap_or_default();
-    let join_timeout_secs = knobs.join_timeout_secs.unwrap_or(defaults.join_timeout_secs);
+    let join_timeout_secs = knobs
+        .join_timeout_secs
+        .unwrap_or(defaults.join_timeout_secs);
     let discovery = knobs.discovery.unwrap_or(false);
     // Discovery has no roster capacity to derive the quorum from, and
     // silently defaulting it would let a single walk-in start a world
@@ -744,9 +735,9 @@ pub struct CoordSpec {
     pub config_factory: Box<
         dyn FnOnce(
                 usize,
-            ) -> Result<
-                crate::distributed::cluster_coordinator::ClusterCoordinatorConfig,
-            > + Send,
+            )
+                -> Result<crate::distributed::cluster_coordinator::ClusterCoordinatorConfig>
+            + Send,
     >,
 }
 
@@ -857,8 +848,7 @@ pub fn run_launcher_with_config(
             w.host,
         )));
     }
-    let bind_loopback =
-        validate_tunnel_topology(&full, &me, backend_is_nccl)? || tunnel_only;
+    let bind_loopback = validate_tunnel_topology(&full, &me, backend_is_nccl)? || tunnel_only;
 
     // Single-port mux: every controller-side channel (join, NCCL
     // rendezvous, CPU-reduce data, coordinator control) accepts on ONE
@@ -877,17 +867,16 @@ pub fn run_launcher_with_config(
     // loudly here (that would need SO_REUSEPORT) — the desirable
     // double-run guard.
     let mux_port = full.controller.port;
-    let mux_bind_ip = if bind_loopback { "127.0.0.1" } else { "0.0.0.0" };
+    let mux_bind_ip = if bind_loopback {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
     let mux_bind = format!("{mux_bind_ip}:{mux_port}");
-    let mux_listener = std::net::TcpListener::bind(&mux_bind).map_err(|e| {
-        TensorError::new(&format!(
-            "cluster launcher: bind {mux_bind} failed: {e}"
-        ))
-    })?;
-    let (port_mux, mux_accept) = crate::distributed::port_mux::PortMux::start(
-        mux_listener,
-        Arc::clone(&abort),
-    )?;
+    let mux_listener = std::net::TcpListener::bind(&mux_bind)
+        .map_err(|e| TensorError::new(&format!("cluster launcher: bind {mux_bind} failed: {e}")))?;
+    let (port_mux, mux_accept) =
+        crate::distributed::port_mux::PortMux::start(mux_listener, Arc::clone(&abort))?;
     let crate::distributed::port_mux::MuxAccept {
         rendezvous: mux_rendezvous,
         data: mux_data,
@@ -899,7 +888,11 @@ pub fn run_launcher_with_config(
         "cluster launcher: port mux bound on {mux_bind_ip}:{} \
          (join + rendezvous + data + control + status{})",
         port_mux.port(),
-        if bind_loopback { "; loopback-only, all workers tunneled" } else { "" },
+        if bind_loopback {
+            "; loopback-only, all workers tunneled"
+        } else {
+            ""
+        },
     );
 
     // Status endpoint: plain HTTP GETs on the mux port answer with the
@@ -910,16 +903,13 @@ pub fn run_launcher_with_config(
     let status_board = crate::distributed::status::StatusBoard::new();
     let mut status_server = {
         let board = status_board.clone();
-        let source =
-            crate::distributed::port_mux::StreamSource::Mux(mux_status);
+        let source = crate::distributed::port_mux::StreamSource::Mux(mux_status);
         let abort_c = Arc::clone(&abort);
         Some(
             thread::Builder::new()
                 .name("flodl-status-http".to_string())
                 .spawn(move || {
-                    crate::distributed::status::serve_status(
-                        source, board, abort_c,
-                    );
+                    crate::distributed::status::serve_status(source, board, abort_c);
                 })
                 .map_err(|e| {
                     TensorError::new(&format!(
@@ -948,11 +938,7 @@ pub fn run_launcher_with_config(
     let capacity = full.world_size();
     // The backend rides into admission so the window can refuse a
     // vendor-mixed cohort exactly when the data plane cannot carry one.
-    let join_config = derive_join_config(
-        full.controller.join.as_ref(),
-        capacity,
-        backend_is_nccl,
-    )?;
+    let join_config = derive_join_config(full.controller.join.as_ref(), capacity, backend_is_nccl)?;
     // A configured token forces credential-authenticated admission even
     // behind a loopback bind: the sshd guardrail and the token are
     // LAYERS (reachability + possession), not alternatives — an
@@ -1035,11 +1021,7 @@ pub fn run_launcher_with_config(
         .filter(|h| h.host != me)
         .filter_map(|h| {
             prebuild_envelope.get(&h.host).map(|pb| {
-                let abs_bin = format!(
-                    "{}/{}",
-                    h.path.trim_end_matches('/'),
-                    pb.bin,
-                );
+                let abs_bin = format!("{}/{}", h.path.trim_end_matches('/'), pb.bin,);
                 (h.clone(), abs_bin)
             })
         })
@@ -1059,8 +1041,8 @@ pub fn run_launcher_with_config(
     // so launcher supervision owns them first-hand exactly as before.
     let mut remote_agents: Vec<RemoteAgentChild> = Vec::new();
     let mut local_joins: Vec<LocalJoin> = Vec::new();
-    let salt_hex_for_agents = (!open_admission)
-        .then(|| crate::distributed::wire::salt_to_hex(&salt));
+    let salt_hex_for_agents =
+        (!open_admission).then(|| crate::distributed::wire::salt_to_hex(&salt));
     let spawn_result: Result<()> = (|| {
         for host in &full.workers {
             // Orchestrator-only entry (empty `ranks`): declared in
@@ -1127,11 +1109,8 @@ pub fn run_launcher_with_config(
                 );
                 // The agent session carries the host's training tunnel
                 // when `tunnel: true` — the ONE ssh session per host.
-                let mut cmd = build_ssh_spawn_command(
-                    host,
-                    &remote_cmd,
-                    host.tunnel.then_some(mux_port),
-                );
+                let mut cmd =
+                    build_ssh_spawn_command(host, &remote_cmd, host.tunnel.then_some(mux_port));
                 // The spec (salt-bearing) rides stdin, never argv.
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -1217,9 +1196,9 @@ pub fn run_launcher_with_config(
     let mut dead_agent: Option<String> = None;
     let formed = loop {
         if gate.is_finished() {
-            break gate.join().map_err(|_| {
-                TensorError::new("cluster launcher: join-gate thread panicked")
-            })?;
+            break gate
+                .join()
+                .map_err(|_| TensorError::new("cluster launcher: join-gate thread panicked"))?;
         }
         if dead_agent.is_none() {
             for (host, child, _) in remote_agents.iter_mut() {
@@ -1286,18 +1265,14 @@ pub fn run_launcher_with_config(
     // same source of truth. Always constructed even on legacy NCCL
     // runs — the cost is negligible (a Vec<AtomicBool>) and the wiring
     // keeps both backends pluggable.
-    let dead_ranks_shared =
-        crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_ranks_shared = crate::distributed::controller::DeadRanks::new(world_size);
     // Consensus-checkpoint forge: holds the launch-captured model schema so the
     // controller reduce thread can write a named `.fdl` from the averaged
     // (name-less) frame. Shared with the coordinator (which arms it before a
     // checkpoint reduce) — same Arc-sharing pattern as `dead_ranks`. Take the
     // schema out of the coord config (the coord never writes the model itself).
-    let model_schema = coord_config
-        .as_mut()
-        .and_then(|c| c.model_schema.take());
-    let checkpoint_forge =
-        crate::distributed::CheckpointForge::new(model_schema);
+    let model_schema = coord_config.as_mut().and_then(|c| c.model_schema.take());
+    let checkpoint_forge = crate::distributed::CheckpointForge::new(model_schema);
     if let Some(cfg) = coord_config.as_mut() {
         cfg.checkpoint_forge = Some(Arc::clone(&checkpoint_forge));
     }
@@ -1306,16 +1281,15 @@ pub fn run_launcher_with_config(
     // 20ms, so an unused ClusterController exits cleanly when the
     // launcher signals shutdown after children finish. Cost is one idle
     // thread.
-    let cpu_averager =
-        crate::distributed::controller::ClusterController::start_from_source(
-            crate::distributed::port_mux::StreamSource::Mux(mux_data),
-            mux_port,
-            world_size,
-            salt,
-            Arc::clone(&dead_ranks_shared),
-            Some(Arc::clone(&checkpoint_forge)),
-            outer_optimizer,
-        )?;
+    let cpu_averager = crate::distributed::controller::ClusterController::start_from_source(
+        crate::distributed::port_mux::StreamSource::Mux(mux_data),
+        mux_port,
+        world_size,
+        salt,
+        Arc::clone(&dead_ranks_shared),
+        Some(Arc::clone(&checkpoint_forge)),
+        outer_optimizer,
+    )?;
     eprintln!(
         "cluster launcher: ClusterController up on port {} (world_size={})",
         cpu_averager.port(),
@@ -1329,8 +1303,7 @@ pub fn run_launcher_with_config(
     // a coord spawned. `None` skips the coord — legacy NCCL routing
     // (worker self-driven ElChe, no elastic membership) handles that
     // path entirely on the rank side.
-    let mut dashboard_sink_outer:
-        Option<Arc<dyn crate::distributed::DashboardSink>> = None;
+    let mut dashboard_sink_outer: Option<Arc<dyn crate::distributed::DashboardSink>> = None;
     let reported_deaths: crate::distributed::cluster_coordinator::ReportedDeaths =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
@@ -1342,16 +1315,13 @@ pub fn run_launcher_with_config(
     // deadline, bind/handshake error): the coord thread records it here and
     // raises `abort`; the supervision verdict below prefers it over the
     // child exit statuses (the children died BECAUSE the brain did).
-    let coord_fatal: Arc<std::sync::Mutex<Option<String>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let coord_fatal: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
 
     // Ask ranks for resource samples when the harness carries a
     // Timeline that will persist them (host-qualified `rank_samples` in
     // timeline.json). Captured here because `coord_config` moves into
     // the coordinator below while the envelope-build loop runs after.
-    let rank_resources = coord_config
-        .as_ref()
-        .is_some_and(|c| c.timeline.is_some());
+    let rank_resources = coord_config.as_ref().is_some_and(|c| c.timeline.is_some());
 
     if let Some(mut config) = coord_config {
         use crate::distributed::cluster_coordinator::ClusterCoordinator;
@@ -1436,8 +1406,8 @@ pub fn run_launcher_with_config(
                     .unwrap_or(crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES),
             ))
         });
-        let dashboard_sink: Arc<dyn crate::distributed::DashboardSink> =
-            Arc::new(crate::distributed::ClusterDashboardSink::new(
+        let dashboard_sink: Arc<dyn crate::distributed::DashboardSink> = Arc::new(
+            crate::distributed::ClusterDashboardSink::new(
                 Arc::new(world.clone()),
                 me.clone(),
                 config.num_epochs,
@@ -1445,7 +1415,8 @@ pub fn run_launcher_with_config(
             .with_record_log(record_log)
             .with_scalar_reductions(config.scalar_reductions.clone())
             .with_dashboard_html(config.dashboard_html.clone())
-            .with_dashboard_theme(config.dashboard_theme.clone()));
+            .with_dashboard_theme(config.dashboard_theme.clone()),
+        );
         dashboard_sink_outer = Some(Arc::clone(&dashboard_sink));
         config = config.dashboard_sink(Arc::clone(&dashboard_sink));
 
@@ -1468,8 +1439,7 @@ pub fn run_launcher_with_config(
         config = config.abort_flag(Arc::clone(&abort));
         let coord_abort = Arc::clone(&abort);
         let coord_fatal_slot = Arc::clone(&coord_fatal);
-        let coord_source =
-            crate::distributed::port_mux::StreamSource::Mux(mux_control);
+        let coord_source = crate::distributed::port_mux::StreamSource::Mux(mux_control);
         coord_driver = Some(thread::Builder::new()
             .name("flodl-cluster-coord".to_string())
             .spawn(move || {
@@ -1588,25 +1558,26 @@ pub fn run_launcher_with_config(
         let rdv_me = me.clone();
         let formed_for_rdv = Arc::clone(&cohort_formed);
         let rdv_abort = Arc::clone(&abort);
-        let rdv_source =
-            crate::distributed::port_mux::StreamSource::Mux(mux_rendezvous);
-        rdv_driver = Some(thread::Builder::new()
-            .name("flodl-cluster-rendezvous".to_string())
-            .spawn(move || {
-                match crate::distributed::rendezvous::run_controller_rendezvous_aborting(
-                    &rdv_full, &rdv_me, rdv_source, &rdv_abort,
-                ) {
-                    Ok(()) => formed_for_rdv.store(true, std::sync::atomic::Ordering::SeqCst),
-                    Err(e) => {
-                        eprintln!("cluster launcher: rendezvous server error: {e}");
+        let rdv_source = crate::distributed::port_mux::StreamSource::Mux(mux_rendezvous);
+        rdv_driver = Some(
+            thread::Builder::new()
+                .name("flodl-cluster-rendezvous".to_string())
+                .spawn(move || {
+                    match crate::distributed::rendezvous::run_controller_rendezvous_aborting(
+                        &rdv_full, &rdv_me, rdv_source, &rdv_abort,
+                    ) {
+                        Ok(()) => formed_for_rdv.store(true, std::sync::atomic::Ordering::SeqCst),
+                        Err(e) => {
+                            eprintln!("cluster launcher: rendezvous server error: {e}");
+                        }
                     }
-                }
-            })
-            .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster launcher: spawn rendezvous thread failed: {e}"
-                ))
-            })?);
+                })
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "cluster launcher: spawn rendezvous thread failed: {e}"
+                    ))
+                })?,
+        );
     } else {
         // No rendezvous subsystem this run (CPU backend). Dropping the
         // receiver makes the mux dispatcher reset any stray rendezvous
@@ -1618,9 +1589,7 @@ pub fn run_launcher_with_config(
     // (e.g. a bench harness writing a hardware header covering remote
     // hosts it can never probe itself). Captured here because the
     // admitted-worker list is consumed just below.
-    let _ = COHORT_INVENTORY.set(
-        formed_workers.iter().map(|aw| aw.member.clone()).collect(),
-    );
+    let _ = COHORT_INVENTORY.set(formed_workers.iter().map(|aw| aw.member.clone()).collect());
 
     // ------------------------------------------------------------------
     // Ship each admitted worker its spawn artifacts
@@ -1715,10 +1684,7 @@ pub fn run_launcher_with_config(
         rank_exit_readers.push(thread::spawn(move || {
             let _ = stream.set_read_timeout(None);
             loop {
-                match crate::distributed::wire::ControlFrame::read_from(
-                    &mut stream,
-                    &reader_salt,
-                ) {
+                match crate::distributed::wire::ControlFrame::read_from(&mut stream, &reader_salt) {
                     Ok(Some(frame)) => {
                         match frame.decode::<crate::distributed::wire::JoinMsgWire>() {
                             Ok(crate::distributed::wire::JoinMsgWire::RankExited {

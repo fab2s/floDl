@@ -93,8 +93,7 @@ fn rank_lost_path_carries_the_host_tier_on_a_multi_host_cohort() {
 #[test]
 fn dropped_control_broadcast_raises_control_drop() {
     let sink = Arc::new(StubSink::default());
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
 
     // `for_test` leaves `control_streams` empty, so the broadcast misses
     // every live rank.
@@ -110,8 +109,7 @@ fn dropped_control_broadcast_raises_control_drop() {
 #[test]
 fn repeated_control_drops_collapse_into_one_record() {
     let sink = Arc::new(StubSink::default());
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
 
     for _ in 0..25 {
         let _ = coord.broadcast_control(&ControlMsgWire::SyncNow);
@@ -132,8 +130,7 @@ fn repeated_control_drops_collapse_into_one_record() {
 #[test]
 fn exempt_shutdown_broadcast_raises_no_alert() {
     let sink = Arc::new(StubSink::default());
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
     let _ = coord.broadcast_control(&ControlMsgWire::Shutdown);
     assert!(
         sink.events().is_empty(),
@@ -163,7 +160,10 @@ fn guard_correction_raises_a_drift_warning() {
     assert_eq!(drift[0]["sev"], "warn");
     assert_eq!(drift[0]["path"], "root");
     assert!(
-        drift[0]["detail"].as_str().unwrap().contains("nudged the anchor down"),
+        drift[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("nudged the anchor down"),
         "{}",
         drift[0],
     );
@@ -181,8 +181,7 @@ fn a_healthy_run_emits_no_alerts() {
     // The default guard path with no deaths and no failed broadcasts: the
     // lane must stay silent, so an alert in a log always means something.
     let sink = Arc::new(StubSink::default());
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).dashboard_sink(sink.clone()));
     coord.finish_averaging_head();
     coord.finish_averaging_head();
     assert!(sink.events().is_empty(), "{:?}", sink.events());

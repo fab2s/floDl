@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::resources::{read_cpu_times, read_meminfo, CpuTimes};
+use super::resources::{CpuTimes, read_cpu_times, read_meminfo};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -493,12 +493,13 @@ impl Timeline {
 
         // Close trailing gap
         if let Some(start) = gap_start
-            && let Some(last) = samples.last() {
-                let duration = last.elapsed_ms.saturating_sub(start);
-                if duration >= min_ms {
-                    gaps.push((start, last.elapsed_ms));
-                }
+            && let Some(last) = samples.last()
+        {
+            let duration = last.elapsed_ms.saturating_sub(start);
+            if duration >= min_ms {
+                gaps.push((start, last.elapsed_ms));
             }
+        }
 
         gaps
     }
@@ -812,9 +813,8 @@ impl Timeline {
                     .unwrap_or(0);
                 // Device-wide used/total via NVML (physical index);
                 // fall back to the nvidia-smi total when NVML is out.
-                let (vram_used, vram_total) =
-                    crate::tensor::gpu_smi_memory_info_idx(phys as i32)
-                        .unwrap_or((0, total_static));
+                let (vram_used, vram_total) = crate::tensor::gpu_smi_memory_info_idx(phys as i32)
+                    .unwrap_or((0, total_static));
                 // Allocator reserved bytes: per-process, runtime index,
                 // and only readable where a CUDA context already exists.
                 let vram_alloc = if crate::tensor::gpu_has_primary_context(i as i32) {
@@ -946,7 +946,11 @@ fn write_rank_samples_json(out: &mut String, samples: &[RankTimelineSample]) {
             out.push_str(",\n");
         }
         let host = s.host.replace('\\', "\\\\").replace('"', "\\\"");
-        let _ = write!(out, "{{\"t\":{},\"rank\":{},\"host\":\"{host}\"", s.elapsed_ms, s.rank);
+        let _ = write!(
+            out,
+            "{{\"t\":{},\"rank\":{},\"host\":\"{host}\"",
+            s.elapsed_ms, s.rank
+        );
         if let Some(cpu) = s.cpu_util {
             let _ = write!(out, ",\"cpu\":{cpu:.1}");
         }
@@ -1080,7 +1084,11 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
                 }
                 out.push(']');
             }
-            EventKind::GuardTelemetry { epoch, step, values } => {
+            EventKind::GuardTelemetry {
+                epoch,
+                step,
+                values,
+            } => {
                 let _ = write!(
                     out,
                     "\"k\":\"guard_telemetry\",\"epoch\":{epoch},\"step\":{step},\"values\":{{",
@@ -1270,13 +1278,25 @@ mod tests {
         write_rank_samples_json(&mut buf, &rank_samples);
 
         assert!(buf.contains("\"rank\":2"), "rank missing: {buf}");
-        assert!(buf.contains("\"host\":\"flodl-pascal\""), "host missing: {buf}");
+        assert!(
+            buf.contains("\"host\":\"flodl-pascal\""),
+            "host missing: {buf}"
+        );
         assert!(buf.contains("\"cpu\":37.5"), "cpu missing: {buf}");
-        assert!(buf.contains("\"ram_used\":4000000000"), "ram_used missing: {buf}");
+        assert!(
+            buf.contains("\"ram_used\":4000000000"),
+            "ram_used missing: {buf}"
+        );
         assert!(buf.contains("\"d\":1"), "gpu device missing: {buf}");
         assert!(buf.contains("\"u\":92.0"), "gpu util missing: {buf}");
-        assert!(buf.contains("\"va\":2000000000"), "vram alloc missing: {buf}");
-        assert!(buf.contains("\"vt\":6000000000"), "vram total missing: {buf}");
+        assert!(
+            buf.contains("\"va\":2000000000"),
+            "vram alloc missing: {buf}"
+        );
+        assert!(
+            buf.contains("\"vt\":6000000000"),
+            "vram total missing: {buf}"
+        );
 
         // The sparse rank 0 entry carries identity + empty gpus and NO
         // resource keys.
@@ -1287,7 +1307,10 @@ mod tests {
         assert!(rank0.contains("\"host\":\"exa\""), "rank0 host: {rank0}");
         assert!(rank0.contains("\"gpus\":[]"), "rank0 gpus: {rank0}");
         for key in ["\"cpu\"", "\"ram_used\"", "\"ram_total\""] {
-            assert!(!rank0.contains(key), "sparse entry must omit {key}: {rank0}");
+            assert!(
+                !rank0.contains(key),
+                "sparse entry must omit {key}: {rank0}"
+            );
         }
     }
 
@@ -1302,7 +1325,10 @@ mod tests {
         let path = dir.join(format!("flodl_tl_no_host_{}.json", std::process::id()));
         tl.save_json(path.to_str().unwrap()).unwrap();
         let doc = std::fs::read_to_string(&path).unwrap();
-        assert!(!doc.contains("\"host\""), "unset host must be absent: {doc}");
+        assert!(
+            !doc.contains("\"host\""),
+            "unset host must be absent: {doc}"
+        );
         let _ = std::fs::remove_file(&path);
 
         tl.set_host("exa-cuda");

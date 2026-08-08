@@ -66,7 +66,7 @@ use std::path::Path;
 
 use safetensors::SafeTensors;
 
-use flodl::nn::{cast_parameters, Module};
+use flodl::nn::{Module, cast_parameters};
 use flodl::{DType, Device, Tensor, Variable};
 use flodl_hf::models::deberta_v2::DebertaV2Model;
 
@@ -125,9 +125,7 @@ fn deberta_v2_parity_vs_pytorch_live() {
     cast_parameters(&graph.parameters(), DType::Float32).unwrap();
     graph.eval();
 
-    let out = graph
-        .forward_multi(&[input_ids, attention_mask])
-        .unwrap();
+    let out = graph.forward_multi(&[input_ids, attention_mask]).unwrap();
     assert_eq!(
         out.shape(),
         hidden_ref_shape,
@@ -139,9 +137,7 @@ fn deberta_v2_parity_vs_pytorch_live() {
 
     let actual = out.data().to_f32_vec().unwrap();
     let diff = max_abs_diff(&actual, &hidden_ref_data);
-    eprintln!(
-        "deberta-v3-base last_hidden_state max_abs_diff = {diff:.3e} (tol {HIDDEN_TOL:.0e})"
-    );
+    eprintln!("deberta-v3-base last_hidden_state max_abs_diff = {diff:.3e} (tol {HIDDEN_TOL:.0e})");
     assert!(
         diff <= HIDDEN_TOL,
         "last_hidden_state parity: max_abs_diff = {diff:.3e} exceeds tol {HIDDEN_TOL:.0e}",

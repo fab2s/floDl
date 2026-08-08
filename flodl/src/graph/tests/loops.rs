@@ -14,7 +14,9 @@ fn test_loop_for() {
 
     // Set linear to identity
     let params = graph.parameters();
-    params[0].variable.set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
+    params[0]
+        .variable
+        .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
     params[1].variable.set_data(from_f32(&[0.0, 0.0], &[2]));
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
@@ -42,7 +44,11 @@ fn test_loop_for_backward() {
 
     // All parameters should have gradients
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 
     // The bias gradient should be 3 (accumulated from 3 iterations)
@@ -74,7 +80,9 @@ fn test_loop_while() {
         .unwrap();
 
     let params = graph.parameters();
-    params[0].variable.set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
+    params[0]
+        .variable
+        .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
     params[1].variable.set_data(from_f32(&[0.0, 0.0], &[2]));
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
@@ -96,7 +104,9 @@ fn test_loop_while_immediate_halt() {
         .unwrap();
 
     let params = graph.parameters();
-    params[0].variable.set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
+    params[0]
+        .variable
+        .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
     params[1].variable.set_data(from_f32(&[0.0, 0.0], &[2]));
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
@@ -123,7 +133,9 @@ fn test_loop_until() {
         .unwrap();
 
     let params = graph.parameters();
-    params[0].variable.set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
+    params[0]
+        .variable
+        .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
     params[1].variable.set_data(from_f32(&[0.0, 0.0], &[2]));
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
@@ -145,7 +157,9 @@ fn test_loop_until_at_least_once() {
         .unwrap();
 
     let params = graph.parameters();
-    params[0].variable.set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
+    params[0]
+        .variable
+        .set_data(from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]));
     params[1].variable.set_data(from_f32(&[0.0, 0.0], &[2]));
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
@@ -176,7 +190,10 @@ fn test_loop_while_parameters() {
     // While loop with body + condition — both contribute parameters
     let graph = FlowBuilder::from(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
         .loop_body(Linear::on_device(2, 2, crate::tensor::test_device()).unwrap())
-        .while_cond(Linear::on_device(2, 1, crate::tensor::test_device()).unwrap(), 10)
+        .while_cond(
+            Linear::on_device(2, 1, crate::tensor::test_device()).unwrap(),
+            10,
+        )
         .build()
         .unwrap();
 
@@ -241,7 +258,11 @@ fn test_loop_using_backward_gradients() {
 
     assert!(x.grad().is_some(), "input should have gradient");
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -322,7 +343,9 @@ impl Module for EmittingDoubler {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         forward_via_step(self, input)
     }
-    fn as_loop_body(&self) -> Option<&dyn LoopBody> { Some(self) }
+    fn as_loop_body(&self) -> Option<&dyn LoopBody> {
+        Some(self)
+    }
 }
 impl LoopBody for EmittingDoubler {
     fn step(
@@ -345,14 +368,22 @@ struct SparseEmitter {
     step_count: RefCell<usize>,
 }
 impl SparseEmitter {
-    fn new() -> Self { SparseEmitter { step_count: RefCell::new(0) } }
+    fn new() -> Self {
+        SparseEmitter {
+            step_count: RefCell::new(0),
+        }
+    }
 }
 impl Module for SparseEmitter {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         forward_via_step(self, input)
     }
-    fn as_loop_body(&self) -> Option<&dyn LoopBody> { Some(self) }
-    fn reset(&self) { *self.step_count.borrow_mut() = 0; }
+    fn as_loop_body(&self) -> Option<&dyn LoopBody> {
+        Some(self)
+    }
+    fn reset(&self) {
+        *self.step_count.borrow_mut() = 0;
+    }
 }
 impl LoopBody for SparseEmitter {
     fn step(
@@ -378,7 +409,9 @@ impl Module for DupEmitter {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         forward_via_step(self, input)
     }
-    fn as_loop_body(&self) -> Option<&dyn LoopBody> { Some(self) }
+    fn as_loop_body(&self) -> Option<&dyn LoopBody> {
+        Some(self)
+    }
 }
 impl LoopBody for DupEmitter {
     fn step(
@@ -407,7 +440,11 @@ fn test_loop_body_emits_two_named_traces() {
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
     let y = graph.forward(&x).unwrap();
     let data = y.data().to_f32_vec().unwrap();
-    assert!((data[0] - 8.0).abs() < 1e-5, "final 8x = [8,16], got {}", data[0]);
+    assert!(
+        (data[0] - 8.0).abs() < 1e-5,
+        "final 8x = [8,16], got {}",
+        data[0]
+    );
 
     let doubles = graph.traces("double").expect("double stream");
     assert_eq!(doubles.len(), 3, "3 iterations = 3 emits of 'double'");
@@ -482,7 +519,6 @@ fn test_loop_body_emit_dup_panics() {
 
 // --- Router tests ---
 
-
 // --- Batched loop control ---
 //
 // Loop tests ran almost entirely at batch size 1, the same blind spot that hid
@@ -505,7 +541,11 @@ fn test_loop_for_batched() {
     let d = y.data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
         let want = base * 8.0; // doubled three times
-        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-5,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -518,9 +558,19 @@ fn test_loop_for_backward_batched() {
         .unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]), true);
-    graph.forward(&x).unwrap().sum().unwrap().backward().unwrap();
+    graph
+        .forward(&x)
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward()
+        .unwrap();
 
-    let g = x.grad().expect("input must receive gradient").to_f32_vec().unwrap();
+    let g = x
+        .grad()
+        .expect("input must receive gradient")
+        .to_f32_vec()
+        .unwrap();
     for (i, v) in g.iter().enumerate() {
         assert!((v - 8.0).abs() < 1e-5, "elem {i} grad: want 8, got {v}");
     }

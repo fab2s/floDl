@@ -17,12 +17,7 @@ enum Mode {
     Native,
 }
 
-pub fn run(
-    name: Option<&str>,
-    docker: bool,
-    native: bool,
-    with_hf: bool,
-) -> Result<(), String> {
+pub fn run(name: Option<&str>, docker: bool, native: bool, with_hf: bool) -> Result<(), String> {
     let name = name.ok_or("usage: fdl init <project-name>")?;
     validate_name(name)?;
 
@@ -67,14 +62,8 @@ pub fn run(
     }
 
     // Shared across all modes.
-    write_file(
-        &format!("{}/src/main.rs", name),
-        &main_rs_template(),
-    )?;
-    write_file(
-        &format!("{}/.gitignore", name),
-        &gitignore_template(mode),
-    )?;
+    write_file(&format!("{}/src/main.rs", name), &main_rs_template())?;
+    write_file(&format!("{}/.gitignore", name), &gitignore_template(mode))?;
     write_file(
         &format!("{}/fdl.yml.example", name),
         &fdl_yml_example_template(name, mode),
@@ -189,10 +178,7 @@ fn write_fdl_bootstrap(name: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(
-            format!("{}/fdl", name),
-            fs::Permissions::from_mode(0o755),
-        );
+        let _ = fs::set_permissions(format!("{}/fdl", name), fs::Permissions::from_mode(0o755));
     }
     Ok(())
 }
@@ -201,7 +187,10 @@ fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("project name cannot be empty".into());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err("project name must contain only letters, digits, hyphens, underscores".into());
     }
     Ok(())
@@ -232,18 +221,9 @@ fn scaffold_docker(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(), 
         &format!("{}/Cargo.toml", name),
         &cargo_toml_template(crate_name, flodl_dep),
     )?;
-    write_file(
-        &format!("{}/Dockerfile.cpu", name),
-        DOCKERFILE_CPU,
-    )?;
-    write_file(
-        &format!("{}/Dockerfile.cuda", name),
-        DOCKERFILE_CUDA,
-    )?;
-    write_file(
-        &format!("{}/Dockerfile.rocm", name),
-        DOCKERFILE_ROCM,
-    )?;
+    write_file(&format!("{}/Dockerfile.cpu", name), DOCKERFILE_CPU)?;
+    write_file(&format!("{}/Dockerfile.cuda", name), DOCKERFILE_CUDA)?;
+    write_file(&format!("{}/Dockerfile.rocm", name), DOCKERFILE_ROCM)?;
     write_file(
         &format!("{}/docker-compose.yml", name),
         &docker_compose_template(crate_name, true),
@@ -260,10 +240,7 @@ fn scaffold_mounted(name: &str, crate_name: &str, flodl_dep: &str) -> Result<(),
         &format!("{}/Cargo.toml", name),
         &cargo_toml_template(crate_name, flodl_dep),
     )?;
-    write_file(
-        &format!("{}/Dockerfile", name),
-        DOCKERFILE_MOUNTED,
-    )?;
+    write_file(&format!("{}/Dockerfile", name), DOCKERFILE_MOUNTED)?;
     write_file(
         &format!("{}/Dockerfile.cuda", name),
         DOCKERFILE_CUDA_MOUNTED,

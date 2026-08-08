@@ -6,8 +6,7 @@ use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
-    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le,
+    read_f64_le, read_tensor_state, read_u32_le, write_f64_le, write_tensor_state, write_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -107,13 +106,25 @@ pub struct RMSpropBuilder {
 
 impl RMSpropBuilder {
     /// Smoothing constant (default 0.99).
-    pub fn alpha(mut self, alpha: f64) -> Self { self.alpha = alpha; self }
+    pub fn alpha(mut self, alpha: f64) -> Self {
+        self.alpha = alpha;
+        self
+    }
     /// Term added for numerical stability (default 1e-8).
-    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+    pub fn eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
     /// Weight decay (L2 penalty, default 0).
-    pub fn weight_decay(mut self, wd: f64) -> Self { self.weight_decay = wd; self }
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
+        self
+    }
     /// Momentum factor (default 0).
-    pub fn momentum(mut self, momentum: f64) -> Self { self.momentum = momentum; self }
+    pub fn momentum(mut self, momentum: f64) -> Self {
+        self.momentum = momentum;
+        self
+    }
 
     /// Build the RMSprop optimizer.
     pub fn build(self) -> RMSprop {
@@ -133,7 +144,9 @@ impl RMSpropBuilder {
 }
 
 impl Optimizer for RMSprop {
-    fn lr(&self) -> f64 { self.lr }
+    fn lr(&self) -> f64 {
+        self.lr
+    }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -224,7 +237,9 @@ impl Optimizer for RMSprop {
 }
 
 impl Stateful for RMSprop {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::RMSprop }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::RMSprop
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
@@ -246,7 +261,9 @@ impl Stateful for RMSprop {
         let count = read_u32_le(r)? as usize;
         if count != self.params.len() {
             return Err(crate::tensor::TensorError::new(&format!(
-                "RMSprop: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+                "RMSprop: param count mismatch: checkpoint={} optimizer={}",
+                count,
+                self.params.len()
             )));
         }
         self.lr = read_f64_le(r)?;
@@ -267,8 +284,8 @@ impl Stateful for RMSprop {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::make_param;
+    use super::*;
     use crate::tensor::Tensor;
 
     #[test]
@@ -313,7 +330,10 @@ mod tests {
 
         // Should not crash and param should have changed
         let data = p.variable.data().to_f32_vec().unwrap();
-        assert!(data.iter().any(|&v| v.abs() > 0.0), "params should be non-zero");
+        assert!(
+            data.iter().any(|&v| v.abs() > 0.0),
+            "params should be non-zero"
+        );
     }
 
     #[test]
@@ -322,10 +342,8 @@ mod tests {
         let init = [0.5f32, -0.3, 0.1, 0.8, -0.2, 0.4];
         let dev = crate::tensor::test_device();
 
-        let p1 = Parameter::new(
-            Tensor::from_f32(&init, &[3, 2], dev).unwrap(), "w1");
-        let p2 = Parameter::new(
-            Tensor::from_f32(&init, &[3, 2], dev).unwrap(), "w2");
+        let p1 = Parameter::new(Tensor::from_f32(&init, &[3, 2], dev).unwrap(), "w1");
+        let p2 = Parameter::new(Tensor::from_f32(&init, &[3, 2], dev).unwrap(), "w2");
 
         let mut opt_wd = RMSprop::builder(std::slice::from_ref(&p1), 0.01)
             .weight_decay(0.1)
@@ -354,7 +372,10 @@ mod tests {
         let d1 = p1.variable.data().to_f32_vec().unwrap();
         let d2 = p2.variable.data().to_f32_vec().unwrap();
         // Weight decay should cause different parameter trajectories
-        assert_ne!(d1, d2, "weight decay should produce different results after 10 steps");
+        assert_ne!(
+            d1, d2,
+            "weight decay should produce different results after 10 steps"
+        );
     }
 
     #[test]
@@ -402,8 +423,7 @@ mod tests {
         opt.save_state(&mut buf).unwrap();
 
         // Load into fresh optimizer
-        let mut opt2 = RMSprop::builder(std::slice::from_ref(&p), 0.99)
-            .build();
+        let mut opt2 = RMSprop::builder(std::slice::from_ref(&p), 0.99).build();
         let mut cursor = std::io::Cursor::new(&buf);
         opt2.load_state(&mut cursor).unwrap();
 

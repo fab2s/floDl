@@ -234,13 +234,22 @@ mod tests {
         // The Debian pair is the load-bearing one: while ssh.socket owns
         // the listener, `Port` in sshd_config is ignored outright.
         let deb = Platform::Debian.enable_sshd();
-        assert!(deb.iter().any(|c| c.contains("disable --now ssh.socket")), "{deb:?}");
-        assert!(deb.iter().any(|c| c.contains("enable --now ssh.service")), "{deb:?}");
+        assert!(
+            deb.iter().any(|c| c.contains("disable --now ssh.socket")),
+            "{deb:?}"
+        );
+        assert!(
+            deb.iter().any(|c| c.contains("enable --now ssh.service")),
+            "{deb:?}"
+        );
         assert_eq!(Platform::Debian.ssh_service(), Some("ssh.service"));
 
         let rhel = Platform::Rhel.enable_sshd();
         assert!(rhel.iter().any(|c| c.contains("sshd.service")), "{rhel:?}");
-        assert!(!rhel.iter().any(|c| c.contains("socket")), "no socket unit on RHEL: {rhel:?}");
+        assert!(
+            !rhel.iter().any(|c| c.contains("socket")),
+            "no socket unit on RHEL: {rhel:?}"
+        );
         assert_eq!(Platform::Rhel.ssh_service(), Some("sshd.service"));
     }
 
@@ -268,19 +277,43 @@ mod tests {
         // installing rsync is the whole answer there.
         let deb = Platform::Debian.rrsync_fix().unwrap();
         assert!(deb.contains("apt") && deb.contains("rsync"), "{deb}");
-        assert!(!deb.contains("install -m"), "no copy needed on Debian: {deb}");
+        assert!(
+            !deb.contains("install -m"),
+            "no copy needed on Debian: {deb}"
+        );
         // RHEL ships it as docs: 0644, not on PATH. Installing rsync is
         // necessary and NOT sufficient, so the fix must also place it.
         let rhel = Platform::Rhel.rrsync_fix().unwrap();
-        assert!(rhel.contains("install -m 755"), "must make it executable: {rhel}");
-        assert!(rhel.contains("/usr/share/doc/rsync/support/rrsync"), "{rhel}");
+        assert!(
+            rhel.contains("install -m 755"),
+            "must make it executable: {rhel}"
+        );
+        assert!(
+            rhel.contains("/usr/share/doc/rsync/support/rrsync"),
+            "{rhel}"
+        );
     }
 
     #[test]
     fn package_commands_speak_each_families_manager() {
-        assert!(Platform::Debian.install(&["rsync"]).unwrap().starts_with("sudo apt"));
-        assert!(Platform::Rhel.install(&["rsync"]).unwrap().starts_with("sudo dnf"));
-        assert!(Platform::MacOs.install(&["rsync"]).unwrap().starts_with("brew"));
+        assert!(
+            Platform::Debian
+                .install(&["rsync"])
+                .unwrap()
+                .starts_with("sudo apt")
+        );
+        assert!(
+            Platform::Rhel
+                .install(&["rsync"])
+                .unwrap()
+                .starts_with("sudo dnf")
+        );
+        assert!(
+            Platform::MacOs
+                .install(&["rsync"])
+                .unwrap()
+                .starts_with("brew")
+        );
         assert!(Platform::Other.install(&["rsync"]).is_none());
         // macOS ships sshd, so there is no package to name for it.
         assert_eq!(Platform::MacOs.sshd_package(), None);

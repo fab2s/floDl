@@ -7,14 +7,14 @@
 //! is managed under `~/.flodl/` (override with `$FLODL_HOME`).
 
 use flodl_cli::{
-    add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init,
-    join, join_config, overlay, parse_or_schema_from, probe, publish, run, setup, skill,
-    status, style, update_check,
+    add, api_ref, builtins, cli_error, cluster, completions, config, diagnose, gpus, init, join,
+    join_config, overlay, parse_or_schema_from, probe, publish, run, setup, skill, status, style,
+    update_check,
 };
 
 use builtins::{
-    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, JoinConfigArgs,
-    ProbeArgs, PublishArgs, SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
+    AddArgs, ApiRefArgs, DiagnoseArgs, InitArgs, InstallArgs, JoinArgs, JoinConfigArgs, ProbeArgs,
+    PublishArgs, SetupArgs, SkillInstallArgs, StartArgs, StatusArgs,
 };
 
 use std::env;
@@ -187,17 +187,29 @@ fn main() -> ExitCode {
                 cli.libtorch_path,
                 cli.docker,
             );
-            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            if code == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         "status" => {
             let cli: StatusArgs = parse_sub("fdl status", &args[1..]);
             let code = status::run(cli.json, cli.addr.as_deref());
-            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            if code == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         "start" => {
             let cli: StartArgs = parse_sub("fdl start", &args[1..]);
             let code = status::run_start(cli.addr.as_deref(), cli.token.as_deref());
-            if code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            if code == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         "publish" => {
             // Same `--` split as `join`: everything after it is the
@@ -358,9 +370,10 @@ fn resolve_env(
         return Ok((Some(env_name), args));
     }
     if let Some(env_name) = fdl_env
-        && !env_name.is_empty() {
-            return Ok((Some(env_name.to_string()), args));
-        }
+        && !env_name.is_empty()
+    {
+        return Ok((Some(env_name.to_string()), args));
+    }
 
     Ok((None, args))
 }
@@ -375,9 +388,7 @@ fn resolve_env(
 ///
 /// Returns the args with `--gpus` (and its value) removed, plus the parsed
 /// [`gpus::GpusSpec`] when set.
-fn extract_gpus_flag(
-    args: &[String],
-) -> Result<(Vec<String>, Option<gpus::GpusSpec>), String> {
+fn extract_gpus_flag(args: &[String]) -> Result<(Vec<String>, Option<gpus::GpusSpec>), String> {
     let mut out = Vec::with_capacity(args.len());
     let mut spec: Option<gpus::GpusSpec> = None;
     let mut i = 0;
@@ -392,8 +403,7 @@ fn extract_gpus_flag(
         }
         if a == "--gpus" {
             let value = args.get(i + 1).ok_or_else(|| {
-                "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)"
-                    .to_string()
+                "--gpus requires a value (e.g. `--gpus 0,1` or `--gpus all`)".to_string()
             })?;
             if value.is_empty() || value.starts_with('-') {
                 return Err(format!("--gpus requires a value, got `{value}`"));
@@ -410,9 +420,7 @@ fn extract_gpus_flag(
                 return Err("--gpus specified more than once".to_string());
             }
             if value.is_empty() {
-                return Err(
-                    "--gpus= requires a value (e.g. `--gpus=0,1`)".to_string(),
-                );
+                return Err("--gpus= requires a value (e.g. `--gpus=0,1`)".to_string());
             }
             spec = Some(gpus::GpusSpec::parse(value)?);
             i += 1;
@@ -447,9 +455,9 @@ fn extract_env_flag(args: &[String]) -> Result<(Vec<String>, Option<String>), St
             break;
         }
         if a == "--env" {
-            let value = args.get(i + 1).ok_or_else(|| {
-                "--env requires a value (e.g. `--env ci`)".to_string()
-            })?;
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| "--env requires a value (e.g. `--env ci`)".to_string())?;
             if value.is_empty() || value.starts_with('-') {
                 return Err(format!("--env requires a value, got `{value}`"));
             }
@@ -509,14 +517,10 @@ fn extract_at_env(args: &[String]) -> Result<(Vec<String>, Option<String>), Stri
         }
         if let Some(name) = arg.strip_prefix('@') {
             if name.is_empty() {
-                return Err(
-                    "`@` requires an env name (e.g. `@cluster`)".to_string(),
-                );
+                return Err("`@` requires an env name (e.g. `@cluster`)".to_string());
             }
             if env.is_some() {
-                return Err(
-                    "env selector (`@<env>`) specified more than once".to_string(),
-                );
+                return Err("env selector (`@<env>`) specified more than once".to_string());
             }
             env = Some(name.to_string());
             continue;
@@ -565,7 +569,6 @@ pub(crate) fn parse_sub<T: flodl_cli::FdlArgsTrait>(program: &str, tail: &[Strin
     parse_or_schema_from::<T>(&argv)
 }
 
-
 // ---------------------------------------------------------------------------
 // skill dispatch
 // ---------------------------------------------------------------------------
@@ -599,13 +602,12 @@ fn dispatch_skill(args: &[String]) -> ExitCode {
     }
 }
 
-
 mod cli;
+use cli::config::{cmd_config_show, dispatch_config, load_project_config};
+use cli::install::cmd_install;
 use cli::libtorch::dispatch_libtorch;
 use cli::nccl::dispatch_nccl;
 use cli::schema::dispatch_schema;
-use cli::install::cmd_install;
-use cli::config::{cmd_config_show, dispatch_config, load_project_config};
 
 // ---------------------------------------------------------------------------
 // Usage
@@ -629,8 +631,12 @@ pub(crate) fn print_usage() {
     println!("    -vv                Debug output (per-batch timing, loop internals)");
     println!("    -vvv               Trace output (maximum detail)");
     println!("    -q, --quiet        Suppress all non-error output");
-    println!("    --no-append        Drop a run command's `append:` suffix (cargo / runner defaults)");
-    println!("    --no-prebuild      Skip the cluster pre-flight build (assumes binaries are fresh)");
+    println!(
+        "    --no-append        Drop a run command's `append:` suffix (cargo / runner defaults)"
+    );
+    println!(
+        "    --no-prebuild      Skip the cluster pre-flight build (assumes binaries are fresh)"
+    );
     println!();
     println!("COMMANDS:");
     println!("    setup              Interactive guided setup");
@@ -696,9 +702,9 @@ fn extract_verbosity(args: &[String]) -> (Vec<String>, Option<u8>) {
             continue;
         }
         match arg.as_str() {
-            "-vvv" => level = Some(4), // Trace
-            "-vv" => level = Some(3),  // Debug
-            "-v" => level = Some(2),   // Verbose
+            "-vvv" => level = Some(4),           // Trace
+            "-vv" => level = Some(3),            // Debug
+            "-v" => level = Some(2),             // Verbose
             "--quiet" | "-q" => level = Some(0), // Quiet
             _ => filtered.push(arg.clone()),
         }
@@ -803,9 +809,7 @@ fn extract_ansi_flags(
     }
 
     let choice = match (ansi, no_ansi) {
-        (true, true) => return Err(
-            "--ansi and --no-ansi are mutually exclusive".to_string()
-        ),
+        (true, true) => return Err("--ansi and --no-ansi are mutually exclusive".to_string()),
         (true, false) => Some(style::ColorChoice::Always),
         (false, true) => Some(style::ColorChoice::Never),
         (false, false) => None,

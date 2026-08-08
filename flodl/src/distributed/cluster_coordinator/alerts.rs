@@ -20,8 +20,8 @@
 
 use crate::monitor::event_lane::EventClass;
 
-use super::window_records::rank_record_path;
 use super::ClusterCoordinator;
+use super::window_records::rank_record_path;
 
 impl ClusterCoordinator {
     /// Per-rank host list indexed by rank, as the record tree sees it.
@@ -45,12 +45,7 @@ impl ClusterCoordinator {
     /// window), one record, or several (a collapsed window closing, plus the
     /// overflow notice). Never fails and never blocks the caller's path — an
     /// alert is an observation of trouble, not a second failure mode.
-    pub(super) fn emit_alert(
-        &mut self,
-        class: EventClass,
-        path: String,
-        detail: String,
-    ) {
+    pub(super) fn emit_alert(&mut self, class: EventClass, path: String, detail: String) {
         let now = now_ms();
         let records = self.event_lane.record(class, &path, detail, now);
         self.push_alert_records(records);

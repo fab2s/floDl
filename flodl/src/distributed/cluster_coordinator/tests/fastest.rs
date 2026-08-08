@@ -34,14 +34,10 @@ fn fastest_role_resolves_to_lowest_smoothed_ms() {
     // wall=[100, 50, 200], batches=10 each → ms_per_batch =
     // [10, 5, 20] → rank 1 fastest.
     el_che.report_timing(&[100.0, 50.0, 200.0], &[10, 10, 10], 0.0);
-    let cfg = ClusterCoordinatorConfig::new(
-        ApplyPolicy::Sync,
-        AverageBackend::Cpu,
-        world_size,
-        el_che,
-    )
-    .no_divergence_guard()
-    .epoch_callback_policy(EpochCallbackPolicy::Fastest);
+    let cfg =
+        ClusterCoordinatorConfig::new(ApplyPolicy::Sync, AverageBackend::Cpu, world_size, el_che)
+            .no_divergence_guard()
+            .epoch_callback_policy(EpochCallbackPolicy::Fastest);
     let coord = ClusterCoordinator::for_test(cfg);
     assert_eq!(
         coord.resolve_fastest_role_for_test(),
@@ -56,8 +52,7 @@ fn fastest_role_resolves_to_lowest_smoothed_ms() {
 #[test]
 fn fastest_role_fallback_to_lowest_live_when_uncalibrated() {
     let world_size = 3usize;
-    let dead_ranks =
-        crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
     // Declare rank 0 dead before resolution to verify fallback
     // picks the lowest LIVE rank, not literal rank 0.
     dead_ranks.declare_dead(0);
@@ -80,17 +75,12 @@ fn fastest_re_resolve_on_role_rank_death() {
     let world_size = 3usize;
     let mut el_che = ElChe::new(world_size, 1);
     el_che.report_timing(&[100.0, 50.0, 200.0], &[10, 10, 10], 0.0);
-    let dead_ranks =
-        crate::distributed::controller::DeadRanks::new(world_size);
-    let cfg = ClusterCoordinatorConfig::new(
-        ApplyPolicy::Sync,
-        AverageBackend::Cpu,
-        world_size,
-        el_che,
-    )
-    .no_divergence_guard()
-    .epoch_callback_policy(EpochCallbackPolicy::Fastest)
-    .dead_ranks(Arc::clone(&dead_ranks));
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
+    let cfg =
+        ClusterCoordinatorConfig::new(ApplyPolicy::Sync, AverageBackend::Cpu, world_size, el_che)
+            .no_divergence_guard()
+            .epoch_callback_policy(EpochCallbackPolicy::Fastest)
+            .dead_ranks(Arc::clone(&dead_ranks));
     let mut coord = ClusterCoordinator::for_test(cfg);
     // Force role resolution by manually setting roles to the
     // fastest rank (the for_test constructor seeds them to 0; in
@@ -142,11 +132,13 @@ fn eval_dispatched_to_role_only() {
 
     let (port, coord_handle) = spawn_coord(
         world_size,
-        move || cfg_sync_cpu(world_size)
-            .total_samples(8)
-            .batch_size(4)
-            .num_epochs(2)
-            .eval_every_epochs(1),
+        move || {
+            cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(2)
+                .eval_every_epochs(1)
+        },
         move |coord| {
             coord.dispatch_epoch(0)?;
             coord.dispatch_epoch(1)?;
@@ -169,8 +161,9 @@ fn eval_dispatched_to_role_only() {
                     ControlMsgWire::ExecuteEvalCallback { .. } => {
                         saw_eval.store(true, Ordering::Relaxed);
                     }
-                    ControlMsgWire::Shutdown
-                    | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                    ControlMsgWire::Shutdown | ControlMsgWire::ShutdownWithSave { .. } => {
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -183,10 +176,14 @@ fn eval_dispatched_to_role_only() {
     r1.join().unwrap().expect("rank 1 drained cleanly");
     coord_handle.join().unwrap().expect("coord finishes");
 
-    assert!(r0_got.load(Ordering::Relaxed),
-        "rank 0 (eval_role default) must receive ExecuteEvalCallback");
-    assert!(!r1_got.load(Ordering::Relaxed),
-        "rank 1 (non-role) must NOT receive ExecuteEvalCallback");
+    assert!(
+        r0_got.load(Ordering::Relaxed),
+        "rank 0 (eval_role default) must receive ExecuteEvalCallback"
+    );
+    assert!(
+        !r1_got.load(Ordering::Relaxed),
+        "rank 1 (non-role) must NOT receive ExecuteEvalCallback"
+    );
 }
 
 /// Integration test: `SetEpochCallbackRole` is broadcast to every
@@ -203,10 +200,12 @@ fn epoch_callback_role_broadcast_at_first_dispatch() {
 
     let (port, coord_handle) = spawn_coord(
         world_size,
-        move || cfg_sync_cpu(world_size)
-            .total_samples(8)
-            .batch_size(4)
-            .num_epochs(3),
+        move || {
+            cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(3)
+        },
         move |coord| {
             coord.dispatch_epoch(0)?;
             coord.dispatch_epoch(1)?;
@@ -230,8 +229,9 @@ fn epoch_callback_role_broadcast_at_first_dispatch() {
                     ControlMsgWire::SetEpochCallbackRole { rank: _ } => {
                         role_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    ControlMsgWire::Shutdown
-                    | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                    ControlMsgWire::Shutdown | ControlMsgWire::ShutdownWithSave { .. } => {
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -266,11 +266,13 @@ fn checkpoint_success_round_trip_updates_ewma() {
     let world_size = 2;
     let (port, coord_handle) = spawn_coord(
         world_size,
-        move || cfg_sync_cpu(world_size)
-            .total_samples(8)
-            .batch_size(4)
-            .num_epochs(2)
-            .checkpoint_every(1),
+        move || {
+            cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(2)
+                .checkpoint_every(1)
+        },
         move |coord| {
             coord.dispatch_epoch(0)?;
             coord.dispatch_epoch(1)?;
@@ -285,8 +287,7 @@ fn checkpoint_success_round_trip_updates_ewma() {
                 thread::sleep(Duration::from_millis(5));
             }
             assert!(
-                (coord.last_checkpoint_elapsed_ms_ewma().unwrap() - 12.5).abs()
-                    < 1e-9,
+                (coord.last_checkpoint_elapsed_ms_ewma().unwrap() - 12.5).abs() < 1e-9,
                 "EWMA = {:?} (expected 12.5)",
                 coord.last_checkpoint_elapsed_ms_ewma(),
             );
@@ -301,18 +302,24 @@ fn checkpoint_success_round_trip_updates_ewma() {
             loop {
                 let msg = recv_control(s, salt)?;
                 match msg {
-                    ControlMsgWire::Checkpoint { version, target_rank }
-                        if target_rank == rank =>
-                    {
-                        send_timing(s, salt, TimingMsgWire::CheckpointResult {
-                            rank,
-                            version,
-                            elapsed_ms: 12.5,
-                            error: None,
-                        })?;
+                    ControlMsgWire::Checkpoint {
+                        version,
+                        target_rank,
+                    } if target_rank == rank => {
+                        send_timing(
+                            s,
+                            salt,
+                            TimingMsgWire::CheckpointResult {
+                                rank,
+                                version,
+                                elapsed_ms: 12.5,
+                                error: None,
+                            },
+                        )?;
                     }
-                    ControlMsgWire::Shutdown
-                    | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                    ControlMsgWire::Shutdown | ControlMsgWire::ShutdownWithSave { .. } => {
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -331,10 +338,8 @@ fn dispatch_epoch_errors_when_total_samples_zero() {
     // Forgetting to set total_samples on the config must surface
     // as a loud error, not silently produce empty partitions.
     let world_size = 2;
-    let (listener, _port) = ClusterCoordinator::bind(
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-    )
-    .unwrap();
+    let (listener, _port) =
+        ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
     let coord_thread = thread::spawn(move || -> Result<()> {
         let mut coord = ClusterCoordinator::start_from_listener(
             listener,
@@ -450,26 +455,20 @@ fn lr_update_frame_populates_last_lr_per_rank() {
         },
     );
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(
-            s,
-            salt,
-            TimingMsgWire::LrUpdate { rank: 0, lr: 0.01 },
-        )?;
+        send_timing(s, salt, TimingMsgWire::LrUpdate { rank: 0, lr: 0.01 })?;
         // Stay alive long enough for the coord to drain the frame.
         thread::sleep(Duration::from_millis(200));
         Ok(())
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(
-            s,
-            salt,
-            TimingMsgWire::LrUpdate { rank: 1, lr: 0.02 },
-        )?;
+        send_timing(s, salt, TimingMsgWire::LrUpdate { rank: 1, lr: 0.02 })?;
         thread::sleep(Duration::from_millis(200));
         Ok(())
     });
     r0.join().unwrap().expect("rank 0 sends LrUpdate");
     r1.join().unwrap().expect("rank 1 sends LrUpdate");
-    coord_handle.join().unwrap().expect("coord captures both LRs");
+    coord_handle
+        .join()
+        .unwrap()
+        .expect("coord captures both LRs");
 }
-

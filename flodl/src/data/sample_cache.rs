@@ -168,11 +168,7 @@ impl SampleCache {
         slot: &std::sync::RwLock<Option<Vec<Tensor>>>,
     ) -> Option<std::sync::RwLockReadGuard<'_, Option<Vec<Tensor>>>> {
         let guard = slot.read().unwrap_or_else(|p| p.into_inner());
-        if guard.is_some() {
-            Some(guard)
-        } else {
-            None
-        }
+        if guard.is_some() { Some(guard) } else { None }
     }
 
     /// Install the admission ceiling. Called once per `epoch()` by the
@@ -211,9 +207,10 @@ impl SampleCache {
         let sample = fetch()?;
         #[cfg(all(debug_assertions, not(test)))]
         if !self.purity_probed.swap(true, Ordering::Relaxed)
-            && let Ok(second) = fetch() {
-                crate::data::assert_fetch_pure("DataSet::get", &sample, &second);
-            }
+            && let Ok(second) = fetch()
+        {
+            crate::data::assert_fetch_pure("DataSet::get", &sample, &second);
+        }
         self.admit(index, &sample);
         Ok(sample)
     }
@@ -223,10 +220,11 @@ impl SampleCache {
     /// from the source.
     pub(crate) fn lookup(&self, index: usize) -> Option<Result<Vec<Tensor>>> {
         if let Some(slot) = self.slots.get(index)
-            && let Some(guard) = Self::read_slot(slot) {
-                let hit = guard.as_ref().expect("read_slot returns occupied");
-                return Some(Ok(hit.clone()));
-            }
+            && let Some(guard) = Self::read_slot(slot)
+        {
+            let hit = guard.as_ref().expect("read_slot returns occupied");
+            return Some(Ok(hit.clone()));
+        }
         self.disk.get().and_then(|stage| stage.read(index))
     }
 
@@ -244,21 +242,20 @@ impl SampleCache {
         let mut ram_admitted = false;
         if let Some(slot) = self.slots.get(index) {
             let estimate = crate::data::budget::retained_cost_estimate(sample);
-            if self.bytes.load(Ordering::Relaxed) + estimate
-                <= self.budget.load(Ordering::Relaxed)
-                && let Ok((rows, cost)) = crate::data::budget::retain_rows(sample) {
-                    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
-                    if guard.is_none() {
-                        *guard = Some(rows);
-                        self.bytes.fetch_add(cost, Ordering::Relaxed);
-                        ram_admitted = true;
-                    }
+            if self.bytes.load(Ordering::Relaxed) + estimate <= self.budget.load(Ordering::Relaxed)
+                && let Ok((rows, cost)) = crate::data::budget::retain_rows(sample)
+            {
+                let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+                if guard.is_none() {
+                    *guard = Some(rows);
+                    self.bytes.fetch_add(cost, Ordering::Relaxed);
+                    ram_admitted = true;
                 }
-        }
-        if !ram_admitted
-            && let Some(stage) = self.disk.get() {
-                stage.admit(index, sample);
             }
+        }
+        if !ram_admitted && let Some(stage) = self.disk.get() {
+            stage.admit(index, sample);
+        }
     }
 }
 
@@ -441,7 +438,7 @@ impl DiskStage {
                 Err(_) => {
                     return Some(Err(TensorError::new(
                         "DataLoader: disk_stage writer poisoned",
-                    )))
+                    )));
                 }
             };
             let end = w.offset;
@@ -510,13 +507,14 @@ fn warn_if_ram_backed(dir: &Path) {
     };
     let target = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     if let Some(fstype) = fs_type_for(&target, &mounts)
-        && (fstype == "tmpfs" || fstype == "ramfs") {
-            eprintln!(
-                "flodl data: disk_stage directory {} is on {fstype} (RAM-backed): the stage \
+        && (fstype == "tmpfs" || fstype == "ramfs")
+    {
+        eprintln!(
+            "flodl data: disk_stage directory {} is on {fstype} (RAM-backed): the stage \
                  will spend RAM, not disk. Point .disk_stage_dir() at a real drive.",
-                target.display()
-            );
-        }
+            target.display()
+        );
+    }
 }
 
 /// Filesystem type of the longest mount point containing `path`
@@ -530,9 +528,7 @@ fn fs_type_for(path: &Path, mounts: &str) -> Option<String> {
         else {
             continue;
         };
-        if path.starts_with(mount_point)
-            && best.is_none_or(|(b, _)| mount_point.len() > b.len())
-        {
+        if path.starts_with(mount_point) && best.is_none_or(|(b, _)| mount_point.len() > b.len()) {
             best = Some((mount_point, fstype));
         }
     }
@@ -694,9 +690,7 @@ mod tests {
     fn fetch_errors_pass_through_and_cache_nothing() {
         let cache = SampleCache::new(2);
         cache.set_budget(64);
-        let out = cache.get_or_fetch(0, || {
-            Err(crate::tensor::TensorError::new("io failure"))
-        });
+        let out = cache.get_or_fetch(0, || Err(crate::tensor::TensorError::new("io failure")));
         assert!(out.is_err());
         assert_eq!(cache.cached_count(), 0);
 
@@ -789,7 +783,11 @@ mod tests {
         }
         assert_eq!(fetches, 3, "first pass: all misses");
         assert_eq!(cache.cached_count(), 1, "RAM took one");
-        assert_eq!(cache.disk().unwrap().staged_count(), 2, "disk took the rest");
+        assert_eq!(
+            cache.disk().unwrap().staged_count(),
+            2,
+            "disk took the rest"
+        );
 
         // Second pass: every index is served without touching the
         // source, from whichever tier holds it.

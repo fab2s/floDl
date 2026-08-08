@@ -6,8 +6,8 @@ use crate::autograd::Variable;
 use crate::nn::{Module, TraceEmit};
 use crate::tensor::Result;
 
-use super::node::*;
 use super::FlowBuilder;
+use super::node::*;
 
 /// Read a loop condition's halt decision for one iteration.
 ///
@@ -28,9 +28,7 @@ fn halt_decision(halt: &Variable, iteration: usize) -> Result<bool> {
         )));
     }
     let value = data.item().map_err(|e| {
-        crate::tensor::TensorError::new(&format!(
-            "loop condition at iteration {iteration}: {e}"
-        ))
+        crate::tensor::TensorError::new(&format!("loop condition at iteration {iteration}: {e}"))
     })?;
     Ok(value > 0.0)
 }
@@ -72,10 +70,7 @@ impl LoopBuilder {
             named_buf.clone(),
             ports.clone(),
         );
-        let composite: Rc<dyn Module> = Rc::new(LoopComposite {
-            body,
-            cond: None,
-        });
+        let composite: Rc<dyn Module> = Rc::new(LoopComposite { body, cond: None });
         wire_loop(fb, composite, run, trace_buf, named_buf, ports)
     }
 
@@ -166,7 +161,9 @@ fn wire_loop(
 
     // If the body supports NamedInputModule, expose ref_forward on the loop node
     // so that .using() can be chained after the loop.
-    let ref_forward = if composite.sub_modules().first()
+    let ref_forward = if composite
+        .sub_modules()
+        .first()
         .and_then(|body| body.as_named_input())
         .is_some()
     {
@@ -276,8 +273,8 @@ fn make_for_loop_func(
         named_buf.borrow_mut().clear();
         body.reset();
         for i in 0..count {
-            state = dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf)
-                .map_err(|e| {
+            state =
+                dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf).map_err(|e| {
                     crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
                 })?;
         }
@@ -304,8 +301,8 @@ fn make_while_loop_func(
             if halt_decision(&halt, i)? {
                 break;
             }
-            state = dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf)
-                .map_err(|e| {
+            state =
+                dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf).map_err(|e| {
                     crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
                 })?;
         }
@@ -328,8 +325,8 @@ fn make_until_loop_func(
         named_buf.borrow_mut().clear();
         body.reset();
         for i in 0..max_iter {
-            state = dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf)
-                .map_err(|e| {
+            state =
+                dispatch_iteration(&body, &state, &refs, &trace_buf, &named_buf).map_err(|e| {
                     crate::tensor::TensorError::new(&format!("loop iteration {}: {}", i, e))
                 })?;
             // Skip condition check on last iteration

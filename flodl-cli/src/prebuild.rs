@@ -80,9 +80,7 @@ pub fn preflight_hosts(
         let explicit = cluster.controller.data_path.is_some();
         let dir_ok = Path::new(&dp).is_dir();
         let read_ok = dir_ok && std::fs::read_dir(&dp).is_ok();
-        if let Some(w) =
-            check_remote_data_path(controller_host, &dp, explicit, dir_ok, read_ok)?
-        {
+        if let Some(w) = check_remote_data_path(controller_host, &dp, explicit, dir_ok, read_ok)? {
             eprintln!("fdl: {w}");
         }
     }
@@ -183,13 +181,16 @@ pub fn prebuild_remotes(
     eprintln!(
         "fdl: pre-flight build for {} remote worker(s): {}",
         remotes.len(),
-        remotes.iter().map(|w| w.host.as_str()).collect::<Vec<_>>().join(", "),
+        remotes
+            .iter()
+            .map(|w| w.host.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
     );
 
     // Controller's view of the shared project root (required field
     // per validator).
-    let controller_path: std::path::PathBuf =
-        std::path::PathBuf::from(&cluster.controller.path);
+    let controller_path: std::path::PathBuf = std::path::PathBuf::from(&cluster.controller.path);
 
     let project_root = Arc::new(project_root.to_path_buf());
     let cmd_cwd = Arc::new(cmd_cwd.to_path_buf());
@@ -219,17 +220,26 @@ pub fn prebuild_remotes(
             );
         }
         match prebuild_one_worker(
-            &project_root, &cmd_cwd, &controller_path,
-            first, &cmd_name,
+            &project_root,
+            &cmd_cwd,
+            &controller_path,
+            first,
+            &cmd_name,
             controller_docker_svc.as_deref(),
         ) {
             Ok(env_entry) => {
                 eprintln!("fdl: pre-flight OK ({})", first.host);
-                envelope.lock().unwrap().insert(first.host.clone(), env_entry);
+                envelope
+                    .lock()
+                    .unwrap()
+                    .insert(first.host.clone(), env_entry);
             }
             Err(e) => {
                 eprintln!("fdl: pre-flight FAILED ({}): {}", first.host, e);
-                errors.lock().unwrap().push(format!("{}: {}", first.host, e));
+                errors
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}: {}", first.host, e));
             }
         }
     }
@@ -247,17 +257,26 @@ pub fn prebuild_remotes(
         let envelope = Arc::clone(&envelope);
         handles.push(thread::spawn(move || {
             match prebuild_one_worker(
-                &project_root, &cmd_cwd, &controller_path,
-                &worker, &cmd_name,
+                &project_root,
+                &cmd_cwd,
+                &controller_path,
+                &worker,
+                &cmd_name,
                 controller_docker_svc.as_deref(),
             ) {
                 Ok(env_entry) => {
                     eprintln!("fdl: pre-flight OK ({})", worker.host);
-                    envelope.lock().unwrap().insert(worker.host.clone(), env_entry);
+                    envelope
+                        .lock()
+                        .unwrap()
+                        .insert(worker.host.clone(), env_entry);
                 }
                 Err(e) => {
                     eprintln!("fdl: pre-flight FAILED ({}): {}", worker.host, e);
-                    errors.lock().unwrap().push(format!("{}: {}", worker.host, e));
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}: {}", worker.host, e));
                 }
             }
         }));
@@ -288,7 +307,9 @@ pub fn prebuild_remotes(
     let json = serde_json::to_string(&env_map)
         .map_err(|e| format!("internal: serialize prebuild envelope: {e}"))?;
     // SAFETY: main has not spawned threads at this point in dispatch.
-    unsafe { std::env::set_var(ENV_PREBUILD_PER_HOST, json); }
+    unsafe {
+        std::env::set_var(ENV_PREBUILD_PER_HOST, json);
+    }
     Ok(())
 }
 
@@ -541,9 +562,7 @@ fn preflight_one_host(worker: &ClusterWorker, prebuilding: bool) -> Result<Vec<S
         let (uname_m, rest) = abi_part
             .split_once("__FLODL_LDD__")
             .unwrap_or((abi_part, ""));
-        let (ldd, pkill_field) = rest
-            .split_once("__FLODL_PKILL__")
-            .unwrap_or((rest, ""));
+        let (ldd, pkill_field) = rest.split_once("__FLODL_PKILL__").unwrap_or((rest, ""));
         let controller_arch = std::env::consts::ARCH;
         match check_remote_abi(&worker.host, controller_arch, uname_m, ldd) {
             AbiCheck::Ok { warning } => warnings.extend(warning),
@@ -633,8 +652,7 @@ fn prebuild_one_worker(
     // (host, arch) is the only thing that forces the rebuild. `arch` is a
     // libtorch subpath (`precompiled/cu128`, `builds/sm61-sm120`); slugify
     // its `/` so it is a single path segment.
-    let target_dir_relative =
-        format!("target/cluster/{}/{}", worker.host, arch_slug(arch));
+    let target_dir_relative = format!("target/cluster/{}/{}", worker.host, arch_slug(arch));
 
     // Two execution modes — docker-backed (controller has `docker:`
     // set in cluster.yml) or native cargo on the host filesystem.
@@ -653,67 +671,78 @@ fn prebuild_one_worker(
     // is the same project-root-relative path on the host, and
     // LIBTORCH_PATH is set directly on the cargo process (no Docker
     // bind-mount indirection).
-    let (sh_cmd, cwd_for_spawn, extra_envs): (String, &Path, Vec<(&str, String)>) =
-        if let Some(docker_svc) = controller_docker_svc {
-            // Docker-backed build.
-            let target_dir_in_container = format!("/workspace/{target_dir_relative}");
-            let sub_path = cmd_cwd
-                .strip_prefix(project_root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let cwd_in_container = if sub_path.is_empty() {
-                "/workspace".to_string()
-            } else {
-                format!("/workspace/{sub_path}")
-            };
-            let build_cmd = if features_arg.is_empty() {
-                format!(
-                    "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --bin {bin}",
-                    cwd = posix_quote(&cwd_in_container),
-                    tgt = posix_quote(&target_dir_in_container),
-                    bin = posix_quote(cmd_name),
-                )
-            } else {
-                format!(
-                    "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --features {feat} --bin {bin}",
-                    cwd = posix_quote(&cwd_in_container),
-                    tgt = posix_quote(&target_dir_in_container),
-                    feat = posix_quote(features_arg),
-                    bin = posix_quote(cmd_name),
-                )
-            };
-            let docker_cmd = format!(
-                "docker compose run --rm {svc} bash -c {inner}",
-                svc = docker_svc,
-                inner = posix_quote(&build_cmd),
-            );
-            (docker_cmd, project_root, vec![
+    let (sh_cmd, cwd_for_spawn, extra_envs): (String, &Path, Vec<(&str, String)>) = if let Some(
+        docker_svc,
+    ) =
+        controller_docker_svc
+    {
+        // Docker-backed build.
+        let target_dir_in_container = format!("/workspace/{target_dir_relative}");
+        let sub_path = cmd_cwd
+            .strip_prefix(project_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cwd_in_container = if sub_path.is_empty() {
+            "/workspace".to_string()
+        } else {
+            format!("/workspace/{sub_path}")
+        };
+        let build_cmd = if features_arg.is_empty() {
+            format!(
+                "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --bin {bin}",
+                cwd = posix_quote(&cwd_in_container),
+                tgt = posix_quote(&target_dir_in_container),
+                bin = posix_quote(cmd_name),
+            )
+        } else {
+            format!(
+                "cd {cwd} && CARGO_TARGET_DIR={tgt} cargo build --release --features {feat} --bin {bin}",
+                cwd = posix_quote(&cwd_in_container),
+                tgt = posix_quote(&target_dir_in_container),
+                feat = posix_quote(features_arg),
+                bin = posix_quote(cmd_name),
+            )
+        };
+        let docker_cmd = format!(
+            "docker compose run --rm {svc} bash -c {inner}",
+            svc = docker_svc,
+            inner = posix_quote(&build_cmd),
+        );
+        (
+            docker_cmd,
+            project_root,
+            vec![
                 ("LIBTORCH_HOST_PATH", host_path.clone()),
                 ("LIBTORCH_CPU_PATH", "./libtorch/precompiled/cpu".into()),
-            ])
+            ],
+        )
+    } else {
+        // Native build (no docker on controller).
+        let target_dir_abs = project_root.join(&target_dir_relative);
+        let bash_cmd = if features_arg.is_empty() {
+            format!(
+                "cargo build --release --bin {bin}",
+                bin = posix_quote(cmd_name),
+            )
         } else {
-            // Native build (no docker on controller).
-            let target_dir_abs = project_root.join(&target_dir_relative);
-            let bash_cmd = if features_arg.is_empty() {
-                format!(
-                    "cargo build --release --bin {bin}",
-                    bin = posix_quote(cmd_name),
-                )
-            } else {
-                format!(
-                    "cargo build --release --features {feat} --bin {bin}",
-                    feat = posix_quote(features_arg),
-                    bin = posix_quote(cmd_name),
-                )
-            };
-            (bash_cmd, cmd_cwd, vec![
+            format!(
+                "cargo build --release --features {feat} --bin {bin}",
+                feat = posix_quote(features_arg),
+                bin = posix_quote(cmd_name),
+            )
+        };
+        (
+            bash_cmd,
+            cmd_cwd,
+            vec![
                 ("LIBTORCH_PATH", host_path.clone()),
                 (
                     "CARGO_TARGET_DIR",
                     target_dir_abs.to_string_lossy().into_owned(),
                 ),
-            ])
-        };
+            ],
+        )
+    };
 
     let mut cmd = Command::new("sh");
     cmd.args(["-c", &sh_cmd])
@@ -740,15 +769,17 @@ fn prebuild_one_worker(
         cmd.env("CUDA_TAG", &cuda_tag);
     }
 
-    let status = cmd
-        .status()
-        .map_err(|e| format!("spawn `{sh_cmd}`: {e}"))?;
+    let status = cmd.status().map_err(|e| format!("spawn `{sh_cmd}`: {e}"))?;
     if !status.success() {
         return Err(format!(
             "cargo build exited {} (libtorch={host_path}, target={target_dir_relative}, \
              features={feat})",
             status.code().unwrap_or(-1),
-            feat = if features_arg.is_empty() { "(none)" } else { features_arg },
+            feat = if features_arg.is_empty() {
+                "(none)"
+            } else {
+                features_arg
+            },
         ));
     }
     let runtime_lib = runtime_ld_library_path(&worker.path, arch);
@@ -861,9 +892,11 @@ mod tests {
 
     #[test]
     fn data_path_present_and_readable_is_clean() {
-        assert!(check_remote_data_path("h", "/flodl/data", true, true, true)
-            .expect("ok")
-            .is_none());
+        assert!(
+            check_remote_data_path("h", "/flodl/data", true, true, true)
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[test]
@@ -893,19 +926,29 @@ mod tests {
 
     #[test]
     fn abi_musl_is_hard_incompatible_on_matching_arch() {
-        let r = check_remote_abi("alp", "x86_64", "x86_64", "musl libc (x86_64)\nVersion 1.2.4");
+        let r = check_remote_abi(
+            "alp",
+            "x86_64",
+            "x86_64",
+            "musl libc (x86_64)\nVersion 1.2.4",
+        );
         assert!(matches!(r, AbiCheck::Incompatible(m) if m.contains("musl")));
     }
 
     #[test]
     fn abi_matching_arch_glibc_ok_with_version_note() {
         let r = check_remote_abi(
-            "w", "x86_64", "x86_64",
+            "w",
+            "x86_64",
+            "x86_64",
             "ldd (Ubuntu GLIBC 2.35-0ubuntu3.4) 2.35",
         );
         match r {
             AbiCheck::Ok { warning: Some(w) } => {
-                assert!(w.contains("2.35"), "warning should quote the reported line: {w}");
+                assert!(
+                    w.contains("2.35"),
+                    "warning should quote the reported line: {w}"
+                );
             }
             other => panic!("expected Ok+warning, got {other:?}"),
         }
@@ -987,9 +1030,18 @@ mod tests {
 
     #[test]
     fn cuda_version_from_arch_extracts_precompiled_version() {
-        assert_eq!(cuda_version_from_arch("precompiled/cu128"), Some("12.8".into()));
-        assert_eq!(cuda_version_from_arch("precompiled/cu126"), Some("12.6".into()));
-        assert_eq!(cuda_version_from_arch("precompiled/cu118"), Some("11.8".into()));
+        assert_eq!(
+            cuda_version_from_arch("precompiled/cu128"),
+            Some("12.8".into())
+        );
+        assert_eq!(
+            cuda_version_from_arch("precompiled/cu126"),
+            Some("12.6".into())
+        );
+        assert_eq!(
+            cuda_version_from_arch("precompiled/cu118"),
+            Some("11.8".into())
+        );
     }
 
     #[test]
@@ -1006,7 +1058,10 @@ mod tests {
         // a stale binary (M24). Different variants -> different slugs.
         assert_eq!(arch_slug("precompiled/cu128"), "precompiled-cu128");
         assert_eq!(arch_slug("precompiled/cu118"), "precompiled-cu118");
-        assert_ne!(arch_slug("precompiled/cu128"), arch_slug("precompiled/cu118"));
+        assert_ne!(
+            arch_slug("precompiled/cu128"),
+            arch_slug("precompiled/cu118")
+        );
         assert_eq!(arch_slug("builds/sm61-sm120"), "builds-sm61-sm120");
         // Single-segment archs pass through unchanged.
         assert_eq!(arch_slug("cpu"), "cpu");
@@ -1065,8 +1120,7 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&env).unwrap();
-        let back: BTreeMap<String, PerHostEnvelope> =
-            serde_json::from_str(&json).unwrap();
+        let back: BTreeMap<String, PerHostEnvelope> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 1);
         let e = back.get("h1").unwrap();
         assert_eq!(e.bin, "t/c/h1/release/x");

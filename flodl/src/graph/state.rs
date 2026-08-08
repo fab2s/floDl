@@ -20,7 +20,9 @@ use crate::tensor::Result;
 pub struct StateAdd;
 
 impl Module for StateAdd {
-    fn name(&self) -> &str { "state_add" }
+    fn name(&self) -> &str {
+        "state_add"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(input.clone())
@@ -39,5 +41,4 @@ impl NamedInputModule for StateAdd {
     ) -> Result<Variable> {
         super::node::sum_named_refs(input, refs)
     }
-
 }

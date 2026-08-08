@@ -40,8 +40,8 @@ pub enum AddDepOutcome {
 ///
 /// Errors on IO failures or when the file isn't valid UTF-8.
 pub fn add_dep(path: &Path, name: &str, version: &str) -> Result<AddDepOutcome, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let (new_content, outcome) = insert_dep(&content, name, version)?;
     if outcome == AddDepOutcome::Added {
         fs::write(path, new_content)
@@ -142,7 +142,10 @@ serde = \"1\"
 ";
         let (out, outcome) = insert_dep(input, "flodl-hf", "=0.5.2").unwrap();
         assert_eq!(outcome, AddDepOutcome::Added);
-        assert!(out.contains("serde = \"1\""), "preserves existing dep: {out}");
+        assert!(
+            out.contains("serde = \"1\""),
+            "preserves existing dep: {out}"
+        );
         assert!(
             out.contains("flodl-hf = \"=0.5.2\""),
             "appends new dep: {out}",

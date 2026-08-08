@@ -90,7 +90,11 @@ fn canon_c_scalar(word: &str) -> String {
 fn canon_c(ty: &str) -> String {
     let ty = ty.replace("const", " ");
     let mut depth = ty.matches('*').count();
-    let base: String = ty.replace('*', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let base: String = ty
+        .replace('*', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     // FlodlTensor is `typedef void* FlodlTensor` — a pointer itself.
     let base = if base == "FlodlTensor" {
         depth += 1;
@@ -157,7 +161,10 @@ fn split_params(params: &str) -> Vec<String> {
     if p.is_empty() || p == "void" {
         return Vec::new();
     }
-    p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    p.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Split a declaration `... flodl_NAME ( PARAMS )` into (name, ret, params).
@@ -250,7 +257,10 @@ fn parse_rust(src: &str) -> BTreeMap<String, Sig> {
     let start = src
         .find("extern \"C\"")
         .expect("ffi_parity: no `extern \"C\"` block in lib.rs");
-    let brace = src[start..].find('{').expect("ffi_parity: malformed extern block") + start;
+    let brace = src[start..]
+        .find('{')
+        .expect("ffi_parity: malformed extern block")
+        + start;
     let mut depth = 0i32;
     let mut end = brace;
     for (i, c) in src[brace..].char_indices() {
@@ -281,10 +291,16 @@ fn parse_rust(src: &str) -> BTreeMap<String, Sig> {
             continue;
         }
         let name_pos = stmt.find("flodl_").unwrap();
-        let open = stmt[name_pos..].find('(').expect("ffi_parity: rust decl without `(`") + name_pos;
+        let open = stmt[name_pos..]
+            .find('(')
+            .expect("ffi_parity: rust decl without `(`")
+            + name_pos;
         let name = stmt[name_pos..open].trim().to_string();
         // Matching close paren for the arg list (no nested parens here).
-        let close = stmt[open..].find(')').expect("ffi_parity: rust decl without `)`") + open;
+        let close = stmt[open..]
+            .find(')')
+            .expect("ffi_parity: rust decl without `)`")
+            + open;
         let params = &stmt[open + 1..close];
         let after = stmt[close + 1..].trim();
         let ret_r = if let Some(rest) = after.strip_prefix("->") {

@@ -6,8 +6,8 @@
 mod roundtrip_common;
 
 use flodl_hf::models::albert::{
-    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering,
-    AlbertForSequenceClassification, AlbertForTokenClassification,
+    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering, AlbertForSequenceClassification,
+    AlbertForTokenClassification,
 };
 
 #[test]
@@ -47,12 +47,7 @@ fn albert_qa_export_roundtrip_live() {
     let head = AlbertForQuestionAnswering::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = AlbertConfig::from_json_str(&config_json).unwrap();
-    roundtrip_common::run_export_roundtrip(
-        head.graph(),
-        &config.to_json_str(),
-        repo,
-        "albert_qa",
-    );
+    roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "albert_qa");
 }
 
 #[test]
@@ -62,10 +57,5 @@ fn albert_mlm_export_roundtrip_live() {
     let head = AlbertForMaskedLM::from_pretrained(repo).unwrap();
     let config_json = roundtrip_common::fetch_hf_config_json(repo);
     let config = AlbertConfig::from_json_str(&config_json).unwrap();
-    roundtrip_common::run_export_roundtrip(
-        head.graph(),
-        &config.to_json_str(),
-        repo,
-        "albert_mlm",
-    );
+    roundtrip_common::run_export_roundtrip(head.graph(), &config.to_json_str(), repo, "albert_mlm");
 }

@@ -83,13 +83,11 @@ impl Door {
             "b" | "B" => Ok(Door::B),
             "a" | "A" => Ok(Door::A),
             "nologin" => Ok(Door::Nologin),
-            "c" | "C" => Err(
-                "door `c` (a second, source-only key) serves cross-host \
+            "c" | "C" => Err("door `c` (a second, source-only key) serves cross-host \
                  routing that fdl join's single identity cannot express — \
                  compose it manually from the guide's recipe \
                  (docs/ddp/02-cluster-guide.md), or use door `b`"
-                    .to_string(),
-            ),
+                .to_string()),
             other => Err(format!(
                 "unknown door `{other}` — one of `b` (rrsync source pull, \
                  the publish-then-join default), `a` (sftp data mount), \
@@ -206,7 +204,10 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     // shape, an operator working next to their script.
     let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
     let root = match crate::config::find_project_config(&cwd) {
-        Some(p) => p.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.clone()),
+        Some(p) => p
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone()),
         None => {
             let target = cwd.join("fdl.yml");
             if !confirm(
@@ -346,8 +347,7 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
             .map_err(|e| format!("cannot read the private key for cloud-init: {e}"))?;
         let content = render_cloud_init(&label, user, door, &worker_yml, &private_key);
         let path = farm_dir.join("cloud-init.yml");
-        fs::write(&path, content)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        fs::write(&path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         set_mode(&path, 0o600)?;
         Some(path)
     } else {
@@ -425,7 +425,13 @@ fn render_cloud_init(
 ) -> String {
     let indent = |s: &str| -> String {
         s.lines()
-            .map(|l| if l.is_empty() { String::new() } else { format!("      {l}") })
+            .map(|l| {
+                if l.is_empty() {
+                    String::new()
+                } else {
+                    format!("      {l}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -541,9 +547,10 @@ fn docker_services(root: &Path, label: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for spec in project.commands.values() {
         if let Some(svc) = &spec.docker
-            && !seen.contains(svc) {
-                seen.push(svc.clone());
-            }
+            && !seen.contains(svc)
+        {
+            seen.push(svc.clone());
+        }
     }
     seen
 }
@@ -592,8 +599,7 @@ fn preflight(door: Door, port: u16, served: &Path, plat: platform::Platform) -> 
     // gap as "nothing is listening", so it is the same check with the
     // cause named rather than a second one repeating the fix.
     let listening = sshd_listening(port);
-    let socket_owns =
-        plat == platform::Platform::Debian && port != 22 && socket_activated();
+    let socket_owns = plat == platform::Platform::Debian && port != 22 && socket_activated();
     checks.push(Check {
         what: if socket_owns {
             format!(
@@ -642,14 +648,19 @@ fn preflight(door: Door, port: u16, served: &Path, plat: platform::Platform) -> 
             });
         }
         Door::A => {
-            let have = ["/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server",
-                        "/usr/libexec/sftp-server"]
-                .iter()
-                .any(|p| Path::new(p).exists());
+            let have = [
+                "/usr/lib/openssh/sftp-server",
+                "/usr/libexec/openssh/sftp-server",
+                "/usr/libexec/sftp-server",
+            ]
+            .iter()
+            .any(|p| Path::new(p).exists());
             checks.push(Check {
                 what: "an sftp server (door a serves the data mount over it)".into(),
                 ok: have,
-                fix: (!have).then(|| plat.sshd_package().and_then(|p| plat.install(&[p]))).flatten(),
+                fix: (!have)
+                    .then(|| plat.sshd_package().and_then(|p| plat.install(&[p])))
+                    .flatten(),
             });
         }
         Door::Nologin => {}
@@ -709,8 +720,7 @@ fn install_authorized_line(
         false
     } else if cli.yes || !prompt::has_tty() {
         return Ok(InstallAction::Skipped(
-            "installing needs explicit consent: the prompt, or --install-key"
-                .to_string(),
+            "installing needs explicit consent: the prompt, or --install-key".to_string(),
         ));
     } else {
         prompt::ask_yn(
@@ -860,8 +870,8 @@ enum UpsertOutcome {
 /// and comment may differ, the key bytes cannot. Every other line is
 /// preserved byte for byte.
 fn upsert_authorized_line(content: &str, line: &str) -> Result<(String, UpsertOutcome), String> {
-    let wanted = key_material(line)
-        .ok_or("the composed authorized_keys line carries no key material")?;
+    let wanted =
+        key_material(line).ok_or("the composed authorized_keys line carries no key material")?;
     let mut out = String::with_capacity(content.len() + line.len() + 2);
     let mut outcome = UpsertOutcome::Appended;
     for existing in content.lines() {
@@ -983,12 +993,15 @@ fn resolve_label(cli: &JoinConfigArgs) -> Result<String, String> {
         return Ok(l.clone());
     }
     if let Ok(env) = std::env::var("FDL_ENV")
-        && !env.trim().is_empty() {
-            return Ok(env.trim().to_string());
-        }
-    Err("a farm needs a label: `fdl join-config <label>` (or target an \
+        && !env.trim().is_empty()
+    {
+        return Ok(env.trim().to_string());
+    }
+    Err(
+        "a farm needs a label: `fdl join-config <label>` (or target an \
          existing overlay: `fdl @<label> join-config`)"
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Labels become filenames (`fdl.<label>.yml`, `.fdl/<label>/`), so the
@@ -1175,7 +1188,11 @@ fn replace_token_line(content: &str, new_token: &str) -> Option<String> {
     let mut replaced = false;
     for line in content.lines() {
         let t = line.trim_start();
-        if !replaced && !t.starts_with('#') && t.strip_prefix("token:").is_some_and(|r| !r.trim().is_empty()) {
+        if !replaced
+            && !t.starts_with('#')
+            && t.strip_prefix("token:")
+                .is_some_and(|r| !r.trim().is_empty())
+        {
             let indent = &line[..line.len() - t.len()];
             out.push_str(indent);
             out.push_str("token: ");
@@ -1328,13 +1345,13 @@ fn authorized_keys_line(
         Door::B => format!("command=\"rrsync -ro {}\"", served_abs.display()),
         Door::A => format!(
             "command=\"internal-sftp -R -d {}\"",
-            cli.data_path.as_deref().unwrap_or(crate::config::DEFAULT_DATA_PATH),
+            cli.data_path
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_DATA_PATH),
         ),
         Door::Nologin => "command=\"/usr/sbin/nologin\"".to_string(),
     };
-    format!(
-        "restrict,port-forwarding,permitopen=\"127.0.0.1:1337\",{forced} {pub_line}"
-    )
+    format!("restrict,port-forwarding,permitopen=\"127.0.0.1:1337\",{forced} {pub_line}")
 }
 
 /// The ready-to-install sshd drop-in for this farm's door.
@@ -1359,9 +1376,7 @@ fn render_sshd_conf(label: &str, door: Door, port: u16, plat: platform::Platform
         format!("# floDl join door for farm `{label}` — generated by `fdl join-config`."),
         format!("# Door: {door_note}."),
         "#".into(),
-        format!(
-            "# Port {port} is the join door and the only one to expose; 22 stays"
-        ),
+        format!("# Port {port} is the join door and the only one to expose; 22 stays"),
         "# for ordinary logins and should NOT be forwarded from a router.".into(),
     ];
     if plat == platform::Platform::Debian && port != 22 {
@@ -1476,7 +1491,10 @@ fn derive_publish(crate_dir: &Path) -> Result<Option<PublishDerivation>, String>
              `{}target/release/{name}`)",
             ws.join("Cargo.toml").display(),
             "../".repeat(
-                crate_abs.strip_prefix(&ws).map(|p| p.components().count()).unwrap_or(1),
+                crate_abs
+                    .strip_prefix(&ws)
+                    .map(|p| p.components().count())
+                    .unwrap_or(1),
             ),
         )
     });
@@ -1488,7 +1506,13 @@ fn derive_publish(crate_dir: &Path) -> Result<Option<PublishDerivation>, String>
         format!("cargo build --release --bin {name}")
     };
 
-    Ok(Some(PublishDerivation { from_root, cwd_rel, bin, build, bin_caveat }))
+    Ok(Some(PublishDerivation {
+        from_root,
+        cwd_rel,
+        bin,
+        build,
+        bin_caveat,
+    }))
 }
 
 /// `[package] name = "..."` — first `name =` line inside the
@@ -1501,13 +1525,12 @@ fn package_name(manifest: &str) -> Option<String> {
             in_package = t == "[package]";
             continue;
         }
-        if in_package
-            && let Some(rest) = t.strip_prefix("name") {
-                let rest = rest.trim_start();
-                if let Some(v) = rest.strip_prefix('=') {
-                    return Some(v.trim().trim_matches('"').to_string());
-                }
+        if in_package && let Some(rest) = t.strip_prefix("name") {
+            let rest = rest.trim_start();
+            if let Some(v) = rest.strip_prefix('=') {
+                return Some(v.trim().trim_matches('"').to_string());
             }
+        }
     }
     None
 }
@@ -1538,9 +1561,10 @@ fn flodl_path_dep(manifest: &str) -> Option<String> {
         }
         if in_flodl_table
             && let Some(rest) = t.strip_prefix("path")
-                && let Some(v) = rest.trim_start().strip_prefix('=') {
-                    return Some(v.trim().trim_matches('"').to_string());
-                }
+            && let Some(v) = rest.trim_start().strip_prefix('=')
+        {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
     }
     None
 }
@@ -1611,9 +1635,10 @@ fn workspace_above(crate_abs: &Path, from_root: &Path) -> Option<PathBuf> {
         let m = dir.join("Cargo.toml");
         if m.is_file()
             && let Ok(content) = fs::read_to_string(&m)
-                && content.lines().any(|l| l.trim() == "[workspace]") {
-                    return Some(dir.to_path_buf());
-                }
+            && content.lines().any(|l| l.trim() == "[workspace]")
+        {
+            return Some(dir.to_path_buf());
+        }
         if dir == from_root {
             return None;
         }
@@ -1662,7 +1687,9 @@ fn newest_source_mtime(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> 
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name();
@@ -1674,10 +1701,11 @@ fn newest_source_mtime(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> 
                 stack.push(path);
             } else if name != "Cargo.lock"
                 && let Ok(m) = entry.metadata()
-                    && let Ok(t) = m.modified()
-                        && newest.as_ref().is_none_or(|(n, _)| t > *n) {
-                            newest = Some((t, path));
-                        }
+                && let Ok(t) = m.modified()
+                && newest.as_ref().is_none_or(|(n, _)| t > *n)
+            {
+                newest = Some((t, path));
+            }
         }
     }
     newest
@@ -1728,7 +1756,10 @@ fn render_worker_yml(
             ));
         }
         Door::A => {
-            let data_path = cli.data_path.as_deref().unwrap_or(crate::config::DEFAULT_DATA_PATH);
+            let data_path = cli
+                .data_path
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_DATA_PATH);
             out.push_str(&format!(
                 "  data_path: {data_path}\n\
                  \x20 data_source: sshfs://{user}@{host}:{data_path}\n\
@@ -1749,9 +1780,10 @@ fn render_worker_yml(
         }
     }
     if door != Door::A
-        && let Some(dp) = &cli.data_path {
-            out.push_str(&format!("  data_path: {dp}\n"));
-        }
+        && let Some(dp) = &cli.data_path
+    {
+        out.push_str(&format!("  data_path: {dp}\n"));
+    }
     if let Some(share) = cli.gpu_ram_share {
         out.push_str(&format!(
             "  gpu_ram_share: {share}            # this box's APU aperture share\n"
@@ -1807,7 +1839,10 @@ impl Report {
         };
         push(&mut out, "");
         push(&mut out, &format!("  farm:      {}", self.label));
-        push(&mut out, &format!("  dir:       {}", self.farm_dir.display()));
+        push(
+            &mut out,
+            &format!("  dir:       {}", self.farm_dir.display()),
+        );
         let overlay = match self.overlay_action {
             OverlayAction::Scaffolded => "created",
             OverlayAction::TokenReplaced => "token regenerated",
@@ -1823,9 +1858,18 @@ impl Report {
             KeyAction::Regenerated => "REGENERATED (old key no longer admits)",
             KeyAction::Reused => "reused",
         };
-        push(&mut out, &format!("  join key:  {} ({key})", self.key_path.display()));
-        push(&mut out, &format!("  worker yml: {}", self.worker_yml_path.display()));
-        push(&mut out, &format!("  notes:     {}", self.notes_path.display()));
+        push(
+            &mut out,
+            &format!("  join key:  {} ({key})", self.key_path.display()),
+        );
+        push(
+            &mut out,
+            &format!("  worker yml: {}", self.worker_yml_path.display()),
+        );
+        push(
+            &mut out,
+            &format!("  notes:     {}", self.notes_path.display()),
+        );
         let install = match &self.install {
             InstallAction::Installed => "line appended to ~/.ssh/authorized_keys".to_string(),
             InstallAction::Replaced => {
@@ -1838,7 +1882,10 @@ impl Report {
         if let Some(ci) = &self.cloud_init_path {
             push(
                 &mut out,
-                &format!("  cloud-init: {} (SECRET: key + token inside)", ci.display()),
+                &format!(
+                    "  cloud-init: {} (SECRET: key + token inside)",
+                    ci.display()
+                ),
             );
         }
         if let Some(w) = &self.reuse_warning {
@@ -1847,23 +1894,41 @@ impl Report {
         }
         if self.overlay_action == OverlayAction::SnippetPrinted {
             push(&mut out, "");
-            push(&mut out, "  Your overlay carries no token; add under `cluster.controller.join:`:");
+            push(
+                &mut out,
+                "  Your overlay carries no token; add under `cluster.controller.join:`:",
+            );
             push(&mut out, "");
-            push(&mut out, "      token: <generated — see worker.yml, they must match>");
+            push(
+                &mut out,
+                "      token: <generated — see worker.yml, they must match>",
+            );
         }
         push(&mut out, "");
-        push(&mut out, "  ── authorized_keys line (controller sshd, one line) ──");
+        push(
+            &mut out,
+            "  ── authorized_keys line (controller sshd, one line) ──",
+        );
         push(&mut out, "");
         push(&mut out, &format!("  {}", self.authorized_line));
         push(&mut out, "");
-        push(&mut out, &format!("  ── worker fdl.yml ({}) ──", self.worker_yml_path.display()));
+        push(
+            &mut out,
+            &format!(
+                "  ── worker fdl.yml ({}) ──",
+                self.worker_yml_path.display()
+            ),
+        );
         push(&mut out, "");
         for line in self.worker_yml.lines() {
             push(&mut out, &format!("  {line}"));
         }
         if let Some(p) = &self.publish_block {
             push(&mut out, "");
-            push(&mut out, "  ── publish recipe for the base fdl.yml (then: `fdl publish`) ──");
+            push(
+                &mut out,
+                "  ── publish recipe for the base fdl.yml (then: `fdl publish`) ──",
+            );
             push(&mut out, "");
             for line in p.lines() {
                 push(&mut out, &format!("  {line}"));
@@ -1913,7 +1978,11 @@ impl Report {
         out.push(format!(
             "  ── setup, in order ({}{}) ──",
             self.plat.name(),
-            if self.in_container { ", inside a container" } else { "" },
+            if self.in_container {
+                ", inside a container"
+            } else {
+                ""
+            },
         ));
         out.push(String::new());
         // What preflight found is true of the environment it ran in. In a
@@ -1963,7 +2032,10 @@ impl Report {
                 ));
                 cmds.push(format!(
                     "#   docker compose exec {} <command>",
-                    self.docker_services.first().map(String::as_str).unwrap_or("<service>"),
+                    self.docker_services
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("<service>"),
                 ));
                 cmds.push(
                     "#   and add it to that image's Dockerfile, or the next \
@@ -1992,7 +2064,10 @@ impl Report {
             },
         );
 
-        if !matches!(self.install, InstallAction::Installed | InstallAction::Replaced | InstallAction::AlreadyPresent) {
+        if !matches!(
+            self.install,
+            InstallAction::Installed | InstallAction::Replaced | InstallAction::AlreadyPresent
+        ) {
             step(
                 &mut out,
                 "authorize the join key (the wizard can do this for you):",
@@ -2011,7 +2086,11 @@ impl Report {
         // test rather than a generic one that would pass on the wrong
         // door.
         let key = self.key_path.display().to_string();
-        let (p, u, h) = (self.controller.port, &self.controller.user, &self.controller.host);
+        let (p, u, h) = (
+            self.controller.port,
+            &self.controller.user,
+            &self.controller.host,
+        );
         let mut verify = vec![format!(
             "ssh -i {key} -p {p} {u}@{h} true                 # must NOT give a shell"
         )];
@@ -2054,9 +2133,15 @@ impl Report {
             &mut out,
             "open the window here, then let the boxes dial in:",
             &[
-                format!("fdl @{} <your-run-command>      # holds a join window", self.label),
+                format!(
+                    "fdl @{} <your-run-command>      # holds a join window",
+                    self.label
+                ),
                 "ssh <worker> 'cd <project> && fdl join'".to_string(),
-                format!("fdl @{} status                  # then: fdl @{} start", self.label, self.label),
+                format!(
+                    "fdl @{} status                  # then: fdl @{} start",
+                    self.label, self.label
+                ),
             ],
         );
 

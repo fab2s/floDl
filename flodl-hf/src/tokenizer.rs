@@ -113,12 +113,12 @@ impl HfTokenizer {
     /// JSON form HuggingFace's fast-tokenizer ecosystem (`tokenizers`,
     /// HF Python's `AutoTokenizer.from_pretrained`) reads back.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        self.inner
-            .save(path.as_ref(), true)
-            .map_err(|e| TensorError::new(&format!(
+        self.inner.save(path.as_ref(), true).map_err(|e| {
+            TensorError::new(&format!(
                 "tokenizer save to {}: {e}",
                 path.as_ref().display(),
-            )))
+            ))
+        })
     }
 
     /// Encode a batch of texts into [`EncodedBatch`] on CPU.
@@ -293,8 +293,7 @@ mod tests {
 
         // Same temp-dir convention as flodl-hf/src/export.rs
         // (`unique_tempdir`): temp_dir + pid + tag, no dev-dep.
-        let dir = std::env::temp_dir()
-            .join(format!("flodl_hf_tokenizer_save_{}", process::id()));
+        let dir = std::env::temp_dir().join(format!("flodl_hf_tokenizer_save_{}", process::id()));
         std::fs::create_dir_all(&dir).expect("create_dir_all");
         let path = dir.join("tokenizer.json");
         hf.save(&path).expect("save");

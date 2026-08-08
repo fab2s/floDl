@@ -85,7 +85,10 @@ pub fn find_flodl_src(explicit: Option<&str>) -> Option<PathBuf> {
                         let mut best: Option<PathBuf> = None;
                         for entry in crates.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with("flodl-") && !name.starts_with("flodl-sys") && !name.starts_with("flodl-cli") {
+                            if name.starts_with("flodl-")
+                                && !name.starts_with("flodl-sys")
+                                && !name.starts_with("flodl-cli")
+                            {
                                 let src = entry.path().join("src");
                                 if src.join("lib.rs").is_file() {
                                     best = Some(src);
@@ -104,9 +107,10 @@ pub fn find_flodl_src(explicit: Option<&str>) -> Option<PathBuf> {
     // Check cached downloads
     if let Some(tag) = fetch_latest_tag() {
         if let Some(cache) = cache_dir(&tag)
-            && let Some(src) = find_src_in_cache(&cache) {
-                return Some(src);
-            }
+            && let Some(src) = find_src_in_cache(&cache)
+        {
+            return Some(src);
+        }
         // Download from GitHub
         match download_source(&tag) {
             Ok(src) => return Some(src),
@@ -133,7 +137,10 @@ const REPO: &str = "flodl-labs/flodl";
 fn fetch_latest_tag() -> Option<String> {
     // curl -sI https://github.com/REPO/releases/latest → Location header has the tag
     let output = Command::new("curl")
-        .args(["-sI", &format!("https://github.com/{}/releases/latest", REPO)])
+        .args([
+            "-sI",
+            &format!("https://github.com/{}/releases/latest", REPO),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -165,8 +172,7 @@ fn cache_dir(tag: &str) -> Option<PathBuf> {
 /// Download and extract flodl source from a GitHub release.
 /// Returns the path to the flodl/src/ directory inside the cache.
 fn download_source(tag: &str) -> Result<PathBuf, String> {
-    let cache = cache_dir(tag)
-        .ok_or_else(|| "cannot determine home directory".to_string())?;
+    let cache = cache_dir(tag).ok_or_else(|| "cannot determine home directory".to_string())?;
 
     // Check if already cached
     let src_dir = find_src_in_cache(&cache);
@@ -176,13 +182,9 @@ fn download_source(tag: &str) -> Result<PathBuf, String> {
 
     eprintln!("Downloading flodl {} source from GitHub...", tag);
 
-    let zip_url = format!(
-        "https://github.com/{}/archive/refs/tags/{}.zip",
-        REPO, tag
-    );
+    let zip_url = format!("https://github.com/{}/archive/refs/tags/{}.zip", REPO, tag);
 
-    fs::create_dir_all(&cache)
-        .map_err(|e| format!("cannot create cache dir: {}", e))?;
+    fs::create_dir_all(&cache).map_err(|e| format!("cannot create cache dir: {}", e))?;
 
     let zip_path = cache.join("source.zip");
     crate::util::http::download_file(&zip_url, &zip_path)?;
@@ -435,8 +437,12 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
             }
             // Count braces even in test to track depth
             for c in trimmed.chars() {
-                if c == '{' { brace_depth += 1; }
-                if c == '}' { brace_depth -= 1; }
+                if c == '{' {
+                    brace_depth += 1;
+                }
+                if c == '}' {
+                    brace_depth -= 1;
+                }
             }
             continue;
         }
@@ -504,38 +510,41 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
         }
 
         // Extract pub fn inside impl blocks
-        if in_impl && (trimmed.starts_with("pub fn ") || trimmed.starts_with("pub const fn "))
+        if in_impl
+            && (trimmed.starts_with("pub fn ") || trimmed.starts_with("pub const fn "))
             && let Some((ref type_name, ref trait_name)) = current_impl
-                && let Some(sig) = extract_fn_sig(trimmed) {
-                    let fn_name = extract_fn_name(&sig);
-                    let fn_sig = FnSig {
-                        name: fn_name.clone(),
-                        signature: sig,
-                    };
+            && let Some(sig) = extract_fn_sig(trimmed)
+        {
+            let fn_name = extract_fn_name(&sig);
+            let fn_sig = FnSig {
+                name: fn_name.clone(),
+                signature: sig,
+            };
 
-                    if let Some(api_type) = types.get_mut(type_name) {
-                        // Record trait implementation
-                        if let Some(t) = &trait_name
-                            && !api_type.traits.contains(t) {
-                                api_type.traits.push(t.clone());
-                            }
-
-                        // Categorize the method
-                        if fn_name == "new"
-                            || fn_name == "on_device"
-                            || fn_name == "no_bias"
-                            || fn_name == "no_bias_on_device"
-                            || fn_name == "configure"
-                            || fn_name == "default"
-                        {
-                            api_type.constructors.push(fn_sig);
-                        } else if fn_name.starts_with("with_") || fn_name == "done" || fn_name == "build" {
-                            api_type.builder_methods.push(fn_sig);
-                        } else {
-                            api_type.methods.push(fn_sig);
-                        }
-                    }
+            if let Some(api_type) = types.get_mut(type_name) {
+                // Record trait implementation
+                if let Some(t) = &trait_name
+                    && !api_type.traits.contains(t)
+                {
+                    api_type.traits.push(t.clone());
                 }
+
+                // Categorize the method
+                if fn_name == "new"
+                    || fn_name == "on_device"
+                    || fn_name == "no_bias"
+                    || fn_name == "no_bias_on_device"
+                    || fn_name == "configure"
+                    || fn_name == "default"
+                {
+                    api_type.constructors.push(fn_sig);
+                } else if fn_name.starts_with("with_") || fn_name == "done" || fn_name == "build" {
+                    api_type.builder_methods.push(fn_sig);
+                } else {
+                    api_type.methods.push(fn_sig);
+                }
+            }
+        }
     }
 
     // Pass 3: collect top-level pub fns (not inside impl blocks).
@@ -552,25 +561,33 @@ fn parse_file(src_root: &Path, path: &Path) -> Vec<ApiType> {
         }
 
         for c in trimmed.chars() {
-            if c == '{' { depth += 1; }
-            if c == '}' { depth -= 1; }
+            if c == '{' {
+                depth += 1;
+            }
+            if c == '}' {
+                depth -= 1;
+            }
         }
 
         if in_test_block {
-            if depth <= 0 { in_test_block = false; }
+            if depth <= 0 {
+                in_test_block = false;
+            }
             continue;
         }
 
         // Top-level pub fn: depth 0 (module level) or 1 (inside mod block)
-        if depth <= 1 && trimmed.starts_with("pub fn ")
-            && let Some(sig) = extract_fn_sig(trimmed) {
-                let fn_name = extract_fn_name(&sig);
-                let (doc, _) = extract_docs(&lines, i);
-                free_fns.push(FnSig {
-                    name: format!("{} -- {}", fn_name, doc),
-                    signature: sig,
-                });
-            }
+        if depth <= 1
+            && trimmed.starts_with("pub fn ")
+            && let Some(sig) = extract_fn_sig(trimmed)
+        {
+            let fn_name = extract_fn_name(&sig);
+            let (doc, _) = extract_docs(&lines, i);
+            free_fns.push(FnSig {
+                name: format!("{} -- {}", fn_name, doc),
+                signature: sig,
+            });
+        }
     }
 
     if !free_fns.is_empty() {
@@ -651,10 +668,13 @@ fn get_version(src_root: &Path) -> String {
             // Look for version = "x.y.z" (not version.workspace = true)
             for line in content.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("version") && trimmed.contains('"') && !trimmed.contains("workspace")
-                    && let Some(v) = trimmed.split('"').nth(1) {
-                        return v.to_string();
-                    }
+                if trimmed.starts_with("version")
+                    && trimmed.contains('"')
+                    && !trimmed.contains("workspace")
+                    && let Some(v) = trimmed.split('"').nth(1)
+                {
+                    return v.to_string();
+                }
             }
         }
     }
@@ -727,7 +747,10 @@ fn print_text(api: &ApiRef) {
 }
 
 fn print_json(api: &ApiRef) {
-    print!("{{\"version\":\"{}\",\"types\":[", escape_json(&api.version));
+    print!(
+        "{{\"version\":\"{}\",\"types\":[",
+        escape_json(&api.version)
+    );
 
     for (i, t) in api.types.iter().enumerate() {
         if t.constructors.is_empty() && t.methods.is_empty() && t.builder_methods.is_empty() {
@@ -746,36 +769,54 @@ fn print_json(api: &ApiRef) {
             escape_json(&t.doc_summary),
         );
 
-        print!("\"traits\":[{}],",
-            t.traits.iter()
+        print!(
+            "\"traits\":[{}],",
+            t.traits
+                .iter()
                 .map(|s| format!("\"{}\"", escape_json(s)))
                 .collect::<Vec<_>>()
                 .join(",")
         );
 
-        print!("\"constructors\":[{}],",
-            t.constructors.iter()
-                .map(|f| format!("{{\"name\":\"{}\",\"sig\":\"{}\"}}", escape_json(&f.name), escape_json(&f.signature)))
+        print!(
+            "\"constructors\":[{}],",
+            t.constructors
+                .iter()
+                .map(|f| format!(
+                    "{{\"name\":\"{}\",\"sig\":\"{}\"}}",
+                    escape_json(&f.name),
+                    escape_json(&f.signature)
+                ))
                 .collect::<Vec<_>>()
                 .join(",")
         );
 
-        print!("\"builder_methods\":[{}],",
-            t.builder_methods.iter()
+        print!(
+            "\"builder_methods\":[{}],",
+            t.builder_methods
+                .iter()
                 .map(|f| format!("\"{}\"", escape_json(&f.name)))
                 .collect::<Vec<_>>()
                 .join(",")
         );
 
-        print!("\"methods\":[{}],",
-            t.methods.iter()
-                .map(|f| format!("{{\"name\":\"{}\",\"sig\":\"{}\"}}", escape_json(&f.name), escape_json(&f.signature)))
+        print!(
+            "\"methods\":[{}],",
+            t.methods
+                .iter()
+                .map(|f| format!(
+                    "{{\"name\":\"{}\",\"sig\":\"{}\"}}",
+                    escape_json(&f.name),
+                    escape_json(&f.signature)
+                ))
                 .collect::<Vec<_>>()
                 .join(",")
         );
 
-        print!("\"examples\":[{}]",
-            t.doc_examples.iter()
+        print!(
+            "\"examples\":[{}]",
+            t.doc_examples
+                .iter()
                 .map(|e| format!("\"{}\"", escape_json(e)))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -807,12 +848,11 @@ fn category_title(cat: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 pub fn run(json: bool, path: Option<&str>) -> Result<(), String> {
-    let src_root = find_flodl_src(path)
-        .ok_or_else(|| {
-            "Could not find flodl source. Run from a flodl checkout, \
+    let src_root = find_flodl_src(path).ok_or_else(|| {
+        "Could not find flodl source. Run from a flodl checkout, \
              or pass --path <flodl/src/>."
-                .to_string()
-        })?;
+            .to_string()
+    })?;
 
     let version = get_version(&src_root);
     let types = parse_source_tree(&src_root);

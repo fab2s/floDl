@@ -38,7 +38,7 @@
 
 use std::collections::VecDeque;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::monitor::record::Severity;
 
@@ -262,8 +262,7 @@ impl EventLane {
     /// `overflow` notice, when any alert was dropped, is appended last and is
     /// never itself evicted.
     pub fn live(&self) -> Vec<Value> {
-        let mut out: Vec<Value> =
-            self.events.iter().map(|a| a.to_json(a.total)).collect();
+        let mut out: Vec<Value> = self.events.iter().map(|a| a.to_json(a.total)).collect();
         if self.dropped_total > 0 {
             out.push(self.overflow_json(self.dropped_total));
         }
@@ -383,8 +382,16 @@ mod tests {
     #[test]
     fn distinct_paths_do_not_collapse_into_each_other() {
         let mut lane = EventLane::new();
-        assert_eq!(lane.record(EventClass::RankLost, "root/rank0", "a", 0).len(), 1);
-        assert_eq!(lane.record(EventClass::RankLost, "root/rank1", "b", 1).len(), 1);
+        assert_eq!(
+            lane.record(EventClass::RankLost, "root/rank0", "a", 0)
+                .len(),
+            1
+        );
+        assert_eq!(
+            lane.record(EventClass::RankLost, "root/rank1", "b", 1)
+                .len(),
+            1
+        );
         assert_eq!(lane.live().len(), 2);
     }
 
@@ -392,7 +399,10 @@ mod tests {
     fn distinct_classes_on_one_path_do_not_collapse() {
         let mut lane = EventLane::new();
         assert_eq!(lane.record(EventClass::Drift, "root", "a", 0).len(), 1);
-        assert_eq!(lane.record(EventClass::ControlDrop, "root", "b", 1).len(), 1);
+        assert_eq!(
+            lane.record(EventClass::ControlDrop, "root", "b", 1).len(),
+            1
+        );
         assert_eq!(lane.live().len(), 2);
     }
 

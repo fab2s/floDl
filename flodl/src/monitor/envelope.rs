@@ -176,7 +176,14 @@ mod tests {
     fn a_single_observation_is_a_degenerate_envelope() {
         let mut acc = EnvelopeAcc::default();
         acc.push(42.0);
-        assert_eq!(acc.take(), Some(Envelope { min: 42.0, mean: 42.0, max: 42.0 }));
+        assert_eq!(
+            acc.take(),
+            Some(Envelope {
+                min: 42.0,
+                mean: 42.0,
+                max: 42.0
+            })
+        );
     }
 
     #[test]

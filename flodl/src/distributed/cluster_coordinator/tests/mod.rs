@@ -9,7 +9,9 @@
 
 pub(crate) use super::*;
 pub(crate) use crate::distributed::ddp_run::ApplyPolicy;
-pub(crate) use crate::distributed::wire::{ControlMsgWire, MetricsMsgWire, TimingMsgWire, read_handshake_rank, write_handshake_rank};
+pub(crate) use crate::distributed::wire::{
+    ControlMsgWire, MetricsMsgWire, TimingMsgWire, read_handshake_rank, write_handshake_rank,
+};
 pub(crate) use crate::tensor::{Result, TensorError};
 pub(crate) use std::io::Read;
 pub(crate) use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -34,8 +36,7 @@ mod window_report;
 
 /// Deterministic non-zero test salt (mirrors controller.rs::tests).
 pub(super) const TEST_SALT: SessionSalt = [
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
 ];
 
 /// Spawn a fake rank that connects to `port` and presents itself to the
@@ -55,9 +56,8 @@ where
 {
     thread::spawn(move || -> Result<()> {
         let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
-        let mut stream = TcpStream::connect(addr).map_err(|e| {
-            TensorError::new(&format!("fake_rank {rank_id} connect: {e}"))
-        })?;
+        let mut stream = TcpStream::connect(addr)
+            .map_err(|e| TensorError::new(&format!("fake_rank {rank_id} connect: {e}")))?;
         let _ = stream.set_nodelay(true);
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -73,11 +73,7 @@ where
 /// Single-rank relay handshake toward the coordinator: send the
 /// channel-select magic and a `Hello` for `[rank_id]`, expect
 /// `HelloAck`. Announces no model signature (gates nothing).
-pub(super) fn relay_hello(
-    stream: &mut TcpStream,
-    salt: &SessionSalt,
-    rank_id: u32,
-) -> Result<()> {
+pub(super) fn relay_hello(stream: &mut TcpStream, salt: &SessionSalt, rank_id: u32) -> Result<()> {
     relay_hello_sigs(stream, salt, rank_id, vec![])
 }
 
@@ -152,8 +148,7 @@ pub(super) fn cfg_async_nccl(world_size: usize) -> ClusterCoordinatorConfig {
         ApplyPolicy::Async,
         AverageBackend::Nccl,
         world_size,
-        ElChe::new(world_size, 4)
-            .with_max_batch_diff(2),
+        ElChe::new(world_size, 4).with_max_batch_diff(2),
     )
     .no_divergence_guard()
 }
@@ -197,10 +192,7 @@ pub(super) fn send_metrics(
 /// read one `MuxRecord::Data` off the (single-rank-relay) stream and parse
 /// its payload as a [`ControlFrame`]. `Ok(None)` on clean EOF. The mux tag
 /// is ignored (single-rank connection).
-pub(super) fn recv_frame(
-    s: &mut TcpStream,
-    salt: &SessionSalt,
-) -> Result<Option<ControlFrame>> {
+pub(super) fn recv_frame(s: &mut TcpStream, salt: &SessionSalt) -> Result<Option<ControlFrame>> {
     match MuxRecord::read_from(s, salt)? {
         Some(MuxRecord::Data { payload, .. }) => {
             ControlFrame::read_from(&mut payload.as_slice(), salt)
@@ -215,10 +207,7 @@ pub(super) fn recv_frame(
 /// Read one Control-kind ControlFrame from the rank-side stream — the
 /// coord sends it as a rank-tagged mux record (the relay would demux it
 /// to the local rank). The tag is ignored here (single-rank conn).
-pub(super) fn recv_control(
-    stream: &mut TcpStream,
-    salt: &SessionSalt,
-) -> Result<ControlMsgWire> {
+pub(super) fn recv_control(stream: &mut TcpStream, salt: &SessionSalt) -> Result<ControlMsgWire> {
     loop {
         let payload = match MuxRecord::read_from(stream, salt)? {
             Some(MuxRecord::Data { payload, .. }) => payload,
@@ -321,15 +310,11 @@ pub(super) fn spawn_coord<F>(
 where
     F: Send + 'static + FnOnce(&mut ClusterCoordinator) -> Result<()>,
 {
-    let (listener, port) = ClusterCoordinator::bind(
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-    )
-    .expect("bind succeeds");
+    let (listener, port) = ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+        .expect("bind succeeds");
     assert_eq!(listener.local_addr().unwrap().port(), port);
     let handle = thread::spawn(move || -> Result<()> {
-        let mut coord = ClusterCoordinator::start_from_listener(
-            listener, TEST_SALT, config_fn(),
-        )?;
+        let mut coord = ClusterCoordinator::start_from_listener(listener, TEST_SALT, config_fn())?;
         let r = drive(&mut coord);
         // Best-effort shutdown even on failure so the readers join.
         let _ = coord.shutdown();
@@ -338,8 +323,10 @@ where
     (port, handle)
 }
 
-
-pub(super) fn cfg_sync_nccl_with_dataset(world_size: usize, total_samples: usize) -> ClusterCoordinatorConfig {
+pub(super) fn cfg_sync_nccl_with_dataset(
+    world_size: usize,
+    total_samples: usize,
+) -> ClusterCoordinatorConfig {
     cfg_sync_nccl(world_size)
         .total_samples(total_samples)
         .batch_size(2)
@@ -395,14 +382,7 @@ impl StubSink {
 
 impl crate::distributed::DashboardSink for StubSink {
     fn register_port(&self, _rank: usize, _port: u16) {}
-    fn set_svg(
-        &self,
-        _rank: usize,
-        _svg: String,
-        _label: Option<String>,
-        _hash: Option<String>,
-    ) {
-    }
+    fn set_svg(&self, _rank: usize, _svg: String, _label: Option<String>, _hash: Option<String>) {}
     fn set_metadata(&self, _rank: usize, _json: String) {}
     fn set_hardware(&self, _rank: usize, _summary: String) {}
     fn push_resource_sample(
@@ -425,8 +405,11 @@ fn handshake_round_trip_with_matching_salt() {
     // 2 ranks, Sync; both handshake and immediately drop. No
     // averaging cycle expected — `drive` just returns Ok.
     let world_size = 2;
-    let (port, coord_handle) =
-        spawn_coord(world_size, move || cfg_sync_nccl(world_size), |_coord| Ok(()));
+    let (port, coord_handle) = spawn_coord(
+        world_size,
+        move || cfg_sync_nccl(world_size),
+        |_coord| Ok(()),
+    );
 
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |_, _| Ok(()));
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |_, _| Ok(()));
@@ -443,21 +426,14 @@ fn handshake_rejects_wrong_salt_full_path() {
     let world_size = 2;
     let bad_salt: SessionSalt = [0u8; 16];
 
-    let (listener, port) = ClusterCoordinator::bind(
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-    )
-    .unwrap();
+    let (listener, port) =
+        ClusterCoordinator::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
     let coord_handle = thread::spawn(move || -> Result<ClusterCoordinator> {
-        ClusterCoordinator::start_from_listener(
-            listener, TEST_SALT, cfg_sync_nccl(world_size),
-        )
+        ClusterCoordinator::start_from_listener(listener, TEST_SALT, cfg_sync_nccl(world_size))
     });
 
     let rank = thread::spawn(move || {
-        let mut s = TcpStream::connect(
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
-        )
-        .unwrap();
+        let mut s = TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
         // Correct channel magic (routing is pre-auth), then a wrong-salt
         // relay Hello → the coord's mux-record HMAC fails server-side
         // during the accept handshake.
@@ -491,18 +467,14 @@ fn handshake_rejects_wrong_salt_full_path() {
 /// handshake validator directly, exercise the wrong-salt branch.
 #[test]
 fn read_handshake_rank_rejects_wrong_salt_direct() {
-    let listener = TcpListener::bind(
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)
-    ).unwrap();
+    let listener = TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
 
     let bad_salt: SessionSalt = [0u8; 16];
     assert_ne!(bad_salt, TEST_SALT);
 
     let rank = thread::spawn(move || {
-        let mut s = TcpStream::connect(
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
-        ).unwrap();
+        let mut s = TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).unwrap();
         // Send a handshake keyed by the wrong salt.
         write_handshake_rank(&mut s, 0, 1, &[0u8; 32], &bad_salt).unwrap();
         // Don't expect an ack; the coordinator should drop us.
@@ -547,14 +519,19 @@ fn sync_policy_fires_after_each_rank_step_once() {
     );
 
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 0,
-            batch_ms: 10.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.5,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 10.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            },
+        )?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::SyncNow);
         let msg2 = recv_control(s, salt)?;
@@ -562,14 +539,19 @@ fn sync_policy_fires_after_each_rank_step_once() {
         Ok(())
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 1,
-            batch_ms: 12.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.4,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 12.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.4,
+                sync_divergence: None,
+            },
+        )?;
         let msg = recv_control(s, salt)?;
         assert_eq!(msg, ControlMsgWire::SyncNow);
         let msg2 = recv_control(s, salt)?;
@@ -577,8 +559,12 @@ fn sync_policy_fires_after_each_rank_step_once() {
         Ok(())
     });
 
-    r0.join().unwrap().expect("rank 0 sees SyncNow + SetGlobalStep");
-    r1.join().unwrap().expect("rank 1 sees SyncNow + SetGlobalStep");
+    r0.join()
+        .unwrap()
+        .expect("rank 0 sees SyncNow + SetGlobalStep");
+    r1.join()
+        .unwrap()
+        .expect("rank 1 sees SyncNow + SetGlobalStep");
     coord_handle.join().unwrap().expect("coord finishes");
 }
 
@@ -606,9 +592,7 @@ fn check_throttle_nccl_backend_is_no_op() {
             let deadline = Instant::now() + Duration::from_secs(2);
             while coord.steps_since_avg().contains(&0) {
                 if Instant::now() > deadline {
-                    return Err(TensorError::new(
-                        "did not receive a batch from each rank",
-                    ));
+                    return Err(TensorError::new("did not receive a batch from each rank"));
                 }
                 coord.tick()?;
                 thread::sleep(Duration::from_millis(10));
@@ -623,14 +607,19 @@ fn check_throttle_nccl_backend_is_no_op() {
     );
 
     let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 0,
-            batch_ms: 5.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.5,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 0,
+                batch_ms: 5.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            },
+        )?;
         // Drain inbound frames until the coordinator drops us.
         // We must NOT receive a Throttle; if we do, assert.
         let mut got = recv_frame(s, salt);
@@ -646,14 +635,19 @@ fn check_throttle_nccl_backend_is_no_op() {
         Ok(())
     });
     let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT, |s, salt| {
-        send_timing(s, salt, TimingMsgWire::Batch {
-            rank: 1,
-            batch_ms: 5.0, data_ms: 0.0,
-            step_count: 1,
-            param_norm: None,
-            batch_loss: 0.5,
-            sync_divergence: None,
-        })?;
+        send_timing(
+            s,
+            salt,
+            TimingMsgWire::Batch {
+                rank: 1,
+                batch_ms: 5.0,
+                data_ms: 0.0,
+                step_count: 1,
+                param_norm: None,
+                batch_loss: 0.5,
+                sync_divergence: None,
+            },
+        )?;
         let mut got = recv_frame(s, salt);
         while let Ok(Some(frame)) = got {
             let msg = frame.decode::<ControlMsgWire>()?;
@@ -673,4 +667,3 @@ fn check_throttle_nccl_backend_is_no_op() {
     let _ = r0.join();
     let _ = r1.join();
 }
-

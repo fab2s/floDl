@@ -63,10 +63,7 @@ pub(super) fn schema_with_model_option(strict: bool) -> Schema {
     };
     let mut model = opt("string");
     model.short = Some("m".into());
-    model.choices = Some(vec![
-        serde_json::json!("mlp"),
-        serde_json::json!("resnet"),
-    ]);
+    model.choices = Some(vec![serde_json::json!("mlp"), serde_json::json!("resnet")]);
     s.options.insert("model".into(), model);
     s.options.insert("epochs".into(), opt("int"));
     // A bool flag, no value.
@@ -81,7 +78,7 @@ pub(super) fn strict_schema_with_model_option() -> Schema {
 /// Minimal tempdir helper — matches the pattern used across the crate.
 pub(super) struct TempDir(PathBuf);
 impl TempDir {
-pub(super)     fn new() -> Self {
+    pub(super) fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -149,6 +146,7 @@ commands:
 /// match `canonical_cluster_yaml`: host-a has 1 device, host-b
 /// has 2; resulting ranks are `[0]` and `[1, 2]`.
 pub(super) fn populate_canonical_ranks(cluster: &mut super::ClusterConfig) {
-    cluster.populate_ranks(&[1, 2]).expect("populate_ranks for canonical fixture");
+    cluster
+        .populate_ranks(&[1, 2])
+        .expect("populate_ranks for canonical fixture");
 }
-

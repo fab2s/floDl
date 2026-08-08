@@ -42,9 +42,14 @@ fn test_control_msg_variants() {
     let _sync = ControlMsg::SyncNow;
     let _throttle = ControlMsg::Throttle;
     let _start = ControlMsg::StartEpoch(EpochPlan {
-        epoch: 0, partition_offset: 0, partition_size: 1000,
+        epoch: 0,
+        partition_offset: 0,
+        partition_size: 1000,
     });
-    let _ckpt = ControlMsg::Checkpoint { version: 42, target_rank: 0 };
+    let _ckpt = ControlMsg::Checkpoint {
+        version: 42,
+        target_rank: 0,
+    };
     let _shutdown = ControlMsg::Shutdown;
     let _update = ControlMsg::Update(AveragedParams {
         params: vec![],
@@ -129,16 +134,20 @@ fn test_worker_config_clone() {
     assert_eq!(cfg2.total_samples, 10000);
 }
 
-
 /// Simple test dataset: random (input, target) pairs.
 pub(super) struct TestDataset {
     n: usize,
 }
 impl crate::data::BatchDataSet for TestDataset {
-    fn len(&self) -> usize { self.n }
+    fn len(&self) -> usize {
+        self.n
+    }
     fn get_batch(&self, indices: &[usize]) -> crate::tensor::Result<Vec<Tensor>> {
         let n = indices.len() as i64;
-        let opts = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device: Device::CPU,
+        };
         Ok(vec![
             Tensor::randn(&[n, 4], opts)?,
             Tensor::randn(&[n, 2], opts)?,
@@ -191,12 +200,12 @@ pub(super) fn make_test_worker_customized(
 
     // Build a temporary model to extract initial params
     let tmp_model = Linear::on_device(4, 2, dev).unwrap();
-    let tmp_params: Vec<Tensor> = tmp_model.parameters().iter()
+    let tmp_params: Vec<Tensor> = tmp_model
+        .parameters()
+        .iter()
         .map(|p| p.variable.data())
         .collect();
-    let tmp_buffers: Vec<Tensor> = tmp_model.buffers().iter()
-        .map(|b| b.get())
-        .collect();
+    let tmp_buffers: Vec<Tensor> = tmp_model.buffers().iter().map(|b| b.get()).collect();
     drop(tmp_model);
 
     let mut config = WorkerConfig {
@@ -234,8 +243,7 @@ pub(super) fn make_test_worker_customized(
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), channels) =
         GpuWorker::<Linear>::channels();
 
-    let dataset: Arc<dyn crate::data::BatchDataSet> =
-        Arc::new(TestDataset { n: dataset_size });
+    let dataset: Arc<dyn crate::data::BatchDataSet> = Arc::new(TestDataset { n: dataset_size });
 
     let worker = GpuWorker::new(
         &config,
@@ -252,7 +260,8 @@ pub(super) fn make_test_worker_customized(
         final_param_tx,
         control_rx,
         None, // no outer optimizer in unit tests
-    ).unwrap();
+    )
+    .unwrap();
 
     (worker, channels)
 }
@@ -269,7 +278,10 @@ fn test_zero_param_model_is_rejected_loudly() {
     let err = super::ensure_trainable_params(0, "ddp: single device")
         .expect_err("zero-parameter model must be rejected");
     let msg = err.to_string();
-    assert!(msg.contains("zero trainable parameters"), "unexpected: {msg}");
+    assert!(
+        msg.contains("zero trainable parameters"),
+        "unexpected: {msg}"
+    );
     assert!(msg.contains("Module::parameters()"), "unexpected: {msg}");
     super::ensure_trainable_params(1, "ddp: single device").unwrap();
 }
@@ -300,8 +312,19 @@ fn partitions_tile_each_split_and_the_pass() {
         let (_, len) = crate::rng::epoch_split_span(event, splits, total);
         let first = len / 2;
         let mut ev = super::make_partition(0, first, total, event, splits, seed);
-        ev.extend(super::make_partition(first, len - first, total, event, splits, seed));
-        assert_eq!(ev.len(), len, "event {event} partitions must tile its slice");
+        ev.extend(super::make_partition(
+            first,
+            len - first,
+            total,
+            event,
+            splits,
+            seed,
+        ));
+        assert_eq!(
+            ev.len(),
+            len,
+            "event {event} partitions must tile its slice"
+        );
         pass.extend(ev);
     }
     // Disjointness, coverage and ordering, through the partition layer.
@@ -325,7 +348,10 @@ fn later_events_of_a_pass_reuse_nothing() {
     for event in 0..splits {
         let (_, len) = crate::rng::epoch_split_span(event, splits, total);
         for pick in super::make_partition(0, len, total, event, splits, seed) {
-            assert!(seen.insert(pick), "pick {pick} served twice within one pass");
+            assert!(
+                seen.insert(pick),
+                "pick {pick} served twice within one pass"
+            );
         }
     }
     assert_eq!(seen.len(), total, "one pass must still cover the corpus");

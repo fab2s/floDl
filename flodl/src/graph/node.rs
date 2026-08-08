@@ -99,10 +99,7 @@ pub(crate) struct PendingUsing {
 }
 
 /// Extract ref_* ports into a name → Variable map.
-pub(crate) fn extract_refs(
-    ports: &[String],
-    inputs: &[Variable],
-) -> HashMap<String, Variable> {
+pub(crate) fn extract_refs(ports: &[String], inputs: &[Variable]) -> HashMap<String, Variable> {
     let mut refs = HashMap::new();
     for (i, port) in ports.iter().enumerate() {
         if let Some(name) = port.strip_prefix("ref_")

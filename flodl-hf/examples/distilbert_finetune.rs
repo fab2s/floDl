@@ -28,7 +28,7 @@
 //! cargo run --release --example distilbert_finetune
 //! ```
 
-use flodl::{clip_grad_norm, Adam, Device, Module, Result, Tensor, TensorError, Variable};
+use flodl::{Adam, Device, Module, Result, Tensor, TensorError, Variable, clip_grad_norm};
 use flodl_hf::models::distilbert::DistilBertForSequenceClassification;
 use flodl_hf::tokenizer::HfTokenizer;
 
@@ -61,16 +61,16 @@ fn main() -> Result<()> {
     // feeding a `DataSet` through `DataLoader::new` - the training
     // body below is unchanged.
     let train: &[(&str, i64)] = &[
-        ("This framework is a real joy to work with",          1),
-        ("I absolutely love the clean API surface",            1),
+        ("This framework is a real joy to work with", 1),
+        ("I absolutely love the clean API surface", 1),
         ("Releases land on schedule and the diff is readable", 1),
-        ("The documentation is thorough and honest",           1),
-        ("Fine-tuning just worked on the first try",           1),
-        ("The tokenizer is painfully slow",                    0),
-        ("I wasted an afternoon chasing a silent shape bug",   0),
-        ("The error messages are useless",                     0),
-        ("I cannot figure out which feature flag I need",      0),
-        ("Performance fell off a cliff after the update",      0),
+        ("The documentation is thorough and honest", 1),
+        ("Fine-tuning just worked on the first try", 1),
+        ("The tokenizer is painfully slow", 0),
+        ("I wasted an afternoon chasing a silent shape bug", 0),
+        ("The error messages are useless", 0),
+        ("I cannot figure out which feature flag I need", 0),
+        ("Performance fell off a cliff after the update", 0),
     ];
 
     let params = head.graph().parameters();
@@ -118,9 +118,8 @@ fn main() -> Result<()> {
     // `<stem>.config.json` sidecar; no hand-rolled config write
     // needed for downstream `--checkpoint` re-export.
     let scratch_dir = "target/distilbert_finetune";
-    std::fs::create_dir_all(scratch_dir).map_err(|e| {
-        TensorError::new(&format!("create {scratch_dir}: {e}"))
-    })?;
+    std::fs::create_dir_all(scratch_dir)
+        .map_err(|e| TensorError::new(&format!("create {scratch_dir}: {e}")))?;
     let ckpt_path = format!("{scratch_dir}/sst2_finetuned.fdl");
     let tokenizer_path = format!("{scratch_dir}/tokenizer.json");
     let export_dir = format!("{scratch_dir}/sst2_export");

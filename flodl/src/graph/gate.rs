@@ -5,8 +5,8 @@ use crate::autograd::Variable;
 use crate::nn::Module;
 use crate::tensor::Result;
 
-use super::node::*;
 use super::FlowBuilder;
+use super::node::*;
 
 /// Wire a Gate (soft routing / mixture of experts) into the graph.
 /// All experts execute, outputs combined via learned router weights.
@@ -121,10 +121,7 @@ fn gate_route(
     weighted.sum_dim(-1, false)
 }
 
-fn make_gate_func(
-    router: Rc<dyn Module>,
-    experts: Vec<Rc<dyn Module>>,
-) -> NodeFn {
+fn make_gate_func(router: Rc<dyn Module>, experts: Vec<Rc<dyn Module>>) -> NodeFn {
     let n_experts = experts.len();
     Box::new(move |inputs: &[Variable]| {
         let empty = HashMap::new();
@@ -133,10 +130,7 @@ fn make_gate_func(
     })
 }
 
-fn make_gate_ref_forward(
-    router: Rc<dyn Module>,
-    experts: Vec<Rc<dyn Module>>,
-) -> RefForwardFn {
+fn make_gate_ref_forward(router: Rc<dyn Module>, experts: Vec<Rc<dyn Module>>) -> RefForwardFn {
     let n_experts = experts.len();
     Rc::new(move |stream: &Variable, refs: &HashMap<String, Variable>| {
         gate_route(&router, stream, refs, &experts, n_experts)

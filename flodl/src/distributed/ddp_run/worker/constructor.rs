@@ -4,15 +4,15 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::autograd::{NoGradGuard, Variable};
 use crate::data::BatchDataSet;
-use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
-use crate::tensor::cuda_stream::{GpuStream, StreamGuard};
 use crate::distributed::nccl::NcclRankComm;
 use crate::nn::{Module, Optimizer, Parameter};
+use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
+use crate::tensor::cuda_stream::{GpuStream, StreamGuard};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
 use super::super::{
-    ApplyPolicy, CheckpointFn, ControlMsg, EvalFn,
-    MetricsMsg, ParamSnapshot, TimingMsg, WorkerConfig,
+    ApplyPolicy, CheckpointFn, ControlMsg, EvalFn, MetricsMsg, ParamSnapshot, TimingMsg,
+    WorkerConfig,
 };
 use super::{GpuWorker, WorkerChannels, WorkerEndpoints};
 
@@ -30,7 +30,13 @@ impl<M: Module> GpuWorker<M> {
         let (control_tx, control_rx) = mpsc::channel();
         (
             (timing_tx, metrics_tx, param_tx, final_param_tx, control_rx),
-            WorkerChannels { timing_rx, metrics_rx, param_rx, final_param_rx, control_tx },
+            WorkerChannels {
+                timing_rx,
+                metrics_rx,
+                param_rx,
+                final_param_rx,
+                control_tx,
+            },
         )
     }
 
@@ -78,9 +84,7 @@ impl<M: Module> GpuWorker<M> {
         // any stream, model or dataset work: a refusal is a
         // configuration verdict and costs nothing to reach.
         crate::data::budget::check_apu_sizing(config.device, config.gpu_ram_share)
-            .map_err(|e| {
-                TensorError::new(&format!("GpuWorker rank {}: {e}", config.rank))
-            })?;
+            .map_err(|e| TensorError::new(&format!("GpuWorker rank {}: {e}", config.rank)))?;
 
         let local_dev = match config.device {
             Device::CUDA(d) => d,
@@ -126,7 +130,9 @@ impl<M: Module> GpuWorker<M> {
         if params.len() != config.initial_params.len() {
             return Err(TensorError::new(&format!(
                 "GpuWorker rank {}: model has {} params but config has {}",
-                config.rank, params.len(), config.initial_params.len()
+                config.rank,
+                params.len(),
+                config.initial_params.len()
             )));
         }
         {
@@ -141,7 +147,9 @@ impl<M: Module> GpuWorker<M> {
         if buffers.len() != config.initial_buffers.len() {
             return Err(TensorError::new(&format!(
                 "GpuWorker rank {}: model has {} buffers but config has {}",
-                config.rank, buffers.len(), config.initial_buffers.len()
+                config.rank,
+                buffers.len(),
+                config.initial_buffers.len()
             )));
         }
         {
@@ -204,7 +212,10 @@ impl<M: Module> GpuWorker<M> {
             .map(|v| v.eq_ignore_ascii_case("off") || v == "0")
             .unwrap_or(false);
         let (dataset, stager) = if stager_off {
-            crate::verbose!("  ddp-worker: rank {} stager disabled (FLODL_STAGER=off)", config.rank);
+            crate::verbose!(
+                "  ddp-worker: rank {} stager disabled (FLODL_STAGER=off)",
+                config.rank
+            );
             if config.disk_stage_gb > 0 {
                 crate::verbose!(
                     "  ddp-worker: rank {} disk_stage ignored (the disk tier \
@@ -214,8 +225,7 @@ impl<M: Module> GpuWorker<M> {
             }
             (dataset, None)
         } else {
-            let stage_cache =
-                Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
+            let stage_cache = Arc::new(crate::data::sample_cache::SampleCache::new(dataset.len()));
             // Local-disk overflow tier under the stager's cache — the
             // same RAM → disk → source cascade the solo loader builds
             // (`DataLoaderBuilder::disk_stage`): samples the RAM budget
@@ -234,12 +244,11 @@ impl<M: Module> GpuWorker<M> {
                 )?);
             }
             let stream_pool = Arc::new(Mutex::new(super::stager::StreamPool::new()));
-            let dataset: Arc<dyn BatchDataSet> =
-                Arc::new(super::stager::StagedBatchDataSet::new(
-                    dataset,
-                    Arc::clone(&stage_cache),
-                    Arc::clone(&stream_pool),
-                ));
+            let dataset: Arc<dyn BatchDataSet> = Arc::new(super::stager::StagedBatchDataSet::new(
+                dataset,
+                Arc::clone(&stage_cache),
+                Arc::clone(&stream_pool),
+            ));
             let stager = super::stager::spawn_stager(
                 Arc::clone(&dataset),
                 stage_cache,
@@ -257,8 +266,7 @@ impl<M: Module> GpuWorker<M> {
         };
 
         // The epoch's work is picks (samples × augment views).
-        let total_batches =
-            dataset.len() * config.augment.max(1) / config.batch_size.max(1);
+        let total_batches = dataset.len() * config.augment.max(1) / config.batch_size.max(1);
         // Device sample pool switch: builder/config knob AND the
         // `FLODL_VRAM_POOL=off` runtime kill-switch (A/B runs) — one
         // shared parse with the solo loader (audit D7).
@@ -269,11 +277,18 @@ impl<M: Module> GpuWorker<M> {
             let psb: usize = sample.iter().map(|t| t.nbytes()).sum();
             drop(sample);
             let depth = crate::data::prefetch_depth_from_vram(
-                psb, config.batch_size, config.device, config.vram_max_usage, 0,
-            ).min(512);
+                psb,
+                config.batch_size,
+                config.device,
+                config.vram_max_usage,
+                0,
+            )
+            .min(512);
             crate::debug!(
                 "  ddp-worker: rank {} constructor prefetch sizing: psb={} depth={} (used, total)={:?}",
-                config.rank, psb, depth,
+                config.rank,
+                psb,
+                depth,
                 crate::tensor::gpu_memory_info_idx(config.device.index() as i32)
             );
             // Reset peak stats so first run_epoch_plan gets a clean baseline.
@@ -292,10 +307,14 @@ impl<M: Module> GpuWorker<M> {
                 }
                 crate::debug!(
                     "  ddp-worker: rank {} prefetch depth={} vram_pool={}",
-                    config.rank, depth, vram_pool_enabled
+                    config.rank,
+                    depth,
+                    vram_pool_enabled
                 );
                 let pw = crate::data::prefetch::PrefetchWorker::new(
-                    Arc::clone(&dataset), config.device, depth,
+                    Arc::clone(&dataset),
+                    config.device,
+                    depth,
                     vram_pool_enabled,
                     config.augment,
                 );
@@ -320,13 +339,16 @@ impl<M: Module> GpuWorker<M> {
         // surfaces later as a misleading abort-retry error (params) or a
         // silent restore skip (buffers).
         let pre_sync_scratch = if nccl_comm.is_some() {
-            let scratch: Vec<Tensor> = param_vars.iter()
+            let scratch: Vec<Tensor> = param_vars
+                .iter()
                 .map(|v| Tensor::zeros_like(&v.data()))
                 .collect::<Result<_>>()
-                .map_err(|e| TensorError::new(&format!(
-                    "GpuWorker r{}: pre-sync param scratch alloc failed: {e}",
-                    config.rank,
-                )))?;
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "GpuWorker r{}: pre-sync param scratch alloc failed: {e}",
+                        config.rank,
+                    ))
+                })?;
             Some(scratch)
         } else {
             None
@@ -337,15 +359,18 @@ impl<M: Module> GpuWorker<M> {
         // vectors vs full weight matrices). Empty (no f32 buffers) is the
         // one legitimate None once a comm is attached.
         let pre_sync_buffer_scratch = if nccl_comm.is_some() {
-            let scratch: Vec<Tensor> = buffer_list.iter()
+            let scratch: Vec<Tensor> = buffer_list
+                .iter()
                 .map(|b| b.get())
                 .filter(|t| t.dtype() == crate::tensor::DType::Float32)
                 .map(|t| Tensor::zeros_like(&t))
                 .collect::<Result<_>>()
-                .map_err(|e| TensorError::new(&format!(
-                    "GpuWorker r{}: pre-sync buffer scratch alloc failed: {e}",
-                    config.rank,
-                )))?;
+                .map_err(|e| {
+                    TensorError::new(&format!(
+                        "GpuWorker r{}: pre-sync buffer scratch alloc failed: {e}",
+                        config.rank,
+                    ))
+                })?;
             (!scratch.is_empty()).then_some(scratch)
         } else {
             None

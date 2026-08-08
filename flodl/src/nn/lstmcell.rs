@@ -1,8 +1,8 @@
 use crate::autograd::{self, Variable};
-use crate::tensor::{Device, DType, Result, Tensor, TensorOptions};
+use crate::tensor::{DType, Device, Result, Tensor, TensorOptions};
 
-use super::parameter::Parameter;
 use super::Module;
+use super::parameter::Parameter;
 
 /// Single-step LSTM cell backed by fused ATen `lstm_cell` kernel.
 ///
@@ -38,16 +38,23 @@ impl LSTMCell {
     /// Create an LSTM cell on a specific device.
     pub fn on_device(input_size: i64, hidden_size: i64, device: Device) -> Result<Self> {
         let bound = 1.0 / (hidden_size as f64).sqrt();
-        let opts = TensorOptions { dtype: DType::Float32, device };
+        let opts = TensorOptions {
+            dtype: DType::Float32,
+            device,
+        };
 
         let w_ih = Tensor::rand(&[4 * hidden_size, input_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let w_hh = Tensor::rand(&[4 * hidden_size, hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let b_ih = Tensor::rand(&[4 * hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
         let b_hh = Tensor::rand(&[4 * hidden_size], opts)?
-            .mul_scalar(2.0 * bound)?.add_scalar(-bound)?;
+            .mul_scalar(2.0 * bound)?
+            .add_scalar(-bound)?;
 
         Ok(LSTMCell {
             w_ih: Parameter::new(w_ih, "w_ih"),
@@ -71,7 +78,10 @@ impl LSTMCell {
                 (h, c)
             }
             None => {
-                let opts = TensorOptions { dtype: DType::Float32, device: self.w_ih.variable.device() };
+                let opts = TensorOptions {
+                    dtype: DType::Float32,
+                    device: self.w_ih.variable.device(),
+                };
                 let h = Variable::new(Tensor::zeros(&[batch, hs], opts)?, false);
                 let c = Variable::new(Tensor::zeros(&[batch, hs], opts)?, false);
                 (h, c)
@@ -79,9 +89,13 @@ impl LSTMCell {
         };
 
         let (h_new, c_new) = autograd::lstm_cell(
-            x, &h, &c,
-            &self.w_ih.variable, &self.w_hh.variable,
-            &self.b_ih.variable, &self.b_hh.variable,
+            x,
+            &h,
+            &c,
+            &self.w_ih.variable,
+            &self.w_hh.variable,
+            &self.b_ih.variable,
+            &self.b_hh.variable,
         )?;
 
         // Pack state: cat(h', c', dim=1)
@@ -90,7 +104,9 @@ impl LSTMCell {
 }
 
 impl Module for LSTMCell {
-    fn name(&self) -> &str { "lstmcell" }
+    fn name(&self) -> &str {
+        "lstmcell"
+    }
 
     /// Module trait forward: returns only h `[batch, hidden_size]` (no cell state).
     /// Use [`forward_step`](LSTMCell::forward_step) for full packed state access.
@@ -121,7 +137,10 @@ mod tests {
     #[test]
     fn test_lstmcell_forward() {
         let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+        let x = Variable::new(
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
         let state = lstm.forward_step(&x, None).unwrap();
         assert_eq!(state.shape(), vec![2, 6]); // h + c packed
 
@@ -140,7 +159,9 @@ mod tests {
     fn test_lstmcell_gradient() {
         let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), true);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            true,
+        );
         let state = lstm.forward_step(&x, None).unwrap();
         let loss = state.sum().unwrap();
         loss.backward().unwrap();
@@ -157,7 +178,9 @@ mod tests {
     fn test_lstmcell_multi_step() {
         let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
         let x = Variable::new(
-            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
 
         // Run 5 steps, each feeding previous state
         let mut state: Option<Variable> = None;
@@ -189,15 +212,27 @@ mod tests {
 
             let xp_var = Variable::new(from_f32(&xp, &[2, 2]), false);
             let xm_var = Variable::new(from_f32(&xm, &[2, 2]), false);
-            let fp: f64 = lstm.forward_step(&xp_var, None).unwrap()
-                .sum().unwrap().item().unwrap();
-            let fm: f64 = lstm.forward_step(&xm_var, None).unwrap()
-                .sum().unwrap().item().unwrap();
+            let fp: f64 = lstm
+                .forward_step(&xp_var, None)
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap();
+            let fm: f64 = lstm
+                .forward_step(&xm_var, None)
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap();
             let numerical = (fp - fm) / (2.0 * eps);
             assert!(
                 (analytical[i] as f64 - numerical).abs() < 0.05,
                 "grad mismatch at {}: analytical={}, numerical={}",
-                i, analytical[i], numerical
+                i,
+                analytical[i],
+                numerical
             );
         }
     }
@@ -206,7 +241,10 @@ mod tests {
     fn test_lstmcell_module_forward() {
         use crate::nn::Module;
         let lstm = LSTMCell::on_device(4, 3, crate::tensor::test_device()).unwrap();
-        let x = Variable::new(Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(), false);
+        let x = Variable::new(
+            Tensor::randn(&[2, 4], crate::tensor::test_opts()).unwrap(),
+            false,
+        );
         let y = lstm.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 3]); // Only h returned from Module::forward
     }

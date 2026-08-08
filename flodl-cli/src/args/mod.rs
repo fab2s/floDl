@@ -117,8 +117,8 @@ mod env_tests {
 
     use std::sync::{Mutex, MutexGuard};
 
-    use crate::args::FdlArgsTrait;
     use crate::FdlArgs;
+    use crate::args::FdlArgsTrait;
 
     /// Serializes every test in this module. Poison is ignored because a
     /// panicking test that leaves the lock poisoned still left the env
@@ -140,13 +140,17 @@ mod env_tests {
         fn set(name: &'static str, value: &str) -> Self {
             // SAFETY: caller holds `ENV_LOCK` for the duration of this
             // test, so no other test thread writes env concurrently.
-            unsafe { std::env::set_var(name, value); }
+            unsafe {
+                std::env::set_var(name, value);
+            }
             EnvGuard(name)
         }
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var(self.0); }
+            unsafe {
+                std::env::remove_var(self.0);
+            }
         }
     }
 
@@ -170,8 +174,7 @@ mod env_tests {
     fn argv_flag_beats_env() {
         let _lock = env_lock();
         let _g = EnvGuard::set("FDL_TEST_PORT", "8080");
-        let cli: OptArgs =
-            OptArgs::try_parse_from(&mk_args(&["prog", "--port", "9999"])).unwrap();
+        let cli: OptArgs = OptArgs::try_parse_from(&mk_args(&["prog", "--port", "9999"])).unwrap();
         assert_eq!(cli.port, Some(9999));
     }
 
@@ -179,8 +182,7 @@ mod env_tests {
     fn equals_form_beats_env() {
         let _lock = env_lock();
         let _g = EnvGuard::set("FDL_TEST_PORT", "8080");
-        let cli: OptArgs =
-            OptArgs::try_parse_from(&mk_args(&["prog", "--port=9999"])).unwrap();
+        let cli: OptArgs = OptArgs::try_parse_from(&mk_args(&["prog", "--port=9999"])).unwrap();
         assert_eq!(cli.port, Some(9999));
     }
 
@@ -256,8 +258,7 @@ mod env_tests {
     fn short_form_suppresses_env_fallback() {
         let _lock = env_lock();
         let _g = EnvGuard::set("FDL_TEST_SHORT", "8080");
-        let cli: ShortArgs =
-            ShortArgs::try_parse_from(&mk_args(&["prog", "-p", "9999"])).unwrap();
+        let cli: ShortArgs = ShortArgs::try_parse_from(&mk_args(&["prog", "-p", "9999"])).unwrap();
         assert_eq!(cli.port, Some(9999));
     }
 }
@@ -267,8 +268,8 @@ mod enum_tests {
     //! Variant-shaped CLI: `#[derive(FdlArgs)]` on an enum of newtype
     //! variants dispatches a subcommand to the wrapped type.
 
-    use crate::args::FdlArgsTrait;
     use crate::FdlArgs;
+    use crate::args::FdlArgsTrait;
 
     fn mk_args(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
@@ -372,7 +373,10 @@ mod enum_tests {
     #[test]
     fn schema_is_a_branch_with_described_children() {
         let s = Cli::schema();
-        assert!(s.args.is_empty() && s.options.is_empty(), "root is a branch, not a leaf");
+        assert!(
+            s.args.is_empty() && s.options.is_empty(),
+            "root is a branch, not a leaf"
+        );
         assert_eq!(s.commands.len(), 3);
         assert_eq!(
             s.commands["train"].description.as_deref(),
@@ -389,7 +393,10 @@ mod enum_tests {
     #[test]
     fn root_help_lists_commands() {
         let help = Cli::render_help();
-        assert!(help.contains("Commands"), "root help has a Commands section");
+        assert!(
+            help.contains("Commands"),
+            "root help has a Commands section"
+        );
         assert!(help.contains("train") && help.contains("eval") && help.contains("gen"));
         assert!(
             help.contains("Train a letter model on a dataset"),
@@ -402,14 +409,23 @@ mod enum_tests {
         // `prog train --help` → train's help (mentions its own flag), not
         // the command list.
         let help = Cli::render_help_path(&mk_args(&["prog", "train", "--help"]));
-        assert!(help.contains("epochs"), "train help must show its flags; got:\n{help}");
-        assert!(!help.contains("Commands"), "must not fall back to the command list");
+        assert!(
+            help.contains("epochs"),
+            "train help must show its flags; got:\n{help}"
+        );
+        assert!(
+            !help.contains("Commands"),
+            "must not fall back to the command list"
+        );
     }
 
     #[test]
     fn help_path_falls_back_to_root_when_no_subcommand() {
         let help = Cli::render_help_path(&mk_args(&["prog"]));
-        assert!(help.contains("Commands"), "bare --help shows the command list");
+        assert!(
+            help.contains("Commands"),
+            "bare --help shows the command list"
+        );
     }
 
     // ── Nested enums: arbitrary subcommand depth, for free ─────────────
@@ -434,9 +450,8 @@ mod enum_tests {
 
     #[test]
     fn nested_enum_dispatches_two_levels() {
-        let cli =
-            WordCli::try_parse_from(&mk_args(&["prog", "train", "subscan", "--epochs", "3"]))
-                .unwrap();
+        let cli = WordCli::try_parse_from(&mk_args(&["prog", "train", "subscan", "--epochs", "3"]))
+            .unwrap();
         match cli {
             WordCli::Train(TrainGroup::Subscan(a)) => assert_eq!(a.epochs, 3),
             other => panic!("expected Train>Subscan, got {other:?}"),
@@ -456,7 +471,10 @@ mod enum_tests {
     fn nested_enum_schema_is_a_two_level_tree() {
         let s = WordCli::schema();
         let train = &s.commands["train"];
-        assert!(train.options.is_empty(), "the train node is itself a branch");
+        assert!(
+            train.options.is_empty(),
+            "the train node is itself a branch"
+        );
         assert!(train.commands.contains_key("subscan"));
         assert!(train.commands["full"].options.contains_key("epochs"));
         crate::config::validate_schema(&s).expect("nested tree must validate");
@@ -465,9 +483,10 @@ mod enum_tests {
     #[test]
     fn nested_enum_help_drills_to_leaf() {
         // `prog train subscan --help` reaches the innermost struct's help.
-        let help =
-            WordCli::render_help_path(&mk_args(&["prog", "train", "subscan", "--help"]));
-        assert!(help.contains("epochs"), "must reach the leaf struct help; got:\n{help}");
+        let help = WordCli::render_help_path(&mk_args(&["prog", "train", "subscan", "--help"]));
+        assert!(
+            help.contains("epochs"),
+            "must reach the leaf struct help; got:\n{help}"
+        );
     }
 }
-

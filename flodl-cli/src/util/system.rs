@@ -22,7 +22,7 @@ use std::process::Command;
 // mask-honoring runtime view, used by `flodl`.
 
 pub use flodl_hw::{
-    detect_gpus_physical as detect_gpus, nvidia_driver_version, GpuInfo, GpuVendor,
+    GpuInfo, GpuVendor, detect_gpus_physical as detect_gpus, nvidia_driver_version,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,9 +34,10 @@ pub fn cpu_model() -> Option<String> {
     let info = fs::read_to_string("/proc/cpuinfo").ok()?;
     for line in info.lines() {
         if let Some(rest) = line.strip_prefix("model name")
-            && let Some(val) = rest.split(':').nth(1) {
-                return Some(val.trim().to_string());
-            }
+            && let Some(val) = rest.split(':').nth(1)
+        {
+            return Some(val.trim().to_string());
+        }
     }
     None
 }
@@ -86,12 +87,7 @@ pub fn cpu_threads() -> usize {
         .args(["-n", "hw.logicalcpu"])
         .output()
         .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .ok()
-        })
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
         .unwrap_or(1)
 }
 
@@ -130,10 +126,7 @@ pub fn ram_total_gb() -> u64 {
         .output()
         .ok()
         .and_then(|o| {
-            let bytes: u64 = String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse()
-                .ok()?;
+            let bytes: u64 = String::from_utf8_lossy(&o.stdout).trim().parse().ok()?;
             Some(bytes / (1024 * 1024 * 1024))
         })
         .unwrap_or(0)
@@ -199,10 +192,7 @@ pub fn os_version() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 pub fn os_version() -> Option<String> {
-    let out = Command::new("cmd")
-        .args(["/C", "ver"])
-        .output()
-        .ok()?;
+    let out = Command::new("cmd").args(["/C", "ver"]).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() { None } else { Some(s) }
 }
@@ -281,10 +271,7 @@ pub fn escape_json(s: &str) -> String {
             '\u{08}' => out.push_str("\\b"),
             '\u{0C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut out,
-                    format_args!("\\u{:04x}", c as u32),
-                );
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\u{:04x}", c as u32));
             }
             c => out.push(c),
         }

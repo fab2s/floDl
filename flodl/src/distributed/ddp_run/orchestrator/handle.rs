@@ -5,19 +5,19 @@
 //! `poll_metrics`, `next_metrics`, plus the `launch` constructor called from
 //! the builder.
 
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::{Device, Result, Tensor, TensorError};
 
-use crate::distributed::ddp_run::{
-    ApplyPolicy, AverageBackend, ConvergenceGuard, DdpRunConfig, RankCallbacks,
-    EpochMetrics, EvalResultFn, MetricsFn, SchedulerFn, TrainedState,
-};
 use super::coord_config::build_coord_config_from_builder;
+use crate::distributed::ddp_run::{
+    ApplyPolicy, AverageBackend, ConvergenceGuard, DdpRunConfig, EpochMetrics, EvalResultFn,
+    MetricsFn, RankCallbacks, SchedulerFn, TrainedState,
+};
 
 /// DDP run-mode handle: spawns GPU worker threads and a coordinator thread.
 ///
@@ -210,10 +210,7 @@ impl DdpHandle {
                 "model-sig probe: CPU model construction failed: {e}"
             ))
         })?;
-        let sig = crate::distributed::model_sig::model_sig(
-            &model.parameters(),
-            &model.buffers(),
-        );
+        let sig = crate::distributed::model_sig::model_sig(&model.parameters(), &model.buffers());
         let hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
         // The line IS the protocol (fdl scans stdout for the prefix, so
         // main-body prints above it stay harmless).
@@ -313,8 +310,7 @@ impl DdpHandle {
                 // each completed epoch's metrics here; the user's
                 // `DdpHandle::next_metrics()` polls them off. Wired
                 // alongside `metrics_fn` (both fire on aggregation).
-                let (sink_tx, sink_rx) =
-                    mpsc::channel::<EpochMetrics>();
+                let (sink_tx, sink_rx) = mpsc::channel::<EpochMetrics>();
                 // Capture the static model schema (param/buffer names) for the
                 // controller-side consensus-checkpoint writer. Built on CPU in
                 // the launcher process — reads names only, touches no CUDA
@@ -330,13 +326,11 @@ impl DdpHandle {
                 let mut expected_model_sig: Option<[u8; 32]> = None;
                 match model_factory(Device::CPU) {
                     Ok(probe) => {
-                        model_schema =
-                            Some(crate::distributed::ModelSchema::from_module(&probe));
-                        expected_model_sig =
-                            Some(crate::distributed::model_sig::model_sig(
-                                &probe.parameters(),
-                                &probe.buffers(),
-                            ));
+                        model_schema = Some(crate::distributed::ModelSchema::from_module(&probe));
+                        expected_model_sig = Some(crate::distributed::model_sig::model_sig(
+                            &probe.parameters(),
+                            &probe.buffers(),
+                        ));
                         // Model-derived frame ceiling: the same CPU probe
                         // yields the exact wire footprint, replacing the
                         // 1 GiB default reject-threshold on every
@@ -352,9 +346,8 @@ impl DdpHandle {
                             .collect();
                         let buffers: Vec<crate::tensor::Tensor> =
                             probe.buffers().iter().map(|b| b.get()).collect();
-                        let wire_bytes =
-                            crate::distributed::wire::tensors_wire_bytes(&params)
-                                + crate::distributed::wire::tensors_wire_bytes(&buffers);
+                        let wire_bytes = crate::distributed::wire::tensors_wire_bytes(&params)
+                            + crate::distributed::wire::tensors_wire_bytes(&buffers);
                         crate::distributed::wire::set_frame_ceiling(
                             crate::distributed::wire::derive_frame_ceiling(wire_bytes),
                         );
@@ -430,10 +423,8 @@ impl DdpHandle {
                 // so everything it needs is captured here and sized
                 // there.
                 // The coordinator's whole ledger runs in pick space.
-                let dataset_len = crate::distributed::ddp_run::pick_space(
-                    dataset.len(),
-                    config.augment,
-                );
+                let dataset_len =
+                    crate::distributed::ddp_run::pick_space(dataset.len(), config.augment);
                 let coord_spec = crate::distributed::launcher::CoordSpec {
                     backend,
                     config_factory: Box::new(move |world_size| {
@@ -458,8 +449,7 @@ impl DdpHandle {
                 };
                 // Cooperative-shutdown flag shared with the launcher's
                 // infrastructure threads; DdpHandle::shutdown raises it.
-                let launcher_abort =
-                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let launcher_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let abort_for_driver = Arc::clone(&launcher_abort);
                 let driver = std::thread::Builder::new()
                     .name("flodl-launcher-driver".to_string())
@@ -549,9 +539,7 @@ impl DdpHandle {
                 // One cluster session per process (see launcher's
                 // `claim_cluster_entry`): the rank-side bridges and the
                 // coordinator they dial are equally per-session.
-                if let Err(e) =
-                    crate::distributed::launcher::claim_cluster_entry("rank")
-                {
+                if let Err(e) = crate::distributed::launcher::claim_cluster_entry("rank") {
                     eprintln!("flodl cluster rank: {e}");
                     clean_process_exit(1);
                 }
@@ -572,9 +560,7 @@ impl DdpHandle {
                 return match dispatch_result {
                     Ok(h) => Ok(h),
                     Err(e) => {
-                        eprintln!(
-                            "flodl cluster rank: pre-rendezvous setup failed: {e}"
-                        );
+                        eprintln!("flodl cluster rank: pre-rendezvous setup failed: {e}");
                         clean_process_exit(1);
                     }
                 };
@@ -584,9 +570,7 @@ impl DdpHandle {
                 // through to the single-host path below.
             }
             Err(e) => {
-                eprintln!(
-                    "flodl cluster rank: envelope parse failed: {e}"
-                );
+                eprintln!("flodl cluster rank: envelope parse failed: {e}");
                 clean_process_exit(1);
             }
         }
@@ -599,11 +583,21 @@ impl DdpHandle {
             let scheduler = scheduler_fn.map(|f| f(1));
             // Single-device path uses the rank callbacks minus the outer
             // optimizer (there is no cross-rank averaging to steer here).
-            let RankCallbacks { checkpoint_fn, epoch_fn, eval_fn, eval_dataset, .. } =
-                rank_callbacks;
+            let RankCallbacks {
+                checkpoint_fn,
+                epoch_fn,
+                eval_fn,
+                eval_dataset,
+                ..
+            } = rank_callbacks;
             return Self::run_single(
-                &model_factory, &optim_factory, &train_fn,
-                dataset, batch_size, num_epochs, dev,
+                &model_factory,
+                &optim_factory,
+                &train_fn,
+                dataset,
+                batch_size,
+                num_epochs,
+                dev,
                 checkpoint_fn,
                 config.checkpoint_every,
                 epoch_fn,
@@ -741,9 +735,7 @@ impl DdpHandle {
         // over the connected `ClusterWorker` instead of self-driving the loop.
         match crate::distributed::cluster::LocalCluster::from_env() {
             Ok(Some(cluster)) => {
-                if let Err(e) =
-                    crate::distributed::launcher::claim_cluster_entry("rank")
-                {
+                if let Err(e) = crate::distributed::launcher::claim_cluster_entry("rank") {
                     eprintln!("flodl cluster rank: {e}");
                     clean_process_exit(1);
                 }
@@ -784,11 +776,19 @@ impl DdpHandle {
         if devices.len() < 2 {
             let dev = devices.first().copied().unwrap_or(Device::CPU);
             let scheduler = scheduler_fn.map(|f| f(1));
-            let RankCallbacks { checkpoint_fn, eval_fn, eval_dataset, .. } =
-                rank_callbacks;
+            let RankCallbacks {
+                checkpoint_fn,
+                eval_fn,
+                eval_dataset,
+                ..
+            } = rank_callbacks;
             return Self::run_single_worker(
-                &model_factory, &optim_factory,
-                dataset, batch_size, num_epochs, dev,
+                &model_factory,
+                &optim_factory,
+                dataset,
+                batch_size,
+                num_epochs,
+                dev,
                 checkpoint_fn,
                 config.max_grad_norm,
                 config.vram_pool,
@@ -867,10 +867,7 @@ impl DdpHandle {
         if let Some(svg) = &self.architecture_svg {
             monitor.set_svg(svg);
         }
-        monitor.set_identity(
-            self.graph_label.as_deref(),
-            self.graph_hash.as_deref(),
-        );
+        monitor.set_identity(self.graph_label.as_deref(), self.graph_hash.as_deref());
         if let Some(meta) = &self.training_meta {
             monitor.set_metadata(meta.clone());
         }
@@ -982,9 +979,7 @@ impl DdpHandle {
                     })
                 }
                 Ok(Err(e)) => Err(e),
-                Err(_) => Err(TensorError::new(
-                    "join: launcher driver thread panicked",
-                )),
+                Err(_) => Err(TensorError::new("join: launcher driver thread panicked")),
             };
         }
 
@@ -994,7 +989,6 @@ impl DdpHandle {
         // practice; surface loudly rather than hang.
         Err(TensorError::new("join: no trained state available"))
     }
-
 }
 
 /// Build the one-time multi-host reminder that checkpoint/resume paths
@@ -1055,9 +1049,7 @@ mod tests {
     fn no_warning_on_single_worker_cluster() {
         // Single-box multi-GPU auto-promote: everything lands on one
         // host's disk, so a save_path is fine.
-        assert!(
-            checkpoint_shared_storage_warning(false, Some("runs/ckpt"), None).is_none()
-        );
+        assert!(checkpoint_shared_storage_warning(false, Some("runs/ckpt"), None).is_none());
     }
 
     #[test]
@@ -1082,9 +1074,8 @@ mod tests {
 
     #[test]
     fn names_both_paths_when_they_differ() {
-        let msg =
-            checkpoint_shared_storage_warning(true, Some("out/save"), Some("in/resume"))
-                .expect("must warn");
+        let msg = checkpoint_shared_storage_warning(true, Some("out/save"), Some("in/resume"))
+            .expect("must warn");
         assert!(msg.contains("out/save"));
         assert!(msg.contains("in/resume"));
     }

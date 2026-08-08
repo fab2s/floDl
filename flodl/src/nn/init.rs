@@ -42,7 +42,9 @@ pub fn kaiming_uniform(shape: &[i64], fan_in: i64, a: f64, device: Device) -> Re
         dtype: crate::tensor::DType::Float32,
         device,
     };
-    Tensor::rand(shape, opts)?.mul_scalar(2.0 * bound)?.add_scalar(-bound)
+    Tensor::rand(shape, opts)?
+        .mul_scalar(2.0 * bound)?
+        .add_scalar(-bound)
 }
 
 /// Kaiming normal initialization.
@@ -68,7 +70,9 @@ pub fn xavier_uniform(shape: &[i64], fan_in: i64, fan_out: i64, device: Device) 
         dtype: crate::tensor::DType::Float32,
         device,
     };
-    Tensor::rand(shape, opts)?.mul_scalar(2.0 * bound)?.add_scalar(-bound)
+    Tensor::rand(shape, opts)?
+        .mul_scalar(2.0 * bound)?
+        .add_scalar(-bound)
 }
 
 /// Xavier (Glorot) normal initialization (for sigmoid/tanh networks).
@@ -90,7 +94,9 @@ pub fn uniform_bias(fan_in: i64, shape: &[i64], device: Device) -> Result<Tensor
         dtype: crate::tensor::DType::Float32,
         device,
     };
-    Tensor::rand(shape, opts)?.mul_scalar(2.0 * bound)?.add_scalar(-bound)
+    Tensor::rand(shape, opts)?
+        .mul_scalar(2.0 * bound)?
+        .add_scalar(-bound)
 }
 
 /// Uniform initialization: values drawn from U[low, high).
@@ -103,7 +109,9 @@ pub fn uniform(shape: &[i64], low: f64, high: f64, device: Device) -> Result<Ten
         dtype: crate::tensor::DType::Float32,
         device,
     };
-    Tensor::rand(shape, opts)?.mul_scalar(high - low)?.add_scalar(low)
+    Tensor::rand(shape, opts)?
+        .mul_scalar(high - low)?
+        .add_scalar(low)
 }
 
 /// Normal initialization: values drawn from N(mean, std).
@@ -116,7 +124,9 @@ pub fn normal(shape: &[i64], mean: f64, std: f64, device: Device) -> Result<Tens
         dtype: crate::tensor::DType::Float32,
         device,
     };
-    Tensor::randn(shape, opts)?.mul_scalar(std)?.add_scalar(mean)
+    Tensor::randn(shape, opts)?
+        .mul_scalar(std)?
+        .add_scalar(mean)
 }
 
 /// Orthogonal initialization via Gram-Schmidt orthogonalization.
@@ -212,7 +222,10 @@ pub fn trunc_normal(
     };
     let low = mean + a * std;
     let high = mean + b * std;
-    Tensor::randn(shape, opts)?.mul_scalar(std)?.add_scalar(mean)?.clamp(low, high)
+    Tensor::randn(shape, opts)?
+        .mul_scalar(std)?
+        .add_scalar(mean)?
+        .clamp(low, high)
 }
 
 #[cfg(test)]
@@ -224,7 +237,11 @@ mod tests {
         let t = uniform(&[1000], -2.0, 3.0, crate::tensor::test_device()).unwrap();
         let data = t.to_f32_vec().unwrap();
         for &v in &data {
-            assert!((-2.0..=3.0).contains(&v), "value {} out of range [-2, 3]", v);
+            assert!(
+                (-2.0..=3.0).contains(&v),
+                "value {} out of range [-2, 3]",
+                v
+            );
         }
         // Mean should be approximately 0.5
         let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
@@ -238,9 +255,14 @@ mod tests {
         let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
         assert!((mean - 5.0).abs() < 0.05, "mean {} too far from 5.0", mean);
 
-        let var: f32 = data.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / data.len() as f32;
+        let var: f32 =
+            data.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / data.len() as f32;
         let std_dev = var.sqrt();
-        assert!((std_dev - 0.1).abs() < 0.02, "std {} too far from 0.1", std_dev);
+        assert!(
+            (std_dev - 0.1).abs() < 0.02,
+            "std {} too far from 0.1",
+            std_dev
+        );
     }
 
     #[test]
@@ -258,7 +280,10 @@ mod tests {
                 assert!(
                     (data[i * 4 + j] - expected).abs() < 0.01,
                     "Q@Q^T[{},{}] = {}, expected {}",
-                    i, j, data[i * 4 + j], expected
+                    i,
+                    j,
+                    data[i * 4 + j],
+                    expected
                 );
             }
         }
@@ -279,7 +304,10 @@ mod tests {
                 assert!(
                     (data[i * 4 + j] - expected).abs() < 0.01,
                     "Q^T@Q[{},{}] = {}, expected {}",
-                    i, j, data[i * 4 + j], expected
+                    i,
+                    j,
+                    data[i * 4 + j],
+                    expected
                 );
             }
         }
@@ -300,7 +328,10 @@ mod tests {
                 assert!(
                     (data[i * 4 + j] - expected).abs() < 0.01,
                     "Q@Q^T[{},{}] = {}, expected {}",
-                    i, j, data[i * 4 + j], expected
+                    i,
+                    j,
+                    data[i * 4 + j],
+                    expected
                 );
             }
         }
@@ -312,10 +343,15 @@ mod tests {
         // Row norms should be approximately gain=2.0
         let data = t.to_f32_vec().unwrap();
         for i in 0..4 {
-            let norm: f32 = (0..4).map(|j| data[i * 4 + j] * data[i * 4 + j]).sum::<f32>().sqrt();
+            let norm: f32 = (0..4)
+                .map(|j| data[i * 4 + j] * data[i * 4 + j])
+                .sum::<f32>()
+                .sqrt();
             assert!(
                 (norm - 2.0).abs() < 0.1,
-                "row {} norm = {}, expected ~2.0", i, norm
+                "row {} norm = {}, expected ~2.0",
+                i,
+                norm
             );
         }
     }

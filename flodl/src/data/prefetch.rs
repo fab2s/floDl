@@ -19,15 +19,15 @@
 //! (network storage). The ring bounds RAM in flight; the depth
 //! governor independently bounds VRAM in flight.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::tensor::{Device, Result, Tensor, TensorError};
-use super::vram_pool::VramSamplePool;
 use super::BatchDataSet;
+use super::vram_pool::VramSamplePool;
+use crate::tensor::{Device, Result, Tensor, TensorError};
 
 // ---------------------------------------------------------------------------
 // Depth governor
@@ -209,16 +209,12 @@ pub(crate) enum WorkerCmd {
     },
     /// Load a single batch (distributed mode). Worker sends the result on
     /// the channel from the preceding `StartDistributedEpoch`.
-    LoadBatch {
-        indices: Vec<usize>,
-    },
+    LoadBatch { indices: Vec<usize> },
     /// Install the device sample pool's budget (distributed mode, where
     /// no governor exists to gate the decision): the caller signals its
     /// post-first-step moment and passes the in-flight bytes to leave
     /// reserved. Idempotent after the first decision.
-    InstallVramPool {
-        reserve_bytes: u64,
-    },
+    InstallVramPool { reserve_bytes: u64 },
     /// Shut down the worker.
     Stop,
 }
@@ -318,9 +314,10 @@ impl PrefetchWorker {
         let (batch_tx, batch_rx) =
             mpsc::sync_channel::<Result<PrefetchedBatch>>(self.prefetch_depth);
 
-        let _ = self
-            .cmd_tx
-            .send(WorkerCmd::StartDistributedEpoch { batch_tx, ring_slots });
+        let _ = self.cmd_tx.send(WorkerCmd::StartDistributedEpoch {
+            batch_tx,
+            ring_slots,
+        });
 
         batch_rx
     }
@@ -336,7 +333,9 @@ impl PrefetchWorker {
     /// VRAM probe sees activations and optimizer state; `reserve_bytes`
     /// is the in-flight buffer to leave for the batch channel.
     pub fn install_vram_pool_budget(&self, reserve_bytes: u64) {
-        let _ = self.cmd_tx.send(WorkerCmd::InstallVramPool { reserve_bytes });
+        let _ = self
+            .cmd_tx
+            .send(WorkerCmd::InstallVramPool { reserve_bytes });
     }
 
     /// Current prefetch depth (channel capacity for next epoch).
@@ -484,7 +483,10 @@ fn worker_loop(
                 pool.epoch_report();
                 // batch_tx is dropped here, closing the epoch's channel.
             }
-            WorkerCmd::StartDistributedEpoch { batch_tx, ring_slots } => {
+            WorkerCmd::StartDistributedEpoch {
+                batch_tx,
+                ring_slots,
+            } => {
                 // Epoch boundary on the coordinator-paced path: report
                 // the closing epoch's pool telemetry before the next
                 // one starts. The previous epoch's reader (if any) is
@@ -552,9 +554,8 @@ fn worker_loop(
                                 // escaped the fetch guard). The batches
                                 // will never come — surface one loud error
                                 // instead of leaving the consumer waiting.
-                                let err: Result<PrefetchedBatch> = Err(TensorError::new(
-                                    "prefetch reader thread died mid-epoch",
-                                ));
+                                let err: Result<PrefetchedBatch> =
+                                    Err(TensorError::new("prefetch reader thread died mid-epoch"));
                                 let _ = send_or_stop(&tx, err, stop);
                                 consumer_gone = true;
                                 break 'pump;
@@ -787,11 +788,17 @@ fn run_two_stage_epoch(
     stop: &AtomicBool,
     #[cfg(feature = "gpu")] copy_stream: Option<&crate::tensor::cuda_stream::GpuStream>,
 ) {
-    let (ring_tx, ring_rx) =
-        mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
+    let (ring_tx, ring_rx) = mpsc::sync_channel::<Result<(Vec<usize>, Vec<Tensor>)>>(ring_slots);
     let reader_dataset = Arc::clone(dataset);
     let reader = thread::spawn(move || {
-        reader_loop(reader_dataset, indices, batch_size, drop_last, ring_tx, augment);
+        reader_loop(
+            reader_dataset,
+            indices,
+            batch_size,
+            drop_last,
+            ring_tx,
+            augment,
+        );
     });
 
     loop {
@@ -919,7 +926,12 @@ impl DistRing {
                 }
             }
         });
-        DistRing { idx_tx, ring_rx, reader, pending: 0 }
+        DistRing {
+            idx_tx,
+            ring_rx,
+            reader,
+            pending: 0,
+        }
     }
 
     /// Hand one batch's picks to the reader.
@@ -1326,7 +1338,10 @@ mod tests {
 
         // Single-stage baseline: the fetch count is pinned at 2.
         let w = PrefetchWorker::new(
-            Arc::new(SlowCountingBatch { fetched: Arc::clone(&fetched), delay }),
+            Arc::new(SlowCountingBatch {
+                fetched: Arc::clone(&fetched),
+                delay,
+            }),
             Device::CPU,
             1,
             false,
@@ -1349,7 +1364,10 @@ mod tests {
         // send + the channel slot — at least 5 reads with zero consumption.
         fetched.store(0, Ordering::SeqCst);
         let w = PrefetchWorker::new(
-            Arc::new(SlowCountingBatch { fetched: Arc::clone(&fetched), delay }),
+            Arc::new(SlowCountingBatch {
+                fetched: Arc::clone(&fetched),
+                delay,
+            }),
             Device::CPU,
             1,
             false,

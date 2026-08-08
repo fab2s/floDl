@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use crate::vendor::GpuVendor;
 use crate::GpuInfo;
+use crate::vendor::GpuVendor;
 
 /// Why a survey has something to say beyond its device list.
 #[non_exhaustive]
@@ -114,7 +114,11 @@ pub struct GpuSurvey {
 impl GpuSurvey {
     /// Record a finding.
     pub(crate) fn note(&mut self, vendor: GpuVendor, kind: NoteKind, message: String) {
-        self.notes.push(SurveyNote { vendor, kind, message });
+        self.notes.push(SurveyNote {
+            vendor,
+            kind,
+            message,
+        });
     }
 
     /// Devices, or a caller-facing explanation of why there are none.
@@ -216,7 +220,11 @@ mod tests {
         // Masking to zero is the operator's own doing. Reporting it as a
         // missing driver would send them chasing the wrong thing.
         let mut s = GpuSurvey::default();
-        s.note(GpuVendor::Nvidia, NoteKind::MaskApplied, "hidden by mask".into());
+        s.note(
+            GpuVendor::Nvidia,
+            NoteKind::MaskApplied,
+            "hidden by mask".into(),
+        );
         let err = s.require_devices().unwrap_err();
         assert!(err.contains("no GPUs detected"), "got: {err}");
         assert!(!err.contains("hidden by mask"), "got: {err}");

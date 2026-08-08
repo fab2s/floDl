@@ -39,21 +39,21 @@
 //! }
 //! ```
 
-pub mod sampler;
-pub mod loader;
+pub(crate) mod budget;
 pub mod datasets;
 pub mod host_cache;
-pub mod records;
-pub(crate) mod budget;
+pub mod loader;
 pub(crate) mod prefetch;
+pub mod records;
 pub(crate) mod sample_cache;
+pub mod sampler;
 pub(crate) mod vram_pool;
 
-pub use sampler::{Sampler, RandomSampler, SequentialSampler, SplitSampler};
-pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
-pub use host_cache::{data_cache_dir, publish_atomically, resolve_cached, write_error};
-pub use records::FixedStrideRecords;
 pub(crate) use budget::prefetch_depth_from_vram;
+pub use host_cache::{data_cache_dir, publish_atomically, resolve_cached, write_error};
+pub use loader::{DataLoader, DataLoaderBuilder, EpochIterator};
+pub use records::FixedStrideRecords;
+pub use sampler::{RandomSampler, Sampler, SequentialSampler, SplitSampler};
 
 use crate::tensor::{Result, Tensor};
 
@@ -326,22 +326,21 @@ pub(crate) fn apply_transform(
         static TRANSFORM_PROBED: AtomicBool = AtomicBool::new(false);
         if !TRANSFORM_PROBED.swap(true, Ordering::Relaxed)
             && let (Ok(c1), Ok(c2)) = (deep_copy_rows(&tensors), deep_copy_rows(&tensors))
-                && let (Ok(a), Ok(b)) =
-                    ((transform.0)(c1, &keys), (transform.0)(c2, &keys))
-                {
-                    let identical = a.len() == b.len()
-                        && a.iter().zip(&b).all(|(x, y)| tensor_identical(x, y));
-                    assert!(
-                        identical,
-                        "flodl data: the delivery transform returned different \
+            && let (Ok(a), Ok(b)) = ((transform.0)(c1, &keys), (transform.0)(c2, &keys))
+        {
+            let identical =
+                a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| tensor_identical(x, y));
+            assert!(
+                identical,
+                "flodl data: the delivery transform returned different \
                          content for the same PickKeys. It must be a pure \
                          function of (rows, keys) — derive per-view randomness \
                          from PickKey::rng(), never from global RNG state, or \
                          augmentation stops being reproducible and the \
                          schedule stops being computable ahead. This probe \
                          runs in debug builds only."
-                    );
-                }
+            );
+        }
     }
     (transform.0)(tensors, &keys)
 }
@@ -367,7 +366,10 @@ fn deep_copy_rows(rows: &[Tensor]) -> Result<Vec<Tensor>> {
 #[cfg(debug_assertions)]
 pub(crate) fn assert_fetch_pure(what: &str, first: &[Tensor], second: &[Tensor]) {
     let identical = first.len() == second.len()
-        && first.iter().zip(second).all(|(a, b)| tensor_identical(a, b));
+        && first
+            .iter()
+            .zip(second)
+            .all(|(a, b)| tensor_identical(a, b));
     if identical {
         return;
     }
@@ -398,10 +400,7 @@ fn tensor_identical(a: &Tensor, b: &Tensor) -> bool {
     if n == 0 {
         return true;
     }
-    let eq_count = a
-        .eq_tensor(b)
-        .and_then(|e| e.sum())
-        .and_then(|s| s.item());
+    let eq_count = a.eq_tensor(b).and_then(|e| e.sum()).and_then(|s| s.item());
     match eq_count {
         Ok(c) if c as i64 == n => true,
         _ => match (a.to_f64_vec(), b.to_f64_vec()) {
@@ -445,10 +444,7 @@ impl<D: DataSet> DataSetAdapter<D> {
     }
 
     /// Adapter sharing `cache` with the loader that will budget it.
-    pub(crate) fn with_cache(
-        inner: D,
-        cache: std::sync::Arc<sample_cache::SampleCache>,
-    ) -> Self {
+    pub(crate) fn with_cache(inner: D, cache: std::sync::Arc<sample_cache::SampleCache>) -> Self {
         DataSetAdapter { inner, cache }
     }
 
@@ -716,10 +712,8 @@ mod tests {
 
         // NaN != NaN fails eq_tensor, but a pure dataset containing
         // NaNs must not be accused: the NaN-tolerant host pass accepts.
-        let n1 =
-            vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
-        let n2 =
-            vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
+        let n1 = vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
+        let n2 = vec![Tensor::from_f32(&[f32::NAN, 1.0], &[2], Device::CPU).unwrap()];
         assert_fetch_pure("DataSet::get", &n1, &n2);
 
         // Empty tensors are trivially identical.
@@ -805,8 +799,7 @@ mod tests {
     fn test_batch_dataset_from_promotes_dataset() {
         // The public promotion path (Trainer entries delegate here),
         // including through an already-erased Arc<dyn DataSet>.
-        let erased: std::sync::Arc<dyn DataSet> =
-            std::sync::Arc::new(make_simple_data(10));
+        let erased: std::sync::Arc<dyn DataSet> = std::sync::Arc::new(make_simple_data(10));
         let batched = batch_dataset_from(erased);
         assert_eq!(batched.len(), 10);
         let batch = batched.get_batch(&[7, 8]).unwrap();
@@ -821,8 +814,8 @@ mod tests {
         let batch = adapter.get_batch(&[5, 10, 15, 19]).unwrap();
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].shape(), &[4, 3, 8, 8]); // images
-        assert_eq!(batch[1].shape(), &[4, 26]);        // letters
-        assert_eq!(batch[2].shape(), &[4, 2]);          // cases
+        assert_eq!(batch[1].shape(), &[4, 26]); // letters
+        assert_eq!(batch[2].shape(), &[4, 2]); // cases
     }
 
     #[test]

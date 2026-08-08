@@ -44,7 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use flodl::{DType, Device, Graph, Result, Tensor, TensorError};
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 
 use crate::path::hf_key_from_flodl_key;
 
@@ -298,12 +298,10 @@ fn load_safetensors_core(
                  map to canonical key {canonical:?}",
             )));
         }
-        let view = st.tensor(name)
+        let view = st
+            .tensor(name)
             .map_err(|e| TensorError::new(&format!("safetensors tensor lookup {name}: {e}")))?;
-        actual_shapes.insert(
-            canonical,
-            view.shape().iter().map(|&s| s as i64).collect(),
-        );
+        actual_shapes.insert(canonical, view.shape().iter().map(|&s| s as i64).collect());
     }
 
     // Validate before touching any graph storage. If this fails, the graph
@@ -330,7 +328,8 @@ fn load_safetensors_core(
                  (validation should have caught this)",
             ))
         })?;
-        let view = st.tensor(original)
+        let view = st
+            .tensor(original)
             .map_err(|e| TensorError::new(&format!("safetensors tensor {original}: {e}")))?;
         let device = param.variable.data().device();
         let src = tensor_view_to_tensor(&view, device)?;
@@ -346,7 +345,8 @@ fn load_safetensors_core(
                 "canonical buffer key {hf_key:?} missing after rename",
             ))
         })?;
-        let view = st.tensor(original)
+        let view = st
+            .tensor(original)
             .map_err(|e| TensorError::new(&format!("safetensors tensor {original}: {e}")))?;
         let src = tensor_view_to_tensor(&view, buffer.device())?;
         buffer.set(src);
@@ -500,9 +500,8 @@ pub fn keys_have_pooler(keys: &[String]) -> bool {
 /// surfaced as `TensorError` with the path in the message for easier
 /// debugging.
 pub fn load_safetensors_file_into_graph(graph: &Graph, path: &Path) -> Result<()> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        TensorError::new(&format!("safetensors read {}: {e}", path.display()))
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| TensorError::new(&format!("safetensors read {}: {e}", path.display())))?;
     load_safetensors_into_graph(graph, &bytes)
 }
 
@@ -517,9 +516,8 @@ pub fn load_safetensors_file_into_graph_with_rename<F>(
 where
     F: Fn(&str) -> String,
 {
-    let bytes = std::fs::read(path).map_err(|e| {
-        TensorError::new(&format!("safetensors read {}: {e}", path.display()))
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| TensorError::new(&format!("safetensors read {}: {e}", path.display())))?;
     load_safetensors_into_graph_with_rename(graph, &bytes, rename)
 }
 
@@ -581,12 +579,12 @@ pub fn save_safetensors_from_graph(graph: &Graph) -> Result<Vec<u8>> {
         entries.insert(hf_key, (dtype_to_safetensors(dtype)?, shape, bytes));
     }
 
-    let views: HashMap<String, TensorView<'_>> = entries.iter()
+    let views: HashMap<String, TensorView<'_>> = entries
+        .iter()
         .map(|(k, (dtype, shape, bytes))| {
-            let view = TensorView::new(*dtype, shape.clone(), bytes.as_slice())
-                .map_err(|e| TensorError::new(&format!(
-                    "safetensors view build for {k:?}: {e}",
-                )))?;
+            let view = TensorView::new(*dtype, shape.clone(), bytes.as_slice()).map_err(|e| {
+                TensorError::new(&format!("safetensors view build for {k:?}: {e}",))
+            })?;
             Ok::<(String, TensorView<'_>), TensorError>((k.clone(), view))
         })
         .collect::<std::result::Result<_, _>>()?;
@@ -616,9 +614,8 @@ fn dtype_to_safetensors(dtype: DType) -> Result<Dtype> {
 /// the message for easier debugging.
 pub fn save_safetensors_file_from_graph(graph: &Graph, path: &Path) -> Result<()> {
     let bytes = save_safetensors_from_graph(graph)?;
-    std::fs::write(path, &bytes).map_err(|e| {
-        TensorError::new(&format!("safetensors write {}: {e}", path.display()))
-    })
+    std::fs::write(path, &bytes)
+        .map_err(|e| TensorError::new(&format!("safetensors write {}: {e}", path.display())))
 }
 
 /// Materialise a safetensors `TensorView` as a `Tensor` on
@@ -658,7 +655,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
         Dtype::F32 => {
             if bytes.len() % 4 != 0 {
                 return Err(TensorError::new(&format!(
-                    "F32 tensor byte length {} is not a multiple of 4", bytes.len(),
+                    "F32 tensor byte length {} is not a multiple of 4",
+                    bytes.len(),
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 4);
@@ -670,14 +668,14 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
         Dtype::F64 => {
             if bytes.len() % 8 != 0 {
                 return Err(TensorError::new(&format!(
-                    "F64 tensor byte length {} is not a multiple of 8", bytes.len(),
+                    "F64 tensor byte length {} is not a multiple of 8",
+                    bytes.len(),
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 8);
             for chunk in bytes.chunks_exact(8) {
                 let bits = f64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                    chunk[4], chunk[5], chunk[6], chunk[7],
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
                 ]);
                 // Matches PyTorch's `.to(torch.float32)`: IEEE 754 narrowing,
                 // overflow saturates silently to ±inf, precision rounds to
@@ -690,7 +688,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
         Dtype::BF16 => {
             if bytes.len() % 2 != 0 {
                 return Err(TensorError::new(&format!(
-                    "BF16 tensor byte length {} is not a multiple of 2", bytes.len(),
+                    "BF16 tensor byte length {} is not a multiple of 2",
+                    bytes.len(),
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -704,7 +703,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
         Dtype::F16 => {
             if bytes.len() % 2 != 0 {
                 return Err(TensorError::new(&format!(
-                    "F16 tensor byte length {} is not a multiple of 2", bytes.len(),
+                    "F16 tensor byte length {} is not a multiple of 2",
+                    bytes.len(),
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 2);

@@ -20,16 +20,14 @@ fn detect_downloader() -> Result<Downloader, String> {
     } else if has_command("wget") {
         Ok(Downloader::Wget)
     } else {
-        Err(
-            "Neither curl nor wget is installed.\n\
+        Err("Neither curl nor wget is installed.\n\
              Install one of them:\n\
              \n\
              \x20 Ubuntu/Debian:  sudo apt install curl\n\
              \x20 Fedora/RHEL:    sudo dnf install curl\n\
              \x20 macOS:          available by default\n\
              \x20 Windows 10+:    curl.exe is built-in"
-                .into(),
-        )
+            .into())
     }
 }
 

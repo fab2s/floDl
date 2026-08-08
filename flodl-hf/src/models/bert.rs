@@ -24,11 +24,15 @@
 
 use std::collections::HashMap;
 
-use flodl::nn::{Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter};
-use flodl::{DType, Device, FlowBuilder, Graph, Result, Tensor, TensorError, TensorOptions, Variable};
+use flodl::nn::{
+    Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter,
+};
+use flodl::{
+    DType, Device, FlowBuilder, Graph, Result, Tensor, TensorError, TensorOptions, Variable,
+};
 
 use crate::models::transformer_layer::{LayerNaming, TransformerLayer, TransformerLayerConfig};
-use crate::path::{prefix_params, HfPath};
+use crate::path::{HfPath, prefix_params};
 
 /// Convert a `[batch, seq_len]` attention mask (0 = mask, 1 = attend,
 /// any numeric dtype) into a `[batch, 1, 1, seq_len]` additive f32 mask
@@ -145,16 +149,16 @@ impl BertConfig {
         let num_labels = parse_num_labels(&v, id2label.as_deref());
         let architectures = parse_architectures(&v);
         Ok(BertConfig {
-            vocab_size:              required_i64(&v, "vocab_size")?,
-            hidden_size:             required_i64(&v, "hidden_size")?,
-            num_hidden_layers:       required_i64(&v, "num_hidden_layers")?,
-            num_attention_heads:     required_i64(&v, "num_attention_heads")?,
-            intermediate_size:       required_i64(&v, "intermediate_size")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
+            hidden_size: required_i64(&v, "hidden_size")?,
+            num_hidden_layers: required_i64(&v, "num_hidden_layers")?,
+            num_attention_heads: required_i64(&v, "num_attention_heads")?,
+            intermediate_size: required_i64(&v, "intermediate_size")?,
             max_position_embeddings: required_i64(&v, "max_position_embeddings")?,
-            type_vocab_size:         required_i64(&v, "type_vocab_size")?,
-            pad_token_id:            optional_i64_or_none(&v, "pad_token_id"),
-            layer_norm_eps:               optional_f64(&v, "layer_norm_eps", 1e-12),
-            hidden_dropout_prob:          optional_f64(&v, "hidden_dropout_prob", 0.1),
+            type_vocab_size: required_i64(&v, "type_vocab_size")?,
+            pad_token_id: optional_i64_or_none(&v, "pad_token_id"),
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-12),
+            hidden_dropout_prob: optional_f64(&v, "hidden_dropout_prob", 0.1),
             attention_probs_dropout_prob: optional_f64(&v, "attention_probs_dropout_prob", 0.1),
             hidden_act: optional_hidden_act(&v, "hidden_act", "gelu")?,
             num_labels,
@@ -198,7 +202,10 @@ impl BertConfig {
         m.insert("vocab_size".into(), self.vocab_size.into());
         m.insert("hidden_size".into(), self.hidden_size.into());
         m.insert("num_hidden_layers".into(), self.num_hidden_layers.into());
-        m.insert("num_attention_heads".into(), self.num_attention_heads.into());
+        m.insert(
+            "num_attention_heads".into(),
+            self.num_attention_heads.into(),
+        );
         m.insert("intermediate_size".into(), self.intermediate_size.into());
         m.insert(
             "max_position_embeddings".into(),
@@ -209,7 +216,10 @@ impl BertConfig {
             m.insert("pad_token_id".into(), pad.into());
         }
         m.insert("layer_norm_eps".into(), self.layer_norm_eps.into());
-        m.insert("hidden_dropout_prob".into(), self.hidden_dropout_prob.into());
+        m.insert(
+            "hidden_dropout_prob".into(),
+            self.hidden_dropout_prob.into(),
+        );
         m.insert(
             "attention_probs_dropout_prob".into(),
             self.attention_probs_dropout_prob.into(),
@@ -285,7 +295,9 @@ impl BertEmbeddings {
 }
 
 impl Module for BertEmbeddings {
-    fn name(&self) -> &str { "bert_embeddings" }
+    fn name(&self) -> &str {
+        "bert_embeddings"
+    }
 
     /// Single-input forward path: word ids only. Position and token-type
     /// embeddings are skipped, which is useful for narrow unit tests but
@@ -299,14 +311,25 @@ impl Module for BertEmbeddings {
 
     fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("word_embeddings", self.word_embeddings.parameters()));
-        out.extend(prefix_params("position_embeddings", self.position_embeddings.parameters()));
-        out.extend(prefix_params("token_type_embeddings", self.token_type_embeddings.parameters()));
+        out.extend(prefix_params(
+            "word_embeddings",
+            self.word_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "position_embeddings",
+            self.position_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "token_type_embeddings",
+            self.token_type_embeddings.parameters(),
+        ));
         out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.dropout.set_training(training);
@@ -352,11 +375,13 @@ impl BertPooler {
 }
 
 impl Module for BertPooler {
-    fn name(&self) -> &str { "bert_pooler" }
+    fn name(&self) -> &str {
+        "bert_pooler"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         // input: [batch, seq_len, hidden] → take index 0 along seq axis.
-        let cls = input.select(1, 0)?;   // [batch, hidden]
+        let cls = input.select(1, 0)?; // [batch, hidden]
         let pooled = self.dense.forward(&cls)?;
         pooled.tanh()
     }
@@ -400,7 +425,9 @@ impl BertPredictionHeadTransform {
 }
 
 impl Module for BertPredictionHeadTransform {
-    fn name(&self) -> &str { "bert_prediction_head_transform" }
+    fn name(&self) -> &str {
+        "bert_prediction_head_transform"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let x = self.dense.forward(input)?;
@@ -409,8 +436,8 @@ impl Module for BertPredictionHeadTransform {
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        let mut out = prefix_params("dense",     self.dense.parameters());
-        out.extend(   prefix_params("LayerNorm", self.layer_norm.parameters()));
+        let mut out = prefix_params("dense", self.dense.parameters());
+        out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 }
@@ -421,13 +448,13 @@ impl Module for BertPredictionHeadTransform {
 /// consumes. Localizes the field-name mapping in one place.
 fn bert_layer_config(config: &BertConfig) -> TransformerLayerConfig {
     TransformerLayerConfig {
-        hidden_size:                  config.hidden_size,
-        num_attention_heads:          config.num_attention_heads,
-        intermediate_size:            config.intermediate_size,
-        hidden_dropout_prob:          config.hidden_dropout_prob,
+        hidden_size: config.hidden_size,
+        num_attention_heads: config.num_attention_heads,
+        intermediate_size: config.intermediate_size,
+        hidden_dropout_prob: config.hidden_dropout_prob,
         attention_probs_dropout_prob: config.attention_probs_dropout_prob,
-        layer_norm_eps:               config.layer_norm_eps,
-        hidden_act:                   config.hidden_act,
+        layer_norm_eps: config.layer_norm_eps,
+        hidden_act: config.hidden_act,
     }
 }
 
@@ -463,7 +490,11 @@ fn bert_backbone_flow(
     for i in 0..config.num_hidden_layers {
         let tag = layer_root.sub(i).to_string();
         fb = fb
-            .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::BERT, device)?)
+            .through(TransformerLayer::on_device(
+                &layer_cfg,
+                LayerNaming::BERT,
+                device,
+            )?)
             .tag(&tag)
             .using(&["attention_mask"]);
     }
@@ -516,10 +547,10 @@ impl BertModel {
 
 // ── Task heads ───────────────────────────────────────────────────────────
 
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead,
-};
 pub use crate::task_heads::{Answer, TokenPrediction};
+use crate::task_heads::{
+    ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead, check_num_labels,
+};
 
 /// BERT graphs take four `forward_multi` inputs — `input_ids`,
 /// `position_ids`, `token_type_ids`, and an extended attention mask —
@@ -567,18 +598,19 @@ impl ClassificationHead<BertConfig> {
     /// Build the full graph (backbone + classifier head) on `device`
     /// without loading any weights. `num_labels` determines the head's
     /// output dimension; `id2label` falls back to `["LABEL_0", ...]`.
-    pub fn on_device(
-        config: &BertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &BertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = bert_backbone_flow(config, device, /*with_pooler=*/ true)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     /// Resolve `num_labels` from config if present; error otherwise.
@@ -613,18 +645,19 @@ pub type BertForTokenClassification = TaggingHead<BertConfig>;
 
 impl TaggingHead<BertConfig> {
     /// Build the full graph (backbone without pooler + classifier head).
-    pub fn on_device(
-        config: &BertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &BertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = bert_backbone_flow(config, device, /*with_pooler=*/ false)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &BertConfig) -> Result<i64> {
@@ -726,7 +759,11 @@ impl MaskedLmHead<BertConfig> {
         for i in 0..config.num_hidden_layers {
             let tag = layer_root.sub(i).to_string();
             fb = fb
-                .through(TransformerLayer::on_device(&layer_cfg, LayerNaming::BERT, device)?)
+                .through(TransformerLayer::on_device(
+                    &layer_cfg,
+                    LayerNaming::BERT,
+                    device,
+                )?)
                 .tag(&tag)
                 .using(&["attention_mask"]);
         }
@@ -737,7 +774,10 @@ impl MaskedLmHead<BertConfig> {
         let decoder_bias = Parameter::new(
             Tensor::zeros(
                 &[config.vocab_size],
-                TensorOptions { dtype: DType::Float32, device },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device,
+                },
             )?,
             "bias",
         );

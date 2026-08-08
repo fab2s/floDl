@@ -32,9 +32,9 @@ fn header_reachable(header: &str, root_include: &Path) -> bool {
         && stdin
             .write_all(format!("#include <{header}>\n").as_bytes())
             .is_err()
-        {
-            return false;
-        }
+    {
+        return false;
+    }
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
@@ -73,8 +73,7 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let libtorch = env::var("LIBTORCH_PATH")
-        .unwrap_or_else(|_| "/usr/local/libtorch".to_string());
+    let libtorch = env::var("LIBTORCH_PATH").unwrap_or_else(|_| "/usr/local/libtorch".to_string());
     let libtorch = PathBuf::from(&libtorch);
 
     // Preflight: confirm libtorch is actually present before cc::Build
@@ -87,8 +86,7 @@ fn main() {
     // (`include/torch/csrc/api/include`); presence here is the
     // canonical "libtorch is installed" sentinel for both the
     // pre-built and source-built variants.
-    let torch_header = libtorch
-        .join("include/torch/csrc/api/include/torch/torch.h");
+    let torch_header = libtorch.join("include/torch/csrc/api/include/torch/torch.h");
     if !torch_header.exists() {
         eprintln!(
             "\nflodl-sys: libtorch not found at `{}`\n\
@@ -176,7 +174,7 @@ fn main() {
         ("hipblaslt/hipblaslt.h", "hipblaslt-dev"),
         ("hipsolver/hipsolver.h", "hipsolver-dev"),
         ("hipsparse/hipsparse.h", "hipsparse-dev"),
-];
+    ];
     const CUDA_HEADERS: &[(&str, &str)] = &[
         ("cuda_runtime.h", "cuda-cudart-dev-<M>-<m>"),
         ("crt/host_config.h", "cuda-crt-<M>-<m>"),
@@ -184,12 +182,18 @@ fn main() {
         ("cusolverDn.h", "libcusolver-dev-<M>-<m>"),
         ("cusparse.h", "libcusparse-dev-<M>-<m>"),
         ("nccl.h", "libnccl-dev"),
-];
+    ];
 
     let toolkit = if want_rocm {
         Some(("rocm", &rocm_path, "ROCM_PATH", "/opt/rocm", ROCM_HEADERS))
     } else if want_cuda {
-        Some(("cuda", &cuda_home, "CUDA_HOME", "/usr/local/cuda", CUDA_HEADERS))
+        Some((
+            "cuda",
+            &cuda_home,
+            "CUDA_HOME",
+            "/usr/local/cuda",
+            CUDA_HEADERS,
+        ))
     } else {
         None
     };
@@ -305,7 +309,10 @@ fn main() {
     build.compile("flodl_shim");
 
     // Link libtorch shared libraries
-    println!("cargo:rustc-link-search=native={}", libtorch.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        libtorch.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=dylib=torch");
     println!("cargo:rustc-link-lib=dylib=torch_cpu");
     println!("cargo:rustc-link-lib=dylib=c10");
@@ -338,8 +345,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=torch_cuda");
         println!("cargo:rustc-link-lib=dylib=c10_cuda");
 
-        let cuda_home = env::var("CUDA_HOME")
-            .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+        let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         println!("cargo:rustc-link-search=native={}/lib64", cuda_home);
         println!("cargo:rustc-link-lib=dylib=cudart");
 

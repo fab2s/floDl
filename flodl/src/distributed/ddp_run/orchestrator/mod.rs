@@ -1,13 +1,13 @@
 //! DDP run-mode orchestrator: spawns GPU worker threads and a coordinator thread.
 
-mod rank_entry;
-mod coord_config;
-mod single_host;
-mod handle;
 mod builder;
+mod coord_config;
+mod handle;
+mod rank_entry;
+mod single_host;
 
-pub use handle::DdpHandle;
 pub use builder::DdpBuilder;
+pub use handle::DdpHandle;
 /// Crate-wide export: every force-exiting cluster role (launcher, relay,
 /// agent, rank death, cooperative Worker drop) must terminate through this
 /// instead of `std::process::exit` — see its doc for the libtorch

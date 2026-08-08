@@ -1,8 +1,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use super::trend::{Trend, TrendGroup};
 use super::Graph;
+use super::trend::{Trend, TrendGroup};
 
 /// Per-node execution time from a single Forward pass.
 #[derive(Clone, Debug)]
@@ -78,9 +78,7 @@ impl fmt::Display for Profile {
             }
             writeln!(f)?;
 
-            while node_idx < self.nodes.len()
-                && self.nodes[node_idx].level == level.index
-            {
+            while node_idx < self.nodes.len() && self.nodes[node_idx].level == level.index {
                 let n = &self.nodes[node_idx];
                 let mut label = n.id.clone();
                 if !n.tag.is_empty() {

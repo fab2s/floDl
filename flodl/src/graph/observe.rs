@@ -26,9 +26,9 @@ impl Reduce {
         }
         let scalar = match self {
             Reduce::Mean => t.mean()?,
-            Reduce::Sum  => t.sum()?,
-            Reduce::Max  => t.max()?,
-            Reduce::Min  => t.min()?,
+            Reduce::Sum => t.sum()?,
+            Reduce::Max => t.max()?,
+            Reduce::Min => t.min()?,
             Reduce::Norm => t.norm()?,
         };
         scalar.item()
@@ -65,7 +65,8 @@ impl Graph {
                     Err(_) => {
                         return Err(TensorError::new(&format!(
                             "tag {:?} has shape {:?} (not scalar); use collect_with() to specify a reduction",
-                            tag, var.shape()
+                            tag,
+                            var.shape()
                         )));
                     }
                 }
@@ -114,7 +115,10 @@ impl Graph {
                 order.push(tag.to_string());
             }
         }
-        buffer.entry(tag.to_string()).or_default().extend_from_slice(values);
+        buffer
+            .entry(tag.to_string())
+            .or_default()
+            .extend_from_slice(values);
     }
 
     /// Record a single scalar value. Convenience wrapper around [`record`](Self::record).
@@ -144,16 +148,17 @@ impl Graph {
         // single-GPU / standalone runs fall through to the local
         // history below.
         if let Ok(slot) = self.aggregated_metrics.lock()
-            && let Some(ref m) = *slot {
-                let mut out = Vec::with_capacity(m.scalars.len() + 1);
-                out.push(("loss".to_string(), m.avg_loss));
-                let mut keys: Vec<&String> = m.scalars.keys().collect();
-                keys.sort();
-                for k in keys {
-                    out.push((k.clone(), m.scalars[k]));
-                }
-                return out;
+            && let Some(ref m) = *slot
+        {
+            let mut out = Vec::with_capacity(m.scalars.len() + 1);
+            out.push(("loss".to_string(), m.avg_loss));
+            let mut keys: Vec<&String> = m.scalars.keys().collect();
+            keys.sort();
+            for k in keys {
+                out.push((k.clone(), m.scalars[k]));
             }
+            return out;
+        }
         let mut metrics = self.latest_metrics_local();
         // Collect from labeled children with dotted prefixes
         for (label, &ni) in &self.children {
@@ -206,14 +211,20 @@ impl Graph {
         order
             .iter()
             .filter_map(|tag| {
-                history.get(tag).and_then(|vals| vals.last().map(|&v| (tag.clone(), v)))
+                history
+                    .get(tag)
+                    .and_then(|vals| vals.last().map(|&v| (tag.clone(), v)))
             })
             .collect()
     }
 
     /// Read raw batch buffer for a tag (all values since last flush).
     pub fn collected(&self, tag: &str) -> Vec<f64> {
-        self.batch_buffer.borrow().get(tag).cloned().unwrap_or_default()
+        self.batch_buffer
+            .borrow()
+            .get(tag)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Compute batch means, append to epoch history, clear batch buffer.
@@ -275,9 +286,9 @@ impl Graph {
         if flushed_any {
             let count = self.flush_count.get();
             self.flush_count.set(count + 1);
-            self.flush_times.borrow_mut().push(
-                super::instant_secs() - self.training_start.get(),
-            );
+            self.flush_times
+                .borrow_mut()
+                .push(super::instant_secs() - self.training_start.get());
         }
     }
 

@@ -24,7 +24,12 @@ fn test_checkpoint_fn_called_on_dispatch() {
         Ok(())
     }));
 
-    ch.control_tx.send(ControlMsg::Checkpoint { version: 7, target_rank: 0 }).unwrap();
+    ch.control_tx
+        .send(ControlMsg::Checkpoint {
+            version: 7,
+            target_rank: 0,
+        })
+        .unwrap();
     worker.handle_control().unwrap();
 
     assert_eq!(called_version.load(Ordering::Relaxed), 7);
@@ -33,11 +38,14 @@ fn test_checkpoint_fn_called_on_dispatch() {
 #[test]
 fn test_checkpoint_error_logged_not_propagated() {
     let (mut worker, ch) = make_test_worker();
-    worker.checkpoint_fn = Some(Arc::new(|_ver, _model| {
-        Err(TensorError::new("disk full"))
-    }));
+    worker.checkpoint_fn = Some(Arc::new(|_ver, _model| Err(TensorError::new("disk full"))));
 
-    ch.control_tx.send(ControlMsg::Checkpoint { version: 1, target_rank: 0 }).unwrap();
+    ch.control_tx
+        .send(ControlMsg::Checkpoint {
+            version: 1,
+            target_rank: 0,
+        })
+        .unwrap();
     // Should not return an error: log-and-continue
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
@@ -158,9 +166,7 @@ fn test_drain_pending_shutdown_consumes_queued_shutdown() {
     assert!(worker.drain_pending_shutdown());
 
     // Queue a non-shutdown frame → returns false, frame dropped.
-    ch.control_tx
-        .send(ControlMsg::SetGlobalStep(42))
-        .unwrap();
+    ch.control_tx.send(ControlMsg::SetGlobalStep(42)).unwrap();
     assert!(!worker.drain_pending_shutdown());
 }
 
@@ -205,19 +211,18 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
     // expected to be written. Controller-side meta-write coverage
     // lives in cluster_coordinator tests.
     let dev = test_device();
-    let dir = std::env::temp_dir().join(format!(
-        "flodl_shutdown_with_save_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("flodl_shutdown_with_save_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let stem = dir.join("ckpt_final");
     let stem_str = stem.to_str().unwrap().to_string();
 
     let tmp_model = Linear::on_device(4, 2, dev).unwrap();
-    let tmp_params: Vec<Tensor> =
-        tmp_model.parameters().iter().map(|p| p.variable.data()).collect();
-    let tmp_buffers: Vec<Tensor> =
-        tmp_model.buffers().iter().map(|b| b.get()).collect();
+    let tmp_params: Vec<Tensor> = tmp_model
+        .parameters()
+        .iter()
+        .map(|p| p.variable.data())
+        .collect();
+    let tmp_buffers: Vec<Tensor> = tmp_model.buffers().iter().map(|b| b.get()).collect();
     drop(tmp_model);
 
     let config = WorkerConfig {
@@ -252,8 +257,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
     };
     let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), ch) =
         GpuWorker::<Linear>::channels();
-    let dataset: Arc<dyn crate::data::BatchDataSet> =
-        Arc::new(TestDataset { n: 16 });
+    let dataset: Arc<dyn crate::data::BatchDataSet> = Arc::new(TestDataset { n: 16 });
     let mut worker = GpuWorker::new(
         &config,
         |d| Linear::on_device(4, 2, d),
@@ -284,13 +288,19 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
     // present at save_path. `.meta.json` is NOT written here —
     // that's the controller's responsibility (see
     // `cluster_coordinator::dispatch_shutdown_with_save`).
-    let model_path =
-        crate::distributed::CheckpointBundle::model_path(&stem_str);
-    let optim_path =
-        crate::distributed::CheckpointBundle::optim_path(&stem_str);
+    let model_path = crate::distributed::CheckpointBundle::model_path(&stem_str);
+    let optim_path = crate::distributed::CheckpointBundle::optim_path(&stem_str);
     let meta_path = crate::distributed::CheckpointBundle::meta_path(&stem_str);
-    assert!(model_path.exists(), "model file missing: {}", model_path.display());
-    assert!(optim_path.exists(), "optim file missing: {}", optim_path.display());
+    assert!(
+        model_path.exists(),
+        "model file missing: {}",
+        model_path.display()
+    );
+    assert!(
+        optim_path.exists(),
+        "optim file missing: {}",
+        optim_path.display()
+    );
     assert!(
         !meta_path.exists(),
         "meta file should NOT be written by worker (controller's job): {}",
@@ -323,7 +333,6 @@ fn shutdown_with_save_no_path_exits_without_write() {
 // Coordinator's epoch-cadence checkpoint trigger; it was removed with the
 // engine. The process path's checkpoint cadence is covered under
 // `cluster_coordinator/tests/`.
-
 
 // 2-GPU end-to-end DDP validation lived here via the in-process engine
 // (`DdpHandle::auto` + thread-per-GPU). That engine was removed; multi-GPU

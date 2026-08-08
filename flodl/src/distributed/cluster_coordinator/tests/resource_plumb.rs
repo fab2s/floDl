@@ -41,10 +41,17 @@ fn drain_metrics_deposits_host_qualified_rank_samples() {
     coord.drain_metrics();
 
     let deposited = tl.rank_samples();
-    assert_eq!(deposited.len(), 1, "one resource-bearing frame → one deposit");
+    assert_eq!(
+        deposited.len(),
+        1,
+        "one resource-bearing frame → one deposit"
+    );
     let s = &deposited[0];
     assert_eq!(s.rank, 1);
-    assert_eq!(s.host, "flodl-pascal", "host resolved from rank_hosts by rank");
+    assert_eq!(
+        s.host, "flodl-pascal",
+        "host resolved from rank_hosts by rank"
+    );
     assert_eq!(s.cpu_util, Some(41.0));
     assert_eq!(s.ram_used_bytes, Some(3_000_000_000));
     assert_eq!(s.ram_total_bytes, None, "unsampled fields stay None");
@@ -61,8 +68,7 @@ fn drain_metrics_deposits_host_qualified_rank_samples() {
 #[test]
 fn drain_metrics_resourceless_frames_and_missing_topology() {
     let tl = Timeline::new(1000);
-    let mut coord =
-        ClusterCoordinator::for_test(cfg_sync_cpu(2).timeline(tl.clone()));
+    let mut coord = ClusterCoordinator::for_test(cfg_sync_cpu(2).timeline(tl.clone()));
     let tx = coord.test_metrics_sender();
 
     tx.send(MetricsMsgWire {
@@ -82,7 +88,14 @@ fn drain_metrics_resourceless_frames_and_missing_topology() {
     coord.drain_metrics();
 
     let deposited = tl.rank_samples();
-    assert_eq!(deposited.len(), 1, "only the resource-bearing frame deposits");
+    assert_eq!(
+        deposited.len(),
+        1,
+        "only the resource-bearing frame deposits"
+    );
     assert_eq!(deposited[0].rank, 1);
-    assert_eq!(deposited[0].host, "", "no topology → empty host, not a panic");
+    assert_eq!(
+        deposited[0].host, "",
+        "no topology → empty host, not a panic"
+    );
 }

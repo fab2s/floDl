@@ -22,7 +22,7 @@ fn test_worker_snapshot_params() {
 
     // Verify snapshot tensors have the right shapes
     assert_eq!(snap.params[0].shape(), &[2, 4]); // weight
-    assert_eq!(snap.params[1].shape(), &[2]);     // bias
+    assert_eq!(snap.params[1].shape(), &[2]); // bias
 }
 
 #[test]
@@ -48,7 +48,10 @@ fn test_worker_load_averaged() {
 
     // Create "averaged" params on CPU (mirrors the real averaging path where
     // coordinator produces CPU tensors). copy_ handles the H2D transfer.
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     let new_weight = Tensor::ones(&[2, 4], cpu).unwrap();
     let new_bias = Tensor::ones(&[2], cpu).unwrap();
 
@@ -74,9 +77,15 @@ fn test_worker_load_averaged() {
     // Verify model params now contain all ones
     let snap = worker.snapshot_params();
     let w_sum: f64 = snap.params[0].sum().unwrap().item().unwrap();
-    assert!((w_sum - 8.0).abs() < 1e-5, "weight should be all ones (sum=8), got {w_sum}");
+    assert!(
+        (w_sum - 8.0).abs() < 1e-5,
+        "weight should be all ones (sum=8), got {w_sum}"
+    );
     let b_sum: f64 = snap.params[1].sum().unwrap().item().unwrap();
-    assert!((b_sum - 2.0).abs() < 1e-5, "bias should be all ones (sum=2), got {b_sum}");
+    assert!(
+        (b_sum - 2.0).abs() < 1e-5,
+        "bias should be all ones (sum=2), got {b_sum}"
+    );
 }
 
 #[test]
@@ -90,7 +99,10 @@ fn test_worker_load_averaged_bf16_update() {
     // All values bf16-exact, so nothing is lost to rounding.
     let (mut worker, _ch) = make_test_worker();
 
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     let new_weight = Tensor::full(&[2, 4], 3.0, cpu)
         .unwrap()
         .to_dtype(DType::BFloat16)
@@ -150,7 +162,10 @@ fn test_worker_load_averaged_easgd_blends() {
     let pre_w = worker.param_vars[0].data().to_f32_vec().unwrap();
     let pre_b = worker.param_vars[1].data().to_f32_vec().unwrap();
 
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     // Named once and reused by the expectations below: the assertion has to
     // blend against the SAME values the update carries, and two copies of a
     // literal can drift apart without failing.
@@ -201,7 +216,10 @@ fn test_worker_load_averaged_easgd_blends_bf16_update() {
 
     let pre_w = worker.param_vars[0].data().to_f32_vec().unwrap();
 
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     let avg_w_val = 3.0; // bf16-exact
     let update = AveragedParams {
         params: vec![
@@ -246,7 +264,10 @@ fn test_update_subtracts_snapshot_steps_not_zeroes() {
     // Overshoot: 3 more steps land while the averaging round-trips.
     worker.set_steps_since_avg(worker.steps_since_avg() + 3);
 
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     let update = AveragedParams {
         params: vec![
             Tensor::ones(&[2, 4], cpu).unwrap(),
@@ -258,7 +279,11 @@ fn test_update_subtracts_snapshot_steps_not_zeroes() {
     worker.dispatch_control(ControlMsg::Update(update)).unwrap();
 
     // The 5 shipped steps are consumed; the 3 overshoot steps remain.
-    assert_eq!(worker.steps_since_avg(), 3, "overshoot steps must keep their mass credit");
+    assert_eq!(
+        worker.steps_since_avg(),
+        3,
+        "overshoot steps must keep their mass credit"
+    );
 
     // A spurious second Update must subtract 0 (marker was reset), not
     // re-subtract the stale snapshot count.
@@ -270,8 +295,14 @@ fn test_update_subtracts_snapshot_steps_not_zeroes() {
         buffers: vec![],
         version: 2,
     };
-    worker.dispatch_control(ControlMsg::Update(update2)).unwrap();
-    assert_eq!(worker.steps_since_avg(), 3, "second Update without a snapshot subtracts nothing");
+    worker
+        .dispatch_control(ControlMsg::Update(update2))
+        .unwrap();
+    assert_eq!(
+        worker.steps_since_avg(),
+        3,
+        "second Update without a snapshot subtracts nothing"
+    );
 }
 
 #[test]
@@ -286,7 +317,10 @@ fn test_snapshot_never_aliases_live_params() {
     let before: f64 = snap.params[0].sum().unwrap().item().unwrap();
 
     // Mutate the live weight in place (what an optimizer step does).
-    let cpu = TensorOptions { dtype: DType::Float32, device: Device::CPU };
+    let cpu = TensorOptions {
+        dtype: DType::Float32,
+        device: Device::CPU,
+    };
     let ones = Tensor::ones(&[2, 4], cpu).unwrap();
     crate::autograd::no_grad(|| -> crate::tensor::Result<()> {
         let live = worker.param_vars[0].data();
@@ -349,7 +383,12 @@ fn test_worker_report_timing() {
 
     let msg = ch.timing_rx.recv().unwrap();
     match msg {
-        TimingMsg::Batch { rank, batch_ms, step_count, .. } => {
+        TimingMsg::Batch {
+            rank,
+            batch_ms,
+            step_count,
+            ..
+        } => {
             assert_eq!(rank, 0);
             assert!((batch_ms - 12.5).abs() < 1e-10);
             assert_eq!(step_count, 0);
@@ -362,7 +401,9 @@ fn test_worker_report_timing() {
 fn test_worker_report_epoch() {
     let (worker, ch) = make_test_worker();
 
-    worker.report_epoch(0.5, 100, 5000.0, 5000.0, 0.0, 0.0).unwrap();
+    worker
+        .report_epoch(0.5, 100, 5000.0, 5000.0, 0.0, 0.0)
+        .unwrap();
 
     let msg = ch.metrics_rx.recv().unwrap();
     assert_eq!(msg.rank, 0);
@@ -389,7 +430,10 @@ fn test_worker_handle_control_request_params() {
 fn test_worker_handle_control_update() {
     let (mut worker, ch) = make_test_worker();
     let dev = test_device();
-    let opts = TensorOptions { dtype: DType::Float32, device: dev };
+    let opts = TensorOptions {
+        dtype: DType::Float32,
+        device: dev,
+    };
 
     let update = AveragedParams {
         params: vec![
@@ -412,9 +456,13 @@ fn test_worker_handle_control_start_epoch() {
 
     assert!(worker.pending_plan.is_none());
 
-    ch.control_tx.send(ControlMsg::StartEpoch(EpochPlan {
-        epoch: 1, partition_offset: 0, partition_size: 750,
-    })).unwrap();
+    ch.control_tx
+        .send(ControlMsg::StartEpoch(EpochPlan {
+            epoch: 1,
+            partition_offset: 0,
+            partition_size: 750,
+        }))
+        .unwrap();
     worker.handle_control().unwrap();
 
     let plan = worker.pending_plan.take();
@@ -496,20 +544,45 @@ fn test_worker_channels_create() {
         GpuWorker::<Linear>::channels();
 
     // Verify channel pairs work
-    timing_tx.send(TimingMsg::Batch { rank: 0, batch_ms: 1.0, data_ms: 0.0, step_count: 0, param_norm: None, batch_loss: 0.1, sync_divergence: None }).unwrap();
+    timing_tx
+        .send(TimingMsg::Batch {
+            rank: 0,
+            batch_ms: 1.0,
+            data_ms: 0.0,
+            step_count: 0,
+            param_norm: None,
+            batch_loss: 0.1,
+            sync_divergence: None,
+        })
+        .unwrap();
     let msg = ch.timing_rx.recv().unwrap();
     assert!(matches!(msg, TimingMsg::Batch { rank: 0, .. }));
 
-    metrics_tx.send(MetricsMsg {
-        rank: 0, epoch: 0, avg_loss: 0.5, batches_processed: 10, epoch_ms: 100.0, share_complete_ms: 100.0, compute_only_ms: 100.0, data_starve_ms: 0.0,
-        samples_processed: 320, scalars: HashMap::new(),
-    }).unwrap();
+    metrics_tx
+        .send(MetricsMsg {
+            rank: 0,
+            epoch: 0,
+            avg_loss: 0.5,
+            batches_processed: 10,
+            epoch_ms: 100.0,
+            share_complete_ms: 100.0,
+            compute_only_ms: 100.0,
+            data_starve_ms: 0.0,
+            samples_processed: 320,
+            scalars: HashMap::new(),
+        })
+        .unwrap();
     let msg = ch.metrics_rx.recv().unwrap();
     assert_eq!(msg.batches_processed, 10);
 
-    param_tx.send(ParamSnapshot {
-        rank: 0, params: vec![], buffers: vec![], batch_count: 0,
-    }).unwrap();
+    param_tx
+        .send(ParamSnapshot {
+            rank: 0,
+            params: vec![],
+            buffers: vec![],
+            batch_count: 0,
+        })
+        .unwrap();
     let snap = ch.param_rx.recv().unwrap();
     assert_eq!(snap.rank, 0);
 
@@ -550,10 +623,14 @@ fn test_worker_metrics_stream_forwards_every_epoch() {
     // Two aggregated epochs arrive on the control channel (as the coordinator
     // broadcasts them); a single handle_control drain processes both.
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(0, 0.9))))
+        .send(ControlMsg::EpochAggregated(Box::new(
+            epoch_metrics_fixture(0, 0.9),
+        )))
         .unwrap();
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(1, 0.5))))
+        .send(ControlMsg::EpochAggregated(Box::new(
+            epoch_metrics_fixture(1, 0.5),
+        )))
         .unwrap();
     let shutdown = worker.handle_control().unwrap();
     assert!(!shutdown);
@@ -578,7 +655,9 @@ fn test_worker_metrics_slot_without_stream() {
     let (mut worker, ch) = make_test_worker();
     // No enable_metrics_stream(): metrics_stream_tx stays None.
     ch.control_tx
-        .send(ControlMsg::EpochAggregated(Box::new(epoch_metrics_fixture(3, 0.1))))
+        .send(ControlMsg::EpochAggregated(Box::new(
+            epoch_metrics_fixture(3, 0.1),
+        )))
         .unwrap();
     worker.handle_control().unwrap();
     let latest = worker.aggregated_metrics().lock().unwrap().clone();
@@ -595,10 +674,16 @@ fn test_worker_eval_stream_forwards_each_broadcast() {
     let rx = worker.enable_eval_stream();
 
     ch.control_tx
-        .send(ControlMsg::EvalBroadcast { epoch: 1, metric: 0.80 })
+        .send(ControlMsg::EvalBroadcast {
+            epoch: 1,
+            metric: 0.80,
+        })
         .unwrap();
     ch.control_tx
-        .send(ControlMsg::EvalBroadcast { epoch: 3, metric: 0.91 })
+        .send(ControlMsg::EvalBroadcast {
+            epoch: 3,
+            metric: 0.91,
+        })
         .unwrap();
     assert!(!worker.handle_control().unwrap());
 
@@ -615,9 +700,11 @@ fn test_worker_eval_stream_forwards_each_broadcast() {
 fn test_worker_eval_broadcast_without_stream_is_noop() {
     let (mut worker, ch) = make_test_worker();
     ch.control_tx
-        .send(ControlMsg::EvalBroadcast { epoch: 2, metric: 0.5 })
+        .send(ControlMsg::EvalBroadcast {
+            epoch: 2,
+            metric: 0.5,
+        })
         .unwrap();
     // Just must not panic / must drain cleanly (eval_stream_tx is None).
     assert!(!worker.handle_control().unwrap());
 }
-

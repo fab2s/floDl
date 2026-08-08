@@ -80,8 +80,7 @@ pub(crate) fn divergence_triple(
         let mut diff_sq = 0.0f64;
         let mut post_sq = 0.0f64;
         for (p, q) in pre.iter().zip(post.iter()) {
-            let pre_n: f64 =
-                Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
+            let pre_n: f64 = Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
             pre_sq += pre_n * pre_n;
             // One upcast transient at a time; shallow clone when
             // already f32 (mixed lists — f32 buffers among bf16 params
@@ -91,16 +90,10 @@ pub(crate) fn divergence_triple(
             } else {
                 q.to_dtype(crate::tensor::DType::Float32)?
             };
-            Tensor::foreach_add_list_(
-                std::slice::from_ref(p),
-                std::slice::from_ref(&q32),
-                -1.0,
-            )?;
-            let diff_n: f64 =
-                Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
+            Tensor::foreach_add_list_(std::slice::from_ref(p), std::slice::from_ref(&q32), -1.0)?;
+            let diff_n: f64 = Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
             diff_sq += diff_n * diff_n;
-            let post_n: f64 =
-                Tensor::foreach_norm(std::slice::from_ref(&q32), 2.0)?[0].item()?;
+            let post_n: f64 = Tensor::foreach_norm(std::slice::from_ref(&q32), 2.0)?[0].item()?;
             post_sq += post_n * post_n;
         }
         (pre_sq, diff_sq, post_sq)
@@ -120,7 +113,7 @@ pub(crate) fn divergence_triple(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::{test_device, Tensor};
+    use crate::tensor::{Tensor, test_device};
 
     fn t(data: &[f32]) -> Tensor {
         Tensor::from_f32(data, &[data.len() as i64], test_device()).unwrap()
@@ -149,7 +142,10 @@ mod tests {
         let (d, post_n, pre_n) = divergence_triple(&pre, &post).unwrap();
         assert!((pre_n.unwrap() - 5.0).abs() < 1e-5);
         assert!((post_n.unwrap() - 10.0).abs() < 1e-5);
-        assert!((d - 0.5).abs() < 1e-5, "divergence = ||pre-post||/||post|| = 5/10");
+        assert!(
+            (d - 0.5).abs() < 1e-5,
+            "divergence = ||pre-post||/||post|| = 5/10"
+        );
     }
 
     #[test]

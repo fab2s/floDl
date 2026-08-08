@@ -59,8 +59,8 @@ fn main() -> Result<()> {
         .through(GELU)
         .through(LayerNorm::new(16)?)
         .tag("encoded")
-        .also(Linear::new(16, 16)?)      // new: residual connection
-        .through(Linear::new(16, 2)?)     // new: different output dim
+        .also(Linear::new(16, 16)?) // new: residual connection
+        .through(Linear::new(16, 2)?) // new: different output dim
         .build()?;
 
     // Partial load: matching names get loaded, new layers keep random init.
@@ -68,8 +68,12 @@ fn main() -> Result<()> {
     let named_bufs2 = model.named_buffers();
     let report = load_checkpoint_file(ckpt_path, &named2, &named_bufs2, None)?;
 
-    println!("Loaded {} parameters, skipped {}, missing {}",
-        report.loaded.len(), report.skipped.len(), report.missing.len());
+    println!(
+        "Loaded {} parameters, skipped {}, missing {}",
+        report.loaded.len(),
+        report.skipped.len(),
+        report.missing.len()
+    );
 
     // Freeze the encoder layers (first 3 modules: Linear, GELU, LayerNorm).
     let all_params = model.parameters();

@@ -55,14 +55,14 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use flodl::nn::{
-    Dropout, Embedding, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter, GELU,
+    Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter,
 };
 use flodl::{
     DType, Device, FlowBuilder, Graph, Result, Tensor, TensorError, TensorOptions, Variable,
 };
 
 use crate::models::transformer_layer::{LayerNaming, TransformerLayer, TransformerLayerConfig};
-use crate::path::{prefix_params, HfPath};
+use crate::path::{HfPath, prefix_params};
 
 /// ALBERT hyperparameters. Matches the fields of a HuggingFace
 /// `AlbertConfig` JSON that affect model shape.
@@ -161,17 +161,17 @@ impl AlbertConfig {
         let num_labels = parse_num_labels(&v, id2label.as_deref());
         let architectures = parse_architectures(&v);
         Ok(AlbertConfig {
-            vocab_size:              required_i64(&v, "vocab_size")?,
-            embedding_size:          required_i64(&v, "embedding_size")?,
-            hidden_size:             required_i64(&v, "hidden_size")?,
-            num_hidden_layers:       required_i64(&v, "num_hidden_layers")?,
-            num_attention_heads:     required_i64(&v, "num_attention_heads")?,
-            intermediate_size:       required_i64(&v, "intermediate_size")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
+            embedding_size: required_i64(&v, "embedding_size")?,
+            hidden_size: required_i64(&v, "hidden_size")?,
+            num_hidden_layers: required_i64(&v, "num_hidden_layers")?,
+            num_attention_heads: required_i64(&v, "num_attention_heads")?,
+            intermediate_size: required_i64(&v, "intermediate_size")?,
             max_position_embeddings: required_i64(&v, "max_position_embeddings")?,
-            type_vocab_size:         optional_i64(&v, "type_vocab_size", 2),
-            pad_token_id:            optional_i64_or_none(&v, "pad_token_id"),
-            layer_norm_eps:               optional_f64(&v, "layer_norm_eps", 1e-12),
-            hidden_dropout_prob:          optional_f64(&v, "hidden_dropout_prob", 0.0),
+            type_vocab_size: optional_i64(&v, "type_vocab_size", 2),
+            pad_token_id: optional_i64_or_none(&v, "pad_token_id"),
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-12),
+            hidden_dropout_prob: optional_f64(&v, "hidden_dropout_prob", 0.0),
             attention_probs_dropout_prob: optional_f64(&v, "attention_probs_dropout_prob", 0.0),
             // ALBERT default is "gelu_new" — both v1 and v2 ship that.
             // A v3 config (or community fine-tune) that overrides to
@@ -215,7 +215,10 @@ impl AlbertConfig {
         m.insert("num_hidden_layers".into(), self.num_hidden_layers.into());
         m.insert("num_hidden_groups".into(), 1i64.into());
         m.insert("inner_group_num".into(), 1i64.into());
-        m.insert("num_attention_heads".into(), self.num_attention_heads.into());
+        m.insert(
+            "num_attention_heads".into(),
+            self.num_attention_heads.into(),
+        );
         m.insert("intermediate_size".into(), self.intermediate_size.into());
         m.insert(
             "max_position_embeddings".into(),
@@ -226,7 +229,10 @@ impl AlbertConfig {
             m.insert("pad_token_id".into(), pad.into());
         }
         m.insert("layer_norm_eps".into(), self.layer_norm_eps.into());
-        m.insert("hidden_dropout_prob".into(), self.hidden_dropout_prob.into());
+        m.insert(
+            "hidden_dropout_prob".into(),
+            self.hidden_dropout_prob.into(),
+        );
         m.insert(
             "attention_probs_dropout_prob".into(),
             self.attention_probs_dropout_prob.into(),
@@ -296,7 +302,9 @@ impl AlbertEmbeddings {
 }
 
 impl Module for AlbertEmbeddings {
-    fn name(&self) -> &str { "albert_embeddings" }
+    fn name(&self) -> &str {
+        "albert_embeddings"
+    }
 
     /// Single-input forward: word ids only. The graph drives the full
     /// three-input path via [`NamedInputModule::forward_named`].
@@ -308,14 +316,25 @@ impl Module for AlbertEmbeddings {
 
     fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("word_embeddings", self.word_embeddings.parameters()));
-        out.extend(prefix_params("position_embeddings", self.position_embeddings.parameters()));
-        out.extend(prefix_params("token_type_embeddings", self.token_type_embeddings.parameters()));
+        out.extend(prefix_params(
+            "word_embeddings",
+            self.word_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "position_embeddings",
+            self.position_embeddings.parameters(),
+        ));
+        out.extend(prefix_params(
+            "token_type_embeddings",
+            self.token_type_embeddings.parameters(),
+        ));
         out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.dropout.set_training(training);
@@ -376,7 +395,9 @@ impl AlbertLayerStack {
 }
 
 impl Module for AlbertLayerStack {
-    fn name(&self) -> &str { "albert_layer_stack" }
+    fn name(&self) -> &str {
+        "albert_layer_stack"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let mut x = self.layer.forward(input)?;
@@ -394,7 +415,9 @@ impl Module for AlbertLayerStack {
         self.layer.parameters()
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.training.set(training);
@@ -439,7 +462,9 @@ impl AlbertPooler {
 }
 
 impl Module for AlbertPooler {
-    fn name(&self) -> &str { "albert_pooler" }
+    fn name(&self) -> &str {
+        "albert_pooler"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let cls = input.select(1, 0)?;
@@ -458,13 +483,13 @@ impl Module for AlbertPooler {
 /// consumes.
 fn albert_layer_config(config: &AlbertConfig) -> TransformerLayerConfig {
     TransformerLayerConfig {
-        hidden_size:                  config.hidden_size,
-        num_attention_heads:          config.num_attention_heads,
-        intermediate_size:            config.intermediate_size,
-        hidden_dropout_prob:          config.hidden_dropout_prob,
+        hidden_size: config.hidden_size,
+        num_attention_heads: config.num_attention_heads,
+        intermediate_size: config.intermediate_size,
+        hidden_dropout_prob: config.hidden_dropout_prob,
         attention_probs_dropout_prob: config.attention_probs_dropout_prob,
-        layer_norm_eps:               config.layer_norm_eps,
-        hidden_act:                   config.hidden_act,
+        layer_norm_eps: config.layer_norm_eps,
+        hidden_act: config.hidden_act,
     }
 }
 
@@ -547,10 +572,10 @@ impl AlbertModel {
 
 // ── Task heads ───────────────────────────────────────────────────────────
 
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead,
-};
 pub use crate::task_heads::{Answer, TokenPrediction};
+use crate::task_heads::{
+    ClassificationHead, EncoderInputs, MaskedLmHead, QaHead, TaggingHead, check_num_labels,
+};
 
 /// ALBERT graphs take four `forward_multi` inputs — `input_ids`,
 /// `position_ids`, `token_type_ids`, and an extended attention mask —
@@ -588,18 +613,19 @@ impl EncoderInputs for AlbertConfig {
 pub type AlbertForSequenceClassification = ClassificationHead<AlbertConfig>;
 
 impl ClassificationHead<AlbertConfig> {
-    pub fn on_device(
-        config: &AlbertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &AlbertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = albert_backbone_flow(config, device, /*with_pooler=*/ true)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &AlbertConfig) -> Result<i64> {
@@ -617,18 +643,19 @@ impl ClassificationHead<AlbertConfig> {
 pub type AlbertForTokenClassification = TaggingHead<AlbertConfig>;
 
 impl TaggingHead<AlbertConfig> {
-    pub fn on_device(
-        config: &AlbertConfig,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &AlbertConfig, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = albert_backbone_flow(config, device, /*with_pooler=*/ false)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &AlbertConfig) -> Result<i64> {
@@ -689,7 +716,9 @@ impl AlbertMLMHeadTransform {
 }
 
 impl Module for AlbertMLMHeadTransform {
-    fn name(&self) -> &str { "albert_mlm_head_transform" }
+    fn name(&self) -> &str {
+        "albert_mlm_head_transform"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let x = self.dense.forward(input)?;
@@ -698,8 +727,8 @@ impl Module for AlbertMLMHeadTransform {
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        let mut out = prefix_params("dense",     self.dense.parameters());
-        out.extend(   prefix_params("LayerNorm", self.layer_norm.parameters()));
+        let mut out = prefix_params("dense", self.dense.parameters());
+        out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 }
@@ -763,7 +792,10 @@ impl MaskedLmHead<AlbertConfig> {
         let decoder_bias = Parameter::new(
             Tensor::zeros(
                 &[config.vocab_size],
-                TensorOptions { dtype: DType::Float32, device },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device,
+                },
             )?,
             "bias",
         );
@@ -838,14 +870,19 @@ mod tests {
         let config = AlbertConfig::albert_base_v2();
         let graph = AlbertModel::on_device_without_pooler(&config, Device::CPU).unwrap();
         let expected = expected_from_graph(&graph);
-        let by_key: std::collections::HashMap<&str, &[i64]> =
-            expected.iter().map(|p| (p.key.as_str(), p.shape.as_slice())).collect();
+        let by_key: std::collections::HashMap<&str, &[i64]> = expected
+            .iter()
+            .map(|p| (p.key.as_str(), p.shape.as_slice()))
+            .collect();
 
         let v = config.vocab_size;
         let e = config.embedding_size;
         let h = config.hidden_size;
         assert_eq!(by_key["albert.embeddings.word_embeddings.weight"], &[v, e]);
-        assert_eq!(by_key["albert.embeddings.position_embeddings.weight"], &[config.max_position_embeddings, e]);
+        assert_eq!(
+            by_key["albert.embeddings.position_embeddings.weight"],
+            &[config.max_position_embeddings, e]
+        );
         assert_eq!(by_key["albert.embeddings.LayerNorm.weight"], &[e]);
         assert_eq!(
             by_key["albert.encoder.embedding_hidden_mapping_in.weight"],
@@ -905,7 +942,9 @@ mod tests {
             assert!(
                 keys.iter().any(|k| *k == full),
                 "missing expected ALBERT key: {full}; got keys starting with {prefix}.*: {:?}",
-                keys.iter().filter(|k| k.starts_with(prefix)).collect::<Vec<_>>(),
+                keys.iter()
+                    .filter(|k| k.starts_with(prefix))
+                    .collect::<Vec<_>>(),
             );
         }
 
@@ -995,10 +1034,18 @@ mod tests {
             Tensor::from_i64(&[0, 1, 2], &[batch, seq], dev).unwrap(),
             false,
         );
-        let tt = Variable::new(Tensor::from_i64(&[0; 3], &[batch, seq], dev).unwrap(), false);
-        let mask_flat = Tensor::ones(&[batch, seq], TensorOptions {
-            dtype: DType::Float32, device: dev,
-        }).unwrap();
+        let tt = Variable::new(
+            Tensor::from_i64(&[0; 3], &[batch, seq], dev).unwrap(),
+            false,
+        );
+        let mask_flat = Tensor::ones(
+            &[batch, seq],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: dev,
+            },
+        )
+        .unwrap();
         let mask = Variable::new(
             crate::models::bert::build_extended_attention_mask(&mask_flat).unwrap(),
             false,

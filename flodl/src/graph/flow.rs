@@ -7,9 +7,9 @@ use crate::autograd::Variable;
 use crate::nn::Module;
 use crate::tensor::TensorError;
 
+use super::MergeOp;
 use super::loop_node::LoopBuilder;
 use super::node::*;
-use super::MergeOp;
 
 /// Fluent builder for computation graphs. Reads as data flow.
 ///
@@ -274,11 +274,7 @@ impl FlowBuilder {
     /// .also_with(downsample_1x1, conv_bn_relu_conv_bn)
     /// .through(ReLU)
     /// ```
-    pub fn also_with(
-        mut self,
-        skip: impl Module + 'static,
-        main: impl Module + 'static,
-    ) -> Self {
+    pub fn also_with(mut self, skip: impl Module + 'static, main: impl Module + 'static) -> Self {
         if self.err.is_some() {
             return self;
         }
@@ -347,7 +343,10 @@ impl FlowBuilder {
         }
 
         // Fork target takes priority (side-branch output), otherwise main stream.
-        let cur = self.fork_target.take().unwrap_or_else(|| self.current[0].clone());
+        let cur = self
+            .fork_target
+            .take()
+            .unwrap_or_else(|| self.current[0].clone());
         self.taps.insert(name.to_string(), cur.clone());
 
         // Resolve any pending forward references to this tag
@@ -385,10 +384,7 @@ impl FlowBuilder {
             return self;
         }
         if self.taps.contains_key(name) {
-            self.fail(format!(
-                "tag group {:?} conflicts with existing tag",
-                name
-            ));
+            self.fail(format!("tag group {:?} conflicts with existing tag", name));
             return self;
         }
 
@@ -431,10 +427,7 @@ impl FlowBuilder {
         }
         for &name in names {
             if self.taps.contains_key(name) {
-                self.fail(format!(
-                    "input tag {:?} conflicts with existing tag",
-                    name
-                ));
+                self.fail(format!("input tag {:?} conflicts with existing tag", name));
                 return self;
             }
 
@@ -483,9 +476,7 @@ impl FlowBuilder {
         } else if self.current.len() > 1 {
             self.current.clone()
         } else {
-            self.fail(
-                "using requires a preceding through, split, or merge",
-            );
+            self.fail("using requires a preceding through, split, or merge");
             return self;
         };
 
@@ -582,22 +573,14 @@ impl FlowBuilder {
     /// batch-dependent layer inside it (BatchNorm especially) computes
     /// statistics over that sub-batch, and a branch that received no rows does
     /// not run — no buffer update, no gradient for it that step.
-    pub fn switch(
-        self,
-        router: impl Module + 'static,
-        branches: Vec<Box<dyn Module>>,
-    ) -> Self {
+    pub fn switch(self, router: impl Module + 'static, branches: Vec<Box<dyn Module>>) -> Self {
         super::switch::wire_switch(self, Box::new(router), branches)
     }
 
     /// Soft routing (mixture of experts): all experts execute, outputs
     /// combined via learned router weights. Router must output shape
     /// `[..., n_experts]`.
-    pub fn gate(
-        self,
-        router: impl Module + 'static,
-        experts: Vec<Box<dyn Module>>,
-    ) -> Self {
+    pub fn gate(self, router: impl Module + 'static, experts: Vec<Box<dyn Module>>) -> Self {
         super::gate::wire_gate(self, Box::new(router), experts)
     }
 
@@ -624,9 +607,7 @@ impl FlowBuilder {
             )));
         }
         if self.current.len() != 1 {
-            return Err(TensorError::new(
-                "open streams: call merge before build",
-            ));
+            return Err(TensorError::new("open streams: call merge before build"));
         }
 
         let output = ExposedPort {
@@ -692,7 +673,10 @@ impl FlowBuilder {
         let ref_forward = if rc.as_named_input().is_some() {
             let rc_clone = rc.clone();
             let rf: RefForwardFn = Rc::new(move |input, refs| {
-                rc_clone.as_named_input().unwrap().forward_named(input, refs)
+                rc_clone
+                    .as_named_input()
+                    .unwrap()
+                    .forward_named(input, refs)
             });
             Some(rf)
         } else {
@@ -720,16 +704,13 @@ impl FlowBuilder {
         }
     }
 
-    fn wire_using(
-        &mut self,
-        target: &NodeRef,
-        refs: &[&str],
-    ) -> std::result::Result<(), String> {
+    fn wire_using(&mut self, target: &NodeRef, refs: &[&str]) -> std::result::Result<(), String> {
         // Check the target node supports refs
         {
-            let node = self.nodes.get(&target.node_id).ok_or_else(|| {
-                format!("unknown target node: {}", target.node_id)
-            })?;
+            let node = self
+                .nodes
+                .get(&target.node_id)
+                .ok_or_else(|| format!("unknown target node: {}", target.node_id))?;
             if node.module.is_some() && node.ref_forward.is_none() {
                 let hint = if target.node_id.contains("gate") || target.node_id.contains("switch") {
                     "the router must implement NamedInputModule and override as_named_input"

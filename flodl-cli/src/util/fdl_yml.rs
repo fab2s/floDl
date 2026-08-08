@@ -40,8 +40,8 @@ pub fn add_command(
     name: &str,
     description: &str,
 ) -> Result<AddCommandOutcome, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let (new_content, outcome) = insert_command(&content, name, description)?;
     if outcome == AddCommandOutcome::Added {
         fs::write(path, new_content)
@@ -137,7 +137,9 @@ fn insert_command(
     // had a non-blank line (visual separator between sibling commands).
     // Skip when the immediately previous line is already blank.
     let prev_blank = insert_at == header_idx + 1
-        || lines.get(insert_at - 1).is_some_and(|l| l.trim().is_empty());
+        || lines
+            .get(insert_at - 1)
+            .is_some_and(|l| l.trim().is_empty());
     if !prev_blank {
         out.push('\n');
     }
@@ -154,7 +156,9 @@ fn insert_command(
 fn render_entry(child_indent: &str, name: &str, description: &str) -> String {
     let mut out = format!("{child_indent}{name}:\n");
     if !description.is_empty() {
-        out.push_str(&format!("{child_indent}{child_indent}description: {description}\n"));
+        out.push_str(&format!(
+            "{child_indent}{child_indent}description: {description}\n"
+        ));
     }
     out
 }
@@ -236,7 +240,10 @@ commands:
         let input = "commands:\n  build:\n    run: cargo build\n";
         let (out, _) = insert_command(input, "flodl-hf", "").unwrap();
         assert!(out.contains("  flodl-hf:"));
-        assert!(!out.contains("description: \n"), "no empty description: {out}");
+        assert!(
+            !out.contains("description: \n"),
+            "no empty description: {out}"
+        );
     }
 
     #[test]
@@ -262,7 +269,10 @@ commands:
 other_top_level: foo
 ";
         let (out, _) = insert_command(input, "flodl-hf", "HF").unwrap();
-        assert!(out.contains("other_top_level: foo"), "trailing key preserved: {out}");
+        assert!(
+            out.contains("other_top_level: foo"),
+            "trailing key preserved: {out}"
+        );
         // `flodl-hf:` lands BEFORE `other_top_level:` (still inside commands block).
         let new = out.find("flodl-hf:").unwrap();
         let other = out.find("other_top_level:").unwrap();

@@ -2,7 +2,6 @@
 //! TrainingConfig, OutputConfig, ClusterConfig, ClusterController,
 //! LocalDevices, ClusterWorker + the `ClusterConfig` impl block.
 
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -774,12 +773,13 @@ impl ClusterConfig {
             .join
             .as_ref()
             .and_then(|j| j.start.as_deref())
-            && !matches!(start, "auto" | "manual" | "hybrid") {
-                return Err(format!(
-                    "cluster.controller.join.start must be one of \
+            && !matches!(start, "auto" | "manual" | "hybrid")
+        {
+            return Err(format!(
+                "cluster.controller.join.start must be one of \
                      auto | manual | hybrid, got {start:?}"
-                ));
-            }
+            ));
+        }
         // Reserved-env-key check: a user env map must not carry a key the
         // launcher owns per-rank. The launcher applies user env after its
         // own built-ins (shell last-wins), so an override would silently
@@ -832,14 +832,15 @@ impl ClusterConfig {
         if self.workers.iter().all(|w| !w.ranks.is_empty()) {
             for (i, w) in self.workers.iter().enumerate() {
                 if let Some(devs) = w.local_devices.as_explicit()
-                    && w.ranks.len() != devs.len() {
-                        return Err(format!(
-                            "cluster.workers[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
-                            w.host,
-                            w.ranks.len(),
-                            devs.len()
-                        ));
-                    }
+                    && w.ranks.len() != devs.len()
+                {
+                    return Err(format!(
+                        "cluster.workers[{i}] ({:?}): ranks ({}) and local_devices ({}) length mismatch",
+                        w.host,
+                        w.ranks.len(),
+                        devs.len()
+                    ));
+                }
             }
             let mut all: Vec<usize> = self
                 .workers

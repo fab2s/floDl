@@ -163,6 +163,12 @@ pub fn assert_grads_flowed(graph: &flodl::Graph) {
             }
         }
     }
-    assert!(any_grad, "no parameter received a gradient — autograd graph broken upstream of params");
-    assert!(any_nonzero, "all gradients were zero — backward did not flow real signal");
+    assert!(
+        any_grad,
+        "no parameter received a gradient — autograd graph broken upstream of params"
+    );
+    assert!(
+        any_nonzero,
+        "all gradients were zero — backward did not flow real signal"
+    );
 }

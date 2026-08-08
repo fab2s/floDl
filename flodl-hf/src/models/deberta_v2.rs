@@ -63,14 +63,14 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use flodl::nn::{
-    Dropout, Embedding, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter, GELU,
+    Dropout, Embedding, GELU, GeluApprox, LayerNorm, Linear, Module, NamedInputModule, Parameter,
 };
 use flodl::{
     DType, Device, FlowBuilder, Graph, Result, Tensor, TensorError, TensorOptions, Variable,
 };
 
 use crate::models::deberta_transformer_layer::{
-    build_relative_position, DebertaV2LayerConfig, DebertaV2TransformerLayer,
+    DebertaV2LayerConfig, DebertaV2TransformerLayer, build_relative_position,
 };
 use crate::path::prefix_params;
 
@@ -271,23 +271,27 @@ impl DebertaV2Config {
         // max_relative_positions: -1 means "use max_position_embeddings".
         let max_pos_emb = required_i64(&v, "max_position_embeddings")?;
         let raw_max_rel = optional_i64(&v, "max_relative_positions", -1);
-        let max_relative_positions = if raw_max_rel < 1 { max_pos_emb } else { raw_max_rel };
+        let max_relative_positions = if raw_max_rel < 1 {
+            max_pos_emb
+        } else {
+            raw_max_rel
+        };
 
         Ok(DebertaV2Config {
-            vocab_size:                   required_i64(&v, "vocab_size")?,
+            vocab_size: required_i64(&v, "vocab_size")?,
             hidden_size,
-            num_hidden_layers:            required_i64(&v, "num_hidden_layers")?,
-            num_attention_heads:          required_i64(&v, "num_attention_heads")?,
-            intermediate_size:            required_i64(&v, "intermediate_size")?,
-            max_position_embeddings:      max_pos_emb,
-            layer_norm_eps:               optional_f64(&v, "layer_norm_eps", 1e-7),
-            hidden_dropout_prob:          optional_f64(&v, "hidden_dropout_prob", 0.1),
+            num_hidden_layers: required_i64(&v, "num_hidden_layers")?,
+            num_attention_heads: required_i64(&v, "num_attention_heads")?,
+            intermediate_size: required_i64(&v, "intermediate_size")?,
+            max_position_embeddings: max_pos_emb,
+            layer_norm_eps: optional_f64(&v, "layer_norm_eps", 1e-7),
+            hidden_dropout_prob: optional_f64(&v, "hidden_dropout_prob", 0.1),
             attention_probs_dropout_prob: optional_f64(&v, "attention_probs_dropout_prob", 0.1),
-            pad_token_id:                 optional_i64_or_none(&v, "pad_token_id"),
-            position_buckets:             optional_i64(&v, "position_buckets", -1),
+            pad_token_id: optional_i64_or_none(&v, "pad_token_id"),
+            position_buckets: optional_i64(&v, "position_buckets", -1),
             max_relative_positions,
-            hidden_act:                   optional_hidden_act(&v, "hidden_act", "gelu")?,
-            pooler_hidden_act:            optional_hidden_act(&v, "pooler_hidden_act", "gelu")?,
+            hidden_act: optional_hidden_act(&v, "hidden_act", "gelu")?,
+            pooler_hidden_act: optional_hidden_act(&v, "pooler_hidden_act", "gelu")?,
             num_labels,
             id2label,
             architectures,
@@ -323,7 +327,10 @@ impl DebertaV2Config {
         m.insert("vocab_size".into(), self.vocab_size.into());
         m.insert("hidden_size".into(), self.hidden_size.into());
         m.insert("num_hidden_layers".into(), self.num_hidden_layers.into());
-        m.insert("num_attention_heads".into(), self.num_attention_heads.into());
+        m.insert(
+            "num_attention_heads".into(),
+            self.num_attention_heads.into(),
+        );
         m.insert("intermediate_size".into(), self.intermediate_size.into());
         m.insert(
             "max_position_embeddings".into(),
@@ -334,7 +341,10 @@ impl DebertaV2Config {
             m.insert("pad_token_id".into(), pad.into());
         }
         m.insert("layer_norm_eps".into(), self.layer_norm_eps.into());
-        m.insert("hidden_dropout_prob".into(), self.hidden_dropout_prob.into());
+        m.insert(
+            "hidden_dropout_prob".into(),
+            self.hidden_dropout_prob.into(),
+        );
         m.insert(
             "attention_probs_dropout_prob".into(),
             self.attention_probs_dropout_prob.into(),
@@ -374,15 +384,15 @@ impl DebertaV2Config {
             self.max_relative_positions
         };
         DebertaV2LayerConfig {
-            hidden_size:                  self.hidden_size,
-            num_attention_heads:          self.num_attention_heads,
-            intermediate_size:            self.intermediate_size,
-            hidden_dropout_prob:          self.hidden_dropout_prob,
+            hidden_size: self.hidden_size,
+            num_attention_heads: self.num_attention_heads,
+            intermediate_size: self.intermediate_size,
+            hidden_dropout_prob: self.hidden_dropout_prob,
             attention_probs_dropout_prob: self.attention_probs_dropout_prob,
-            layer_norm_eps:               self.layer_norm_eps,
-            position_buckets:             buckets,
-            max_relative_positions:       self.max_relative_positions,
-            hidden_act:                   self.hidden_act,
+            layer_norm_eps: self.layer_norm_eps,
+            position_buckets: buckets,
+            max_relative_positions: self.max_relative_positions,
+            hidden_act: self.hidden_act,
         }
     }
 }
@@ -401,7 +411,11 @@ impl DebertaV2Config {
 /// addition doesn't trip libtorch's same-dtype matmul check.
 pub fn build_deberta_attention_mask(flat_mask: &Tensor, target_dtype: DType) -> Result<Tensor> {
     let shape = flat_mask.shape();
-    assert_eq!(shape.len(), 2, "flat_mask must be [B, S], got shape {shape:?}");
+    assert_eq!(
+        shape.len(),
+        2,
+        "flat_mask must be [B, S], got shape {shape:?}"
+    );
     let batch = shape[0];
     let seq = shape[1];
 
@@ -414,9 +428,13 @@ pub fn build_deberta_attention_mask(flat_mask: &Tensor, target_dtype: DType) -> 
     // finite value (matches HF's `torch.finfo(dtype).min`) — using
     // f32::MIN here would overflow f16's ±65504 range and libtorch
     // would refuse the masked_fill cast.
-    let zero_base = Tensor::zeros(&[batch, 1, seq, seq], TensorOptions {
-        dtype: target_dtype, device: flat.device(),
-    })?;
+    let zero_base = Tensor::zeros(
+        &[batch, 1, seq, seq],
+        TensorOptions {
+            dtype: target_dtype,
+            device: flat.device(),
+        },
+    )?;
     let zero_positions = grid.eq_scalar(0.0)?;
     zero_base.masked_fill(&zero_positions, dtype_min_finite(target_dtype))
 }
@@ -479,7 +497,9 @@ impl DebertaV2Embeddings {
 }
 
 impl Module for DebertaV2Embeddings {
-    fn name(&self) -> &str { "deberta_v2_embeddings" }
+    fn name(&self) -> &str {
+        "deberta_v2_embeddings"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let emb = self.word_embeddings.forward(input)?;
@@ -493,7 +513,9 @@ impl Module for DebertaV2Embeddings {
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.dropout.set_training(training);
@@ -526,10 +548,7 @@ impl NamedInputModule for DebertaV2Embeddings {
             let shape = mask_cast.shape();
             // Mask from the tokenizer is [B, S]; unsqueeze last dim for
             // broadcast with [B, S, H].
-            let mask_unsq = Variable::new(
-                mask_cast.reshape(&[shape[0], shape[1], 1])?,
-                false,
-            );
+            let mask_unsq = Variable::new(mask_cast.reshape(&[shape[0], shape[1], 1])?, false);
             ln.mul(&mask_unsq)?
         } else {
             ln
@@ -580,16 +599,9 @@ impl DebertaV2Encoder {
         } else {
             config.max_relative_positions
         };
-        let rel_embeddings = Embedding::on_device(
-            pos_ebd_size * 2,
-            config.hidden_size,
-            device,
-        )?;
-        let layer_norm = LayerNorm::on_device_with_eps(
-            config.hidden_size,
-            config.layer_norm_eps,
-            device,
-        )?;
+        let rel_embeddings = Embedding::on_device(pos_ebd_size * 2, config.hidden_size, device)?;
+        let layer_norm =
+            LayerNorm::on_device_with_eps(config.hidden_size, config.layer_norm_eps, device)?;
 
         Ok(DebertaV2Encoder {
             layers,
@@ -603,21 +615,31 @@ impl DebertaV2Encoder {
 }
 
 impl Module for DebertaV2Encoder {
-    fn name(&self) -> &str { "deberta_v2_encoder" }
+    fn name(&self) -> &str {
+        "deberta_v2_encoder"
+    }
 
     /// Unmasked forward — used by diagnostics. The graph drives the
     /// masked path via [`NamedInputModule::forward_named`].
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let seq = input.shape()[1];
         let rel_pos = build_relative_position(
-            seq, self.position_buckets, self.max_relative_positions, input.device(),
+            seq,
+            self.position_buckets,
+            self.max_relative_positions,
+            input.device(),
         )?;
-        let rel_emb = self.layer_norm.forward(&self.rel_embeddings.weight.variable)?;
+        let rel_emb = self
+            .layer_norm
+            .forward(&self.rel_embeddings.weight.variable)?;
         let batch = input.shape()[0];
         let zero_mask = Variable::new(
             Tensor::zeros(
                 &[batch, 1, seq, seq],
-                TensorOptions { dtype: DType::Float32, device: input.device() },
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device: input.device(),
+                },
             )?,
             false,
         );
@@ -638,7 +660,9 @@ impl Module for DebertaV2Encoder {
         out
     }
 
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 
     fn set_training(&self, training: bool) {
         self.training.set(training);
@@ -672,11 +696,16 @@ impl NamedInputModule for DebertaV2Encoder {
 
         // Relative-position grid (deterministic given seq_len, no grad).
         let rel_pos = build_relative_position(
-            seq, self.position_buckets, self.max_relative_positions, device,
+            seq,
+            self.position_buckets,
+            self.max_relative_positions,
+            device,
         )?;
 
         // LayerNorm-normalise the shared rel_embeddings table once.
-        let rel_emb = self.layer_norm.forward(&self.rel_embeddings.weight.variable)?;
+        let rel_emb = self
+            .layer_norm
+            .forward(&self.rel_embeddings.weight.variable)?;
 
         let mut h = input.clone();
         for layer in &self.layers {
@@ -749,10 +778,12 @@ impl ContextPooler {
 }
 
 impl Module for ContextPooler {
-    fn name(&self) -> &str { "context_pooler" }
+    fn name(&self) -> &str {
+        "context_pooler"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
-        let cls = input.select(1, 0)?;          // [B, H]
+        let cls = input.select(1, 0)?; // [B, H]
         let dropped = self.dropout.forward(&cls)?;
         let dense = self.dense.forward(&dropped)?;
         self.activation.forward(&dense)
@@ -769,9 +800,7 @@ impl Module for ContextPooler {
 
 // ─── Task heads ──────────────────────────────────────────────────────────
 
-use crate::task_heads::{
-    check_num_labels, ClassificationHead, MaskedLmHead, QaHead, TaggingHead,
-};
+use crate::task_heads::{ClassificationHead, MaskedLmHead, QaHead, TaggingHead, check_num_labels};
 
 /// DeBERTa-v2 graphs take **2** `forward_multi` inputs: `input_ids`
 /// and a flat `[B, S]` padding mask. The encoder handles the
@@ -799,11 +828,7 @@ impl crate::task_heads::EncoderInputs for DebertaV2Config {
 pub type DebertaV2ForSequenceClassification = ClassificationHead<DebertaV2Config>;
 
 impl ClassificationHead<DebertaV2Config> {
-    pub fn on_device(
-        config: &DebertaV2Config,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &DebertaV2Config, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = backbone_flow(config, device)?
             .through(ContextPooler::on_device(config, device)?)
@@ -812,7 +837,12 @@ impl ClassificationHead<DebertaV2Config> {
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &DebertaV2Config) -> Result<i64> {
@@ -830,18 +860,19 @@ impl ClassificationHead<DebertaV2Config> {
 pub type DebertaV2ForTokenClassification = TaggingHead<DebertaV2Config>;
 
 impl TaggingHead<DebertaV2Config> {
-    pub fn on_device(
-        config: &DebertaV2Config,
-        num_labels: i64,
-        device: Device,
-    ) -> Result<Self> {
+    pub fn on_device(config: &DebertaV2Config, num_labels: i64, device: Device) -> Result<Self> {
         let num_labels = check_num_labels(num_labels)?;
         let graph = backbone_flow(config, device)?
             .through(Dropout::new(config.hidden_dropout_prob))
             .through(Linear::on_device(config.hidden_size, num_labels, device)?)
             .tag("classifier")
             .build()?;
-        Ok(Self::from_graph(graph, config, num_labels, config.id2label.clone()))
+        Ok(Self::from_graph(
+            graph,
+            config,
+            num_labels,
+            config.id2label.clone(),
+        ))
     }
 
     pub(crate) fn num_labels_from_config(config: &DebertaV2Config) -> Result<i64> {
@@ -905,7 +936,10 @@ impl DebertaV2LMHead {
             variable: Variable::new(
                 Tensor::zeros(
                     &[config.vocab_size],
-                    TensorOptions { dtype: DType::Float32, device },
+                    TensorOptions {
+                        dtype: DType::Float32,
+                        device,
+                    },
                 )?,
                 true,
             ),
@@ -925,7 +959,9 @@ impl DebertaV2LMHead {
 }
 
 impl Module for DebertaV2LMHead {
-    fn name(&self) -> &str { "deberta_v2_lm_head" }
+    fn name(&self) -> &str {
+        "deberta_v2_lm_head"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         let x = self.dense.forward(input)?;
@@ -944,7 +980,10 @@ impl Module for DebertaV2LMHead {
         // under the embeddings tag.
         for p in self.decoder.parameters() {
             if p.name == "bias" {
-                out.push(Parameter { variable: p.variable, name: "bias".into() });
+                out.push(Parameter {
+                    variable: p.variable,
+                    name: "bias".into(),
+                });
             }
             // weight: skip (tied + dedup'd under embeddings tag)
         }

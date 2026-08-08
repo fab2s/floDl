@@ -9,11 +9,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use super::detect;
 use crate::context::Context;
 use crate::util::docker;
 use crate::util::prompt;
 use crate::util::system;
-use super::detect;
 
 const DOCKERFILE_CONTENT: &str = include_str!("../../assets/Dockerfile.cuda.source");
 const IMAGE_NAME: &str = "flodl-libtorch-builder";
@@ -21,8 +21,13 @@ const LIBTORCH_VERSION: &str = "2.10.0";
 const PYTORCH_VERSION: &str = "v2.10.0";
 
 const PYTHON_DEPS: &[&str] = &[
-    "typing_extensions", "pyyaml", "filelock",
-    "jinja2", "networkx", "sympy", "packaging",
+    "typing_extensions",
+    "pyyaml",
+    "filelock",
+    "jinja2",
+    "networkx",
+    "sympy",
+    "packaging",
 ];
 
 // ---------------------------------------------------------------------------
@@ -70,12 +75,10 @@ impl Default for BuildOpts {
 fn detect_arch_list() -> Result<String, String> {
     let gpus = system::detect_gpus();
     if gpus.is_empty() {
-        return Err(
-            "No NVIDIA GPUs detected.\n\
+        return Err("No NVIDIA GPUs detected.\n\
              Source builds require GPUs to auto-detect architectures.\n\
              Use --archs to specify manually (e.g. --archs \"8.6;12.0\")."
-                .into(),
-        );
+            .into());
     }
 
     // Collect unique compute capabilities, sorted numerically. This
@@ -88,7 +91,10 @@ fn detect_arch_list() -> Result<String, String> {
         .collect();
     caps.sort();
     caps.dedup();
-    let caps: Vec<String> = caps.iter().map(|(ma, mi)| format!("{}.{}", ma, mi)).collect();
+    let caps: Vec<String> = caps
+        .iter()
+        .map(|(ma, mi)| format!("{}.{}", ma, mi))
+        .collect();
 
     println!("  GPUs detected:");
     for g in &gpus {
@@ -127,11 +133,21 @@ impl NativeTools {
 
     fn missing(&self) -> Vec<&'static str> {
         let mut m = Vec::new();
-        if !self.nvcc { m.push("nvcc (CUDA toolkit)"); }
-        if !self.cmake { m.push("cmake"); }
-        if !self.python3 { m.push("python3"); }
-        if !self.git { m.push("git"); }
-        if !self.gcc { m.push("gcc/cc (C++ compiler)"); }
+        if !self.nvcc {
+            m.push("nvcc (CUDA toolkit)");
+        }
+        if !self.cmake {
+            m.push("cmake");
+        }
+        if !self.python3 {
+            m.push("python3");
+        }
+        if !self.git {
+            m.push("git");
+        }
+        if !self.gcc {
+            m.push("gcc/cc (C++ compiler)");
+        }
         m
     }
 }
@@ -156,11 +172,9 @@ fn select_backend(backend: &BuildBackend) -> Result<&'static str, String> {
     match backend {
         BuildBackend::Docker => {
             if !has_docker {
-                return Err(
-                    "Docker was requested but is not available.\n\
+                return Err("Docker was requested but is not available.\n\
                      Install Docker: https://docs.docker.com/engine/install/"
-                        .into(),
-                );
+                    .into());
             }
             Ok("docker")
         }
@@ -241,7 +255,10 @@ pub fn run(opts: BuildOpts) -> Result<(), String> {
     println!();
 
     if opts.dry_run {
-        println!("  [dry-run] Would build libtorch from source via {}.", backend);
+        println!(
+            "  [dry-run] Would build libtorch from source via {}.",
+            backend
+        );
         println!("  This typically takes 2-6 hours depending on CPU cores.");
         return Ok(());
     }
@@ -332,9 +349,7 @@ fn build_docker(archs: &str, install_path: &str, max_jobs: usize) -> Result<(), 
         "--build-arg",
         &format!("MAX_JOBS={}", max_jobs),
         "-f",
-        dockerfile_path
-            .to_str()
-            .ok_or("temp path not UTF-8")?,
+        dockerfile_path.to_str().ok_or("temp path not UTF-8")?,
         ".",
     ])?;
 
@@ -383,7 +398,12 @@ fn build_docker(archs: &str, install_path: &str, max_jobs: usize) -> Result<(), 
 // Native backend
 // ---------------------------------------------------------------------------
 
-fn build_native(archs: &str, install_path: &str, ctx: &Context, max_jobs: usize) -> Result<(), String> {
+fn build_native(
+    archs: &str,
+    install_path: &str,
+    ctx: &Context,
+    max_jobs: usize,
+) -> Result<(), String> {
     let build_dir = ctx.root.join("libtorch/.build-cache/pytorch");
 
     // Clone PyTorch if not cached
@@ -394,9 +414,13 @@ fn build_native(archs: &str, install_path: &str, ctx: &Context, max_jobs: usize)
 
         let status = Command::new("git")
             .args([
-                "clone", "--depth", "1",
-                "--branch", PYTORCH_VERSION,
-                "--recurse-submodules", "--shallow-submodules",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                PYTORCH_VERSION,
+                "--recurse-submodules",
+                "--shallow-submodules",
                 "https://github.com/pytorch/pytorch.git",
                 build_dir.to_str().ok_or("path not UTF-8")?,
             ])
@@ -434,7 +458,10 @@ fn build_native(archs: &str, install_path: &str, ctx: &Context, max_jobs: usize)
     }
 
     // Build libtorch
-    println!("  Building libtorch (TORCH_CUDA_ARCH_LIST=\"{}\", MAX_JOBS={})...", archs, max_jobs);
+    println!(
+        "  Building libtorch (TORCH_CUDA_ARCH_LIST=\"{}\", MAX_JOBS={})...",
+        archs, max_jobs
+    );
     println!();
 
     let status = Command::new("python3")
@@ -544,9 +571,10 @@ fn bundle_system_cudnn(dst_lib: &Path) {
                 // the gate is about compiling on Windows, not behavior.
                 #[cfg(unix)]
                 if let Ok(target) = fs::read_link(&path)
-                    && std::os::unix::fs::symlink(&target, &dst).is_ok() {
-                        copied += 1;
-                    }
+                    && std::os::unix::fs::symlink(&target, &dst).is_ok()
+                {
+                    copied += 1;
+                }
                 #[cfg(not(unix))]
                 if fs::copy(&path, &dst).is_ok() {
                     copied += 1;
@@ -556,9 +584,7 @@ fn bundle_system_cudnn(dst_lib: &Path) {
             }
         }
         if copied > 0 {
-            println!(
-                "  Bundled {copied} cuDNN file(s) from {prefix} into the libtorch install",
-            );
+            println!("  Bundled {copied} cuDNN file(s) from {prefix} into the libtorch install",);
             return;
         }
     }
@@ -573,8 +599,7 @@ fn bundle_system_cudnn(dst_lib: &Path) {
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), String> {
-    fs::create_dir_all(dest)
-        .map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
+    fs::create_dir_all(dest).map_err(|e| format!("cannot create {}: {}", dest.display(), e))?;
 
     for entry in fs::read_dir(src).map_err(|e| format!("read {}: {}", src.display(), e))? {
         let entry = entry.map_err(|e| format!("read_dir error: {}", e))?;

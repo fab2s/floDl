@@ -465,7 +465,10 @@ mod tests {
     }
 
     fn masked(devices: Vec<GpuInfo>, mask: &str) -> GpuSurvey {
-        let mut s = GpuSurvey { devices, notes: vec![] };
+        let mut s = GpuSurvey {
+            devices,
+            notes: vec![],
+        };
         apply_visibility_mask(&mut s, GpuVendor::Nvidia, CVD, mask);
         s
     }
@@ -492,7 +495,10 @@ mod tests {
             index: 0,
             vendor: GpuVendor::Nvidia,
             name: "NVIDIA GeForce Test".into(),
-            arch: GpuArch::Sm { major: 12, minor: 0 },
+            arch: GpuArch::Sm {
+                major: 12,
+                minor: 0,
+            },
             total_memory_mb: 16000,
         };
         assert_eq!(g.arch_label(), "sm_120");
@@ -528,19 +534,29 @@ mod tests {
         assert_eq!(s.notes.len(), 1);
         assert_eq!(s.notes[0].kind, NoteKind::MaskApplied);
         // An operator-caused zero must not read as a hardware fault.
-        assert!(s.require_devices().unwrap_err().contains("no GPUs detected"));
+        assert!(
+            s.require_devices()
+                .unwrap_err()
+                .contains("no GPUs detected")
+        );
     }
 
     #[test]
     fn empty_mask_on_a_gpuless_box_is_not_worth_a_note() {
         let s = masked(vec![], "");
-        assert!(s.notes.is_empty(), "nothing was hidden, so nothing to report");
+        assert!(
+            s.notes.is_empty(),
+            "nothing was hidden, so nothing to report"
+        );
     }
 
     #[test]
     fn mask_filters_by_index_and_reports_the_hidden_count() {
         let s = masked(vec![gpu(0, 8, 6), gpu(1, 6, 1), gpu(2, 8, 6)], "0,2");
-        assert_eq!(s.devices.iter().map(|g| g.index).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            s.devices.iter().map(|g| g.index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
         assert!(s.notes.iter().any(|n| n.message.contains("hides 1 of 3")));
     }
 
@@ -555,14 +571,21 @@ mod tests {
     #[test]
     fn mask_tolerates_whitespace_and_ignores_unknown_indices() {
         let s = masked(vec![gpu(0, 8, 6), gpu(1, 8, 6)], " 1 , 99 ");
-        assert_eq!(s.devices.iter().map(|g| g.index).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            s.devices.iter().map(|g| g.index).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
     fn mask_drops_uuid_forms_rather_than_inventing_devices() {
         let s = masked(vec![gpu(0, 8, 6)], "GPU-deadbeef");
         assert!(s.devices.is_empty());
-        assert!(s.notes.iter().any(|n| n.message.contains("not a numeric index")));
+        assert!(
+            s.notes
+                .iter()
+                .any(|n| n.message.contains("not a numeric index"))
+        );
     }
 
     #[test]
@@ -588,13 +611,17 @@ mod tests {
         // directions on a mixed box, which is why the filter is
         // per-vendor.
         let mut s = GpuSurvey {
-            devices: vec![gpu(0, 8, 6), gpu(1, 8, 6), amd(0, "gfx1030"), amd(1, "gfx1100")],
+            devices: vec![
+                gpu(0, 8, 6),
+                gpu(1, 8, 6),
+                amd(0, "gfx1030"),
+                amd(1, "gfx1100"),
+            ],
             notes: vec![],
         };
         apply_visibility_mask(&mut s, GpuVendor::Nvidia, CVD, "1");
         apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "0");
-        let kept: Vec<(GpuVendor, u8)> =
-            s.devices.iter().map(|g| (g.vendor, g.index)).collect();
+        let kept: Vec<(GpuVendor, u8)> = s.devices.iter().map(|g| (g.vendor, g.index)).collect();
         assert_eq!(kept, vec![(GpuVendor::Nvidia, 1), (GpuVendor::Amd, 0)]);
     }
 
@@ -611,7 +638,10 @@ mod tests {
 
     #[test]
     fn minus_one_means_none_for_hip() {
-        let mut s = GpuSurvey { devices: vec![amd(0, "gfx1030")], notes: vec![] };
+        let mut s = GpuSurvey {
+            devices: vec![amd(0, "gfx1030")],
+            notes: vec![],
+        };
         apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "-1");
         assert!(s.devices.is_empty());
         assert!(s.notes[0].message.contains("hides all 1"), "{:?}", s.notes);
@@ -621,7 +651,10 @@ mod tests {
     fn masking_a_vendor_with_no_devices_is_silent() {
         // An AMD mask exported on a pure-NVIDIA box must not produce a
         // note about zero AMD devices.
-        let mut s = GpuSurvey { devices: vec![gpu(0, 8, 6)], notes: vec![] };
+        let mut s = GpuSurvey {
+            devices: vec![gpu(0, 8, 6)],
+            notes: vec![],
+        };
         apply_visibility_mask(&mut s, GpuVendor::Amd, "HIP_VISIBLE_DEVICES", "");
         assert_eq!(s.devices.len(), 1);
         assert!(s.notes.is_empty());
@@ -696,7 +729,11 @@ mod tests {
             r#"[{"arch":"sm_86"},{"arch":"sm_86"},{"arch":"sm_86"},{"arch":"sm_86"}]"#,
         );
         let _cvd = EnvGuard::set(CVD, "2");
-        assert_eq!(detect_gpus_physical().len(), 4, "physical view ignores the mask");
+        assert_eq!(
+            detect_gpus_physical().len(),
+            4,
+            "physical view ignores the mask"
+        );
         let visible = detect_gpus();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].index, 2);
@@ -715,7 +752,11 @@ mod tests {
         let _cvd = EnvGuard::set(CVD, "0,1");
         let _hip = EnvGuard::set("HIP_VISIBLE_DEVICES", "1");
         let visible = detect_gpus();
-        assert_eq!(visible.len(), 1, "HIP_VISIBLE_DEVICES wins over CUDA_VISIBLE_DEVICES");
+        assert_eq!(
+            visible.len(),
+            1,
+            "HIP_VISIBLE_DEVICES wins over CUDA_VISIBLE_DEVICES"
+        );
         assert_eq!(visible[0].arch, GpuArch::Gfx("gfx1100".into()));
     }
 

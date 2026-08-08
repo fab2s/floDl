@@ -17,8 +17,7 @@ use crate::util::prompt;
 /// Returns silently (no prompt, no output) when the offer is not
 /// applicable — see the module-level doc for the skip conditions.
 pub fn offer_global_install() {
-    let Some(home_os) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-    else {
+    let Some(home_os) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
         return;
     };
     let target = PathBuf::from(home_os).join(".local/bin/fdl");
@@ -42,10 +41,7 @@ pub fn offer_global_install() {
     }
 
     println!();
-    let msg = format!(
-        "Install fdl globally to {}?",
-        target.display()
-    );
+    let msg = format!("Install fdl globally to {}?", target.display());
     if !prompt::ask_yn(&msg, true) {
         println!("  (later: ./fdl install)");
         return;

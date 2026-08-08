@@ -51,9 +51,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::GpuInfo;
 use crate::report::{GpuSurvey, NoteKind};
 use crate::vendor::{GpuArch, GpuVendor};
-use crate::GpuInfo;
 
 /// `vendor_id` a KFD node reports for AMD silicon (0x1002).
 ///
@@ -391,11 +391,14 @@ fn rocm_runtime_root_from(candidates: &[PathBuf]) -> Option<PathBuf> {
 /// [`rocm_runtime_lib_dir`] over an explicit candidate list, for tests.
 fn rocm_runtime_lib_dir_from(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find_map(|root| {
-        ["lib", "lib64"].iter().map(|libdir| root.join(libdir)).find(|lib| {
-            ["libhsa-runtime64.so", "libhsa-runtime64.so.1"]
-                .iter()
-                .any(|so| lib.join(so).exists())
-        })
+        ["lib", "lib64"]
+            .iter()
+            .map(|libdir| root.join(libdir))
+            .find(|lib| {
+                ["libhsa-runtime64.so", "libhsa-runtime64.so.1"]
+                    .iter()
+                    .any(|so| lib.join(so).exists())
+            })
     })
 }
 
@@ -499,7 +502,14 @@ mod tests {
 
     #[test]
     fn kfd_is_open_to_a_member_of_the_render_group() {
-        assert!(mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, 1000, &[44, RENDER_GID]));
+        assert!(mode_grants_rw(
+            KFD_MODE,
+            ROOT,
+            RENDER_GID,
+            1000,
+            1000,
+            &[44, RENDER_GID]
+        ));
     }
 
     #[test]
@@ -507,7 +517,14 @@ mod tests {
         // THE cloud-host case: everything else looks healthy, this is
         // the only thing wrong, and the resulting libtorch error never
         // mentions groups.
-        assert!(!mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, 1000, &[44, 100]));
+        assert!(!mode_grants_rw(
+            KFD_MODE,
+            ROOT,
+            RENDER_GID,
+            1000,
+            1000,
+            &[44, 100]
+        ));
     }
 
     #[test]
@@ -518,14 +535,28 @@ mod tests {
     #[test]
     fn the_effective_gid_counts_as_membership() {
         // Supplementary list empty, but our primary group IS render.
-        assert!(mode_grants_rw(KFD_MODE, ROOT, RENDER_GID, 1000, RENDER_GID, &[]));
+        assert!(mode_grants_rw(
+            KFD_MODE,
+            ROOT,
+            RENDER_GID,
+            1000,
+            RENDER_GID,
+            &[]
+        ));
     }
 
     #[test]
     fn owner_bits_apply_to_the_owner_even_when_group_bits_grant_more() {
         // Kernel order, not "most permissive wins": we own it, so the
         // OWNER bits decide, and here they grant nothing.
-        assert!(!mode_grants_rw(0o060, 1000, RENDER_GID, 1000, 1000, &[RENDER_GID]));
+        assert!(!mode_grants_rw(
+            0o060,
+            1000,
+            RENDER_GID,
+            1000,
+            1000,
+            &[RENDER_GID]
+        ));
     }
 
     #[test]
@@ -536,7 +567,14 @@ mod tests {
     #[test]
     fn read_only_group_access_is_not_enough() {
         // KFD needs read/write; r-- would fail at open.
-        assert!(!mode_grants_rw(0o440, ROOT, RENDER_GID, 1000, 1000, &[RENDER_GID]));
+        assert!(!mode_grants_rw(
+            0o440,
+            ROOT,
+            RENDER_GID,
+            1000,
+            1000,
+            &[RENDER_GID]
+        ));
     }
 
     #[test]
@@ -794,7 +832,10 @@ mod tests {
         assert_eq!(out.notes.len(), 1);
         assert_eq!(out.notes[0].kind, NoteKind::HardwareUnusable);
         assert!(out.notes[0].message.contains("gfx1036"), "names the arch");
-        assert!(out.notes[0].message.contains("Install ROCm"), "says what to do");
+        assert!(
+            out.notes[0].message.contains("Install ROCm"),
+            "says what to do"
+        );
     }
 
     #[test]
@@ -826,7 +867,11 @@ mod tests {
         probe_at(s.path(), &s.path().join("absent"), Some(&rocm), &mut out);
 
         assert!(out.devices.is_empty());
-        assert!(out.notes[0].message.contains("--device=/dev/kfd"), "{:?}", out.notes);
+        assert!(
+            out.notes[0].message.contains("--device=/dev/kfd"),
+            "{:?}",
+            out.notes
+        );
     }
 
     // Unix-only: see `pci_device` -- a PCI slot name contains colons,
@@ -844,7 +889,11 @@ mod tests {
         assert!(out.devices.is_empty());
         assert_eq!(out.notes.len(), 1);
         assert!(out.notes[0].message.contains("amdgpu"), "{:?}", out.notes);
-        assert!(out.notes[0].message.contains("0000:0d:00.0"), "{:?}", out.notes);
+        assert!(
+            out.notes[0].message.contains("0000:0d:00.0"),
+            "{:?}",
+            out.notes
+        );
     }
 
     // Unix-only: see `pci_device` -- a PCI slot name contains colons,
@@ -922,7 +971,10 @@ mod tests {
     #[test]
     fn no_candidates_is_none() {
         assert_eq!(rocm_runtime_root_from(&[]), None);
-        assert_eq!(rocm_runtime_root_from(&[PathBuf::from("/nonexistent")]), None);
+        assert_eq!(
+            rocm_runtime_root_from(&[PathBuf::from("/nonexistent")]),
+            None
+        );
     }
 
     #[test]

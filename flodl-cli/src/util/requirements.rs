@@ -20,11 +20,7 @@ use crate::util::system;
 ///
 /// `curl` is special-cased by the caller: `util/http.rs` accepts wget
 /// as well, so either satisfies the requirement.
-const HOST_TOOLS: &[(&str, &str)] = &[
-    ("curl", "curl"),
-    ("unzip", "unzip"),
-    ("c++", "g++"),
-];
+const HOST_TOOLS: &[(&str, &str)] = &[("curl", "curl"), ("unzip", "unzip"), ("c++", "g++")];
 
 /// Vendor toolkit headers, as (header relative to an include dir,
 /// package that owns it).
@@ -295,9 +291,7 @@ pub fn install_hint(packages: &[String]) -> String {
         "no native Windows build is supported; use WSL2 \
          (https://flodl.dev/guide/windows-wsl)"
             .to_string()
-    } else if crate::util::platform::Platform::detect()
-        == crate::util::platform::Platform::Rhel
-    {
+    } else if crate::util::platform::Platform::detect() == crate::util::platform::Platform::Rhel {
         let list = packages.iter().map(|p| rpm_name(p)).collect::<Vec<_>>();
         format!(
             "sudo dnf install {}   (or your distribution's equivalent)",
@@ -438,7 +432,10 @@ mod tests {
         let table: &[(&str, &str)] = &[("cstdio", "libstdc++-dev")];
         let missing = missing_headers(&root, table);
         if header_reachable("cstdio", &[]) == Some(true) {
-            assert!(missing.is_empty(), "compiler-visible header reported missing");
+            assert!(
+                missing.is_empty(),
+                "compiler-visible header reported missing"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -464,5 +461,4 @@ mod tests {
             assert_eq!(rpm_name(deb), rpm, "{deb}");
         }
     }
-
 }

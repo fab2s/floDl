@@ -55,10 +55,7 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
     // commands + flags. Envs are added too when env_offset == 0; once
     // an env is consumed, only commands are valid in this slot.
     let top = join_for_shell(&data.top_level);
-    let top_with_flags = format!(
-        "{top} {}",
-        TOP_FLAGS.join(" ")
-    );
+    let top_with_flags = format!("{top} {}", TOP_FLAGS.join(" "));
     s.push_str("    if [[ $cword -eq 1 ]]; then\n");
     s.push_str("        if [[ $env_offset -eq 0 ]]; then\n");
     s.push_str(&format!(
@@ -102,16 +99,13 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
                     ValueKind::Completer(c) => format!(
                         "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
                     ),
-                    ValueKind::Any => format!(
-                        "            {flags}) return ;;\n",
-                    ),
+                    ValueKind::Any => format!("            {flags}) return ;;\n",),
                     ValueKind::None => continue,
                 };
                 s.push_str(&line);
             }
             s.push_str("        esac\n");
-            let mut flags: Vec<String> =
-                tc.options.iter().flat_map(|o| o.flag_tokens()).collect();
+            let mut flags: Vec<String> = tc.options.iter().flat_map(|o| o.flag_tokens()).collect();
             flags.push("--help".into());
             flags.push("-h".into());
             s.push_str(&format!(
@@ -125,7 +119,10 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
 
     // Sub-commands with schema / nested commands.
     for cmd in &data.commands {
-        s.push_str(&format!("\n    if [[ \"$cmd\" == \"{name}\" ]]; then\n", name = cmd.name));
+        s.push_str(&format!(
+            "\n    if [[ \"$cmd\" == \"{name}\" ]]; then\n",
+            name = cmd.name
+        ));
 
         // Value completion for options that take a value.
         s.push_str("        case \"$prev\" in\n");
@@ -145,9 +142,7 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
                 ValueKind::Completer(c) => format!(
                     "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
                 ),
-                ValueKind::Any => format!(
-                    "            {flags}) return ;;\n",
-                ),
+                ValueKind::Any => format!("            {flags}) return ;;\n",),
                 ValueKind::None => continue,
             };
             s.push_str(&line);
@@ -157,11 +152,7 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
         // At position 2, offer first-positional candidates (presets +
         // real sub-commands) plus option flags. Beyond position 2,
         // offer option flags only (prev-value already handled above).
-        let option_flags: Vec<String> = cmd
-            .options
-            .iter()
-            .flat_map(|o| o.flag_tokens())
-            .collect();
+        let option_flags: Vec<String> = cmd.options.iter().flat_map(|o| o.flag_tokens()).collect();
         let cmd_flags_str = {
             let mut v = option_flags.clone();
             v.push("--help".into());
@@ -218,9 +209,7 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
                 ValueKind::Completer(c) => format!(
                     "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
                 ),
-                ValueKind::Any => format!(
-                    "            {flags}) return ;;\n",
-                ),
+                ValueKind::Any => format!("            {flags}) return ;;\n",),
                 ValueKind::None => continue,
             };
             s.push_str(&line);
@@ -268,9 +257,7 @@ pub(super) fn emit_bash(data: &CompletionData) -> String {
                     ValueKind::Completer(c) => format!(
                         "            {flags}) COMPREPLY=($(compgen -W \"$({c})\" -- \"$cur\")); return ;;\n",
                     ),
-                    ValueKind::Any => format!(
-                        "            {flags}) return ;;\n",
-                    ),
+                    ValueKind::Any => format!("            {flags}) return ;;\n",),
                     ValueKind::None => continue,
                 };
                 s.push_str(&line);

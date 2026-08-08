@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use crate::tensor::{Device, DType, Result, Tensor, TensorError};
+use crate::tensor::{DType, Device, Result, Tensor, TensorError};
 
 use super::buffer::Buffer;
 use super::parameter::Parameter;
@@ -80,7 +80,8 @@ pub(crate) fn write_checkpoint_header<W: Write>(
 /// the tensor body in every checkpoint entry).
 fn write_entry_name<W: Write>(w: &mut W, name: &str) -> Result<()> {
     let name_bytes = name.as_bytes();
-    w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(name_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     w.write_all(name_bytes).map_err(io_err)?;
     Ok(())
 }
@@ -116,12 +117,14 @@ pub(crate) fn save_checkpoint_from_raw<W: Write>(
         write_entry_name(w, e.name)?;
         // Tensor body: ndim(u32) + shape(i64*ndim) + dtype_tag(1) +
         // byte_count(u64) + raw. Mirrors `write_tensor_data` exactly.
-        w.write_all(&(e.shape.len() as u32).to_le_bytes()).map_err(io_err)?;
+        w.write_all(&(e.shape.len() as u32).to_le_bytes())
+            .map_err(io_err)?;
         for &s in e.shape {
             w.write_all(&s.to_le_bytes()).map_err(io_err)?;
         }
         w.write_all(&[e.dtype_tag]).map_err(io_err)?;
-        w.write_all(&(e.raw.len() as u64).to_le_bytes()).map_err(io_err)?;
+        w.write_all(&(e.raw.len() as u64).to_le_bytes())
+            .map_err(io_err)?;
         w.write_all(e.raw).map_err(io_err)?;
     }
     Ok(())
@@ -134,7 +137,9 @@ pub(crate) fn save_checkpoint_from_raw_file(
     entries: &[RawCheckpointEntry<'_>],
     structural_hash: Option<&str>,
 ) -> Result<()> {
-    write_file_atomic(path, |mut w| save_checkpoint_from_raw(&mut w, entries, structural_hash))
+    write_file_atomic(path, |mut w| {
+        save_checkpoint_from_raw(&mut w, entries, structural_hash)
+    })
 }
 
 /// Load a checkpoint, matching entries by qualified name against both
@@ -156,7 +161,7 @@ pub fn load_checkpoint<R: Read>(
     r.read_exact(&mut magic).map_err(io_err)?;
     if magic != MAGIC {
         return Err(TensorError::new(
-            "invalid checkpoint: bad magic (expected .fdl checkpoint)"
+            "invalid checkpoint: bad magic (expected .fdl checkpoint)",
         ));
     }
 
@@ -217,7 +222,11 @@ pub fn load_checkpoint<R: Read>(
             }
             let t = tensor_from_raw_bytes(&raw, &shape, dtype)?;
             let model_dtype = p.variable.data().dtype();
-            let t = if t.dtype() != model_dtype { t.to_dtype(model_dtype)? } else { t };
+            let t = if t.dtype() != model_dtype {
+                t.to_dtype(model_dtype)?
+            } else {
+                t
+            };
             let dev = p.variable.data().device();
             if dev != Device::CPU {
                 p.variable.set_data(t.to_device(dev)?);
@@ -242,7 +251,11 @@ pub fn load_checkpoint<R: Read>(
             }
             let t = tensor_from_raw_bytes(&raw, &shape, dtype)?;
             let model_dtype = b.get().dtype();
-            let t = if t.dtype() != model_dtype { t.to_dtype(model_dtype)? } else { t };
+            let t = if t.dtype() != model_dtype {
+                t.to_dtype(model_dtype)?
+            } else {
+                t
+            };
             let dev = b.device();
             if dev != Device::CPU {
                 b.set(t.to_device(dev)?);
@@ -257,7 +270,11 @@ pub fn load_checkpoint<R: Read>(
 
     let skipped: Vec<String> = ckpt.into_keys().collect();
 
-    Ok(LoadReport { loaded, skipped, missing })
+    Ok(LoadReport {
+        loaded,
+        skipped,
+        missing,
+    })
 }
 
 /// Atomic file write shared by every checkpoint writer: stream into
@@ -311,7 +328,9 @@ pub fn save_checkpoint_file(
     buffers: &[(String, Buffer)],
     structural_hash: Option<&str>,
 ) -> Result<()> {
-    write_file_atomic(path, |mut w| save_checkpoint(&mut w, params, buffers, structural_hash))
+    write_file_atomic(path, |mut w| {
+        save_checkpoint(&mut w, params, buffers, structural_hash)
+    })
 }
 
 /// Load checkpoint from a file path. Detects gzip from `.gz` extension.
@@ -381,8 +400,11 @@ pub fn checkpoint_keys(path: &str) -> Result<Vec<String>> {
         r.read_exact(&mut tag).map_err(io_err)?;
         let byte_count = read_u64(&mut r)? as usize;
         // Skip payload.
-        std::io::copy(&mut r.by_ref().take(byte_count as u64), &mut std::io::sink())
-            .map_err(io_err)?;
+        std::io::copy(
+            &mut r.by_ref().take(byte_count as u64),
+            &mut std::io::sink(),
+        )
+        .map_err(io_err)?;
     }
     Ok(keys)
 }
@@ -400,7 +422,7 @@ pub fn checkpoint_version(path: &str) -> Result<u32> {
     r.read_exact(&mut magic).map_err(io_err)?;
     if magic != MAGIC {
         return Err(TensorError::new(
-            "invalid checkpoint: bad magic (expected .fdl checkpoint)"
+            "invalid checkpoint: bad magic (expected .fdl checkpoint)",
         ));
     }
     read_u32(&mut r)
@@ -446,12 +468,12 @@ pub(crate) fn read_tensor_state<R: Read>(r: &mut R, device: Device) -> Result<Op
 /// [`save_checkpoint_from_raw`] without duplicating the mapping.
 pub(crate) fn dtype_tag(dtype: DType) -> u8 {
     match dtype {
-        DType::Float16  => 1,
+        DType::Float16 => 1,
         DType::BFloat16 => 2,
-        DType::Float32  => 3,
-        DType::Float64  => 4,
-        DType::Int32    => 5,
-        DType::Int64    => 6,
+        DType::Float32 => 3,
+        DType::Float64 => 4,
+        DType::Int32 => 5,
+        DType::Int64 => 6,
     }
 }
 
@@ -470,7 +492,8 @@ fn dtype_from_tag(tag: u8) -> Result<DType> {
 /// Write tensor data in native dtype: shape + dtype tag + raw bytes.
 pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
     let shape = t.shape();
-    w.write_all(&(shape.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(shape.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     for &s in &shape {
         w.write_all(&s.to_le_bytes()).map_err(io_err)?;
     }
@@ -484,7 +507,8 @@ pub(crate) fn write_tensor_data<W: Write>(w: &mut W, t: &Tensor) -> Result<()> {
 
     // Copy raw bytes from tensor (handles any dtype)
     let raw = copy_raw_bytes(t, byte_count)?;
-    w.write_all(&(byte_count as u64).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(byte_count as u64).to_le_bytes())
+        .map_err(io_err)?;
     w.write_all(&raw).map_err(io_err)?;
 
     Ok(())
@@ -523,19 +547,22 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
     // Route through the typed constructors to get a proper owned tensor
     match dtype {
         DType::Float32 => {
-            let data: Vec<f32> = raw.chunks_exact(4)
+            let data: Vec<f32> = raw
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             Tensor::from_f32(&data, shape, Device::CPU)
         }
         DType::Float64 => {
-            let data: Vec<f64> = raw.chunks_exact(8)
+            let data: Vec<f64> = raw
+                .chunks_exact(8)
                 .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect();
             Tensor::from_f64(&data, shape, Device::CPU)
         }
         DType::Int64 => {
-            let data: Vec<i64> = raw.chunks_exact(8)
+            let data: Vec<i64> = raw
+                .chunks_exact(8)
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                 .collect();
             Tensor::from_i64(&data, shape, Device::CPU)
@@ -578,19 +605,27 @@ impl std::fmt::Display for MigrateReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if !self.unchanged.is_empty() {
             writeln!(f, "unchanged ({}):", self.unchanged.len())?;
-            for name in &self.unchanged { writeln!(f, "  {}", name)?; }
+            for name in &self.unchanged {
+                writeln!(f, "  {}", name)?;
+            }
         }
         if !self.remapped.is_empty() {
             writeln!(f, "remapped ({}):", self.remapped.len())?;
-            for (old, new) in &self.remapped { writeln!(f, "  {} -> {}", old, new)?; }
+            for (old, new) in &self.remapped {
+                writeln!(f, "  {} -> {}", old, new)?;
+            }
         }
         if !self.dropped.is_empty() {
             writeln!(f, "dropped ({}):", self.dropped.len())?;
-            for name in &self.dropped { writeln!(f, "  {}", name)?; }
+            for name in &self.dropped {
+                writeln!(f, "  {}", name)?;
+            }
         }
         if !self.missing.is_empty() {
             writeln!(f, "missing ({}):", self.missing.len())?;
-            for name in &self.missing { writeln!(f, "  {}", name)?; }
+            for name in &self.missing {
+                writeln!(f, "  {}", name)?;
+            }
         }
         Ok(())
     }
@@ -610,7 +645,7 @@ fn read_raw_checkpoint<R: Read>(r: &mut R) -> Result<Vec<RawEntry>> {
     r.read_exact(&mut magic).map_err(io_err)?;
     if magic != MAGIC {
         return Err(TensorError::new(
-            "invalid checkpoint: bad magic (expected .fdl checkpoint)"
+            "invalid checkpoint: bad magic (expected .fdl checkpoint)",
         ));
     }
     let version = read_u32(r)?;
@@ -636,7 +671,12 @@ fn read_raw_checkpoint<R: Read>(r: &mut R) -> Result<Vec<RawEntry>> {
         let byte_count = read_u64(r)? as usize;
         let raw = read_payload(r, byte_count)?;
 
-        entries.push(RawEntry { name, shape, dtype, raw });
+        entries.push(RawEntry {
+            name,
+            shape,
+            dtype,
+            raw,
+        });
     }
 
     Ok(entries)
@@ -645,14 +685,17 @@ fn read_raw_checkpoint<R: Read>(r: &mut R) -> Result<Vec<RawEntry>> {
 /// Write a single raw entry (name + tensor data) into a checkpoint stream.
 fn write_raw_entry<W: Write>(w: &mut W, name: &str, e: &RawEntry) -> Result<()> {
     let name_bytes = name.as_bytes();
-    w.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(name_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     w.write_all(name_bytes).map_err(io_err)?;
-    w.write_all(&(e.shape.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(e.shape.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     for &s in &e.shape {
         w.write_all(&s.to_le_bytes()).map_err(io_err)?;
     }
     w.write_all(&[dtype_tag(e.dtype)]).map_err(io_err)?;
-    w.write_all(&(e.raw.len() as u64).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(e.raw.len() as u64).to_le_bytes())
+        .map_err(io_err)?;
     w.write_all(&e.raw).map_err(io_err)?;
     Ok(())
 }
@@ -695,9 +738,8 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
     let entries = read_raw_checkpoint(r)?;
 
     // Build model expectations in order: params then buffers
-    let mut targets: Vec<(String, Vec<i64>, DType)> = Vec::with_capacity(
-        params.len() + buffers.len()
-    );
+    let mut targets: Vec<(String, Vec<i64>, DType)> =
+        Vec::with_capacity(params.len() + buffers.len());
     for (name, p) in params {
         targets.push((name.clone(), p.variable.shape(), p.variable.data().dtype()));
     }
@@ -714,8 +756,11 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
     let mut output: Vec<(String, usize)> = Vec::new();
 
     // Index checkpoint entries by name for O(1) exact lookup
-    let name_index: std::collections::HashMap<&str, usize> =
-        entries.iter().enumerate().map(|(i, e)| (e.name.as_str(), i)).collect();
+    let name_index: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.as_str(), i))
+        .collect();
 
     // Indices of model targets not yet matched
     let mut unmatched: Vec<usize> = Vec::new();
@@ -723,12 +768,14 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
     // Pass 1: exact name + shape match
     for (mi, (name, shape, _)) in targets.iter().enumerate() {
         if let Some(&ci) = name_index.get(name.as_str())
-            && !used[ci] && entries[ci].shape == *shape {
-                unchanged.push(name.clone());
-                used[ci] = true;
-                output.push((name.clone(), ci));
-                continue;
-            }
+            && !used[ci]
+            && entries[ci].shape == *shape
+        {
+            unchanged.push(name.clone());
+            used[ci] = true;
+            output.push((name.clone(), ci));
+            continue;
+        }
         unmatched.push(mi);
     }
 
@@ -736,7 +783,9 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
     for &mi in &unmatched {
         let (name, shape, dtype) = &targets[mi];
 
-        let found = entries.iter().enumerate()
+        let found = entries
+            .iter()
+            .enumerate()
             .find(|(ci, e)| !used[*ci] && e.shape == *shape && e.dtype == *dtype)
             .map(|(ci, _)| ci);
 
@@ -749,7 +798,9 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
         }
     }
 
-    let dropped: Vec<String> = entries.iter().enumerate()
+    let dropped: Vec<String> = entries
+        .iter()
+        .enumerate()
         .filter(|(i, _)| !used[*i])
         .map(|(_, e)| e.name.clone())
         .collect();
@@ -758,13 +809,19 @@ pub fn migrate_checkpoint<R: Read, W: Write>(
     w.write_all(&MAGIC).map_err(io_err)?;
     w.write_all(&VERSION.to_le_bytes()).map_err(io_err)?;
     w.write_all(&[0u8; HASH_LEN]).map_err(io_err)?;
-    w.write_all(&(output.len() as u32).to_le_bytes()).map_err(io_err)?;
+    w.write_all(&(output.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
 
     for (name, ci) in &output {
         write_raw_entry(w, name, &entries[*ci])?;
     }
 
-    Ok(MigrateReport { unchanged, remapped, dropped, missing })
+    Ok(MigrateReport {
+        unchanged,
+        remapped,
+        dropped,
+        missing,
+    })
 }
 
 /// Migrate a checkpoint file. Detects gzip from `.gz` extension on both paths.

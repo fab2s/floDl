@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use super::graph::{instant_secs, Graph};
+use super::graph::{Graph, instant_secs};
 use super::profile;
 use crate::autograd::Variable;
 use crate::nn::{Module, Parameter};
@@ -30,7 +30,11 @@ impl Graph {
         }
 
         let is_profiling = self.profiling.get();
-        let forward_start = if is_profiling { Some(Instant::now()) } else { None };
+        let forward_start = if is_profiling {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let mut prof_nodes: Vec<profile::NodeTiming> = Vec::new();
         let mut prof_levels: Vec<profile::LevelTiming> = Vec::new();
 
@@ -72,7 +76,11 @@ impl Graph {
 
         // Execute levels sequentially
         for (level_idx, level) in self.levels.iter().enumerate() {
-            let level_start = if is_profiling { Some(Instant::now()) } else { None };
+            let level_start = if is_profiling {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let mut level_sum_ns: u64 = 0;
 
             for &ni in level {
@@ -93,10 +101,7 @@ impl Graph {
                                         node.id, i
                                     ))
                                 })?;
-                                Ok(Variable::new(
-                                    Tensor::zeros_like(&first.data())?,
-                                    false,
-                                ))
+                                Ok(Variable::new(Tensor::zeros_like(&first.data())?, false))
                             }
                             _ => Err(TensorError::new(&format!(
                                 "node '{}': missing primary input (port {}) — check that all \
@@ -113,7 +118,11 @@ impl Graph {
                 }
 
                 // Execute node (with optional per-node timing)
-                let node_start = if is_profiling { Some(Instant::now()) } else { None };
+                let node_start = if is_profiling {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let node_outputs = (node.run)(&inputs)?;
                 if is_profiling {
                     let elapsed = node_start.unwrap().elapsed();
@@ -147,18 +156,14 @@ impl Graph {
                 }
 
                 // Capture tagged outputs for observation
-                if has_tags
-                    && let Some(captures) = self.tag_capture.get(&ni) {
-                        let mut tagged = self.tagged_outputs.borrow_mut();
-                        for (tag_name, port_idx) in captures {
-                            if *port_idx < node_outputs.len() {
-                                tagged.insert(
-                                    tag_name.clone(),
-                                    node_outputs[*port_idx].clone(),
-                                );
-                            }
+                if has_tags && let Some(captures) = self.tag_capture.get(&ni) {
+                    let mut tagged = self.tagged_outputs.borrow_mut();
+                    for (tag_name, port_idx) in captures {
+                        if *port_idx < node_outputs.len() {
+                            tagged.insert(tag_name.clone(), node_outputs[*port_idx].clone());
                         }
                     }
+                }
 
                 // Keep output node's results; all others drop here (early release)
                 if ni == self.output_node_idx {
@@ -197,11 +202,15 @@ impl Graph {
 }
 
 impl Module for Graph {
-    fn name(&self) -> &str { "graph" }
+    fn name(&self) -> &str {
+        "graph"
+    }
 
     // The identity hook behind `GraphExt::as_graph` — framework code
     // holding `dyn Module` downcasts through this to reach the graph.
-    fn as_any(&self) -> Option<&dyn std::any::Any> { Some(self) }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 
     /// Expose Graph's shared aggregated-metrics slot to the cluster-
     /// rank worker setup. The worker stores an `Arc` clone of THIS
@@ -210,9 +219,7 @@ impl Module for Graph {
     /// [`Graph::latest_metrics`] / [`Graph::aggregated_gpu_tabs`].
     fn aggregated_metrics_slot(
         &self,
-    ) -> Option<std::sync::Arc<
-        std::sync::Mutex<Option<crate::metrics::EpochMetrics>>,
-    >> {
+    ) -> Option<std::sync::Arc<std::sync::Mutex<Option<crate::metrics::EpochMetrics>>>> {
         Some(std::sync::Arc::clone(&self.aggregated_metrics))
     }
 
@@ -325,9 +332,10 @@ impl<'a> GraphEpochIterator<'a> {
     pub fn activate(self) -> ActiveGraphEpochIterator<'a> {
         match self {
             GraphEpochIterator::Single(graph, epoch) => {
-                let mut guard = graph.data_loader.try_borrow_mut().expect(
-                    "Graph::epoch: an epoch iterator is already active on this graph",
-                );
+                let mut guard = graph
+                    .data_loader
+                    .try_borrow_mut()
+                    .expect("Graph::epoch: an epoch iterator is already active on this graph");
                 let loader = guard
                     .as_mut()
                     .expect("Graph::epoch() requires set_data_loader() first");

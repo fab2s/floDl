@@ -2,12 +2,11 @@
 
 use std::process::ExitCode;
 
-use flodl_cli::{builtins, nccl};
-use flodl_cli::cli_error;
 use builtins::NcclBuildArgs;
+use flodl_cli::cli_error;
+use flodl_cli::{builtins, nccl};
 
 use crate::parse_sub;
-
 
 // ---------------------------------------------------------------------------
 // nccl dispatch

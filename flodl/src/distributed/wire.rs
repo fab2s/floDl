@@ -194,13 +194,15 @@ pub(crate) fn warn_cleartext_public_peer(what: &str, peer: std::net::SocketAddr)
     if is_private_or_local(peer.ip()) {
         return;
     }
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
-        std::sync::OnceLock::new();
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>,
+    > = std::sync::OnceLock::new();
     let warned = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     if let Ok(mut set) = warned.lock()
-        && !set.insert(peer.ip()) {
-            return;
-        }
+        && !set.insert(peer.ip())
+    {
+        return;
+    }
     eprintln!(
         "flodl: WARNING: {what} peer {peer} is outside any private network \
          range and this channel is CLEARTEXT (frames are HMAC-authenticated, \
@@ -215,23 +217,17 @@ pub(crate) fn warn_cleartext_public_peer(what: &str, peer: std::net::SocketAddr)
 /// Write the channel-select magic. First bytes on every cross-host
 /// dial, immediately after `connect`.
 pub(crate) fn write_channel_magic<W: Write>(w: &mut W, magic: u32) -> Result<()> {
-    w.write_all(&magic.to_le_bytes()).map_err(|e| {
-        TensorError::new(&format!("wire: writing channel magic failed: {e}"))
-    })
+    w.write_all(&magic.to_le_bytes())
+        .map_err(|e| TensorError::new(&format!("wire: writing channel magic failed: {e}")))
 }
 
 /// Consume the 4-byte channel-select magic from an accepted stream and
 /// require it to be `expected`. `what` names the accepting subsystem
 /// for the error message.
-pub(crate) fn expect_channel_magic<R: Read>(
-    r: &mut R,
-    expected: u32,
-    what: &str,
-) -> Result<()> {
+pub(crate) fn expect_channel_magic<R: Read>(r: &mut R, expected: u32, what: &str) -> Result<()> {
     let mut buf = [0u8; 4];
-    r.read_exact(&mut buf).map_err(|e| {
-        TensorError::new(&format!("{what}: reading channel magic failed: {e}"))
-    })?;
+    r.read_exact(&mut buf)
+        .map_err(|e| TensorError::new(&format!("{what}: reading channel magic failed: {e}")))?;
     let got = u32::from_le_bytes(buf);
     if got != expected {
         return Err(TensorError::new(&format!(
@@ -303,9 +299,7 @@ pub(crate) fn set_frame_ceiling(bytes: usize) {
 /// `HostFrame`, which sums element-wise and never outgrows one rank's
 /// frame.
 pub(crate) fn derive_frame_ceiling(model_wire_bytes: usize) -> usize {
-    model_wire_bytes
-        .saturating_mul(2)
-        .max(FRAME_CEILING_FLOOR)
+    model_wire_bytes.saturating_mul(2).max(FRAME_CEILING_FLOOR)
 }
 
 /// Σ bytes of `tensors` as they ride a `RoundFrame` (numel × element
@@ -326,8 +320,7 @@ pub(crate) fn tensors_wire_bytes(tensors: &[crate::tensor::Tensor]) -> usize {
 /// wrong tier. One budget, ordered by definition.
 pub(crate) const CONNECT_ATTEMPTS: u32 = 60;
 /// Pause between [`CONNECT_ATTEMPTS`].
-pub(crate) const CONNECT_BACKOFF: std::time::Duration =
-    std::time::Duration::from_millis(500);
+pub(crate) const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 /// Zero-progress write-stall ceiling for every cluster socket.
 ///
 /// `SO_SNDTIMEO` applies per `write()` call and `write_all` loops over
@@ -338,8 +331,7 @@ pub(crate) const CONNECT_BACKOFF: std::time::Duration =
 /// an error. Matches the heartbeat-staleness default so both liveness
 /// axes agree on what "gone" means. Socket options are fd-level, so one
 /// call at socket setup covers every cloned handle.
-pub(crate) const WRITE_STALL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
+pub(crate) const WRITE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Env var scaling every cluster network deadline together.
 ///
@@ -445,10 +437,7 @@ pub(crate) fn join_host_port(host: &str, port: u16) -> String {
 
 /// TCP connect with the shared cluster retry budget. `what` names the
 /// dial for the error message (e.g. "relay upstream", "rendezvous").
-pub(crate) fn connect_with_retry<A>(
-    addr: A,
-    what: &str,
-) -> Result<std::net::TcpStream>
+pub(crate) fn connect_with_retry<A>(addr: A, what: &str) -> Result<std::net::TcpStream>
 where
     A: std::net::ToSocketAddrs + std::fmt::Display + Copy,
 {
@@ -476,10 +465,7 @@ where
 /// Read exactly `len` bytes, growing the buffer in [`READ_CHUNK`] steps
 /// so a garbage/hostile length field can only make us allocate as much
 /// as the peer actually sends.
-pub(crate) fn read_exact_incremental<R: Read>(
-    r: &mut R,
-    len: usize,
-) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_exact_incremental<R: Read>(r: &mut R, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < len {
         let chunk = (len - buf.len()).min(READ_CHUNK);
@@ -660,9 +646,9 @@ pub(crate) fn write_handshake_rank(
     buf[16..48].copy_from_slice(model_sig);
     let tag = hmac_first8(salt, &buf[0..48]);
     buf[48..56].copy_from_slice(&tag);
-    stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("wire: handshake write: {e}"))
-    })
+    stream
+        .write_all(&buf)
+        .map_err(|e| TensorError::new(&format!("wire: handshake write: {e}")))
 }
 
 /// Read and validate the rank-side control-channel handshake (salt-
@@ -676,9 +662,9 @@ pub(crate) fn read_handshake_rank(
     salt: &SessionSalt,
 ) -> Result<(u32, [u8; 32])> {
     let mut buf = [0u8; HS_RANK_BYTES];
-    stream.read_exact(&mut buf).map_err(|e| {
-        TensorError::new(&format!("wire: handshake read: {e}"))
-    })?;
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| TensorError::new(&format!("wire: handshake read: {e}")))?;
     let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if magic != CONTROL_HANDSHAKE_MAGIC_RANK {
         return Err(TensorError::new(&format!(
@@ -718,9 +704,9 @@ pub(crate) fn write_handshake_ack(stream: &mut TcpStream, salt: &SessionSalt) ->
     buf[4..8].copy_from_slice(&CONTROL_PROTOCOL_VERSION.to_le_bytes());
     let tag = hmac_first8(salt, &buf[0..8]);
     buf[8..16].copy_from_slice(&tag);
-    stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("wire: handshake ack write: {e}"))
-    })
+    stream
+        .write_all(&buf)
+        .map_err(|e| TensorError::new(&format!("wire: handshake ack write: {e}")))
 }
 
 /// Rank-side handshake-ack read + validation (the worker's half of
@@ -850,11 +836,7 @@ impl ControlFrame {
     /// Convenience wrapper for callers that have a serializable message
     /// in hand; the alternative is to set `payload` manually if the
     /// caller already holds bytes.
-    pub fn encode<T: Serialize>(
-        salt: &SessionSalt,
-        kind: MsgKind,
-        msg: &T,
-    ) -> Result<Self> {
+    pub fn encode<T: Serialize>(salt: &SessionSalt, kind: MsgKind, msg: &T) -> Result<Self> {
         let payload = encode(msg)?;
         let auth_tag = frame_mac(salt, kind, &payload);
         Ok(ControlFrame {
@@ -922,12 +904,7 @@ impl ControlFrame {
         Self::finish_read_from(hdr, r, salt).map(Some)
     }
 
-
-    fn finish_read_from<R: Read>(
-        hdr: [u8; 24],
-        r: &mut R,
-        salt: &SessionSalt,
-    ) -> Result<Self> {
+    fn finish_read_from<R: Read>(hdr: [u8; 24], r: &mut R, salt: &SessionSalt) -> Result<Self> {
         let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         if magic != CONTROL_FRAME_MAGIC {
             return Err(TensorError::new(&format!(
@@ -978,7 +955,6 @@ impl ControlFrame {
         })
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Wire-friendly message types
@@ -1334,7 +1310,9 @@ pub enum TimingMsgWire {
     /// is honest per-rank capacity — snapshot + upload time only,
     /// NOT polluted by the slowest-rank barrier wait that contaminates
     /// `SyncAck` timestamps.
-    SnapshotReady { rank: u64 },
+    SnapshotReady {
+        rank: u64,
+    },
     /// Worker → coord eval result. Carries the scalar metric returned
     /// by the user's [`crate::distributed::ddp_run::EvalFn`] (or an
     /// error string when the closure failed). Result-bearing per
@@ -1608,8 +1586,6 @@ pub struct EpochMetricsWire {
     pub per_rank_loss: Vec<Option<f64>>,
     pub per_rank_samples: Vec<u64>,
 }
-
-
 
 /// Per-rank role assignment for the bootstrap rendezvous.
 ///

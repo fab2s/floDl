@@ -6,8 +6,8 @@ use crate::autograd::{Variable, no_grad};
 use crate::tensor::Result;
 
 use crate::nn::checkpoint::{
-    write_tensor_state, read_tensor_state, write_f64_le, read_f64_le,
-    write_u32_le, read_u32_le, write_i64_le, read_i64_le,
+    read_f64_le, read_i64_le, read_tensor_state, read_u32_le, write_f64_le, write_i64_le,
+    write_tensor_state, write_u32_le,
 };
 use crate::nn::parameter::Parameter;
 
@@ -44,19 +44,30 @@ pub struct AdagradBuilder {
 
 impl AdagradBuilder {
     /// Set epsilon for numerical stability (default: 1e-10).
-    pub fn eps(mut self, eps: f64) -> Self { self.eps = eps; self }
+    pub fn eps(mut self, eps: f64) -> Self {
+        self.eps = eps;
+        self
+    }
     /// Set L2 penalty / weight decay (default: 0.0).
-    pub fn weight_decay(mut self, wd: f64) -> Self { self.weight_decay = wd; self }
+    pub fn weight_decay(mut self, wd: f64) -> Self {
+        self.weight_decay = wd;
+        self
+    }
     /// Set learning rate decay applied each step: `clr = lr / (1 + (step-1) * lr_decay)` (default: 0.0).
-    pub fn lr_decay(mut self, lr_decay: f64) -> Self { self.lr_decay = lr_decay; self }
+    pub fn lr_decay(mut self, lr_decay: f64) -> Self {
+        self.lr_decay = lr_decay;
+        self
+    }
 
     /// Build the Adagrad optimizer.
     pub fn build(self) -> Adagrad {
         let n = self.params.len();
         Adagrad {
             params: self.params.iter().map(|p| p.variable.clone()).collect(),
-            lr: self.lr, eps: self.eps,
-            weight_decay: self.weight_decay, lr_decay: self.lr_decay,
+            lr: self.lr,
+            eps: self.eps,
+            weight_decay: self.weight_decay,
+            lr_decay: self.lr_decay,
             state_sum: vec![None; n],
             steps: vec![0; n],
         }
@@ -70,7 +81,10 @@ impl Adagrad {
         let n = params.len();
         Adagrad {
             params: params.iter().map(|p| p.variable.clone()).collect(),
-            lr, eps: 1e-10, weight_decay: 0.0, lr_decay: 0.0,
+            lr,
+            eps: 1e-10,
+            weight_decay: 0.0,
+            lr_decay: 0.0,
             state_sum: vec![None; n],
             steps: vec![0; n],
         }
@@ -79,16 +93,24 @@ impl Adagrad {
     /// Create a builder for Adagrad with customizable options.
     pub fn builder(params: &[Parameter], lr: f64) -> AdagradBuilder {
         AdagradBuilder {
-            params: params.to_vec(), lr, eps: 1e-10, weight_decay: 0.0, lr_decay: 0.0,
+            params: params.to_vec(),
+            lr,
+            eps: 1e-10,
+            weight_decay: 0.0,
+            lr_decay: 0.0,
         }
     }
 
     /// Current learning rate.
-    pub fn lr(&self) -> f64 { self.lr }
+    pub fn lr(&self) -> f64 {
+        self.lr
+    }
 }
 
 impl Optimizer for Adagrad {
-    fn lr(&self) -> f64 { self.lr }
+    fn lr(&self) -> f64 {
+        self.lr
+    }
     fn step(&mut self) -> Result<()> {
         no_grad(|| {
             for (i, param) in self.params.iter().enumerate() {
@@ -107,7 +129,9 @@ impl Optimizer for Adagrad {
                         Some(ss) => ss.add(&grad2)?,
                         None => grad2,
                     };
-                    let update = grad.div(&ss.sqrt()?.add_scalar(self.eps)?)?.mul_scalar(clr)?;
+                    let update = grad
+                        .div(&ss.sqrt()?.add_scalar(self.eps)?)?
+                        .mul_scalar(clr)?;
                     data.sub_(&update)?;
                     self.state_sum[i] = Some(ss);
                 }
@@ -128,10 +152,14 @@ impl Optimizer for Adagrad {
     }
 
     fn zero_grad(&self) {
-        for p in &self.params { p.zero_grad_set_to_none(); }
+        for p in &self.params {
+            p.zero_grad_set_to_none();
+        }
     }
 
-    fn set_lr(&mut self, lr: f64) { self.lr = lr; }
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
 
     fn save_state_to(&self, path: &str) -> Result<()> {
         <Self as Stateful>::save_state_file(self, path)
@@ -139,7 +167,9 @@ impl Optimizer for Adagrad {
 }
 
 impl Stateful for Adagrad {
-    fn state_kind(&self) -> super::StateKind { super::StateKind::Adagrad }
+    fn state_kind(&self) -> super::StateKind {
+        super::StateKind::Adagrad
+    }
 
     fn save_state<W: Write>(&self, w: &mut W) -> Result<()> {
         write_u32_le(w, self.params.len() as u32)?;
@@ -161,7 +191,9 @@ impl Stateful for Adagrad {
         let count = read_u32_le(r)? as usize;
         if count != self.params.len() {
             return Err(crate::tensor::TensorError::new(&format!(
-                "Adagrad: param count mismatch: checkpoint={} optimizer={}", count, self.params.len()
+                "Adagrad: param count mismatch: checkpoint={} optimizer={}",
+                count,
+                self.params.len()
             )));
         }
         self.lr = read_f64_le(r)?;
@@ -186,8 +218,8 @@ impl Stateful for Adagrad {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{make_param, state_tmp};
+    use super::*;
     use crate::tensor::Tensor;
 
     #[test]
@@ -197,7 +229,8 @@ mod tests {
         let dev = crate::tensor::test_device();
         let p = make_param("w", &[2]);
         let mut opt = Adagrad::new(std::slice::from_ref(&p), 0.02);
-        p.variable.set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
+        p.variable
+            .set_grad(Tensor::from_f32(&[0.1, 0.2], &[2], dev).unwrap());
         opt.step().unwrap();
 
         let path = state_tmp("adagrad_roundtrip.optim");
@@ -218,13 +251,20 @@ mod tests {
         let p = make_param("w", &[2]);
         let mut opt = Adagrad::new(std::slice::from_ref(&p), 0.01);
         for _ in 0..3 {
-            p.variable.set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
+            p.variable
+                .set_grad(Tensor::from_f32(&[0.1, -0.2], &[2], dev).unwrap());
             opt.step().unwrap();
         }
-        assert!(opt.steps.iter().any(|&s| s > 0), "warm-up should advance steps");
+        assert!(
+            opt.steps.iter().any(|&s| s > 0),
+            "warm-up should advance steps"
+        );
         opt.reset_state();
         assert!(opt.steps.iter().all(|&s| s == 0), "steps must reset to 0");
-        assert!(opt.state_sum.iter().all(|s| s.is_none()), "state_sum must be cleared");
+        assert!(
+            opt.state_sum.iter().all(|s| s.is_none()),
+            "state_sum must be cleared"
+        );
     }
 
     #[test]
@@ -233,14 +273,18 @@ mod tests {
         let before = p.variable.data().item().unwrap();
         let mut opt = Adagrad::new(std::slice::from_ref(&p), 0.5);
         let x = Variable::new(
-            Tensor::from_f32(&[2.0], &[1], crate::tensor::test_device()).unwrap(), false,
+            Tensor::from_f32(&[2.0], &[1], crate::tensor::test_device()).unwrap(),
+            false,
         );
         let loss = x.mul(&p.variable).unwrap().sum().unwrap();
         loss.backward().unwrap();
         opt.step().unwrap();
         let after = p.variable.data().item().unwrap();
         // Parameter should change
-        assert!((after - before).abs() > 1e-6, "Adagrad step should change parameter");
+        assert!(
+            (after - before).abs() > 1e-6,
+            "Adagrad step should change parameter"
+        );
     }
 
     #[test]
@@ -253,12 +297,13 @@ mod tests {
 
         let x = Variable::new(
             Tensor::from_f32(
-                &[1.0, 0.0, 0.0, 0.0,
-                  0.0, 1.0, 0.0, 0.0,
-                  0.0, 0.0, 1.0, 0.0,
-                  0.0, 0.0, 0.0, 1.0],
-                &[4, 4], dev,
-            ).unwrap(),
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                &[4, 4],
+                dev,
+            )
+            .unwrap(),
             false,
         );
         let target = Variable::new(
@@ -282,7 +327,11 @@ mod tests {
 
         let pred = model.forward(&x).unwrap();
         let final_loss = mse_loss(&pred, &target).unwrap().item().unwrap();
-        assert!(final_loss < first_loss * 0.5,
-            "Adagrad should converge: first={}, final={}", first_loss, final_loss);
+        assert!(
+            final_loss < first_loss * 0.5,
+            "Adagrad should converge: first={}, final={}",
+            first_loss,
+            final_loss
+        );
     }
 }

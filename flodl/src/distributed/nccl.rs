@@ -20,16 +20,15 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flodl_sys::{self as ffi, FlodlTensor};
 
-use crate::tensor::{
-    check_err, current_gpu_device, set_current_gpu_device,
-    Device, Result, Tensor, TensorError,
-};
 use crate::tensor::cuda_stream::GpuStream;
+use crate::tensor::{
+    Device, Result, Tensor, TensorError, check_err, current_gpu_device, set_current_gpu_device,
+};
 
 /// NCCL reduction operation.
 #[derive(Clone, Copy, Debug)]
@@ -69,18 +68,14 @@ impl NcclComms {
     /// builds or if NCCL initialization fails.
     pub fn new(devices: &[Device]) -> Result<Self> {
         if devices.len() < 2 {
-            return Err(TensorError::new(
-                "NcclComms requires at least 2 devices",
-            ));
+            return Err(TensorError::new("NcclComms requires at least 2 devices"));
         }
         let mut devlist: Vec<i32> = Vec::with_capacity(devices.len());
         for &dev in devices {
             match dev {
                 Device::CUDA(idx) => devlist.push(idx as i32),
                 Device::CPU => {
-                    return Err(TensorError::new(
-                        "NcclComms requires CUDA devices, got CPU",
-                    ))
+                    return Err(TensorError::new("NcclComms requires CUDA devices, got CPU"));
                 }
             }
         }
@@ -89,13 +84,8 @@ impl NcclComms {
         // NCCL init calls cudaSetDevice internally. Save/restore so we
         // don't corrupt the caller's device context.
         let saved = current_gpu_device();
-        let err = unsafe {
-            ffi::flodl_nccl_init(
-                devlist.len() as i32,
-                devlist.as_ptr(),
-                &mut handle,
-            )
-        };
+        let err =
+            unsafe { ffi::flodl_nccl_init(devlist.len() as i32, devlist.as_ptr(), &mut handle) };
         set_current_gpu_device(saved);
         check_err(err)?;
         Ok(NcclComms {
@@ -150,7 +140,8 @@ impl NcclComms {
         if streams.len() != self.devices.len() {
             return Err(TensorError::new(&format!(
                 "all_reduce_on_streams: expected {} streams, got {}",
-                self.devices.len(), streams.len()
+                self.devices.len(),
+                streams.len()
             )));
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
@@ -182,7 +173,8 @@ impl NcclComms {
         if root >= self.devices.len() {
             return Err(TensorError::new(&format!(
                 "broadcast: root {} out of range (have {} devices)",
-                root, self.devices.len()
+                root,
+                self.devices.len()
             )));
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
@@ -218,13 +210,15 @@ impl NcclComms {
         self.validate_tensors(tensors, "broadcast_on_streams")?;
         if root >= self.devices.len() {
             return Err(TensorError::new(&format!(
-                "broadcast_on_streams: root {} out of range", root
+                "broadcast_on_streams: root {} out of range",
+                root
             )));
         }
         if streams.len() != self.devices.len() {
             return Err(TensorError::new(&format!(
                 "broadcast_on_streams: expected {} streams, got {}",
-                self.devices.len(), streams.len()
+                self.devices.len(),
+                streams.len()
             )));
         }
         let mut handles: Vec<FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
@@ -256,7 +250,9 @@ impl NcclComms {
         if tensors.len() != self.devices.len() {
             return Err(TensorError::new(&format!(
                 "{}: expected {} tensors (one per device), got {}",
-                op, self.devices.len(), tensors.len()
+                op,
+                self.devices.len(),
+                tensors.len()
             )));
         }
         Ok(())
@@ -287,13 +283,8 @@ impl NcclComms {
         let mut comms = Vec::with_capacity(self.devices.len());
         for i in 0..self.devices.len() {
             let mut rank_handle: *mut c_void = ptr::null_mut();
-            let err = unsafe {
-                ffi::flodl_nccl_split_rank(
-                    self.handle,
-                    i as i32,
-                    &mut rank_handle,
-                )
-            };
+            let err =
+                unsafe { ffi::flodl_nccl_split_rank(self.handle, i as i32, &mut rank_handle) };
             check_err(err)?;
             let abort_handle = Arc::new(NcclAbortHandle {
                 ptr: rank_handle,
@@ -530,13 +521,12 @@ impl NcclRankComm {
     pub fn init_rank(rank: usize, world_size: usize, uid: &NcclUniqueId) -> Result<Self> {
         if rank >= world_size {
             return Err(TensorError::new(&format!(
-                "NcclRankComm: rank {} >= world_size {}", rank, world_size
+                "NcclRankComm: rank {} >= world_size {}",
+                rank, world_size
             )));
         }
         if world_size < 2 {
-            return Err(TensorError::new(
-                "NcclRankComm requires world_size >= 2"
-            ));
+            return Err(TensorError::new("NcclRankComm requires world_size >= 2"));
         }
         let mut handle: *mut c_void = ptr::null_mut();
         let err = unsafe {
@@ -553,7 +543,12 @@ impl NcclRankComm {
             aborted: AtomicBool::new(false),
             guard: std::sync::Mutex::new(()),
         });
-        Ok(NcclRankComm { handle, rank, world_size, abort_handle })
+        Ok(NcclRankComm {
+            handle,
+            rank,
+            world_size,
+            abort_handle,
+        })
     }
 
     /// This rank's index.
@@ -642,9 +637,8 @@ impl NcclRankComm {
         // collectives; see NcclAbortHandle::lock_for_issue).
         let _guard = self.abort_handle.lock_for_issue()?;
         let mut op: i32 = 0;
-        let err = unsafe {
-            ffi::flodl_nccl_redop_premulsum_create_rank(self.handle, factor, &mut op)
-        };
+        let err =
+            unsafe { ffi::flodl_nccl_redop_premulsum_create_rank(self.handle, factor, &mut op) };
         check_err(err)?;
         let mut handles: Vec<ffi::FlodlTensor> = tensors.iter().map(|t| t.handle).collect();
         let stream_ptr = stream.map_or(ptr::null_mut(), |s| s.as_ptr());

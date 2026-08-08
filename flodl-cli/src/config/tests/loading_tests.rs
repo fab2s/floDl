@@ -141,8 +141,8 @@ fn load_project_with_env_empty_config_is_default() {
     let tmp = TempDir::new();
     let base = tmp.0.join("fdl.yml");
     std::fs::write(&base, "# just a comment\n").unwrap();
-    let cfg = load_project_with_env(&base, None)
-        .expect("empty config must load as defaults, not error");
+    let cfg =
+        load_project_with_env(&base, None).expect("empty config must load as defaults, not error");
     assert!(cfg.commands.is_empty());
     assert!(cfg.cluster.is_none());
     assert!(cfg.description.is_none());
@@ -157,7 +157,10 @@ fn load_project_rejects_unknown_root_key() {
     std::fs::write(&base, "descripton: typo\n").unwrap();
     let err = load_project_with_env(&base, None).unwrap_err();
     assert!(err.contains("unknown field `descripton`"), "got: {err}");
-    assert!(err.contains("description"), "should list valid fields: {err}");
+    assert!(
+        err.contains("description"),
+        "should list valid fields: {err}"
+    );
 }
 
 #[test]

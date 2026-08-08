@@ -27,10 +27,7 @@ fn test_tagged_capture() {
 
 #[test]
 fn test_tagged_updates_each_forward() {
-    let graph = FlowBuilder::from(Doubler)
-        .tag("doubled")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Doubler).tag("doubled").build().unwrap();
 
     let x1 = Variable::new(from_f32(&[1.0], &[1, 1]), false);
     let _ = graph.forward(&x1).unwrap();
@@ -57,14 +54,10 @@ fn test_tag_names() {
     assert_eq!(names, vec!["a", "b"]);
 }
 
-
 #[test]
 fn test_collect_flush_trend() {
     // Simulate a training loop with collect → flush → trend
-    let graph = FlowBuilder::from(ScalarSum)
-        .tag("loss")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(ScalarSum).tag("loss").build().unwrap();
 
     // Epoch 1: 3 batches with different inputs
     for val in &[1.0f32, 2.0, 3.0] {
@@ -155,7 +148,6 @@ fn test_trends_group() {
 
 // --- TagGroup tests ---
 
-
 #[test]
 fn test_tag_group() {
     // Split into 3 branches with tag_group, then merge
@@ -183,11 +175,19 @@ fn test_tag_group() {
 
     let b0 = graph.tagged("branch_0").unwrap();
     let b0_data = b0.data().to_f32_vec().unwrap();
-    assert!((b0_data[0] - 2.0).abs() < 1e-5, "doubler: got {}", b0_data[0]);
+    assert!(
+        (b0_data[0] - 2.0).abs() < 1e-5,
+        "doubler: got {}",
+        b0_data[0]
+    );
 
     let b1 = graph.tagged("branch_1").unwrap();
     let b1_data = b1.data().to_f32_vec().unwrap();
-    assert!((b1_data[0] - 3.0).abs() < 1e-5, "tripler: got {}", b1_data[0]);
+    assert!(
+        (b1_data[0] - 3.0).abs() < 1e-5,
+        "tripler: got {}",
+        b1_data[0]
+    );
 }
 
 #[test]
@@ -216,9 +216,7 @@ fn test_tag_group_observation() {
 #[test]
 fn test_tag_group_errors() {
     // tag_group on single stream should error
-    let result = FlowBuilder::from(Identity)
-        .tag_group("bad")
-        .build();
+    let result = FlowBuilder::from(Identity).tag_group("bad").build();
     assert!(result.is_err());
 
     // Duplicate group name
@@ -239,10 +237,7 @@ fn test_tag_group_errors() {
 #[test]
 fn test_collect_with_sum_reduction() {
     // Non-scalar tagged output reduced via Sum
-    let graph = FlowBuilder::from(Identity)
-        .tag("features")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("features").build().unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0, 3.0], &[1, 3]), false);
     let _ = graph.forward(&x).unwrap();
@@ -250,60 +245,64 @@ fn test_collect_with_sum_reduction() {
 
     let collected = graph.collected("features");
     assert_eq!(collected.len(), 1);
-    assert!((collected[0] - 6.0).abs() < 1e-5, "sum([1,2,3]) = 6, got {}", collected[0]);
+    assert!(
+        (collected[0] - 6.0).abs() < 1e-5,
+        "sum([1,2,3]) = 6, got {}",
+        collected[0]
+    );
 }
 
 #[test]
 fn test_collect_with_mean_reduction() {
-    let graph = FlowBuilder::from(Identity)
-        .tag("out")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("out").build().unwrap();
 
     let x = Variable::new(from_f32(&[2.0, 4.0, 6.0], &[1, 3]), false);
     let _ = graph.forward(&x).unwrap();
     graph.collect_with(&["out"], Reduce::Mean).unwrap();
 
     let collected = graph.collected("out");
-    assert!((collected[0] - 4.0).abs() < 1e-5, "mean([2,4,6]) = 4, got {}", collected[0]);
+    assert!(
+        (collected[0] - 4.0).abs() < 1e-5,
+        "mean([2,4,6]) = 4, got {}",
+        collected[0]
+    );
 }
 
 #[test]
 fn test_collect_with_max_reduction() {
-    let graph = FlowBuilder::from(Identity)
-        .tag("out")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("out").build().unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 5.0, 3.0], &[1, 3]), false);
     let _ = graph.forward(&x).unwrap();
     graph.collect_with(&["out"], Reduce::Max).unwrap();
 
     let collected = graph.collected("out");
-    assert!((collected[0] - 5.0).abs() < 1e-5, "max([1,5,3]) = 5, got {}", collected[0]);
+    assert!(
+        (collected[0] - 5.0).abs() < 1e-5,
+        "max([1,5,3]) = 5, got {}",
+        collected[0]
+    );
 }
 
 #[test]
 fn test_collect_with_min_reduction() {
-    let graph = FlowBuilder::from(Identity)
-        .tag("out")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("out").build().unwrap();
 
     let x = Variable::new(from_f32(&[-2.0, 0.0, 3.0], &[1, 3]), false);
     let _ = graph.forward(&x).unwrap();
     graph.collect_with(&["out"], Reduce::Min).unwrap();
 
     let collected = graph.collected("out");
-    assert!((collected[0] - (-2.0)).abs() < 1e-5, "min([-2,0,3]) = -2, got {}", collected[0]);
+    assert!(
+        (collected[0] - (-2.0)).abs() < 1e-5,
+        "min([-2,0,3]) = -2, got {}",
+        collected[0]
+    );
 }
 
 #[test]
 fn test_collect_with_norm_reduction() {
-    let graph = FlowBuilder::from(Identity)
-        .tag("out")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("out").build().unwrap();
 
     let x = Variable::new(from_f32(&[3.0, 4.0], &[1, 2]), false);
     let _ = graph.forward(&x).unwrap();
@@ -311,16 +310,17 @@ fn test_collect_with_norm_reduction() {
 
     let collected = graph.collected("out");
     // L2 norm of [3, 4] = 5
-    assert!((collected[0] - 5.0).abs() < 1e-4, "norm([3,4]) = 5, got {}", collected[0]);
+    assert!(
+        (collected[0] - 5.0).abs() < 1e-4,
+        "norm([3,4]) = 5, got {}",
+        collected[0]
+    );
 }
 
 #[test]
 fn test_collect_rejects_non_scalar() {
     // Plain collect() should reject non-scalar outputs
-    let graph = FlowBuilder::from(Identity)
-        .tag("out")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("out").build().unwrap();
 
     let x = Variable::new(from_f32(&[1.0, 2.0], &[1, 2]), false);
     let _ = graph.forward(&x).unwrap();
@@ -330,10 +330,7 @@ fn test_collect_rejects_non_scalar() {
 #[test]
 fn test_collect_with_scalar_passthrough() {
     // collect_with on already-scalar output should work without reduction
-    let graph = FlowBuilder::from(ScalarSum)
-        .tag("loss")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(ScalarSum).tag("loss").build().unwrap();
 
     let x = Variable::new(from_f32(&[3.0, 7.0], &[1, 2]), false);
     let _ = graph.forward(&x).unwrap();
@@ -347,10 +344,7 @@ fn test_collect_with_scalar_passthrough() {
 #[test]
 fn test_collect_with_flush_trend_pipeline() {
     // Full pipeline: non-scalar → reduce → flush → trend
-    let graph = FlowBuilder::from(Identity)
-        .tag("h")
-        .build()
-        .unwrap();
+    let graph = FlowBuilder::from(Identity).tag("h").build().unwrap();
 
     // Epoch 1: two batches with decreasing norms
     let x1 = Variable::new(from_f32(&[3.0, 4.0], &[1, 2]), false);

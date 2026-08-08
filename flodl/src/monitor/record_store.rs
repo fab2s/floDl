@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Records retained in the live arrival ring. Sized so a long run keeps a
 /// useful scrollback in memory; deeper history is the on-disk log's job.
@@ -188,18 +188,22 @@ impl RecordStore {
             return;
         }
         if kind == "node"
-            && let Some(path) = rec.get("path").and_then(Value::as_str) {
-                // A known path always updates; a new one is admitted only
-                // under the cap, so a malformed producer cannot grow the
-                // index without bound.
-                if let Some(slot) = self.latest.get_mut(path) {
-                    slot.store(rec.clone());
-                } else if self.latest.len() < MAX_PATHS {
-                    self.latest.entry(path.to_string()).or_default().store(rec.clone());
-                } else {
-                    self.path_cap_hit = true;
-                }
+            && let Some(path) = rec.get("path").and_then(Value::as_str)
+        {
+            // A known path always updates; a new one is admitted only
+            // under the cap, so a malformed producer cannot grow the
+            // index without bound.
+            if let Some(slot) = self.latest.get_mut(path) {
+                slot.store(rec.clone());
+            } else if self.latest.len() < MAX_PATHS {
+                self.latest
+                    .entry(path.to_string())
+                    .or_default()
+                    .store(rec.clone());
+            } else {
+                self.path_cap_hit = true;
             }
+        }
         if self.ring.len() >= MAX_RECORDS {
             self.ring.pop_front();
         }
@@ -326,7 +330,10 @@ mod tests {
         assert!(delivers("root", &event("root", "control_drop")));
         assert!(delivers("root/exa", &event("root/exa/rank0", "rank_lost")));
         // But an alert from a sibling subtree is not this viewer's.
-        assert!(!delivers("root/exa", &event("root/pascal/rank1", "rank_lost")));
+        assert!(!delivers(
+            "root/exa",
+            &event("root/pascal/rank1", "rank_lost")
+        ));
     }
 
     #[test]
@@ -544,7 +551,11 @@ mod tests {
             .iter()
             .map(|r| r.get("epoch_complete").and_then(Value::as_bool) == Some(true))
             .collect();
-        assert_eq!(marks, vec![false, false, true, false], "epoch row is marked");
+        assert_eq!(
+            marks,
+            vec![false, false, true, false],
+            "epoch row is marked"
+        );
     }
 
     #[test]

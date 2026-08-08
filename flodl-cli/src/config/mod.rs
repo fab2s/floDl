@@ -17,9 +17,9 @@ mod validation;
 mod tests;
 
 pub use cluster::{
-    ClusterConfig, ClusterController, ClusterWorker, DdpConfig, LocalDevices, OutputConfig,
-    PublishBlock, SpeedHint, SshConfig, TrainingConfig, WorkerJoin, WorkerSource,
-    DEFAULT_CONTROLLER_PORT, DEFAULT_DATA_PATH,
+    ClusterConfig, ClusterController, ClusterWorker, DEFAULT_CONTROLLER_PORT, DEFAULT_DATA_PATH,
+    DdpConfig, LocalDevices, OutputConfig, PublishBlock, SpeedHint, SshConfig, TrainingConfig,
+    WorkerJoin, WorkerSource,
 };
 pub use command::{load_command, load_command_with_env};
 pub use loading::{
@@ -28,10 +28,10 @@ pub use loading::{
     resolve_cluster_dispatch, resolve_config_layers,
 };
 pub use schema::{
-    validate_schema, ArgSpec, CommandConfig, CommandKind, CommandSpec, OptionSpec,
-    ProjectConfig, Schema,
+    ArgSpec, CommandConfig, CommandKind, CommandSpec, OptionSpec, ProjectConfig, Schema,
+    validate_schema,
 };
 pub use validation::{
-    defaults_only, merge_preset, schema_to_args_spec, validate_preset_for_exec,
-    validate_preset_values, validate_presets_strict, validate_tail, ResolvedConfig,
+    ResolvedConfig, defaults_only, merge_preset, schema_to_args_spec, validate_preset_for_exec,
+    validate_preset_values, validate_presets_strict, validate_tail,
 };

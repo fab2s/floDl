@@ -88,7 +88,7 @@ mod tests {
         let max_before = clip_grad_value(std::slice::from_ref(&p), 2.0).unwrap();
         assert!((max_before - 10.0).abs() < 1e-3);
         let g = p.variable.grad().unwrap().to_f32_vec().unwrap();
-        assert!((g[0] - 2.0).abs() < 1e-4);  // clamped from 10
+        assert!((g[0] - 2.0).abs() < 1e-4); // clamped from 10
         assert!((g[1] - (-2.0)).abs() < 1e-4); // clamped from -5
     }
 

@@ -15,8 +15,8 @@
 mod common;
 
 use flodl_hf::models::albert::{
-    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering,
-    AlbertForSequenceClassification, AlbertForTokenClassification, AlbertModel,
+    AlbertConfig, AlbertForMaskedLM, AlbertForQuestionAnswering, AlbertForSequenceClassification,
+    AlbertForTokenClassification, AlbertModel,
 };
 use flodl_hf::path::hf_key_from_flodl_key;
 use flodl_hf::task_heads::{
@@ -25,8 +25,8 @@ use flodl_hf::task_heads::{
 };
 
 use common::{
-    assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels, position_ids,
-    qa_positions, seqcls_labels, tokcls_labels, token_type_ids, BATCH, CUDA, SEQ,
+    BATCH, CUDA, SEQ, assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels,
+    position_ids, qa_positions, seqcls_labels, tokcls_labels, token_type_ids,
 };
 
 const NUM_LABELS: i64 = 3;
@@ -153,7 +153,10 @@ fn albert_cross_layer_sharing_cuda_smoke() {
                 break;
             }
         }
-        assert!(found, "shared block query.weight not found under HF key {target}");
+        assert!(
+            found,
+            "shared block query.weight not found under HF key {target}"
+        );
         sum_abs
     }
 

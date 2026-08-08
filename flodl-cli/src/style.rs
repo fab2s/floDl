@@ -142,8 +142,8 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::TEST_ENV_LOCK as LOCK;
+    use super::*;
 
     fn reset() {
         set_color_choice(ColorChoice::Auto);

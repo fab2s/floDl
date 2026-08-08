@@ -66,13 +66,14 @@ pub fn classify_path_step(
     // the level the user is asking about, not to the parent. If the
     // next token names a nested entry, we descend before reading flags.
     if let Some(next) = tail.first()
-        && child_cfg.commands.contains_key(next) {
-            return PathOutcome::Descend {
-                child: Box::new(child_cfg),
-                new_dir: child_dir,
-                new_name: next.clone(),
-            };
-        }
+        && child_cfg.commands.contains_key(next)
+    {
+        return PathOutcome::Descend {
+            child: Box::new(child_cfg),
+            new_dir: child_dir,
+            new_name: next.clone(),
+        };
+    }
 
     if tail.iter().any(|a| a == "--help" || a == "-h") {
         return PathOutcome::ShowHelp {
@@ -222,9 +223,7 @@ pub fn walk_commands(
 
         match kind {
             CommandKind::Run => {
-                let command = spec
-                    .run
-                    .expect("Run kind guarantees `run` is set");
+                let command = spec.run.expect("Run kind guarantees `run` is set");
                 if current_tail.iter().any(|a| a == "--help" || a == "-h") {
                     return WalkOutcome::PrintRunHelp {
                         name: qualified,
@@ -477,11 +476,7 @@ mod tests {
         // no top-level `entry:` should print help, not error with
         // "no entry point defined". Mirrors the top-level `fdl` UX.
         let tmp = TempDir::new();
-        mkcmd(
-            tmp.path(),
-            "sub",
-            "commands:\n  foo:\n    run: echo foo\n",
-        );
+        mkcmd(tmp.path(), "sub", "commands:\n  foo:\n    run: echo foo\n");
         let spec = path_spec();
         let tail: Vec<String> = vec![];
         let out = classify_path_step(&spec, "sub", tmp.path(), &tail, None);
@@ -581,9 +576,7 @@ mod tests {
     #[test]
     fn walk_top_level_run_with_docker_preserves_service() {
         let tmp = TempDir::new();
-        let commands = top_commands(
-            "commands:\n  dev:\n    run: cargo test\n    docker: dev\n",
-        );
+        let commands = top_commands("commands:\n  dev:\n    run: cargo test\n    docker: dev\n");
         let out = walk_commands("dev", &[], &commands, tmp.path(), None);
         match out {
             WalkOutcome::RunScript { docker, .. } => {
@@ -698,9 +691,7 @@ mod tests {
         // neither `run:` nor `path:` has no enclosing CommandConfig to
         // borrow an `entry:` from — must error loudly.
         let tmp = TempDir::new();
-        let commands = top_commands(
-            "commands:\n  orphan:\n    options: { model: linear }\n",
-        );
+        let commands = top_commands("commands:\n  orphan:\n    options: { model: linear }\n");
         let out = walk_commands("orphan", &[], &commands, tmp.path(), None);
         match out {
             WalkOutcome::PresetAtTopLevel { name } => assert_eq!(name, "orphan"),
@@ -711,9 +702,7 @@ mod tests {
     #[test]
     fn walk_run_and_path_both_set_is_error() {
         let tmp = TempDir::new();
-        let commands = top_commands(
-            "commands:\n  bad:\n    run: echo hi\n    path: ./sub\n",
-        );
+        let commands = top_commands("commands:\n  bad:\n    run: echo hi\n    path: ./sub\n");
         let out = walk_commands("bad", &[], &commands, tmp.path(), None);
         match out {
             WalkOutcome::Error(msg) => {
@@ -786,11 +775,7 @@ mod tests {
         // tmp/a/fdl.yml           → commands: { b: {} }   + entry (required for preset parent)
         // tmp/a/b/fdl.yml         → commands: { quick: { options: { x: 1 } } } + entry
         let tmp = TempDir::new();
-        mkcmd(
-            tmp.path(),
-            "a",
-            "entry: echo a\ncommands:\n  b: {}\n",
-        );
+        mkcmd(tmp.path(), "a", "entry: echo a\ncommands:\n  b: {}\n");
         // b is a sibling directory under a/
         let b_dir = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&b_dir).unwrap();
@@ -919,9 +904,7 @@ mod tests {
     #[test]
     fn walk_run_with_cluster_true_carries_single_entry_chain() {
         let tmp = TempDir::new();
-        let commands = top_commands(
-            "commands:\n  train:\n    cluster: true\n    run: cargo run\n",
-        );
+        let commands = top_commands("commands:\n  train:\n    cluster: true\n    run: cargo run\n");
         let out = walk_commands("train", &[], &commands, tmp.path(), None);
         match out {
             WalkOutcome::RunScript { cluster_chain, .. } => {
@@ -938,9 +921,7 @@ mod tests {
         // this would inherit cluster: true at dispatch.
         let tmp = TempDir::new();
         mkcmd(tmp.path(), "ddp-bench", "entry: cargo run -p ddp-bench\n");
-        let commands = top_commands(
-            "commands:\n  ddp-bench:\n    cluster: true\n",
-        );
+        let commands = top_commands("commands:\n  ddp-bench:\n    cluster: true\n");
         let out = walk_commands("ddp-bench", &[], &commands, tmp.path(), None);
         match out {
             WalkOutcome::ExecCommand { cluster_chain, .. } => {
@@ -963,9 +944,7 @@ mod tests {
             "entry: cargo run -p ddp-bench\n\
              commands:\n  quick:\n    cluster: false\n    options: { model: linear }\n",
         );
-        let commands = top_commands(
-            "commands:\n  ddp-bench:\n    cluster: true\n",
-        );
+        let commands = top_commands("commands:\n  ddp-bench:\n    cluster: true\n");
         let tail = args(&["quick"]);
         let out = walk_commands("ddp-bench", &tail, &commands, tmp.path(), None);
         match out {

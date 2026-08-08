@@ -120,11 +120,7 @@ impl StatusBoard {
 /// mux shuts down (source disconnect) or `abort` is raised. One request
 /// per connection (`Connection: close`) — status polls are sparse and
 /// short-lived, keep-alive buys nothing.
-pub(crate) fn serve_status(
-    source: StreamSource,
-    board: StatusBoard,
-    abort: Arc<AtomicBool>,
-) {
+pub(crate) fn serve_status(source: StreamSource, board: StatusBoard, abort: Arc<AtomicBool>) {
     loop {
         if abort.load(Ordering::SeqCst) {
             return;
@@ -141,8 +137,7 @@ pub(crate) fn serve_status(
 /// Read one HTTP request and answer it. All failures just drop the
 /// connection — a status client can never harm the run.
 fn answer_status_request(mut stream: TcpStream, board: &StatusBoard) {
-    let deadline =
-        Duration::from_secs(scaled_deadline_secs(REQUEST_TIMEOUT_SECS));
+    let deadline = Duration::from_secs(scaled_deadline_secs(REQUEST_TIMEOUT_SECS));
     if stream.set_read_timeout(Some(deadline)).is_err()
         || stream
             .set_write_timeout(Some(super::wire::write_stall_timeout()))
@@ -181,8 +176,7 @@ fn answer_status_request(mut stream: TcpStream, board: &StatusBoard) {
         }
         _ => (
             "404 Not Found",
-            r#"{"error":"not found","endpoints":["GET /state.json","POST /start"]}"#
-                .to_string(),
+            r#"{"error":"not found","endpoints":["GET /state.json","POST /start"]}"#.to_string(),
         ),
     };
     let response = format!(
@@ -223,10 +217,7 @@ fn handle_start(
         );
     }
     if !peer_is_loopback {
-        let presented = query.and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("token="))
-        });
+        let presented = query.and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
         if presented != Some(switch.token_hex.as_str()) {
             return (
                 "403 Forbidden",
@@ -281,9 +272,7 @@ fn handle_start(
 fn read_request_line(stream: &mut TcpStream) -> Option<(String, String)> {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 256];
-    while !buf.windows(2).any(|w| w == b"\r\n")
-        && buf.len() < MAX_REQUEST_BYTES
-    {
+    while !buf.windows(2).any(|w| w == b"\r\n") && buf.len() < MAX_REQUEST_BYTES {
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -513,8 +502,7 @@ mod tests {
         assert!(code.starts_with("403"), "{code} {body}");
         assert!(!board.start_requested());
         // Wrong token → refused.
-        let (code, _) =
-            handle_start(false, Some("token=wrong"), &board);
+        let (code, _) = handle_start(false, Some("token=wrong"), &board);
         assert!(code.starts_with("403"), "{code}");
         assert!(!board.start_requested());
         // Right token → armed.

@@ -70,22 +70,22 @@
 
 mod worker;
 pub(crate) use worker::NcclAbortSlot;
+pub mod convergence;
 mod cooperative;
 mod orchestrator;
 mod shared;
-pub mod convergence;
 
+pub use convergence::{
+    ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample, MsfGuard,
+    NoGuard, TrendGuard,
+};
 pub use cooperative::{StepOutcome, Worker};
-pub use worker::*;
+pub use orchestrator::*;
 pub(crate) use shared::{
     aggregate_epoch_metrics, check_epoch_geometry, epoch_label, equal_sizes, pick_space,
     ratio_to_sizes, throughput_sizes, window_cap_batches,
 };
-pub use orchestrator::*;
-pub use convergence::{
-    ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample,
-    MsfGuard, NoGuard, TrendGuard,
-};
+pub use worker::*;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -149,7 +149,6 @@ pub(crate) fn ensure_trainable_params(n_params: usize, entry: &str) -> Result<()
     }
     Ok(())
 }
-
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
 ///
@@ -222,16 +221,13 @@ pub enum EvalCadence {
 ///   post-EASGD-blend state when invoked.
 /// - `model.eval()` is called before and `model.train()` after the
 ///   user's closure; no explicit mode flip needed inside.
-pub type EvalFn<M> = std::sync::Arc<
-    dyn Fn(&M, &dyn crate::data::BatchDataSet) -> Result<f64> + Send + Sync,
->;
+pub type EvalFn<M> =
+    std::sync::Arc<dyn Fn(&M, &dyn crate::data::BatchDataSet) -> Result<f64> + Send + Sync>;
 
 /// Receiver for the [`EvalFn`] scalar result on the controller side.
 /// Mirrors [`MetricsFn`]'s shape — fires after the chosen rank's eval
 /// metric flows back over `EvalResult`.
-pub type EvalResultFn = std::sync::Arc<
-    dyn Fn(usize, f64) -> Result<()> + Send + Sync,
->;
+pub type EvalResultFn = std::sync::Arc<dyn Fn(usize, f64) -> Result<()> + Send + Sync>;
 
 /// Scheduler factory type: `(world_size) -> Arc<dyn Scheduler>`.
 ///
@@ -263,8 +259,7 @@ pub(crate) struct RankCallbacks<M: crate::nn::Module> {
     pub epoch_fn: Option<EpochFn<M>>,
     pub eval_fn: Option<EvalFn<M>>,
     pub eval_dataset: Option<Arc<dyn crate::data::BatchDataSet>>,
-    pub outer_optimizer_factory:
-        Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
+    pub outer_optimizer_factory: Option<crate::distributed::outer_optimizer::OuterOptimizerFactory>,
 }
 
 // Hand-written (not derived) so it doesn't require `M: Default` — every
@@ -886,7 +881,11 @@ impl DdpRunConfig {
     /// [`DEFAULT_MAX_LOG_BYTES`](crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES).
     pub fn with_record_log(mut self, dir: impl Into<String>, max_bytes: u64) -> Self {
         self.record_log_dir = Some(dir.into());
-        self.max_log_size = if max_bytes == 0 { None } else { Some(max_bytes) };
+        self.max_log_size = if max_bytes == 0 {
+            None
+        } else {
+            Some(max_bytes)
+        };
         self
     }
 
@@ -978,9 +977,9 @@ impl DdpRunConfig {
     pub fn with_transform(
         mut self,
         f: impl Fn(Vec<Tensor>, &[crate::data::PickKey]) -> crate::tensor::Result<Vec<Tensor>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.transform = Some(crate::data::TransformFn::new(f));
         self
@@ -1448,9 +1447,7 @@ pub(crate) enum ControlMsg {
     /// in its local `epoch_callback_role` and consults it at every
     /// epoch transition. Mirrors
     /// `SetEpochCallbackRole`.
-    SetEpochCallbackRole {
-        rank: usize,
-    },
+    SetEpochCallbackRole { rank: usize },
     /// Shut down this worker.
     Shutdown,
     /// Persist a checkpoint bundle to the configured `save_path` then

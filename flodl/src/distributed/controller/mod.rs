@@ -124,8 +124,6 @@ pub const DTYPE_BF16: u8 = 1;
 /// models sit in the thousands.
 pub(crate) const MAX_ROUND_FRAME_TENSORS: usize = 65_536;
 
-
-
 mod dead_ranks;
 mod round_frame;
 pub use dead_ranks::DeadRanks;
@@ -135,14 +133,14 @@ pub(crate) use round_frame::{read_round_frame, write_round_frame};
 // ([`crate::distributed::relay`]'s HostFold, same monoid) or inside
 // `reduce_realized_work`; the direct entry remains the reference the
 // fold tests compare against.
+use round_frame::reduce_realized_work;
 #[cfg(test)]
 pub(crate) use round_frame::sum_frames;
-pub(crate) use round_frame::{f32_slice_to_payload_bytes, payload_to_f32};
 pub(crate) use round_frame::{
-    accumulate_payload_into, payload_element_size, read_round_frame_streamed,
-    round_frame_wire_len, scale_payload_bytes, write_round_frame_streamed, PayloadPart,
+    PayloadPart, accumulate_payload_into, payload_element_size, read_round_frame_streamed,
+    round_frame_wire_len, scale_payload_bytes, write_round_frame_streamed,
 };
-use round_frame::reduce_realized_work;
+pub(crate) use round_frame::{f32_slice_to_payload_bytes, payload_to_f32};
 // Byte-codec helpers used only by the controller round-frame tests.
 #[cfg(test)]
 use round_frame::{bytes_as_f32, f32_to_bytes};
@@ -183,11 +181,7 @@ impl ClusterController {
     // Production callers share a DeadRanks ledger (start_with_dead_ranks);
     // this standalone form is exercised by the controller tests.
     #[allow(dead_code)]
-    pub fn start(
-        bind_addr: SocketAddr,
-        world_size: usize,
-        salt: SessionSalt,
-    ) -> Result<Self> {
+    pub fn start(bind_addr: SocketAddr, world_size: usize, salt: SessionSalt) -> Result<Self> {
         // Standalone constructor: world is fixed at startup and no
         // elastic-membership path. Equivalent to passing a private
         // ledger that nobody else can declare into.
@@ -214,16 +208,12 @@ impl ClusterController {
         outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
-            TensorError::new(&format!(
-                "cluster_controller: bind {bind_addr} failed: {e}"
-            ))
+            TensorError::new(&format!("cluster_controller: bind {bind_addr} failed: {e}"))
         })?;
         let bound_port = listener
             .local_addr()
             .map_err(|e| {
-                TensorError::new(&format!(
-                    "cluster_controller: local_addr() failed: {e}"
-                ))
+                TensorError::new(&format!("cluster_controller: local_addr() failed: {e}"))
             })?
             .port();
         let source = crate::distributed::port_mux::StreamSource::from_listener(
@@ -231,7 +221,12 @@ impl ClusterController {
             "cluster_controller",
         )?;
         Self::start_from_source(
-            source, bound_port, world_size, salt, dead_ranks, forge,
+            source,
+            bound_port,
+            world_size,
+            salt,
+            dead_ranks,
+            forge,
             outer_optimizer,
         )
     }
@@ -270,7 +265,12 @@ impl ClusterController {
             .name(format!("flodl-cluster-controller:{bound_port}"))
             .spawn(move || {
                 run_reduce_thread(
-                    source, world_size, salt, shutdown_cloned, dead_ranks, forge,
+                    source,
+                    world_size,
+                    salt,
+                    shutdown_cloned,
+                    dead_ranks,
+                    forge,
                     outer_optimizer,
                 )
             })
@@ -339,8 +339,8 @@ fn run_reduce_thread(
     // Outer optimizer applied to the consensus before scatter (and before
     // the forge tap, so the checkpoint captures the stepped global). `None`
     // leaves the reduce stream byte-for-byte as the plain weighted average.
-    let mut outer_stepper = outer_optimizer
-        .map(crate::distributed::outer_optimizer::OuterStepper::new);
+    let mut outer_stepper =
+        outer_optimizer.map(crate::distributed::outer_optimizer::OuterStepper::new);
 
     let slots = Arc::new(ReduceSlots::new());
     // Sole-writer half per relay connection (the reduce loop writes
@@ -373,9 +373,7 @@ fn run_reduce_thread(
                 stream
                     .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
                     .map_err(|e| {
-                        TensorError::new(&format!(
-                            "cluster_controller: set_write_timeout: {e}"
-                        ))
+                        TensorError::new(&format!("cluster_controller: set_write_timeout: {e}"))
                     })?;
                 // 10s handshake timeout (mirrors the coordinator's
                 // formation guard): the mux peek only guarantees the 4
@@ -387,9 +385,7 @@ fn run_reduce_thread(
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .map_err(|e| {
-                        TensorError::new(&format!(
-                            "cluster_controller: set_read_timeout: {e}"
-                        ))
+                        TensorError::new(&format!("cluster_controller: set_read_timeout: {e}"))
                     })?;
                 // Channel-select magic, then the relay handshake
                 // (relays send both immediately on connect).
@@ -445,11 +441,9 @@ fn run_reduce_thread(
                 let read_half = stream.try_clone().map_err(|e| {
                     TensorError::new(&format!("cluster_controller: relay try_clone: {e}"))
                 })?;
-                read_half
-                    .set_read_timeout(Some(REDUCE_POLL))
-                    .map_err(|e| {
-                        TensorError::new(&format!("cluster_controller: set_read_timeout: {e}"))
-                    })?;
+                read_half.set_read_timeout(Some(REDUCE_POLL)).map_err(|e| {
+                    TensorError::new(&format!("cluster_controller: set_read_timeout: {e}"))
+                })?;
                 conn_writes.push(stream);
                 covered += conn_ranks.len();
                 let registered = slots.register_conn(conn_ranks.clone());
@@ -463,8 +457,7 @@ fn run_reduce_thread(
                     .name(format!("flodl-controller-relay{conn_idx}"))
                     .spawn(move || {
                         reduce_reader(
-                            read_half, conn_idx, conn_ranks, slots_c, dead_c, shutdown_c,
-                            salt,
+                            read_half, conn_idx, conn_ranks, slots_c, dead_c, shutdown_c, salt,
                         )
                     })
                     .map_err(|e| {
@@ -500,13 +493,7 @@ fn run_reduce_thread(
             let conn_writes = &mut conn_writes;
             let forwarded_dead = &mut forwarded_dead;
             slots.wait_for_round(&dead_ranks, &shutdown, REDUCE_POLL, || {
-                forward_dead_diffs(
-                    &dead_ranks,
-                    forwarded_dead,
-                    &rank_conn,
-                    conn_writes,
-                    &salt,
-                );
+                forward_dead_diffs(&dead_ranks, forwarded_dead, &rank_conn, conn_writes, &salt);
             })
         };
         match round {
@@ -796,10 +783,8 @@ fn forward_dead_diffs(
         let Some(ci) = rank_conn.get(rank).copied().flatten() else {
             continue;
         };
-        if let Err(e) = MuxRecord::control(RelayControlMsg::DeclareDead {
-            rank: rank as u32,
-        })
-        .write_to(&mut conn_writes[ci], salt)
+        if let Err(e) = MuxRecord::control(RelayControlMsg::DeclareDead { rank: rank as u32 })
+            .write_to(&mut conn_writes[ci], salt)
         {
             crate::verbose!(
                 "  cluster_controller: DeclareDead({rank}) forward to relay \
@@ -955,11 +940,12 @@ pub(crate) fn write_handshake_ack(stream: &mut TcpStream) -> Result<()> {
     buf[0..4].copy_from_slice(&HANDSHAKE_MAGIC_CONTROLLER_ACK.to_le_bytes());
     buf[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     stream.write_all(&buf).map_err(|e| {
-        TensorError::new(&format!("cluster_controller: handshake ack write failed: {e}"))
+        TensorError::new(&format!(
+            "cluster_controller: handshake ack write failed: {e}"
+        ))
     })?;
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

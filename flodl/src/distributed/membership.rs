@@ -60,8 +60,8 @@ use serde::Serialize;
 
 use crate::distributed::port_mux::StreamSource;
 use crate::distributed::wire::{
-    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES,
-    SessionSalt, expect_channel_magic, salt_to_hex, scaled_deadline_secs,
+    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
+    expect_channel_magic, salt_to_hex, scaled_deadline_secs,
 };
 use crate::tensor::{Result, TensorError};
 
@@ -164,14 +164,15 @@ impl JoinConfig {
             ));
         }
         if let Some(target) = self.target_ranks
-            && target < self.min_rank_start {
-                return Err(TensorError::new(&format!(
-                    "cluster join: target_ranks ({target}) must be >= \
+            && target < self.min_rank_start
+        {
+            return Err(TensorError::new(&format!(
+                "cluster join: target_ranks ({target}) must be >= \
                      min_rank_start ({}) — the early-close target cannot sit \
                      below the quorum",
-                    self.min_rank_start,
-                )));
-            }
+                self.min_rank_start,
+            )));
+        }
         if self.max_join_timeout_secs < self.join_timeout_secs {
             return Err(TensorError::new(&format!(
                 "cluster join: max_join_timeout ({}s) must be >= join_timeout \
@@ -493,32 +494,32 @@ impl MembershipLedger {
         if self.config.nccl_backend
             && let flodl_hw::VariantClass::Vendor(vendor) =
                 flodl_hw::classify_variant_label(&libtorch)
-            {
-                match self.expected_vendor {
-                    None => self.expected_vendor = Some(vendor),
-                    Some(expected) if expected != vendor => {
-                        return Err(format!(
-                            "GPU vendor mismatch: this run's cohort is {expected} \
+        {
+            match self.expected_vendor {
+                None => self.expected_vendor = Some(vendor),
+                Some(expected) if expected != vendor => {
+                    return Err(format!(
+                        "GPU vendor mismatch: this run's cohort is {expected} \
                              (libtorch {:?}) and {host:?} offers {vendor} \
                              ({libtorch:?}) — NCCL and RCCL cannot form one \
                              communicator, so a mixed cohort hangs at formation. \
                              Use a CPU ElChe mode (cpu_sync / cpu_cadence / \
                              cpu_async), or a one-vendor fleet",
-                            self.members
-                                .iter()
-                                .map(|m| m.libtorch.as_str())
-                                .find(|l| {
-                                    matches!(
-                                        flodl_hw::classify_variant_label(l),
-                                        flodl_hw::VariantClass::Vendor(v) if v == expected
-                                    )
-                                })
-                                .unwrap_or(""),
-                        ));
-                    }
-                    Some(_) => {}
+                        self.members
+                            .iter()
+                            .map(|m| m.libtorch.as_str())
+                            .find(|l| {
+                                matches!(
+                                    flodl_hw::classify_variant_label(l),
+                                    flodl_hw::VariantClass::Vendor(v) if v == expected
+                                )
+                            })
+                            .unwrap_or(""),
+                    ));
                 }
+                Some(_) => {}
             }
+        }
         // Run identity, whatever the data plane: a cohort straddling a
         // publish boundary holds two different runs — different args at
         // minimum, and rank children re-enter the binary with them.
@@ -547,21 +548,22 @@ impl MembershipLedger {
         // probe to sweep — this window is the only place the check can
         // live.
         if self.config.nccl_backend
-            && let Some((maj, min, _)) = nccl_version {
-                match self.expected_nccl {
-                    None => self.expected_nccl = Some((maj, min)),
-                    Some((emaj, emin)) if (emaj, emin) != (maj, min) => {
-                        return Err(format!(
-                            "NCCL version skew: this cohort loads \
+            && let Some((maj, min, _)) = nccl_version
+        {
+            match self.expected_nccl {
+                None => self.expected_nccl = Some((maj, min)),
+                Some((emaj, emin)) if (emaj, emin) != (maj, min) => {
+                    return Err(format!(
+                        "NCCL version skew: this cohort loads \
                              {emaj}.{emin}.x and {host:?} loads {maj}.{min}.x \
                              — NCCL refuses its handshake across major.minor \
                              skew, at formation. Align the libtorch variants, \
                              or bridge with `fdl nccl build`",
-                        ));
-                    }
-                    Some(_) => {}
+                    ));
                 }
+                Some(_) => {}
             }
+        }
         // Model signature, whatever the data plane: mismatched parameter
         // manifests corrupt CPU averaging exactly as they hang NCCL.
         // Refusing here (instead of at the formation handshake, which
@@ -646,9 +648,11 @@ impl MembershipLedger {
         // capacity, no reason to wait out the window. (Manual mode has
         // no target — validate() refuses the combination.)
         if let Some(target) = self.config.target_ranks
-            && !manual && joined >= target {
-                return WindowVerdict::Formed("target ranks reached");
-            }
+            && !manual
+            && joined >= target
+        {
+            return WindowVerdict::Formed("target ranks reached");
+        }
         // Inside the window the door stays open no matter what: quorum
         // reached early does not refuse later capacity.
         if elapsed < window {
@@ -693,8 +697,7 @@ impl MembershipLedger {
     /// `Waiting` otherwise. Closed-window phases (`Forming` onward) are
     /// the caller's to assert.
     pub fn open_phase(&self) -> ClusterPhase {
-        if self.config.start_mode != StartMode::Auto
-            && self.next_rank >= self.config.min_rank_start
+        if self.config.start_mode != StartMode::Auto && self.next_rank >= self.config.min_rank_start
         {
             ClusterPhase::Staging
         } else {
@@ -712,9 +715,8 @@ impl MembershipLedger {
     ) -> MembershipSnapshot {
         let window = Duration::from_secs(scaled_deadline_secs(self.config.join_timeout_secs));
         let cap = Duration::from_secs(scaled_deadline_secs(self.config.max_join_timeout_secs));
-        let remaining = |limit: Duration| -> Option<u64> {
-            limit.checked_sub(elapsed).map(|d| d.as_secs())
-        };
+        let remaining =
+            |limit: Duration| -> Option<u64> { limit.checked_sub(elapsed).map(|d| d.as_secs()) };
         MembershipSnapshot {
             phase,
             joined_ranks: self.next_rank,
@@ -832,7 +834,11 @@ pub(crate) fn run_join_window(
             .unwrap_or_else(|| "none".to_string()),
         window.as_secs(),
         cap.as_secs(),
-        if pre_shared_salt { "pre-shared salt" } else { "open" },
+        if pre_shared_salt {
+            "pre-shared salt"
+        } else {
+            "open"
+        },
     );
     status.publish(&ledger.snapshot(ledger.open_phase(), Duration::ZERO, false));
 
@@ -856,8 +862,7 @@ pub(crate) fn run_join_window(
             WindowVerdict::Open => {}
             WindowVerdict::Formed(reason) => {
                 let world_size = ledger.joined_ranks();
-                let snapshot =
-                    ledger.snapshot(ClusterPhase::Forming, elapsed, armed);
+                let snapshot = ledger.snapshot(ClusterPhase::Forming, elapsed, armed);
                 let members = ledger.into_members();
                 eprintln!(
                     "cluster join: world formed — {world_size} ranks across \
@@ -867,7 +872,11 @@ pub(crate) fn run_join_window(
                 );
                 status.publish(&snapshot);
                 debug_assert_eq!(admitted.len(), members.len());
-                return Ok(FormedWorld { workers: admitted, world_size, snapshot });
+                return Ok(FormedWorld {
+                    workers: admitted,
+                    world_size,
+                    snapshot,
+                });
             }
             WindowVerdict::Failed(why) => {
                 let msg = format!("cluster join: FAILED — {why}");
@@ -879,9 +888,7 @@ pub(crate) fn run_join_window(
         }
         if abort.load(Ordering::SeqCst) {
             let why = "launcher aborted before the world formed".to_string();
-            status.publish(
-                &ledger.snapshot(ClusterPhase::Failed, started.elapsed(), armed),
-            );
+            status.publish(&ledger.snapshot(ClusterPhase::Failed, started.elapsed(), armed));
             abort_admitted(&mut admitted, salt, &why);
             return Err(TensorError::new(&format!("cluster join: {why}")));
         }
@@ -897,8 +904,7 @@ pub(crate) fn run_join_window(
         // Handshake budget: magic + hello must arrive promptly; a
         // wedged dialer only condemns its own attempt.
         let _ = stream.set_nodelay(true);
-        let handshake =
-            Duration::from_secs(scaled_deadline_secs(JOIN_HANDSHAKE_TIMEOUT_SECS));
+        let handshake = Duration::from_secs(scaled_deadline_secs(JOIN_HANDSHAKE_TIMEOUT_SECS));
         if stream.set_read_timeout(Some(handshake)).is_err()
             || stream
                 .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()))
@@ -977,8 +983,7 @@ fn handle_join_dial(
     started: Instant,
     cap: Duration,
 ) -> std::result::Result<JoinedMember, String> {
-    expect_channel_magic(stream, CHANNEL_MAGIC_JOIN, "cluster join")
-        .map_err(|e| e.to_string())?;
+    expect_channel_magic(stream, CHANNEL_MAGIC_JOIN, "cluster join").map_err(|e| e.to_string())?;
     let frame = match ControlFrame::read_from(stream, join_key) {
         Ok(Some(f)) => f,
         Ok(None) => return Err("connection closed before hello".to_string()),
@@ -1040,8 +1045,8 @@ fn handle_join_dial(
         // may have to wait for WorldFormed.
         formation_wait_secs: cap.saturating_sub(started.elapsed()).as_secs(),
     };
-    let write = ControlFrame::encode(join_key, MsgKind::Join, &accept)
-        .and_then(|f| f.write_to(stream));
+    let write =
+        ControlFrame::encode(join_key, MsgKind::Join, &accept).and_then(|f| f.write_to(stream));
     if let Err(e) = write {
         // The worker died between hello and accept: return its rank ids
         // to the pool so the space stays contiguous.
@@ -1061,19 +1066,22 @@ fn handle_join_dial(
 
 /// Best-effort reject frame; the peer may already be gone.
 fn reject(stream: &mut TcpStream, join_key: &SessionSalt, reason: &str) {
-    let msg = JoinMsgWire::Reject { reason: reason.to_string() };
-    let _ = ControlFrame::encode(join_key, MsgKind::Join, &msg)
-        .and_then(|f| f.write_to(stream));
+    let msg = JoinMsgWire::Reject {
+        reason: reason.to_string(),
+    };
+    let _ = ControlFrame::encode(join_key, MsgKind::Join, &msg).and_then(|f| f.write_to(stream));
 }
 
 /// Best-effort abort to every admitted worker (window failed / launcher
 /// abort). Keyed with the session salt — these workers are admitted, so
 /// they hold it.
 fn abort_admitted(admitted: &mut [AdmittedWorker], salt: &SessionSalt, reason: &str) {
-    let msg = JoinMsgWire::Abort { reason: reason.to_string() };
+    let msg = JoinMsgWire::Abort {
+        reason: reason.to_string(),
+    };
     for w in admitted.iter_mut() {
-        let _ = ControlFrame::encode(salt, MsgKind::Join, &msg)
-            .and_then(|f| f.write_to(&mut w.stream));
+        let _ =
+            ControlFrame::encode(salt, MsgKind::Join, &msg).and_then(|f| f.write_to(&mut w.stream));
     }
 }
 

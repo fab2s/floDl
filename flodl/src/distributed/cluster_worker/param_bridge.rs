@@ -86,9 +86,7 @@ pub(super) fn param_bridge_loop(
             match allocated {
                 Ok(s) => pre_scratch = Some(s),
                 Err(e) => {
-                    eprintln!(
-                        "cluster_worker: param bridge r{rank} scratch alloc: {e}"
-                    );
+                    eprintln!("cluster_worker: param bridge r{rank} scratch alloc: {e}");
                     inject_shutdown();
                     return;
                 }
@@ -102,9 +100,7 @@ pub(super) fn param_bridge_loop(
         let mut copy_failed = false;
         for (dst, src) in scratch.iter().zip(params.iter()) {
             if let Err(e) = dst.copy_(src, false) {
-                eprintln!(
-                    "cluster_worker: param bridge r{rank} pre_scratch copy_: {e}"
-                );
+                eprintln!("cluster_worker: param bridge r{rank} pre_scratch copy_: {e}");
                 copy_failed = true;
                 break;
             }
@@ -184,9 +180,7 @@ pub(super) fn param_bridge_loop(
             match sumcount_reduce(&mut client, &params, my_w) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
-                        "cluster_worker: param bridge r{rank} all_reduce params: {e}"
-                    );
+                    eprintln!("cluster_worker: param bridge r{rank} all_reduce params: {e}");
                     inject_shutdown();
                     return;
                 }
@@ -200,9 +194,7 @@ pub(super) fn param_bridge_loop(
             match crate::distributed::divergence::divergence_triple(scratch, &avg_params) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!(
-                        "cluster_worker: param bridge r{rank} divergence: {e}"
-                    );
+                    eprintln!("cluster_worker: param bridge r{rank} divergence: {e}");
                     inject_shutdown();
                     return;
                 }
@@ -230,8 +222,7 @@ pub(super) fn param_bridge_loop(
         let avg_buffers = if f32_buffer_idx.is_empty() || total_n == 0.0 {
             buffers.clone()
         } else {
-            let subset: Vec<Tensor> =
-                f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
+            let subset: Vec<Tensor> = f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
             let my_indicator = crate::distributed::realized_work::mover_mass(n_i as f64);
             match sumcount_reduce(&mut client, &subset, my_indicator) {
                 Ok(reduced) => {
@@ -242,9 +233,7 @@ pub(super) fn param_bridge_loop(
                     merged
                 }
                 Err(e) => {
-                    eprintln!(
-                        "cluster_worker: param bridge r{rank} all_reduce buffers: {e}"
-                    );
+                    eprintln!("cluster_worker: param bridge r{rank} all_reduce buffers: {e}");
                     inject_shutdown();
                     return;
                 }

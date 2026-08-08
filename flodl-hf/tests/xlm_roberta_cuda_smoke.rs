@@ -20,8 +20,8 @@ use flodl_hf::task_heads::{
 };
 
 use common::{
-    assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels, qa_positions,
-    seqcls_labels, tokcls_labels, token_type_ids, BATCH, CUDA, SEQ,
+    BATCH, CUDA, SEQ, assert_grads_flowed, extended_attention_mask, input_ids, mlm_labels,
+    qa_positions, seqcls_labels, tokcls_labels, token_type_ids,
 };
 
 const NUM_LABELS: i64 = 3;
@@ -41,7 +41,10 @@ fn xlm_roberta_seqcls_cuda_smoke() {
     let cfg = XlmRobertaConfig::xlm_roberta_base();
     let head = XlmRobertaForSequenceClassification::on_device(&cfg, NUM_LABELS, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&xlm_roberta_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&xlm_roberta_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, NUM_LABELS]);
 
     let labels = seqcls_labels(BATCH, NUM_LABELS);
@@ -57,7 +60,10 @@ fn xlm_roberta_tokcls_cuda_smoke() {
     let cfg = XlmRobertaConfig::xlm_roberta_base();
     let head = XlmRobertaForTokenClassification::on_device(&cfg, NUM_LABELS, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&xlm_roberta_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&xlm_roberta_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, NUM_LABELS]);
 
     let labels = tokcls_labels(BATCH, SEQ, NUM_LABELS);
@@ -73,7 +79,10 @@ fn xlm_roberta_qa_cuda_smoke() {
     let cfg = XlmRobertaConfig::xlm_roberta_base();
     let head = XlmRobertaForQuestionAnswering::on_device(&cfg, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&xlm_roberta_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&xlm_roberta_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, 2]);
 
     let (starts, ends) = qa_positions(BATCH, SEQ);
@@ -89,7 +98,10 @@ fn xlm_roberta_mlm_cuda_smoke() {
     let cfg = XlmRobertaConfig::xlm_roberta_base();
     let head = XlmRobertaForMaskedLM::on_device(&cfg, CUDA).unwrap();
 
-    let logits = head.graph().forward_multi(&xlm_roberta_inputs(&cfg)).unwrap();
+    let logits = head
+        .graph()
+        .forward_multi(&xlm_roberta_inputs(&cfg))
+        .unwrap();
     assert_eq!(logits.shape(), vec![BATCH, SEQ, cfg.vocab_size]);
 
     let labels = mlm_labels(BATCH, SEQ, cfg.vocab_size);

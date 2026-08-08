@@ -115,8 +115,8 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprLit, Fields, GenericArgument,
-    Ident, Lit, PathArguments, Type, TypePath,
+    Attribute, Data, DeriveInput, Expr, ExprLit, Fields, GenericArgument, Ident, Lit,
+    PathArguments, Type, TypePath, parse_macro_input,
 };
 
 // ── Reserved flags (kept in sync with flodl-cli/src/config.rs) ─────────
@@ -465,9 +465,10 @@ struct FieldSpec {
 }
 
 fn parse_field(f: &syn::Field) -> syn::Result<FieldSpec> {
-    let ident = f.ident.clone().ok_or_else(|| {
-        syn::Error::new_spanned(f, "FdlArgs requires named fields")
-    })?;
+    let ident = f
+        .ident
+        .clone()
+        .ok_or_else(|| syn::Error::new_spanned(f, "FdlArgs requires named fields"))?;
     let description = extract_doc(&f.attrs);
     let (shape, inner_ty) = classify_type(&f.ty);
 
@@ -491,7 +492,14 @@ fn parse_field(f: &syn::Field) -> syn::Result<FieldSpec> {
                 ));
             }
             kind = Some(FieldKind::Option);
-            parse_option_attr(attr, &mut short, &mut default, &mut choices, &mut env, &mut completer)?;
+            parse_option_attr(
+                attr,
+                &mut short,
+                &mut default,
+                &mut choices,
+                &mut env,
+                &mut completer,
+            )?;
         } else if attr.path().is_ident("arg") {
             if kind.is_some() {
                 return Err(syn::Error::new_spanned(
@@ -500,15 +508,18 @@ fn parse_field(f: &syn::Field) -> syn::Result<FieldSpec> {
                 ));
             }
             kind = Some(FieldKind::Arg);
-            parse_arg_attr(attr, &mut default, &mut choices, &mut variadic, &mut completer)?;
+            parse_arg_attr(
+                attr,
+                &mut default,
+                &mut choices,
+                &mut variadic,
+                &mut completer,
+            )?;
         }
     }
 
     let kind = kind.ok_or_else(|| {
-        syn::Error::new_spanned(
-            &ident,
-            "field must carry either #[option] or #[arg]",
-        )
+        syn::Error::new_spanned(&ident, "field must carry either #[option] or #[arg]")
     })?;
 
     // Type + kind + attrs consistency checks.
@@ -526,7 +537,10 @@ fn parse_field(f: &syn::Field) -> syn::Result<FieldSpec> {
                     "#[option(env = ...)] is not supported on bare `bool` (truthy/falsy string semantics are ambiguous) — use `Option<bool>` if you need env fallback",
                 ));
             }
-            if matches!(shape, TypeShape::Scalar) && default.is_none() && !matches!(shape, TypeShape::Bool) {
+            if matches!(shape, TypeShape::Scalar)
+                && default.is_none()
+                && !matches!(shape, TypeShape::Bool)
+            {
                 return Err(syn::Error::new_spanned(
                     &f.ty,
                     "#[option] on a non-Option, non-bool type requires `default = \"...\"` (the field must always have a value)",
@@ -706,20 +720,23 @@ fn parse_choices(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Vec<String>> 
 
 fn classify_type(ty: &Type) -> (TypeShape, Type) {
     if let Type::Path(TypePath { path, .. }) = ty
-        && let Some(seg) = path.segments.last() {
-            let name = seg.ident.to_string();
-            if name == "bool" {
-                return (TypeShape::Bool, ty.clone());
-            }
-            if name == "Option"
-                && let Some(inner) = first_generic(&seg.arguments) {
-                    return (TypeShape::Opt, inner);
-                }
-            if name == "Vec"
-                && let Some(inner) = first_generic(&seg.arguments) {
-                    return (TypeShape::List, inner);
-                }
+        && let Some(seg) = path.segments.last()
+    {
+        let name = seg.ident.to_string();
+        if name == "bool" {
+            return (TypeShape::Bool, ty.clone());
         }
+        if name == "Option"
+            && let Some(inner) = first_generic(&seg.arguments)
+        {
+            return (TypeShape::Opt, inner);
+        }
+        if name == "Vec"
+            && let Some(inner) = first_generic(&seg.arguments)
+        {
+            return (TypeShape::List, inner);
+        }
+    }
     (TypeShape::Scalar, ty.clone())
 }
 
@@ -737,10 +754,8 @@ fn first_generic(args: &PathArguments) -> Option<Type> {
 // ── Validation ──────────────────────────────────────────────────────────
 
 fn validate_collisions(fields: &[FieldSpec]) -> syn::Result<()> {
-    let mut seen_long: std::collections::HashMap<String, Span> =
-        std::collections::HashMap::new();
-    let mut seen_short: std::collections::HashMap<char, Span> =
-        std::collections::HashMap::new();
+    let mut seen_long: std::collections::HashMap<String, Span> = std::collections::HashMap::new();
+    let mut seen_short: std::collections::HashMap<char, Span> = std::collections::HashMap::new();
 
     // Positionals: variadic-last, no-required-after-optional.
     let mut seen_optional = false;
@@ -748,8 +763,7 @@ fn validate_collisions(fields: &[FieldSpec]) -> syn::Result<()> {
         if !matches!(f.kind, FieldKind::Arg) {
             continue;
         }
-        let is_optional =
-            matches!(f.shape, TypeShape::Opt) || f.default.is_some() || f.variadic;
+        let is_optional = matches!(f.shape, TypeShape::Opt) || f.default.is_some() || f.variadic;
         if seen_optional && !is_optional {
             return Err(syn::Error::new(
                 f.span,
@@ -791,7 +805,10 @@ fn validate_collisions(fields: &[FieldSpec]) -> syn::Result<()> {
         if let Some(prev) = seen_long.insert(long.clone(), f.span) {
             return Err(syn::Error::new(
                 f.span,
-                format!("duplicate long flag --{long} (previously declared at {:?})", prev),
+                format!(
+                    "duplicate long flag --{long} (previously declared at {:?})",
+                    prev
+                ),
             ));
         }
         if let Some(s) = f.short {
@@ -1050,9 +1067,10 @@ fn schema_type_str(f: &FieldSpec) -> &'static str {
 
 fn inner_ty_name(ty: &Type) -> String {
     if let Type::Path(TypePath { path, .. }) = ty
-        && let Some(seg) = path.segments.last() {
-            return seg.ident.to_string();
-        }
+        && let Some(seg) = path.segments.last()
+    {
+        return seg.ident.to_string();
+    }
     String::from("_")
 }
 
@@ -1268,7 +1286,11 @@ fn arg_extraction(f: &FieldSpec, idx: usize) -> TokenStream2 {
     }
 }
 
-fn build_help_expr(fields: &[FieldSpec], description: Option<&str>, struct_name: &str) -> TokenStream2 {
+fn build_help_expr(
+    fields: &[FieldSpec],
+    description: Option<&str>,
+    struct_name: &str,
+) -> TokenStream2 {
     // Prefer the doc-comment description as the banner; fall back to the
     // struct ident only when no description is present. The struct name is
     // an implementation detail that users shouldn't see in `--help`.
@@ -1399,16 +1421,23 @@ fn extract_doc(attrs: &[Attribute]) -> Option<String> {
             continue;
         }
         if let syn::Meta::NameValue(nv) = &a.meta
-            && let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
-                let text = s.value();
-                lines.push(text.trim().to_string());
-            }
+            && let Expr::Lit(ExprLit {
+                lit: Lit::Str(s), ..
+            }) = &nv.value
+        {
+            let text = s.value();
+            lines.push(text.trim().to_string());
+        }
     }
     if lines.is_empty() {
         return None;
     }
     // Join lines with a space; collapse internal whitespace runs.
-    let joined = lines.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined = lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if joined.is_empty() {
         None
     } else {

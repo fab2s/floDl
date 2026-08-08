@@ -4,7 +4,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 use super::schema::ProjectConfig;
 
 /// Resolve whether a leaf command should fan out across the cluster, given
@@ -44,7 +43,6 @@ pub fn resolve_cluster_dispatch(chain: &[Option<bool>]) -> bool {
 pub fn cluster_dispatch_enabled(project: &ProjectConfig, chain: &[Option<bool>]) -> bool {
     project.cluster.is_some() && resolve_cluster_dispatch(chain)
 }
-
 
 // ── Config discovery ────────────────────────────────────────────────────
 
@@ -90,7 +88,10 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
 /// example-copy prompt. For resolvers that already hold the project root
 /// and must not block on interactive prompts.
 pub fn find_config_in(dir: &Path) -> Option<PathBuf> {
-    CONFIG_NAMES.iter().map(|n| dir.join(n)).find(|c| c.is_file())
+    CONFIG_NAMES
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|c| c.is_file())
 }
 
 /// Walk up from `start` to the PROJECT-level config, stepping over
@@ -114,14 +115,12 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
         if let Some(candidate) = find_config_in(&dir) {
             let is_command_shaped = std::fs::read_to_string(&candidate)
                 .ok()
-                .and_then(|raw| {
-                    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&raw).ok()
-                })
+                .and_then(|raw| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&raw).ok())
                 .and_then(|v| v.as_mapping().cloned())
                 .is_some_and(|map| {
-                    COMMAND_MARKERS.iter().any(|k| {
-                        map.contains_key(serde_yaml_ng::Value::String((*k).into()))
-                    })
+                    COMMAND_MARKERS
+                        .iter()
+                        .any(|k| map.contains_key(serde_yaml_ng::Value::String((*k).into())))
                 });
             if !is_command_shaped {
                 return Some(candidate);
@@ -182,14 +181,10 @@ pub fn load_project(path: &Path) -> Result<ProjectConfig, String> {
 /// to `base_path` and deep-merges it over the base before deserialization.
 /// Missing overlay files are a hard error — the user asked for this env, so
 /// silently ignoring it would be worse than a clear message.
-pub fn load_project_with_env(
-    base_path: &Path,
-    env: Option<&str>,
-) -> Result<ProjectConfig, String> {
+pub fn load_project_with_env(base_path: &Path, env: Option<&str>) -> Result<ProjectConfig, String> {
     let layers = resolve_config_layers(base_path, env)?;
-    let merged = crate::overlay::merge_layers(
-        layers.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
-    );
+    let merged =
+        crate::overlay::merge_layers(layers.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>());
     // An empty (or comments-only) fdl.yml — and empty overlays — merge to a
     // null value. That is a valid "nothing configured" state, so return an
     // all-defaults config instead of letting `from_str::<ProjectConfig>("null")`
@@ -215,9 +210,7 @@ pub fn load_project_with_env(
                     .to_string()
             })
             .collect();
-        let env_hint = env
-            .map(|n| format!(" {n}"))
-            .unwrap_or_default();
+        let env_hint = env.map(|n| format!(" {n}")).unwrap_or_default();
         let (loc_str, context) = match e.location() {
             Some(loc) => (
                 format!(" at merged-view line {}, col {}", loc.line(), loc.column()),
@@ -269,9 +262,10 @@ fn validate_gpu_ram_shares(cfg: &ProjectConfig, base_path: &Path) -> Result<(), 
         }
     }
     if let Some(join) = &cfg.join
-        && bad(join.gpu_ram_share) {
-            return err("join.gpu_ram_share", join.gpu_ram_share.unwrap());
-        }
+        && bad(join.gpu_ram_share)
+    {
+        return err("join.gpu_ram_share", join.gpu_ram_share.unwrap());
+    }
     Ok(())
 }
 

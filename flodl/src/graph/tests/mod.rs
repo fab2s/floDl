@@ -9,12 +9,12 @@
 pub(crate) use super::*;
 pub(crate) use crate::autograd::Variable;
 pub(crate) use crate::graph::{
-    ArgmaxSelector, FixedSelector, FlowBuilder, LearnedHalt, MergeOp, Reduce,
-    SigmoidRouter, SoftmaxRouter, ThresholdHalt,
+    ArgmaxSelector, FixedSelector, FlowBuilder, LearnedHalt, MergeOp, Reduce, SigmoidRouter,
+    SoftmaxRouter, ThresholdHalt,
 };
 pub(crate) use crate::nn::{
-    Identity, Linear, LoopBody, NamedInputModule, Optimizer, ReLU, SGD, Sigmoid,
-    TraceEmit, forward_via_step, mse_loss,
+    Identity, Linear, LoopBody, NamedInputModule, Optimizer, ReLU, SGD, Sigmoid, TraceEmit,
+    forward_via_step, mse_loss,
 };
 pub(crate) use crate::tensor::Tensor;
 pub(crate) use std::collections::HashMap;
@@ -24,7 +24,6 @@ mod loops;
 mod map_and_inputs;
 mod misc;
 mod observation;
-
 
 pub(super) fn from_f32(data: &[f32], shape: &[i64]) -> Tensor {
     Tensor::from_f32(data, shape, crate::tensor::test_device()).unwrap()
@@ -71,7 +70,9 @@ impl Module for AddRefModule {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(input.clone())
     }
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 }
 impl NamedInputModule for AddRefModule {
     fn forward_named(
@@ -88,7 +89,6 @@ impl NamedInputModule for AddRefModule {
 }
 
 // --- Core graph tests (from before) ---
-
 
 #[test]
 fn test_single_module() {
@@ -228,7 +228,11 @@ fn test_fork_backward() {
 
     assert!(x.grad().is_some(), "input should have gradient");
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -321,7 +325,11 @@ fn test_graph_backward() {
     loss.backward().unwrap();
 
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
     assert!(x.grad().is_some());
 }
@@ -383,7 +391,11 @@ fn test_also_backward() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -405,7 +417,11 @@ fn test_split_merge_backward() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -477,7 +493,11 @@ fn test_using_backward_gradients() {
 
     assert!(x.grad().is_some());
     for p in graph.parameters() {
-        assert!(p.variable.grad().is_some(), "{} should have gradient", p.name);
+        assert!(
+            p.variable.grad().is_some(),
+            "{} should have gradient",
+            p.name
+        );
     }
 }
 
@@ -503,7 +523,6 @@ fn test_using_error_unknown_tag() {
 
 // --- Loop tests ---
 
-
 // ---------------------------------------------------------------------------
 // Shared helpers (used by sibling test files)
 // ---------------------------------------------------------------------------
@@ -514,7 +533,9 @@ impl Module for SumRefs {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(input.clone())
     }
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 }
 impl NamedInputModule for SumRefs {
     fn forward_named(
@@ -530,15 +551,15 @@ impl NamedInputModule for SumRefs {
     }
 }
 
-
-
 // --- from loops.rs ---
 pub(super) struct NilSafeAdd;
 impl Module for NilSafeAdd {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         Ok(input.clone())
     }
-    fn as_named_input(&self) -> Option<&dyn NamedInputModule> { Some(self) }
+    fn as_named_input(&self) -> Option<&dyn NamedInputModule> {
+        Some(self)
+    }
 }
 impl NamedInputModule for NilSafeAdd {
     fn forward_named(
@@ -554,8 +575,6 @@ impl NamedInputModule for NilSafeAdd {
     }
 }
 
-
-
 // --- from map_and_inputs.rs ---
 pub(super) struct ScalarSum;
 impl Module for ScalarSum {
@@ -564,12 +583,12 @@ impl Module for ScalarSum {
     }
 }
 
-
-
 // --- from map_and_inputs.rs ---
 pub(super) struct LinearSched(f64);
 impl crate::nn::Scheduler for LinearSched {
-    fn lr(&self, step: usize) -> f64 { step as f64 * self.0 }
+    fn lr(&self, step: usize) -> f64 {
+        step as f64 * self.0
+    }
 }
 
 /// Build a tiny Graph + optimizer + a fake gradient so step() can run end
@@ -590,16 +609,16 @@ pub(super) fn current_optim_lr(graph: &crate::graph::Graph) -> f64 {
     graph.optimizer.borrow().as_ref().map(|o| o.lr()).unwrap()
 }
 
-
 // --- from flow_and_routing.rs ---
 pub(super) struct Tripler;
 impl Module for Tripler {
     fn forward(&self, input: &Variable) -> Result<Variable> {
         input.add(&input.add(input)?)
     }
-    fn parameters(&self) -> Vec<Parameter> { vec![] }
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![]
+    }
 }
-
 
 // --- from misc.rs ---
 pub(super) struct TracingDoubler {
@@ -623,9 +642,6 @@ impl Module for TracingDoubler {
     }
 }
 
-
-
-
 // --- Batched merge and ref wiring ---
 //
 // Both combine tensors, and at batch size 1 a row-wise combination and a
@@ -646,7 +662,11 @@ fn test_split_merge_mean_batched() {
     let d = y.data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
         let want = base * 2.5; // (2x + 3x) / 2, row by row
-        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-4,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -665,7 +685,11 @@ fn test_using_ref_is_row_wise_batched() {
     let d = y.data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
         let want = base * 2.0; // stream + ctx, and ctx is the stream here
-        assert!((d[i] - want).abs() < 1e-5, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-5,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -689,7 +713,11 @@ fn test_split_merge_add_batched() {
     let d = y.data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, 2.0, 10.0, 20.0].iter().enumerate() {
         let want = base * 5.0; // 2x + 3x, row by row
-        assert!((d[i] - want).abs() < 1e-4, "elem {i}: want {want}, got {}", d[i]);
+        assert!(
+            (d[i] - want).abs() < 1e-4,
+            "elem {i}: want {want}, got {}",
+            d[i]
+        );
     }
 }
 
@@ -714,12 +742,20 @@ fn test_fork_batched_main_and_side_are_row_wise() {
     let main = y.data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, -2.0, 10.0, -20.0].iter().enumerate() {
         let want = base * 2.0;
-        assert!((main[i] - want).abs() < 1e-5, "main elem {i}: want {want}, got {}", main[i]);
+        assert!(
+            (main[i] - want).abs() < 1e-5,
+            "main elem {i}: want {want}, got {}",
+            main[i]
+        );
     }
 
     let side = graph.tagged("side").unwrap().data().to_f32_vec().unwrap();
     for (i, base) in [1.0f32, -2.0, 10.0, -20.0].iter().enumerate() {
         let want = base * 3.0;
-        assert!((side[i] - want).abs() < 1e-5, "side elem {i}: want {want}, got {}", side[i]);
+        assert!(
+            (side[i] - want).abs() < 1e-5,
+            "side elem {i}: want {want}, got {}",
+            side[i]
+        );
     }
 }

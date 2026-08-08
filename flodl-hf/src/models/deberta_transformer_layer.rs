@@ -60,7 +60,7 @@
 
 use std::cell::Cell;
 
-use flodl::nn::{Dropout, GeluApprox, LayerNorm, Linear, Module, Parameter, GELU};
+use flodl::nn::{Dropout, GELU, GeluApprox, LayerNorm, Linear, Module, Parameter};
 use flodl::{DType, Device, Result, Tensor, TensorOptions, Variable};
 
 use crate::path::prefix_params;
@@ -110,7 +110,10 @@ fn make_log_bucket_position(
 ) -> Result<Tensor> {
     let mid = bucket_size / 2;
     let device = rel_pos.device();
-    let f32_opts = TensorOptions { dtype: DType::Float32, device };
+    let f32_opts = TensorOptions {
+        dtype: DType::Float32,
+        device,
+    };
 
     let rp_f = rel_pos.to_dtype(DType::Float32)?;
 
@@ -168,11 +171,20 @@ pub fn build_relative_position(
     max_relative_positions: i64,
     device: Device,
 ) -> Result<Tensor> {
-    let i64_opts = TensorOptions { dtype: DType::Int64, device };
+    let i64_opts = TensorOptions {
+        dtype: DType::Int64,
+        device,
+    };
     let ids = Tensor::arange(0.0, seq_len as f64, 1.0, i64_opts)?;
     // q_ids[:, None] - k_ids[None, :]
-    let q = ids.unsqueeze(-1)?.expand(&[seq_len, seq_len])?.contiguous()?;
-    let k = ids.unsqueeze(0)?.expand(&[seq_len, seq_len])?.contiguous()?;
+    let q = ids
+        .unsqueeze(-1)?
+        .expand(&[seq_len, seq_len])?
+        .contiguous()?;
+    let k = ids
+        .unsqueeze(0)?
+        .expand(&[seq_len, seq_len])?
+        .contiguous()?;
     let rel = q.sub(&k)?;
 
     let bucketed = make_log_bucket_position(&rel, position_buckets, max_relative_positions)?;
@@ -212,20 +224,21 @@ impl DisentangledSelfAttention {
         assert!(
             config.hidden_size % config.num_attention_heads == 0,
             "hidden_size ({}) must be divisible by num_attention_heads ({})",
-            config.hidden_size, config.num_attention_heads,
+            config.hidden_size,
+            config.num_attention_heads,
         );
         let head_dim = config.hidden_size / config.num_attention_heads;
         Ok(DisentangledSelfAttention {
-            query_proj:             Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            key_proj:               Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            value_proj:             Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            num_heads:              config.num_attention_heads,
+            query_proj: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            key_proj: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            value_proj: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            num_heads: config.num_attention_heads,
             head_dim,
-            attn_dropout:           Dropout::new(config.attention_probs_dropout_prob),
-            pos_dropout:            Dropout::new(config.hidden_dropout_prob),
-            position_buckets:       config.position_buckets,
+            attn_dropout: Dropout::new(config.attention_probs_dropout_prob),
+            pos_dropout: Dropout::new(config.hidden_dropout_prob),
+            position_buckets: config.position_buckets,
             max_relative_positions: config.max_relative_positions,
-            training:               Cell::new(true),
+            training: Cell::new(true),
         })
     }
 
@@ -255,9 +268,9 @@ impl DisentangledSelfAttention {
     /// Returns `[B*Nh, S, S]`.
     fn disentangled_bias(
         &self,
-        query_layer: &Variable,  // [B*Nh, S, D]
-        key_layer: &Variable,    // [B*Nh, S, D]
-        relative_pos: &Tensor,   // [1, S, S] int64
+        query_layer: &Variable,    // [B*Nh, S, D]
+        key_layer: &Variable,      // [B*Nh, S, D]
+        relative_pos: &Tensor,     // [1, S, S] int64
         rel_embeddings: &Variable, // [2P, H] — already LayerNormed by encoder
         scale: f64,
     ) -> Result<Variable> {
@@ -265,18 +278,18 @@ impl DisentangledSelfAttention {
         let two_span = att_span * 2;
 
         // Take first 2*att_span rows, add batch dim → [1, 2P, H]
-        let rel = rel_embeddings
-            .narrow(0, 0, two_span)?
-            .unsqueeze(0)?;
+        let rel = rel_embeddings.narrow(0, 0, two_span)?.unsqueeze(0)?;
         let rel = self.pos_dropout.forward(&rel)?;
 
         // share_att_key=true: reuse query_proj / key_proj to project rel_embeddings
         let bh = query_layer.shape()[0]; // B*Nh
         let batch = bh / self.num_heads;
 
-        let pos_key = self.split_heads(&self.key_proj.forward(&rel)?)? // [Nh, 2P, D]  (batch=1 so B*Nh = Nh)
+        let pos_key = self
+            .split_heads(&self.key_proj.forward(&rel)?)? // [Nh, 2P, D]  (batch=1 so B*Nh = Nh)
             .repeat(&[batch, 1, 1])?; // [B*Nh, 2P, D]
-        let pos_query = self.split_heads(&self.query_proj.forward(&rel)?)?
+        let pos_query = self
+            .split_heads(&self.query_proj.forward(&rel)?)?
             .repeat(&[batch, 1, 1])?;
 
         // c2p: query @ pos_key.T, gather at (rel_pos + att_span)
@@ -290,10 +303,7 @@ impl DisentangledSelfAttention {
             .clamp(0.0, (two_span - 1) as f64)?
             .to_dtype(DType::Int64)?;
         let s = c2p_scores.shape()[1]; // seq length (query size)
-        let c2p_idx = c2p_pos
-            .squeeze(0)?
-            .expand(&[bh, s, s])?
-            .contiguous()?;
+        let c2p_idx = c2p_pos.squeeze(0)?.expand(&[bh, s, s])?.contiguous()?;
         let c2p_att = c2p_scores.gather(-1, &c2p_idx)?; // [B*Nh, S, S]
 
         // p2c: key @ pos_query.T, gather at (-rel_pos + att_span), then transpose
@@ -303,10 +313,7 @@ impl DisentangledSelfAttention {
             .add_scalar(att_span as f64)?
             .clamp(0.0, (two_span - 1) as f64)?
             .to_dtype(DType::Int64)?;
-        let p2c_idx = p2c_pos
-            .squeeze(0)?
-            .expand(&[bh, s, s])?
-            .contiguous()?;
+        let p2c_idx = p2c_pos.squeeze(0)?.expand(&[bh, s, s])?.contiguous()?;
         let p2c_att = p2c_scores.gather(-1, &p2c_idx)?.transpose(-1, -2)?;
 
         let scaled_c2p = c2p_att.div_scalar(scale)?;
@@ -365,7 +372,7 @@ impl DisentangledSelfAttention {
     pub fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
         out.extend(prefix_params("query_proj", self.query_proj.parameters()));
-        out.extend(prefix_params("key_proj",   self.key_proj.parameters()));
+        out.extend(prefix_params("key_proj", self.key_proj.parameters()));
         out.extend(prefix_params("value_proj", self.value_proj.parameters()));
         out
     }
@@ -391,9 +398,13 @@ pub struct DebertaV2SelfOutput {
 impl DebertaV2SelfOutput {
     pub fn on_device(config: &DebertaV2LayerConfig, device: Device) -> Result<Self> {
         Ok(DebertaV2SelfOutput {
-            dense:      Linear::on_device(config.hidden_size, config.hidden_size, device)?,
-            layer_norm: LayerNorm::on_device_with_eps(config.hidden_size, config.layer_norm_eps, device)?,
-            dropout:    Dropout::new(config.hidden_dropout_prob),
+            dense: Linear::on_device(config.hidden_size, config.hidden_size, device)?,
+            layer_norm: LayerNorm::on_device_with_eps(
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
+            )?,
+            dropout: Dropout::new(config.hidden_dropout_prob),
         })
     }
 
@@ -404,8 +415,8 @@ impl DebertaV2SelfOutput {
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        let mut out = prefix_params("dense",     self.dense.parameters());
-        out.extend(prefix_params("LayerNorm",    self.layer_norm.parameters()));
+        let mut out = prefix_params("dense", self.dense.parameters());
+        out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
@@ -449,9 +460,13 @@ pub struct DebertaV2Output {
 impl DebertaV2Output {
     pub fn on_device(config: &DebertaV2LayerConfig, device: Device) -> Result<Self> {
         Ok(DebertaV2Output {
-            dense:      Linear::on_device(config.intermediate_size, config.hidden_size, device)?,
-            layer_norm: LayerNorm::on_device_with_eps(config.hidden_size, config.layer_norm_eps, device)?,
-            dropout:    Dropout::new(config.hidden_dropout_prob),
+            dense: Linear::on_device(config.intermediate_size, config.hidden_size, device)?,
+            layer_norm: LayerNorm::on_device_with_eps(
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
+            )?,
+            dropout: Dropout::new(config.hidden_dropout_prob),
         })
     }
 
@@ -462,8 +477,8 @@ impl DebertaV2Output {
     }
 
     fn parameters(&self) -> Vec<Parameter> {
-        let mut out = prefix_params("dense",     self.dense.parameters());
-        out.extend(prefix_params("LayerNorm",    self.layer_norm.parameters()));
+        let mut out = prefix_params("dense", self.dense.parameters());
+        out.extend(prefix_params("LayerNorm", self.layer_norm.parameters()));
         out
     }
 
@@ -485,19 +500,19 @@ impl DebertaV2Output {
 /// of its own [`flodl::nn::NamedInputModule::forward_named`]
 /// implementation.
 pub struct DebertaV2TransformerLayer {
-    attention_self:   DisentangledSelfAttention,
+    attention_self: DisentangledSelfAttention,
     attention_output: DebertaV2SelfOutput,
-    intermediate:     DebertaV2Intermediate,
-    output:           DebertaV2Output,
+    intermediate: DebertaV2Intermediate,
+    output: DebertaV2Output,
 }
 
 impl DebertaV2TransformerLayer {
     pub fn on_device(config: &DebertaV2LayerConfig, device: Device) -> Result<Self> {
         Ok(DebertaV2TransformerLayer {
-            attention_self:   DisentangledSelfAttention::on_device(config, device)?,
+            attention_self: DisentangledSelfAttention::on_device(config, device)?,
             attention_output: DebertaV2SelfOutput::on_device(config, device)?,
-            intermediate:     DebertaV2Intermediate::on_device(config, device)?,
-            output:           DebertaV2Output::on_device(config, device)?,
+            intermediate: DebertaV2Intermediate::on_device(config, device)?,
+            output: DebertaV2Output::on_device(config, device)?,
         })
     }
 
@@ -512,7 +527,10 @@ impl DebertaV2TransformerLayer {
         rel_embeddings: &Variable,
     ) -> Result<Variable> {
         let attn = self.attention_self.forward(
-            hidden_states, attention_mask, relative_pos, rel_embeddings,
+            hidden_states,
+            attention_mask,
+            relative_pos,
+            rel_embeddings,
         )?;
         let attn_out = self.attention_output.forward(&attn, hidden_states)?;
         let ffn_mid = self.intermediate.forward(&attn_out)?;
@@ -524,10 +542,19 @@ impl DebertaV2TransformerLayer {
     /// `output.*`. Caller (encoder) prefixes these with `layer.{i}.`.
     pub fn parameters(&self) -> Vec<Parameter> {
         let mut out = Vec::new();
-        out.extend(prefix_params("attention.self",   self.attention_self.parameters()));
-        out.extend(prefix_params("attention.output", self.attention_output.parameters()));
-        out.extend(prefix_params("intermediate",     self.intermediate.parameters()));
-        out.extend(prefix_params("output",           self.output.parameters()));
+        out.extend(prefix_params(
+            "attention.self",
+            self.attention_self.parameters(),
+        ));
+        out.extend(prefix_params(
+            "attention.output",
+            self.attention_output.parameters(),
+        ));
+        out.extend(prefix_params(
+            "intermediate",
+            self.intermediate.parameters(),
+        ));
+        out.extend(prefix_params("output", self.output.parameters()));
         out
     }
 
@@ -544,15 +571,15 @@ mod tests {
 
     fn mini_config() -> DebertaV2LayerConfig {
         DebertaV2LayerConfig {
-            hidden_size:                  16,
-            num_attention_heads:          4,
-            intermediate_size:            32,
-            hidden_dropout_prob:          0.0,
+            hidden_size: 16,
+            num_attention_heads: 4,
+            intermediate_size: 32,
+            hidden_dropout_prob: 0.0,
             attention_probs_dropout_prob: 0.0,
-            layer_norm_eps:               1e-7,
-            position_buckets:             4,
-            max_relative_positions:       8,
-            hidden_act:                   GeluApprox::Exact,
+            layer_norm_eps: 1e-7,
+            position_buckets: 4,
+            max_relative_positions: 8,
+            hidden_act: GeluApprox::Exact,
         }
     }
 
@@ -603,7 +630,8 @@ mod tests {
             assert!(
                 (2..=3).contains(&v),
                 "out[{}] = {} not in [2, 3] for bucket_size=4",
-                i + 1, v,
+                i + 1,
+                v,
             );
         }
     }
@@ -661,14 +689,18 @@ mod tests {
         let mask = Variable::new(
             Tensor::zeros(
                 &[batch, 1, seq, seq],
-                TensorOptions { dtype: DType::Float32, device: dev },
-            ).unwrap(),
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device: dev,
+                },
+            )
+            .unwrap(),
             false,
         );
         // rel_pos grid
-        let rel_pos = build_relative_position(
-            seq, cfg.position_buckets, cfg.max_relative_positions, dev,
-        ).unwrap();
+        let rel_pos =
+            build_relative_position(seq, cfg.position_buckets, cfg.max_relative_positions, dev)
+                .unwrap();
         // rel_embeddings: [2*P, H] random (stand-in for encoder-owned table).
         let rel_emb_shape = [cfg.position_buckets * 2, hidden];
         let rel_emb_data: Vec<f32> = (0..(rel_emb_shape[0] * rel_emb_shape[1]) as usize)
@@ -713,9 +745,9 @@ mod tests {
             Tensor::from_f32(&hidden_data, &[batch, seq, hidden], dev).unwrap(),
             false,
         );
-        let rel_pos = build_relative_position(
-            seq, cfg.position_buckets, cfg.max_relative_positions, dev,
-        ).unwrap();
+        let rel_pos =
+            build_relative_position(seq, cfg.position_buckets, cfg.max_relative_positions, dev)
+                .unwrap();
         let rel_emb_data: Vec<f32> = (0..((cfg.position_buckets * 2) * hidden) as usize)
             .map(|i| ((i as f32) * 0.003).sin())
             .collect();
@@ -727,8 +759,12 @@ mod tests {
         let all_attend = Variable::new(
             Tensor::zeros(
                 &[batch, 1, seq, seq],
-                TensorOptions { dtype: DType::Float32, device: dev },
-            ).unwrap(),
+                TensorOptions {
+                    dtype: DType::Float32,
+                    device: dev,
+                },
+            )
+            .unwrap(),
             false,
         );
         // Mask out key position 3 from query position 0 (heavy -inf).
@@ -743,7 +779,11 @@ mod tests {
         let out_mask = layer.forward(&x, &partial, &rel_pos, &rel_emb).unwrap();
         let a: Vec<f32> = out_all.data().to_f32_vec().unwrap();
         let b: Vec<f32> = out_mask.data().to_f32_vec().unwrap();
-        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max);
         assert!(
             max_diff > 1e-5,
             "masking one key position must change the output; got max_diff = {max_diff}",

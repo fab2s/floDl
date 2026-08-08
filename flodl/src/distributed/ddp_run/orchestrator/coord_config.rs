@@ -12,7 +12,7 @@
 //!     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
 
 use crate::distributed::ddp_run::{
-    convergence, ApplyPolicy, AverageBackend, DdpRunConfig, EvalResultFn, MetricsFn,
+    ApplyPolicy, AverageBackend, DdpRunConfig, EvalResultFn, MetricsFn, convergence,
 };
 use crate::tensor::Result;
 
@@ -85,21 +85,16 @@ pub(crate) fn build_coord_config_from_builder(
     // checkpointed ElCheState.anchor, mis-seeding a later Cadence resume.
     el_che = el_che.with_window_growth_applicable(policy != ApplyPolicy::Sync);
 
-    let mut coord_config = ClusterCoordinatorConfig::new(
-        policy,
-        backend,
-        world_size,
-        el_che,
-    )
-    .total_samples(total_samples)
-    // Must be the same value every rank's WorkerConfig carries, or the
-    // ledger and the ranks' expansions land on different slices.
-    .epoch_splits(epoch_splits)
-    .batch_size(batch_size)
-    .num_epochs(num_epochs)
-    .elche_relax_up(config.elche.relax_up)
-    .meta_controller(config.elche.meta_controller)
-    .partition_ratios(config.elche.partition_ratios.clone());
+    let mut coord_config = ClusterCoordinatorConfig::new(policy, backend, world_size, el_che)
+        .total_samples(total_samples)
+        // Must be the same value every rank's WorkerConfig carries, or the
+        // ledger and the ranks' expansions land on different slices.
+        .epoch_splits(epoch_splits)
+        .batch_size(batch_size)
+        .num_epochs(num_epochs)
+        .elche_relax_up(config.elche.relax_up)
+        .meta_controller(config.elche.meta_controller)
+        .partition_ratios(config.elche.partition_ratios.clone());
 
     // Guard precedence: user override > NoGuard (if flagged) >
     // TrendGuard with user threshold or 0.05 default. On resume, the
@@ -119,9 +114,10 @@ pub(crate) fn build_coord_config_from_builder(
                 Box::new(convergence::NoGuard)
             } else {
                 let mut tg = convergence::TrendGuard::new(
-                    config.elche.divergence_threshold.unwrap_or_else(|| {
-                        default_trend_threshold(config.elche.easgd_alpha)
-                    }),
+                    config
+                        .elche
+                        .divergence_threshold
+                        .unwrap_or_else(|| default_trend_threshold(config.elche.easgd_alpha)),
                 );
                 if let Some(history) = resume_trend_history {
                     tg = tg.with_history(history);

@@ -1,9 +1,9 @@
 use crate::autograd::{Variable, conv1d};
-use crate::tensor::{Result, Device};
+use crate::tensor::{Device, Result};
 
+use super::Module;
 use super::init::{kaiming_uniform, uniform_bias};
 use super::parameter::Parameter;
-use super::Module;
 
 /// 1D convolution layer.
 ///
@@ -89,33 +89,68 @@ impl Conv1dBuilder {
     /// Build the convolution layer with the configured parameters.
     pub fn done(self) -> Result<Conv1d> {
         Conv1d::build(
-            self.in_channels, self.out_channels, self.kernel_size,
-            self.with_bias, self.stride, self.padding, self.dilation,
-            self.groups, self.device,
+            self.in_channels,
+            self.out_channels,
+            self.kernel_size,
+            self.with_bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+            self.device,
         )
     }
 }
 
 impl Conv1d {
     /// Create a Conv1d layer with default stride=1, padding=0, dilation=1, groups=1, with bias.
-    pub fn new(
-        in_channels: i64, out_channels: i64, kernel_size: i64,
-    ) -> Result<Self> {
-        Self::build(in_channels, out_channels, kernel_size, true, 1, 0, 1, 1, Device::CPU)
+    pub fn new(in_channels: i64, out_channels: i64, kernel_size: i64) -> Result<Self> {
+        Self::build(
+            in_channels,
+            out_channels,
+            kernel_size,
+            true,
+            1,
+            0,
+            1,
+            1,
+            Device::CPU,
+        )
     }
 
     /// Create a Conv1d layer without bias.
-    pub fn no_bias(
-        in_channels: i64, out_channels: i64, kernel_size: i64,
-    ) -> Result<Self> {
-        Self::build(in_channels, out_channels, kernel_size, false, 1, 0, 1, 1, Device::CPU)
+    pub fn no_bias(in_channels: i64, out_channels: i64, kernel_size: i64) -> Result<Self> {
+        Self::build(
+            in_channels,
+            out_channels,
+            kernel_size,
+            false,
+            1,
+            0,
+            1,
+            1,
+            Device::CPU,
+        )
     }
 
     /// Create a Conv1d layer on a specific device.
     pub fn on_device(
-        in_channels: i64, out_channels: i64, kernel_size: i64, device: Device,
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
+        device: Device,
     ) -> Result<Self> {
-        Self::build(in_channels, out_channels, kernel_size, true, 1, 0, 1, 1, device)
+        Self::build(
+            in_channels,
+            out_channels,
+            kernel_size,
+            true,
+            1,
+            0,
+            1,
+            1,
+            device,
+        )
     }
 
     /// Start a fluent builder for full configuration.
@@ -143,10 +178,15 @@ impl Conv1d {
     /// Fully configurable Conv1d constructor.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        in_channels: i64, out_channels: i64, kernel_size: i64,
+        in_channels: i64,
+        out_channels: i64,
+        kernel_size: i64,
         with_bias: bool,
-        stride: i64, padding: i64, dilation: i64,
-        groups: i64, device: Device,
+        stride: i64,
+        padding: i64,
+        dilation: i64,
+        groups: i64,
+        device: Device,
     ) -> Result<Self> {
         super::init::validate_conv_groups("Conv1d", in_channels, out_channels, groups)?;
         let shape = [out_channels, in_channels / groups, kernel_size];
@@ -166,7 +206,10 @@ impl Conv1d {
         };
 
         Ok(Conv1d {
-            weight: Parameter { variable: weight, name: "weight".into() },
+            weight: Parameter {
+                variable: weight,
+                name: "weight".into(),
+            },
             bias,
             stride,
             padding,
@@ -177,7 +220,9 @@ impl Conv1d {
 }
 
 impl Module for Conv1d {
-    fn name(&self) -> &str { "conv1d" }
+    fn name(&self) -> &str {
+        "conv1d"
+    }
 
     fn forward(&self, input: &Variable) -> Result<Variable> {
         conv1d(
@@ -208,9 +253,7 @@ mod tests {
     #[test]
     fn test_conv1d_forward() {
         let conv = Conv1d::on_device(3, 16, 3, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 3, 100], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 3, 100], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![1, 16, 98]); // (100 - 3 + 1) = 98
     }
@@ -220,11 +263,10 @@ mod tests {
         let conv = Conv1d::configure(3, 8, 5)
             .without_bias()
             .on_device(test_device())
-            .done().unwrap();
+            .done()
+            .unwrap();
         assert_eq!(conv.parameters().len(), 1); // weight only
-        let x = Variable::new(
-            Tensor::randn(&[2, 3, 50], test_opts()).unwrap(), false,
-        );
+        let x = Variable::new(Tensor::randn(&[2, 3, 50], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![2, 8, 46]);
     }
@@ -235,10 +277,9 @@ mod tests {
             .with_stride(2)
             .with_padding(1)
             .on_device(test_device())
-            .done().unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 1, 20], test_opts()).unwrap(), false,
-        );
+            .done()
+            .unwrap();
+        let x = Variable::new(Tensor::randn(&[1, 1, 20], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         // (20 + 2*1 - 3) / 2 + 1 = 10
         assert_eq!(y.shape(), vec![1, 4, 10]);
@@ -247,9 +288,7 @@ mod tests {
     #[test]
     fn test_conv1d_gradient() {
         let conv = Conv1d::on_device(2, 4, 3, test_device()).unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 2, 10], test_opts()).unwrap(), true,
-        );
+        let x = Variable::new(Tensor::randn(&[1, 2, 10], test_opts()).unwrap(), true);
         let y = conv.forward(&x).unwrap().sum().unwrap();
         y.backward().unwrap();
         assert!(x.grad().is_some());
@@ -261,10 +300,9 @@ mod tests {
         let conv = Conv1d::configure(4, 8, 3)
             .with_groups(2)
             .on_device(test_device())
-            .done().unwrap();
-        let x = Variable::new(
-            Tensor::randn(&[1, 4, 20], test_opts()).unwrap(), false,
-        );
+            .done()
+            .unwrap();
+        let x = Variable::new(Tensor::randn(&[1, 4, 20], test_opts()).unwrap(), false);
         let y = conv.forward(&x).unwrap();
         assert_eq!(y.shape(), vec![1, 8, 18]);
         // Weight shape: [8, 4/2, 3] = [8, 2, 3]

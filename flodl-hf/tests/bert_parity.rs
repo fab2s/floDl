@@ -23,7 +23,7 @@ use safetensors::SafeTensors;
 
 use flodl::nn::Module;
 use flodl::{Device, Tensor, Variable};
-use flodl_hf::models::bert::{build_extended_attention_mask, BertModel};
+use flodl_hf::models::bert::{BertModel, build_extended_attention_mask};
 
 const FIXTURE: &str = "tests/fixtures/bert_base_uncased_parity.safetensors";
 
@@ -41,10 +41,10 @@ use parity_common::{max_abs_diff, parse_f32, parse_i64, shape_i64};
 fn bert_parity_vs_pytorch_live() {
     let dev = Device::CPU;
 
-    let fixture_bytes = std::fs::read(Path::new(FIXTURE))
-        .unwrap_or_else(|e| panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity bert` to regenerate)"));
-    let st = SafeTensors::deserialize(&fixture_bytes)
-        .expect("parse parity fixture");
+    let fixture_bytes = std::fs::read(Path::new(FIXTURE)).unwrap_or_else(|e| {
+        panic!("reading {FIXTURE}: {e} (run `fdl flodl-hf parity bert` to regenerate)")
+    });
+    let st = SafeTensors::deserialize(&fixture_bytes).expect("parse parity fixture");
 
     let input_ids_view = st.tensor("inputs.input_ids").unwrap();
     let position_ids_view = st.tensor("inputs.position_ids").unwrap();
@@ -53,15 +53,30 @@ fn bert_parity_vs_pytorch_live() {
     let pooler_ref_view = st.tensor("outputs.pooler_output").unwrap();
 
     let input_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&input_ids_view), &shape_i64(&input_ids_view), dev).unwrap(),
+        Tensor::from_i64(
+            &parse_i64(&input_ids_view),
+            &shape_i64(&input_ids_view),
+            dev,
+        )
+        .unwrap(),
         false,
     );
     let position_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&position_ids_view), &shape_i64(&position_ids_view), dev).unwrap(),
+        Tensor::from_i64(
+            &parse_i64(&position_ids_view),
+            &shape_i64(&position_ids_view),
+            dev,
+        )
+        .unwrap(),
         false,
     );
     let token_type_ids = Variable::new(
-        Tensor::from_i64(&parse_i64(&token_type_ids_view), &shape_i64(&token_type_ids_view), dev).unwrap(),
+        Tensor::from_i64(
+            &parse_i64(&token_type_ids_view),
+            &shape_i64(&token_type_ids_view),
+            dev,
+        )
+        .unwrap(),
         false,
     );
 
@@ -71,11 +86,9 @@ fn bert_parity_vs_pytorch_live() {
         .iter()
         .map(|&x| x as f32)
         .collect();
-    let mask_flat = Tensor::from_f32(&mask_flat_f32, &shape_i64(&attention_mask_view), dev).unwrap();
-    let attention_mask = Variable::new(
-        build_extended_attention_mask(&mask_flat).unwrap(),
-        false,
-    );
+    let mask_flat =
+        Tensor::from_f32(&mask_flat_f32, &shape_i64(&attention_mask_view), dev).unwrap();
+    let attention_mask = Variable::new(build_extended_attention_mask(&mask_flat).unwrap(), false);
 
     let pooler_ref = parse_f32(&pooler_ref_view);
     let pooler_ref_shape = shape_i64(&pooler_ref_view);

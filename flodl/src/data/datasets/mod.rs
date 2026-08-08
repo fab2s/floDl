@@ -9,12 +9,12 @@
 //! sample-keyed tiers (RAM cache, disk stage, reservation staging)
 //! compose above them automatically.
 
-pub mod mnist;
 pub mod cifar10;
+pub mod mnist;
 pub mod shakespeare;
 pub mod token_shards;
 
-pub use mnist::Mnist;
 pub use cifar10::{Cifar10, Cifar10Disk};
+pub use mnist::Mnist;
 pub use shakespeare::Shakespeare;
 pub use token_shards::{TokenDtype, TokenShards};

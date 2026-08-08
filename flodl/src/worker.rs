@@ -4,9 +4,9 @@
 //! executes them in order. Designed for offloading CPU-bound work (checkpoints,
 //! evaluation, file I/O) off the GPU training thread.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 /// A single-threaded background worker that executes closures in order.

@@ -62,7 +62,11 @@ impl Mnist {
             .iter()
             .map(|&b| b as f32 / 255.0)
             .collect();
-        let images = Tensor::from_f32(&pixels, &[n as i64, 1, rows as i64, cols as i64], Device::CPU)?;
+        let images = Tensor::from_f32(
+            &pixels,
+            &[n as i64, 1, rows as i64, cols as i64],
+            Device::CPU,
+        )?;
 
         // Parse labels: magic(4) + count(4) + labels
         if labels_raw.len() < 8 {
@@ -84,10 +88,7 @@ impl Mnist {
             return Err(TensorError::new("MNIST labels: truncated"));
         }
 
-        let label_vals: Vec<i64> = labels_raw[8..8 + n]
-            .iter()
-            .map(|&b| b as i64)
-            .collect();
+        let label_vals: Vec<i64> = labels_raw[8..8 + n].iter().map(|&b| b as i64).collect();
         let labels = Tensor::from_i64(&label_vals, &[n as i64], Device::CPU)?;
 
         Ok(Mnist { images, labels })
@@ -159,8 +160,8 @@ mod tests {
 
     /// Gzip-compress bytes.
     fn gzip(data: &[u8]) -> Vec<u8> {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
         let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
         enc.write_all(data).unwrap();
@@ -170,7 +171,9 @@ mod tests {
     #[test]
     fn parse_small_mnist() {
         // 2 images of 3x3 pixels
-        let pixels = vec![0u8, 128, 255, 0, 0, 0, 255, 255, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+        let pixels = vec![
+            0u8, 128, 255, 0, 0, 0, 255, 255, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90,
+        ];
         let images_raw = make_idx3(2, 3, 3, &pixels);
         let labels_raw = make_idx1(2, &[3, 7]);
 
@@ -184,17 +187,27 @@ mod tests {
 
         // Check first pixel normalized: 0/255 = 0.0
         let first = mnist.images.select(0, 0).unwrap();
-        let val: f64 = first.select(0, 0).unwrap()
-            .select(0, 0).unwrap()
-            .select(0, 0).unwrap()
-            .item().unwrap();
+        let val: f64 = first
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .item()
+            .unwrap();
         assert!((val - 0.0).abs() < 1e-6);
 
         // Check second pixel: 128/255
-        let val: f64 = first.select(0, 0).unwrap()
-            .select(0, 0).unwrap()
-            .select(0, 1).unwrap()
-            .item().unwrap();
+        let val: f64 = first
+            .select(0, 0)
+            .unwrap()
+            .select(0, 0)
+            .unwrap()
+            .select(0, 1)
+            .unwrap()
+            .item()
+            .unwrap();
         assert!((val - 128.0 / 255.0).abs() < 1e-4);
 
         // Check labels

@@ -190,7 +190,12 @@ pub(crate) fn read_round_frame_streamed<R: Read>(
     let mut hdr = [0u8; 8];
     match stream.read_exact(&mut hdr) {
         Ok(()) => {}
-        Err(e) if matches!(e.kind(), ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+            ) =>
+        {
             return Ok(None);
         }
         Err(e) => {
@@ -229,7 +234,9 @@ pub(crate) fn read_round_frame_streamed<R: Read>(
     // kind byte. See [`RoundFrame::weight`].
     let mut weight_bytes = [0u8; 8];
     stream.read_exact(&mut weight_bytes).map_err(|e| {
-        TensorError::new(&format!("cluster_controller: frame weight read failed: {e}"))
+        TensorError::new(&format!(
+            "cluster_controller: frame weight read failed: {e}"
+        ))
     })?;
     mac.update(weight_bytes);
     let weight = f64::from_le_bytes(weight_bytes);
@@ -284,8 +291,8 @@ pub(crate) fn read_round_frame_streamed<R: Read>(
         }
         // Incremental allocation: nbytes is unauthenticated until the
         // trailing MAC verifies; never pre-allocate a hostile length.
-        let bytes = crate::distributed::wire::read_exact_incremental(stream, nbytes)
-            .map_err(|e| {
+        let bytes =
+            crate::distributed::wire::read_exact_incremental(stream, nbytes).map_err(|e| {
                 TensorError::new(&format!(
                     "cluster_controller: tensor[{ti}] data read failed: {e}"
                 ))
@@ -397,7 +404,9 @@ pub(crate) fn write_round_frame_streamed<W: Write>(
     hdr[0..4].copy_from_slice(&ROUND_FRAME_MAGIC.to_le_bytes());
     hdr[4..8].copy_from_slice(&(parts.len() as u32).to_le_bytes());
     stream.write_all(&hdr).map_err(|e| {
-        TensorError::new(&format!("cluster_controller: frame header write failed: {e}"))
+        TensorError::new(&format!(
+            "cluster_controller: frame header write failed: {e}"
+        ))
     })?;
     mac.update(hdr);
     // Round-kind byte (MAC-covered), mirroring `read_round_frame`.
@@ -409,7 +418,9 @@ pub(crate) fn write_round_frame_streamed<W: Write>(
     // Realized-work weight (MAC-covered), mirroring `read_round_frame`.
     let weight_bytes = weight.to_le_bytes();
     stream.write_all(&weight_bytes).map_err(|e| {
-        TensorError::new(&format!("cluster_controller: frame weight write failed: {e}"))
+        TensorError::new(&format!(
+            "cluster_controller: frame weight write failed: {e}"
+        ))
     })?;
     mac.update(weight_bytes);
     for (ti, p) in parts.iter().enumerate() {
@@ -460,7 +471,9 @@ pub(crate) fn write_round_frame_streamed<W: Write>(
     let mut footer = [0u8; 8];
     footer.copy_from_slice(&computed_full[0..8]);
     stream.write_all(&footer).map_err(|e| {
-        TensorError::new(&format!("cluster_controller: frame HMAC footer write failed: {e}"))
+        TensorError::new(&format!(
+            "cluster_controller: frame HMAC footer write failed: {e}"
+        ))
     })?;
     stream
         .flush()
@@ -606,14 +619,11 @@ pub(crate) fn sum_frames(frames: &[&RoundFrame]) -> Result<RoundFrame> {
     let mut out_tensors = Vec::with_capacity(ref_frame.tensors.len());
     for ti in 0..ref_frame.tensors.len() {
         let dtype = ref_frame.tensors[ti].dtype;
-        let elem = payload_element_size(dtype).map_err(|e| {
-            TensorError::new(&format!("cluster_controller: tensor[{ti}]: {e}"))
-        })?;
+        let elem = payload_element_size(dtype)
+            .map_err(|e| TensorError::new(&format!("cluster_controller: tensor[{ti}]: {e}")))?;
         let shape = ref_frame.tensors[ti].shape.clone();
         let numel = ref_frame.tensors[ti].numel();
-        if !ref_frame.tensors[ti].is_elided()
-            && numel * elem != ref_frame.tensors[ti].bytes.len()
-        {
+        if !ref_frame.tensors[ti].is_elided() && numel * elem != ref_frame.tensors[ti].bytes.len() {
             return Err(TensorError::new(&format!(
                 "cluster_controller: tensor[{ti}] shape {shape:?} numel*element_size {} != nbytes {}",
                 numel * elem,
@@ -725,10 +735,7 @@ pub(crate) fn payload_element_size(dtype: u8) -> Result<usize> {
 /// intermediate f32 vector. The fold's inner loop — payloads are
 /// model-sized, so the zero-alloc path matters for the per-host RAM
 /// peak.
-pub(crate) fn accumulate_payload_into(
-    payload: &TensorPayload,
-    accum: &mut [f32],
-) -> Result<()> {
+pub(crate) fn accumulate_payload_into(payload: &TensorPayload, accum: &mut [f32]) -> Result<()> {
     // Wire zero-elision: an elided payload IS zeros of its declared
     // schema, and adding zeros is adding nothing (IEEE-exact — ±0.0
     // changes no accumulator bit). Shape agreement was the caller's

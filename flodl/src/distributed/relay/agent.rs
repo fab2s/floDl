@@ -70,14 +70,13 @@ use crate::distributed::wire::SessionSalt;
 use crate::tensor::{Result, TensorError};
 
 use super::mux::{
-    try_read_len_framed, write_len_framed, LenFramedRead, MuxRead, MuxRecord, RelayControlMsg,
+    LenFramedRead, MuxRead, MuxRecord, RelayControlMsg, try_read_len_framed, write_len_framed,
 };
 
 /// Poll cadence for the relay's reader/writer threads. Read timeouts are
 /// set to this so each thread re-checks its shutdown flag on idle ticks
 /// without busy-spinning.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
-
 
 // ---------------------------------------------------------------------------
 // Channel kind + handshake termination
@@ -119,17 +118,13 @@ impl ChannelKind {
     ) -> Result<(u32, Option<[u8; 32]>)> {
         match self {
             ChannelKind::Data => {
-                let rank =
-                    crate::distributed::controller::read_handshake(stream, world_size)?;
+                let rank = crate::distributed::controller::read_handshake(stream, world_size)?;
                 crate::distributed::controller::write_handshake_ack(stream)?;
                 Ok((rank as u32, None))
             }
             ChannelKind::Control => {
-                let (rank, model_sig) = crate::distributed::wire::read_handshake_rank(
-                    stream,
-                    world_size as u32,
-                    salt,
-                )?;
+                let (rank, model_sig) =
+                    crate::distributed::wire::read_handshake_rank(stream, world_size as u32, salt)?;
                 crate::distributed::wire::write_handshake_ack(stream, salt)?;
                 Ok((rank, Some(model_sig)))
             }
@@ -187,17 +182,15 @@ impl RelayChannel {
         let mut rank_streams: Vec<(u32, TcpStream)> = Vec::with_capacity(ranks.len());
         let mut rank_sigs: Vec<(u32, [u8; 32])> = Vec::with_capacity(ranks.len());
         while rank_streams.len() < ranks.len() {
-            let (mut stream, _peer) = listener.accept().map_err(|e| {
-                TensorError::new(&format!("relay: loopback accept failed: {e}"))
-            })?;
+            let (mut stream, _peer) = listener
+                .accept()
+                .map_err(|e| TensorError::new(&format!("relay: loopback accept failed: {e}")))?;
             let _ = stream.set_nodelay(true);
             // Write-stall ceiling (fd-level): a wedged rank must error
             // the upstream_reader's demux write instead of parking it
             // (its per-write failures are already tolerated).
-            let _ = stream
-                .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
-            let (rank, model_sig) =
-                kind.terminate_handshake(&mut stream, world_size, &salt)?;
+            let _ = stream.set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
+            let (rank, model_sig) = kind.terminate_handshake(&mut stream, world_size, &salt)?;
             if !expected.contains(&rank) {
                 return Err(TensorError::new(&format!(
                     "relay: rank {rank} connected but is not in this host's rank set {ranks:?}"
@@ -216,14 +209,11 @@ impl RelayChannel {
         // Signatures aligned with the sorted `ranks` announced upstream;
         // empty on the data channel (its handshake carries none).
         rank_sigs.sort_unstable_by_key(|(r, _)| *r);
-        let model_sigs: Vec<[u8; 32]> =
-            rank_sigs.into_iter().map(|(_, sig)| sig).collect();
+        let model_sigs: Vec<[u8; 32]> = rank_sigs.into_iter().map(|(_, sig)| sig).collect();
 
         // Phase 2: connect upstream + relay handshake.
-        let mut upstream = crate::distributed::wire::connect_with_retry(
-            upstream_addr,
-            "relay upstream",
-        )?;
+        let mut upstream =
+            crate::distributed::wire::connect_with_retry(upstream_addr, "relay upstream")?;
         let _ = upstream.set_nodelay(true);
         // Dialer-side cleartext guard: a public controller address means
         // this host's frames cross an uncontrolled network unencrypted.
@@ -233,15 +223,11 @@ impl RelayChannel {
         // Write-stall ceiling: a wedged controller errors outbound_writer,
         // which flags relay shutdown — reachable teardown instead of a
         // parked writer holding the host hostage.
-        let _ = upstream
-            .set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
+        let _ = upstream.set_write_timeout(Some(crate::distributed::wire::write_stall_timeout()));
         // Channel-select magic first: the controller's single-port mux
         // routes on it, and the owning subsystem validates it before the
         // Hello.
-        crate::distributed::wire::write_channel_magic(
-            &mut upstream,
-            kind.channel_magic(),
-        )?;
+        crate::distributed::wire::write_channel_magic(&mut upstream, kind.channel_magic())?;
         MuxRecord::control(RelayControlMsg::Hello {
             host,
             ranks: ranks.clone(),
@@ -306,7 +292,6 @@ impl Drop for RelayChannel {
 // ---------------------------------------------------------------------------
 // Upstream connect with retry
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Data-channel fold station
@@ -456,15 +441,11 @@ impl HostFold {
             // Round's first deposit: hold it verbatim as the seed (wire
             // dtype residency; also pins the schema).
             let mut payloads: Vec<TensorPayload> = Vec::new();
-            let hdr = controller::read_round_frame_streamed(
-                &mut &blob[..],
-                salt,
-                None,
-                &mut |_, p| {
+            let hdr =
+                controller::read_round_frame_streamed(&mut &blob[..], salt, None, &mut |_, p| {
                     payloads.push(p);
                     Ok(())
-                },
-            )?;
+                })?;
             let Some((kind, weight)) = hdr else {
                 return Err(TensorError::new(&format!(
                     "relay fold: truncated RoundFrame from rank {rank}"
@@ -491,11 +472,8 @@ impl HostFold {
             FoldPayloads::Sums { schema, .. } => schema.len(),
         };
         let mut seen = 0usize;
-        let hdr = controller::read_round_frame_streamed(
-            &mut &blob[..],
-            salt,
-            None,
-            &mut |ti, p| {
+        let hdr =
+            controller::read_round_frame_streamed(&mut &blob[..], salt, None, &mut |ti, p| {
                 // Schema check against whichever form the fold holds;
                 // the borrow ends with this block so promotion below
                 // can take the payloads mutably.
@@ -559,8 +537,7 @@ impl HostFold {
                     TensorError::new(&format!("relay fold: rank {rank} tensor[{ti}]: {e}"))
                 })?;
                 Ok(())
-            },
-        )?;
+            })?;
         let Some((kind, weight)) = hdr else {
             return Err(TensorError::new(&format!(
                 "relay fold: truncated RoundFrame from rank {rank}"
@@ -613,12 +590,7 @@ impl FoldCtx {
     /// so a second frame before the round folded means a desynced
     /// stream — plus every schema/parse/HMAC failure from the
     /// incremental fold, see [`HostFold`]).
-    fn deposit(
-        &self,
-        rank: u32,
-        blob: &[u8],
-        tx: &mpsc::SyncSender<MuxRecord>,
-    ) -> Result<()> {
+    fn deposit(&self, rank: u32, blob: &[u8], tx: &mpsc::SyncSender<MuxRecord>) -> Result<()> {
         let taken = {
             let mut inner = self.inner.lock().expect("relay fold lock poisoned");
             if inner.dead.contains(&rank) {
@@ -637,7 +609,8 @@ impl FoldCtx {
                 )));
             }
             HostFold::accumulate(&mut inner.fold, rank, blob, &self.salt)?;
-            self.bytes_in.fetch_add(blob.len() as u64, Ordering::Relaxed);
+            self.bytes_in
+                .fetch_add(blob.len() as u64, Ordering::Relaxed);
             self.take_if_complete(&mut inner)
         };
         self.fold_and_ship(taken, tx)
@@ -663,11 +636,7 @@ impl FoldCtx {
     /// least one contribution is in), take the round's fold.
     fn take_if_complete(&self, inner: &mut FoldInner) -> Option<HostFold> {
         let complete = self.local_ranks.iter().all(|r| {
-            inner.dead.contains(r)
-                || inner
-                    .fold
-                    .as_ref()
-                    .is_some_and(|f| f.deposited.contains(r))
+            inner.dead.contains(r) || inner.fold.as_ref().is_some_and(|f| f.deposited.contains(r))
         });
         if !complete {
             return None;
@@ -709,9 +678,7 @@ impl FoldCtx {
                         nbytes: p.bytes.len() as u64,
                     })
                     .collect();
-                buf = Vec::with_capacity(
-                    controller::round_frame_wire_len(&parts) as usize,
-                );
+                buf = Vec::with_capacity(controller::round_frame_wire_len(&parts) as usize);
                 controller::write_round_frame_streamed(
                     &mut buf,
                     kind,
@@ -734,15 +701,11 @@ impl FoldCtx {
                         Ok(controller::PayloadPart {
                             dtype: s.dtype,
                             shape: &s.shape,
-                            nbytes: (sum.len()
-                                * controller::payload_element_size(s.dtype)?)
-                                as u64,
+                            nbytes: (sum.len() * controller::payload_element_size(s.dtype)?) as u64,
                         })
                     })
                     .collect::<Result<_>>()?;
-                buf = Vec::with_capacity(
-                    controller::round_frame_wire_len(&parts) as usize,
-                );
+                buf = Vec::with_capacity(controller::round_frame_wire_len(&parts) as usize);
                 controller::write_round_frame_streamed(
                     &mut buf,
                     kind,
@@ -756,10 +719,7 @@ impl FoldCtx {
                         // shrinks while the payload buffer grows instead
                         // of coexisting whole.
                         let sum = std::mem::take(&mut sums[ti]);
-                        let bytes = controller::f32_slice_to_payload_bytes(
-                            &sum,
-                            schema[ti].dtype,
-                        )?;
+                        let bytes = controller::f32_slice_to_payload_bytes(&sum, schema[ti].dtype)?;
                         drop(sum);
                         tee.write_all(&bytes)
                             .map_err(|e| TensorError::new(&e.to_string()))
@@ -769,9 +729,8 @@ impl FoldCtx {
         }
         self.rounds.fetch_add(1, Ordering::Relaxed);
         self.bytes_up.fetch_add(buf.len() as u64, Ordering::Relaxed);
-        tx.send(MuxRecord::host_frame(buf)).map_err(|_| {
-            TensorError::new("relay fold: outbound writer gone before fold shipped")
-        })
+        tx.send(MuxRecord::host_frame(buf))
+            .map_err(|_| TensorError::new("relay fold: outbound writer gone before fold shipped"))
     }
 
     /// Fan the controller's consensus out to every local alive rank.
@@ -801,7 +760,11 @@ impl Drop for FoldCtx {
         }
         let bytes_in = self.bytes_in.load(Ordering::Relaxed) as f64 / 1e6;
         let bytes_up = self.bytes_up.load(Ordering::Relaxed) as f64 / 1e6;
-        let ratio = if bytes_up > 0.0 { bytes_in / bytes_up } else { 0.0 };
+        let ratio = if bytes_up > 0.0 {
+            bytes_in / bytes_up
+        } else {
+            0.0
+        };
         eprintln!(
             "[relay-fold-prof] ranks={} rounds={rounds} | local={bytes_in:.2}MB \
              uplink={bytes_up:.2}MB fold-ratio={ratio:.2}x",
@@ -990,10 +953,11 @@ fn rank_reader(
                 // idempotent on the controller (declare_dead), so a
                 // spurious one during teardown is harmless.
                 if let Some(ctx) = &fold
-                    && let Err(e) = ctx.mark_dead(rank, &tx) {
-                        eprintln!("relay fold: rank {rank} error-fold: {e}");
-                        shutdown.store(true, Ordering::SeqCst);
-                    }
+                    && let Err(e) = ctx.mark_dead(rank, &tx)
+                {
+                    eprintln!("relay fold: rank {rank} error-fold: {e}");
+                    shutdown.store(true, Ordering::SeqCst);
+                }
                 let _ = tx.send(MuxRecord::control(RelayControlMsg::RankExit { rank }));
                 break;
             }
@@ -1076,9 +1040,7 @@ fn upstream_reader(
                     }
                 }
             }
-            Ok(MuxRead::Record(MuxRecord::Control(
-                RelayControlMsg::DeclareDead { rank },
-            ))) => {
+            Ok(MuxRead::Record(MuxRecord::Control(RelayControlMsg::DeclareDead { rank }))) => {
                 if let Some(ctx) = &fold {
                     // Controller-side death (heartbeat staleness, a
                     // broken host elsewhere): drop the rank from the

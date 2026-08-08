@@ -94,19 +94,25 @@ impl NpyDtype {
         match self {
             NpyDtype::U8 => out.extend(bytes.iter().map(|&b| b as i64)),
             NpyDtype::U16 => out.extend(
-                bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as i64),
+                bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]) as i64),
             ),
             NpyDtype::U32 => out.extend(
-                bytes.chunks_exact(4)
-                     .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64),
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64),
             ),
             NpyDtype::I32 => out.extend(
-                bytes.chunks_exact(4)
-                     .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64),
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64),
             ),
-            NpyDtype::I64 => out.extend(bytes.chunks_exact(8).map(|c| {
-                i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
-            })),
+            NpyDtype::I64 => out.extend(
+                bytes
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])),
+            ),
         }
     }
 }
@@ -172,11 +178,7 @@ impl TokenShards {
 
     /// Shared assembly for [`open`](Self::open) (`raw = None`, parse the
     /// npy header) and [`open_raw`](Self::open_raw) (`raw = Some(dtype)`).
-    fn build<P: AsRef<Path>>(
-        paths: &[P],
-        seq_len: usize,
-        raw: Option<NpyDtype>,
-    ) -> Result<Self> {
+    fn build<P: AsRef<Path>>(paths: &[P], seq_len: usize, raw: Option<NpyDtype>) -> Result<Self> {
         if seq_len == 0 {
             return Err(TensorError::new("TokenShards: seq_len must be positive"));
         }
@@ -197,10 +199,7 @@ impl TokenShards {
             let file_len = file
                 .metadata()
                 .map_err(|e| {
-                    TensorError::new(&format!(
-                        "TokenShards: cannot stat {}: {e}",
-                        path.display()
-                    ))
+                    TensorError::new(&format!("TokenShards: cannot stat {}: {e}", path.display()))
                 })?
                 .len();
 
@@ -239,7 +238,13 @@ impl TokenShards {
             };
             total_tokens += tokens;
             cum.push(cum.last().unwrap() + windows);
-            shards.push(Shard { file, path, dtype, data_offset, tokens });
+            shards.push(Shard {
+                file,
+                path,
+                dtype,
+                data_offset,
+                tokens,
+            });
         }
 
         if *cum.last().unwrap() == 0 {
@@ -251,7 +256,12 @@ impl TokenShards {
             )));
         }
 
-        Ok(TokenShards { shards, cum, seq_len, total_tokens })
+        Ok(TokenShards {
+            shards,
+            cum,
+            seq_len,
+            total_tokens,
+        })
     }
 
     /// Open every `.npy` file in a directory, sorted by file name for a
@@ -385,7 +395,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Resul
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "unexpected end of file",
-                ))
+                ));
             }
             n => {
                 buf = &mut buf[n..];
@@ -400,9 +410,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Resul
 /// (`descr` / `fortran_order` / `shape`). Accepts 1-D C-order arrays of
 /// the supported integer dtypes; anything else errors loudly.
 fn parse_npy_header(file: &File, path: &Path) -> Result<(NpyDtype, u64, u64)> {
-    let fail = |msg: &str| {
-        TensorError::new(&format!("TokenShards: {}: {msg}", path.display()))
-    };
+    let fail = |msg: &str| TensorError::new(&format!("TokenShards: {}: {msg}", path.display()));
 
     let mut fixed = [0u8; 8];
     read_exact_at(file, &mut fixed, 0).map_err(|e| fail(&format!("cannot read header: {e}")))?;
@@ -431,8 +439,8 @@ fn parse_npy_header(file: &File, path: &Path) -> Result<(NpyDtype, u64, u64)> {
     let header = String::from_utf8(header).map_err(|_| fail("header is not UTF-8"))?;
 
     // 'descr': '<u2'
-    let descr = extract_quoted(&header, "'descr'")
-        .ok_or_else(|| fail("header has no 'descr' field"))?;
+    let descr =
+        extract_quoted(&header, "'descr'").ok_or_else(|| fail("header has no 'descr' field"))?;
     let dtype = NpyDtype::from_descr(&descr).ok_or_else(|| {
         fail(&format!(
             "unsupported dtype {descr:?} (token shards must be |u1, <u2, <u4, <i4 or <i8)"
@@ -454,7 +462,10 @@ fn parse_npy_header(file: &File, path: &Path) -> Result<(NpyDtype, u64, u64)> {
         .ok_or_else(|| fail("header has no 'shape' field"))?;
     let after_sh = &header[sh..];
     let open = after_sh.find('(').ok_or_else(|| fail("malformed shape"))?;
-    let close = after_sh[open..].find(')').ok_or_else(|| fail("malformed shape"))? + open;
+    let close = after_sh[open..]
+        .find(')')
+        .ok_or_else(|| fail("malformed shape"))?
+        + open;
     let dims: Vec<&str> = after_sh[open + 1..close]
         .split(',')
         .map(|d| d.trim())
@@ -517,8 +528,8 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("flodl-token-shards-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("flodl-token-shards-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -714,13 +725,19 @@ mod tests {
         f.write_all(header.as_bytes()).unwrap();
         f.write_all(&[0u8; 32]).unwrap();
         let err = TokenShards::open(&[&f4], 4).map(|_| ()).unwrap_err();
-        assert!(err.to_string().contains("unsupported dtype"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("unsupported dtype"),
+            "unexpected: {err}"
+        );
 
         // Truncated data (header declares more tokens than the file holds).
         let trunc = dir.join("trunc.npy");
         write_npy(&trunc, "<u2", &(0..20).collect::<Vec<i64>>());
         let len = std::fs::metadata(&trunc).unwrap().len();
-        let fh = std::fs::OpenOptions::new().write(true).open(&trunc).unwrap();
+        let fh = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&trunc)
+            .unwrap();
         fh.set_len(len - 10).unwrap();
         let err = TokenShards::open(&[&trunc], 4).map(|_| ()).unwrap_err();
         assert!(err.to_string().contains("truncated"), "unexpected: {err}");

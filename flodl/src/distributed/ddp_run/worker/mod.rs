@@ -6,18 +6,16 @@ use std::sync::mpsc;
 
 use crate::autograd::Variable;
 use crate::data::BatchDataSet;
+use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
 use crate::nn::buffer::Buffer;
+use crate::nn::{Module, Optimizer};
 use crate::tensor::cuda_event::GpuEvent;
 use crate::tensor::cuda_stream::GpuStream;
-use crate::distributed::nccl::{NcclAbortHandle, NcclRankComm};
-use crate::nn::{Module, Optimizer};
 use crate::tensor::{Device, Tensor};
 
 use super::{
-    CheckpointFn, EpochMetrics, EvalFn, TimingMsg, MetricsMsg,
-    ParamSnapshot, ControlMsg, EpochPlan,
+    CheckpointFn, ControlMsg, EpochMetrics, EpochPlan, EvalFn, MetricsMsg, ParamSnapshot, TimingMsg,
 };
-
 
 mod constructor;
 mod control;
@@ -45,8 +43,7 @@ pub(crate) use sync::weighted_allreduce_nccl;
 /// Written by [`GpuWorker::replace_nccl_comm`] on every comm rebuild;
 /// read by the cluster-mode NCCL watchdog on every firing, so the
 /// watchdog always aborts the live comm across cascading peer deaths.
-pub(crate) type NcclAbortSlot =
-    Arc<Mutex<Option<Arc<NcclAbortHandle>>>>;
+pub(crate) type NcclAbortSlot = Arc<Mutex<Option<Arc<NcclAbortHandle>>>>;
 
 /// A training worker bound to a single GPU device.
 ///
@@ -155,9 +152,8 @@ pub struct GpuWorker<M: Module> {
     /// drained here by `sync_now_nccl` post-abort to rebuild the comm.
     /// `None` outside cluster mode (standalone single-process NCCL has
     /// no rendezvous channel).
-    nccl_session_mailbox: Option<
-        Arc<Mutex<Option<crate::distributed::nccl_session::PendingNcclSession>>>,
-    >,
+    nccl_session_mailbox:
+        Option<Arc<Mutex<Option<crate::distributed::nccl_session::PendingNcclSession>>>>,
     /// Cluster-mode local dead-rank ledger (a clone of the
     /// `cluster_worker`'s ledger). Polled by `wait_for_nccl_session` to
     /// detect the lone-survivor case (NCCL needs `world_size >= 2`); in
@@ -470,7 +466,7 @@ pub(crate) type WorkerEndpoints = (
     mpsc::Sender<TimingMsg>,
     mpsc::Sender<MetricsMsg>,
     mpsc::Sender<ParamSnapshot>,
-    mpsc::Sender<ParamSnapshot>,  // final_param_tx
+    mpsc::Sender<ParamSnapshot>, // final_param_tx
     mpsc::Receiver<ControlMsg>,
 );
 

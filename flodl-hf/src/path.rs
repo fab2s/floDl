@@ -70,14 +70,18 @@ impl HfPath {
     pub fn sub<S: ToString>(&self, segment: S) -> Self {
         let seg = segment.to_string();
         validate_segment(&seg).expect("invalid HfPath segment");
-        HfPath { path: format!("{}.{}", self.path, seg) }
+        HfPath {
+            path: format!("{}.{}", self.path, seg),
+        }
     }
 
     /// Fallible version of [`HfPath::sub`].
     pub fn try_sub<S: ToString>(&self, segment: S) -> Result<Self> {
         let seg = segment.to_string();
         validate_segment(&seg)?;
-        Ok(HfPath { path: format!("{}.{}", self.path, seg) })
+        Ok(HfPath {
+            path: format!("{}.{}", self.path, seg),
+        })
     }
 
     /// Return the full dotted tag string for a leaf module.
@@ -96,7 +100,9 @@ impl HfPath {
     }
 
     /// Return this path as a `&str` without the leaf suffix.
-    pub fn as_str(&self) -> &str { &self.path }
+    pub fn as_str(&self) -> &str {
+        &self.path
+    }
 }
 
 impl std::fmt::Display for HfPath {
@@ -266,10 +272,7 @@ mod tests {
     fn hf_key_conversion_only_last_slash() {
         // If the tag itself ever contained a '/', only the final '/' gets
         // converted. In normal flodl-hf usage, tags don't contain '/'.
-        assert_eq!(
-            hf_key_from_flodl_key("a/b/c"),
-            "a/b.c",
-        );
+        assert_eq!(hf_key_from_flodl_key("a/b/c"), "a/b.c",);
     }
 
     #[test]

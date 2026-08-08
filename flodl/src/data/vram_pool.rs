@@ -44,8 +44,8 @@
 
 use std::collections::HashMap;
 
-use crate::tensor::{Device, Result, Tensor, TensorOptions};
 use super::prefetch::GovernorCtl;
+use crate::tensor::{Device, Result, Tensor, TensorOptions};
 
 /// Target bytes per slab (all data positions combined). Small enough
 /// that last-resort eviction frees useful amounts without giving up
@@ -196,8 +196,7 @@ impl VramSamplePool {
         self.decided = true;
 
         // The probe returns (used, total) — used first, not free.
-        let Ok((used, total)) =
-            crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
+        let Ok((used, total)) = crate::tensor::gpu_memory_info_idx(self.device.index() as i32)
         else {
             return; // no probe, no budget: stay dormant
         };
@@ -270,8 +269,7 @@ impl VramSamplePool {
             let mut pieces = Vec::with_capacity(per_slab.len());
             let mut ranks = Vec::with_capacity(positions.len());
             for (&slab, (rows, rs)) in &per_slab {
-                let rows_t =
-                    Tensor::from_i64(rows, &[rows.len() as i64], self.device)?;
+                let rows_t = Tensor::from_i64(rows, &[rows.len() as i64], self.device)?;
                 pieces.push(self.slabs[slab as usize].tensors[p].index_select(0, &rows_t)?);
                 ranks.extend_from_slice(rs);
             }
@@ -296,11 +294,7 @@ impl VramSamplePool {
     /// Rows already pooled are skipped. Device-to-device on the
     /// caller's stream.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    pub(crate) fn capture(
-        &mut self,
-        sample_indices: &[usize],
-        tensors: &[Tensor],
-    ) -> Result<()> {
+    pub(crate) fn capture(&mut self, sample_indices: &[usize], tensors: &[Tensor]) -> Result<()> {
         if !self.active() {
             return Ok(());
         }
@@ -359,10 +353,16 @@ impl VramSamplePool {
                     shape.extend(t.shape().iter().skip(1));
                     slab_tensors.push(Tensor::empty(
                         &shape,
-                        TensorOptions { dtype: t.dtype(), device: self.device },
+                        TensorOptions {
+                            dtype: t.dtype(),
+                            device: self.device,
+                        },
                     )?);
                 }
-                self.slabs.push(Slab { tensors: slab_tensors, used: 0 });
+                self.slabs.push(Slab {
+                    tensors: slab_tensors,
+                    used: 0,
+                });
                 self.bytes += slab_bytes;
                 continue;
             }

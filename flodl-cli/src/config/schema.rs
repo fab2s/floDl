@@ -180,25 +180,19 @@ impl CommandSpec {
             return Err(e.clone());
         }
         if self.docker.is_some() && self.run.is_none() {
-            return Err(
-                "command declares `docker:` without `run:`; \
+            return Err("command declares `docker:` without `run:`; \
                  `docker:` only wraps inline run-scripts"
-                    .to_string(),
-            );
+                .to_string());
         }
         if self.append.is_some() && self.run.is_none() {
-            return Err(
-                "command declares `append:` without `run:`; \
+            return Err("command declares `append:` without `run:`; \
                  `append:` only forwards trailing tokens for inline run-scripts"
-                    .to_string(),
-            );
+                .to_string());
         }
         match (self.run.as_deref(), self.path.as_deref()) {
-            (Some(_), Some(_)) => Err(
-                "command declares both `run:` and `path:`; \
+            (Some(_), Some(_)) => Err("command declares both `run:` and `path:`; \
                  only one is allowed"
-                    .to_string(),
-            ),
+                .to_string()),
             (Some(_), None) => Ok(CommandKind::Run),
             (None, Some(_)) => Ok(CommandKind::Path),
             (None, None) => {
@@ -416,15 +410,18 @@ fn default_required() -> bool {
 
 /// Flags reserved at the fdl level — no sub-command option may shadow them.
 /// Kept in sync with main.rs dispatch.
-const RESERVED_LONGS: &[&str] = &[
-    "help", "version", "quiet", "env",
-];
-const RESERVED_SHORTS: &[&str] = &[
-    "h", "V", "q", "v", "e",
-];
+const RESERVED_LONGS: &[&str] = &["help", "version", "quiet", "env"];
+const RESERVED_SHORTS: &[&str] = &["h", "V", "q", "v", "e"];
 const VALID_TYPES: &[&str] = &[
-    "string", "int", "float", "bool", "path",
-    "list[string]", "list[int]", "list[float]", "list[path]",
+    "string",
+    "int",
+    "float",
+    "bool",
+    "path",
+    "list[string]",
+    "list[int]",
+    "list[float]",
+    "list[path]",
 ];
 
 /// Check a schema for collisions and structural issues.
@@ -438,12 +435,10 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
     // hand-authored yaml tree must keep its flags on the leaves.
     if !schema.commands.is_empty() {
         if !schema.args.is_empty() || !schema.options.is_empty() {
-            return Err(
-                "schema declares both `commands` (a subcommand tree) and \
+            return Err("schema declares both `commands` (a subcommand tree) and \
                  top-level `args`/`options`; a node is either a leaf or a \
                  branch, not both — move the flags onto the subcommands"
-                    .to_string(),
-            );
+                .to_string());
         }
         for (name, child) in &schema.commands {
             if name.trim().is_empty() {
@@ -466,9 +461,7 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
             ));
         }
         if RESERVED_LONGS.contains(&long.as_str()) {
-            return Err(format!(
-                "option --{long} shadows a reserved fdl-level flag"
-            ));
+            return Err(format!("option --{long} shadows a reserved fdl-level flag"));
         }
         if let Some(s) = &spec.short {
             if s.chars().count() != 1 {

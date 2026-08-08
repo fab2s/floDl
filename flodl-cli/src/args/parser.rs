@@ -163,8 +163,8 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
                 continue;
             }
             for (pos, c) in chars.iter().enumerate() {
-                let decl = find_short(spec, *c)
-                    .ok_or_else(|| format!("unknown short flag `-{c}`"))?;
+                let decl =
+                    find_short(spec, *c).ok_or_else(|| format!("unknown short flag `-{c}`"))?;
                 let is_last = pos == chars.len() - 1;
                 if !is_last && decl.takes_value {
                     return Err(format!(
@@ -213,13 +213,14 @@ pub fn parse(spec: &ArgsSpec, args: &[String]) -> Result<ParsedArgs, String> {
         match positional_decl_for(spec, idx) {
             Some(d) => {
                 if let Some(choices) = &d.choices
-                    && !choices.iter().any(|c| c == value) {
-                        return Err(format!(
-                            "invalid value `{value}` for <{}> -- allowed: {}",
-                            d.name,
-                            choices.join(", ")
-                        ));
-                    }
+                    && !choices.iter().any(|c| c == value)
+                {
+                    return Err(format!(
+                        "invalid value `{value}` for <{}> -- allowed: {}",
+                        d.name,
+                        choices.join(", ")
+                    ));
+                }
             }
             None if spec.lenient_unknowns => {}
             None => {
@@ -276,10 +277,7 @@ fn consume_flag(
 
     // Look at next token: if it exists and is not itself a flag, consume.
     let next_idx = i + 1;
-    let next_is_flag = args
-        .get(next_idx)
-        .map(|s| is_flag_like(s))
-        .unwrap_or(true); // absent counts as "no value available"
+    let next_is_flag = args.get(next_idx).map(|s| is_flag_like(s)).unwrap_or(true); // absent counts as "no value available"
 
     if !next_is_flag {
         let v = args[next_idx].clone();
@@ -344,7 +342,10 @@ fn record_option(
 /// Split a list value on commas, trimming whitespace around each piece.
 /// Empty pieces are dropped (so `--tags a,,b` = `["a", "b"]`).
 fn split_list_value(v: &str) -> Vec<&str> {
-    v.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn find_long<'a>(spec: &'a ArgsSpec, name: &str) -> Option<&'a OptionDecl> {
@@ -416,9 +417,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -568,7 +567,10 @@ mod tests {
             ..ArgsSpec::default()
         };
         let out = parse(&spec, &argv(&["--report"])).unwrap();
-        assert!(matches!(out.options.get("report"), Some(OptionState::BarePresent)));
+        assert!(matches!(
+            out.options.get("report"),
+            Some(OptionState::BarePresent)
+        ));
     }
 
     #[test]
@@ -579,7 +581,10 @@ mod tests {
             ..ArgsSpec::default()
         };
         let out = parse(&spec, &argv(&["--validate"])).unwrap();
-        assert!(matches!(out.options.get("validate"), Some(OptionState::BarePresent)));
+        assert!(matches!(
+            out.options.get("validate"),
+            Some(OptionState::BarePresent)
+        ));
     }
 
     #[test]
@@ -601,7 +606,10 @@ mod tests {
             ..ArgsSpec::default()
         };
         let out = parse(&spec, &argv(&["-v"])).unwrap();
-        assert!(matches!(out.options.get("verbose"), Some(OptionState::BarePresent)));
+        assert!(matches!(
+            out.options.get("verbose"),
+            Some(OptionState::BarePresent)
+        ));
     }
 
     #[test]
@@ -677,7 +685,10 @@ mod tests {
             ..ArgsSpec::default()
         };
         let out = parse(&spec, &argv(&["a", "b", "c"])).unwrap();
-        assert_eq!(out.positionals, vec!["a".to_string(), "b".into(), "c".into()]);
+        assert_eq!(
+            out.positionals,
+            vec!["a".to_string(), "b".into(), "c".into()]
+        );
     }
 
     #[test]

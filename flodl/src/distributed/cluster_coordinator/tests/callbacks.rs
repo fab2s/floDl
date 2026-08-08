@@ -60,24 +60,22 @@ fn checkpoint_failure_records_tried_and_failovers_role() {
     // Rank 0 reports failure: tried={0}, role moves to next live
     // (rank 1). send_control to rank 1 fails under for_test
     // (no streams) — that's fine; the test asserts state, not IO.
-    coord.handle_checkpoint_result(
-        0, 5, 12.0, Some("disk full".into()),
+    coord.handle_checkpoint_result(0, 5, 12.0, Some("disk full".into()));
+    assert_eq!(
+        coord.checkpoint_role(),
+        1,
+        "role should fail over to rank 1"
     );
-    assert_eq!(coord.checkpoint_role(), 1, "role should fail over to rank 1");
     assert_eq!(coord.checkpoint_tried_count(5), 1);
 
     // Rank 1 also fails: tried={0,1}, role moves to rank 2.
-    coord.handle_checkpoint_result(
-        1, 5, 8.0, Some("io error".into()),
-    );
+    coord.handle_checkpoint_result(1, 5, 8.0, Some("io error".into()));
     assert_eq!(coord.checkpoint_role(), 2);
     assert_eq!(coord.checkpoint_tried_count(5), 2);
 
     // Rank 2 also fails: no more live untried ranks → exhaust +
     // clear tried_ranks (the next cadence boundary starts fresh).
-    coord.handle_checkpoint_result(
-        2, 5, 5.0, Some("permission denied".into()),
-    );
+    coord.handle_checkpoint_result(2, 5, 5.0, Some("permission denied".into()));
     assert_eq!(
         coord.checkpoint_tried_count(5),
         0,
@@ -265,11 +263,9 @@ fn build_coord_for_slack(remaining_batches: usize) -> ClusterCoordinator {
     .no_divergence_guard();
     let mut coord = ClusterCoordinator::for_test(cfg);
     // Calibrate ElChe: rank 0 fast, rank 1 slow → batch_counts [20, 10].
-    coord.el_che_mut_for_test().report_timing(
-        &[500.0, 1000.0],
-        &[10, 10],
-        10.0,
-    );
+    coord
+        .el_che_mut_for_test()
+        .report_timing(&[500.0, 1000.0], &[10, 10], 10.0);
     // Rank 0 fires all callbacks.
     coord.set_callback_roles_for_test(0, 0, 0);
     // Install pool for the current epoch (epoch 0 by default).
@@ -399,11 +395,13 @@ fn checkpoint_dispatched_to_role_only() {
 
     let (port, coord_handle) = spawn_coord(
         world_size,
-        move || cfg_sync_cpu(world_size)
-            .total_samples(8)
-            .batch_size(4)
-            .num_epochs(2)
-            .checkpoint_every(1),
+        move || {
+            cfg_sync_cpu(world_size)
+                .total_samples(8)
+                .batch_size(4)
+                .num_epochs(2)
+                .checkpoint_every(1)
+        },
         move |coord| {
             coord.dispatch_epoch(0)?;
             coord.dispatch_epoch(1)?;
@@ -425,38 +423,60 @@ fn checkpoint_dispatched_to_role_only() {
             loop {
                 let msg = recv_control(s, salt)?;
                 match msg {
-                    ControlMsgWire::Checkpoint { version, target_rank } => {
+                    ControlMsgWire::Checkpoint {
+                        version,
+                        target_rank,
+                    } => {
                         saw_checkpoint.store(true, Ordering::Relaxed);
                         if target_rank == send_ack_for {
                             send_metrics(s, salt, MetricsMsgWire::default()).ok();
-                            send_timing(s, salt, TimingMsgWire::CheckpointResult {
-                                rank: send_ack_for,
-                                version,
-                                elapsed_ms: 1.0,
-                                error: None,
-                            })?;
+                            send_timing(
+                                s,
+                                salt,
+                                TimingMsgWire::CheckpointResult {
+                                    rank: send_ack_for,
+                                    version,
+                                    elapsed_ms: 1.0,
+                                    error: None,
+                                },
+                            )?;
                         }
                     }
-                    ControlMsgWire::Shutdown
-                    | ControlMsgWire::ShutdownWithSave { .. } => return Ok(()),
+                    ControlMsgWire::Shutdown | ControlMsgWire::ShutdownWithSave { .. } => {
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
         }
     }
-    let r0 = fake_rank(port, 0, world_size as u32, TEST_SALT,
-        drain_until_shutdown(r0_flag, 0));
-    let r1 = fake_rank(port, 1, world_size as u32, TEST_SALT,
-        drain_until_shutdown(r1_flag, u64::MAX /* never matches */));
+    let r0 = fake_rank(
+        port,
+        0,
+        world_size as u32,
+        TEST_SALT,
+        drain_until_shutdown(r0_flag, 0),
+    );
+    let r1 = fake_rank(
+        port,
+        1,
+        world_size as u32,
+        TEST_SALT,
+        drain_until_shutdown(r1_flag, u64::MAX /* never matches */),
+    );
 
     r0.join().unwrap().expect("rank 0 drained cleanly");
     r1.join().unwrap().expect("rank 1 drained cleanly");
     coord_handle.join().unwrap().expect("coord finishes");
 
-    assert!(r0_got.load(Ordering::Relaxed),
-        "rank 0 (role) must receive Checkpoint frame");
-    assert!(!r1_got.load(Ordering::Relaxed),
-        "rank 1 (non-role) must NOT receive Checkpoint frame");
+    assert!(
+        r0_got.load(Ordering::Relaxed),
+        "rank 0 (role) must receive Checkpoint frame"
+    );
+    assert!(
+        !r1_got.load(Ordering::Relaxed),
+        "rank 1 (non-role) must NOT receive Checkpoint frame"
+    );
 }
 
 /// Role failover on rank death: when the heartbeat detector
@@ -467,8 +487,7 @@ fn checkpoint_dispatched_to_role_only() {
 #[test]
 fn checkpoint_role_failover_on_rank_death() {
     let world_size = 3usize;
-    let dead_ranks =
-        crate::distributed::controller::DeadRanks::new(world_size);
+    let dead_ranks = crate::distributed::controller::DeadRanks::new(world_size);
     let cfg = cfg_sync_cpu(world_size).dead_ranks(Arc::clone(&dead_ranks));
     let mut coord = ClusterCoordinator::for_test(cfg);
     assert_eq!(coord.checkpoint_role(), 0);
@@ -477,8 +496,7 @@ fn checkpoint_role_failover_on_rank_death() {
     // heartbeat_timeout_secs threshold, then drive
     // check_dead_ranks. heartbeat_timeout_secs default ~ 30s;
     // setting last_heartbeat[0] to (now - 60s) is a safe margin.
-    let stale = Instant::now()
-        - Duration::from_secs(coord.heartbeat_timeout_secs() * 2 + 5);
+    let stale = Instant::now() - Duration::from_secs(coord.heartbeat_timeout_secs() * 2 + 5);
     coord.set_last_heartbeat_for_test(0, stale);
     coord.check_dead_ranks_for_test();
 
@@ -489,7 +507,6 @@ fn checkpoint_role_failover_on_rank_death() {
         "checkpoint_role must fail over to next live rank (1)"
     );
 }
-
 
 // -----------------------------------------------------------------
 // Cooperative-tier intent channel (Worker::request_eval /

@@ -56,10 +56,7 @@ impl ClusterCoordinator {
                 self.process_rank_death(
                     r,
                     &ledger,
-                    &format!(
-                        "heartbeat stale (>{}s)",
-                        self.heartbeat_timeout_secs,
-                    ),
+                    &format!("heartbeat stale (>{}s)", self.heartbeat_timeout_secs,),
                 );
                 any_newly_dead = true;
             }
@@ -75,16 +72,10 @@ impl ClusterCoordinator {
         if any_newly_dead {
             if let Some(reason) = self.unrecoverable_reason() {
                 if let Err(e) = self.dispatch_shutdown_with_save(reason) {
-                    crate::verbose!(
-                        "  ddp: ShutdownWithSave broadcast failed: {}",
-                        e,
-                    );
+                    crate::verbose!("  ddp: ShutdownWithSave broadcast failed: {}", e,);
                 }
             } else if let Err(e) = self.initiate_nccl_rendezvous_if_needed() {
-                crate::verbose!(
-                    "  ddp: NCCL rendezvous initiation failed: {}",
-                    e,
-                );
+                crate::verbose!("  ddp: NCCL rendezvous initiation failed: {}", e,);
             } else if self.progressive {
                 // Put the reclaimed samples (and any survivor parked in
                 // `wait_for_epoch_plan` because the pool LOOKED empty
@@ -95,7 +86,6 @@ impl ClusterCoordinator {
             }
         }
     }
-
 
     /// Full death side-effect chain for rank `r`, shared by every
     /// detector (heartbeat staleness, externally-reported child exits).
@@ -139,17 +129,16 @@ impl ClusterCoordinator {
                 // checkpoint role, fall over to lowest live as
                 // a best-effort. Eval/epoch roles stay pinned.
                 if r == self.checkpoint_role
-                    && let Some(next) =
-                        (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
-                    {
-                        self.checkpoint_role = next;
-                        crate::verbose!(
-                            "  ddp: checkpoint_role failover {} -> {} \
+                    && let Some(next) = (0..self.world_size).find(|&i| i != r && !ledger.is_dead(i))
+                {
+                    self.checkpoint_role = next;
+                    crate::verbose!(
+                        "  ddp: checkpoint_role failover {} -> {} \
                              (prior role declared dead)",
-                            r,
-                            next,
-                        );
-                    }
+                        r,
+                        next,
+                    );
+                }
             }
             crate::distributed::ddp_run::EpochCallbackPolicy::Fastest => {
                 self.re_resolve_callback_roles_on_death(r);
@@ -170,29 +159,22 @@ impl ClusterCoordinator {
         // stream shutdown via the shared `DeadRanks` ledger
         // already releases its blocked AllReduce read.
         if matches!(self.backend, AverageBackend::Nccl)
-            && let Err(e) = self.broadcast_control(
-                &ControlMsgWire::DeclareDead { rank: r as u64 },
-            ) {
-                crate::verbose!(
-                    "  ddp: DeclareDead broadcast for rank {} failed: {}",
-                    r,
-                    e,
-                );
-            }
+            && let Err(e) = self.broadcast_control(&ControlMsgWire::DeclareDead { rank: r as u64 })
+        {
+            crate::verbose!("  ddp: DeclareDead broadcast for rank {} failed: {}", r, e,);
+        }
         if let Some((remainder_offset, remainder_size)) = remainder_plan
-            && let Err(e) = self.redistribute_dead_rank_partition(
-                r,
-                remainder_offset,
-                remainder_size,
-            ) {
-                crate::verbose!(
-                    "  ddp: ExtendPartition dispatch for dead rank {} \
+            && let Err(e) =
+                self.redistribute_dead_rank_partition(r, remainder_offset, remainder_size)
+        {
+            crate::verbose!(
+                "  ddp: ExtendPartition dispatch for dead rank {} \
                      remainder failed: {} (samples will roll into \
                      next epoch's reshuffle)",
-                    r,
-                    e,
-                );
-            }
+                r,
+                e,
+            );
+        }
         // PROGRESSIVE-MODE RECLAIM. The `ExtendPartition` path above
         // is non-progressive only (`epoch_plan_cache` is populated by
         // `plans_for_epoch`, which progressive never calls), so
@@ -205,11 +187,7 @@ impl ClusterCoordinator {
         // pool for survivor re-dispatch and zeroes the rank's
         // in-flight books.
         if self.progressive {
-            let reclaimed: usize = self
-                .chunk_pools
-                .values_mut()
-                .map(|p| p.forfeit(r))
-                .sum();
+            let reclaimed: usize = self.chunk_pools.values_mut().map(|p| p.forfeit(r)).sum();
             if reclaimed > 0 {
                 crate::verbose!(
                     "  ddp: reclaimed {} in-flight samples from dead \
@@ -262,9 +240,8 @@ impl ClusterCoordinator {
         let epoch = self.rank_epoch[r];
         let plans = self.epoch_plan_cache.get(&epoch)?;
         let plan = plans.get(r)?;
-        let processed_batches = self
-            .last_step_count[r]
-            .saturating_sub(self.last_step_count_at_epoch_start[r]);
+        let processed_batches =
+            self.last_step_count[r].saturating_sub(self.last_step_count_at_epoch_start[r]);
         let processed_samples = (processed_batches * self.batch_size) as u64;
         if processed_samples >= plan.partition_size {
             return None;
@@ -365,9 +342,10 @@ impl ClusterCoordinator {
             None => self.world_size.saturating_sub(self.active_count),
         };
         if let Some(threshold) = self.max_failure
-            && dead_count >= threshold.limit_for(self.world_size) {
-                return Some(crate::distributed::SaveReason::MaxFailureExceeded);
-            }
+            && dead_count >= threshold.limit_for(self.world_size)
+        {
+            return Some(crate::distributed::SaveReason::MaxFailureExceeded);
+        }
         match self.backend {
             AverageBackend::Nccl if self.active_count < 2 => {
                 // NCCL requires world_size >= 2 to form a comm; the
@@ -380,6 +358,4 @@ impl ClusterCoordinator {
             _ => None,
         }
     }
-
-
 }

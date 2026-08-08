@@ -550,7 +550,13 @@ impl Variable {
     // --- Sorting ---
 
     /// Return the `k` largest (or smallest) values and their indices along `dim`.
-    pub fn topk(&self, k: i64, dim: i32, largest: bool, sorted: bool) -> Result<(Variable, Tensor)> {
+    pub fn topk(
+        &self,
+        k: i64,
+        dim: i32,
+        largest: bool,
+        sorted: bool,
+    ) -> Result<(Variable, Tensor)> {
         let (values, indices) = self.data().topk(k, dim, largest, sorted)?;
         Ok((Variable::wrap(values), indices))
     }
@@ -567,16 +573,9 @@ impl Variable {
 /// Fused linear: `y = input @ weight^T + bias` with autograd support.
 /// Uses `torch::linear()` (single BLAS kernel) instead of separate
 /// transpose + matmul + add.
-pub fn linear(
-    input: &Variable,
-    weight: &Variable,
-    bias: Option<&Variable>,
-) -> Result<Variable> {
+pub fn linear(input: &Variable, weight: &Variable, bias: Option<&Variable>) -> Result<Variable> {
     let bias_tensor = bias.map(|b| b.data());
-    let result = input.data().linear(
-        &weight.data(),
-        bias_tensor.as_ref(),
-    )?;
+    let result = input.data().linear(&weight.data(), bias_tensor.as_ref())?;
     Ok(Variable::wrap(result))
 }
 
@@ -593,8 +592,10 @@ pub fn gru_cell(
 ) -> Result<Variable> {
     let result = input.data().gru_cell(
         &hx.data(),
-        &w_ih.data(), &w_hh.data(),
-        &b_ih.data(), &b_hh.data(),
+        &w_ih.data(),
+        &w_hh.data(),
+        &b_ih.data(),
+        &b_hh.data(),
     )?;
     Ok(Variable::wrap(result))
 }
@@ -613,9 +614,12 @@ pub fn lstm_cell(
     b_hh: &Variable,
 ) -> Result<(Variable, Variable)> {
     let (h, c) = input.data().lstm_cell(
-        &hx.data(), &cx.data(),
-        &w_ih.data(), &w_hh.data(),
-        &b_ih.data(), &b_hh.data(),
+        &hx.data(),
+        &cx.data(),
+        &w_ih.data(),
+        &w_hh.data(),
+        &b_ih.data(),
+        &b_hh.data(),
     )?;
     Ok((Variable::wrap(h), Variable::wrap(c)))
 }
@@ -629,9 +633,10 @@ pub fn layer_norm(
     normalized_size: i64,
     eps: f64,
 ) -> Result<Variable> {
-    let (output, _mean, _rstd) = input.data().native_layer_norm(
-        &weight.data(), &bias.data(), normalized_size, eps,
-    )?;
+    let (output, _mean, _rstd) =
+        input
+            .data()
+            .native_layer_norm(&weight.data(), &bias.data(), normalized_size, eps)?;
     Ok(Variable::wrap(output))
 }
 
@@ -650,7 +655,10 @@ pub fn conv2d(
     let result = input.data().conv2d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, dilation, groups,
+        stride,
+        padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -672,7 +680,11 @@ pub fn conv_transpose2d(
     let result = input.data().conv_transpose2d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, output_padding, dilation, groups,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -692,7 +704,10 @@ pub fn conv1d(
     let result = input.data().conv1d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, dilation, groups,
+        stride,
+        padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -713,7 +728,11 @@ pub fn conv_transpose1d(
     let result = input.data().conv_transpose1d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, output_padding, dilation, groups,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -727,12 +746,10 @@ pub fn group_norm(
     bias: &Variable,
     eps: f64,
 ) -> Result<Variable> {
-    let result = input.data().group_norm(
-        num_groups,
-        Some(&weight.data()),
-        Some(&bias.data()),
-        eps,
-    )?;
+    let result =
+        input
+            .data()
+            .group_norm(num_groups, Some(&weight.data()), Some(&bias.data()), eps)?;
     Ok(Variable::wrap(result))
 }
 
@@ -745,7 +762,9 @@ pub fn max_pool2d(
     dilation: [i64; 2],
     ceil_mode: bool,
 ) -> Result<Variable> {
-    let result = input.data().max_pool2d(kernel_size, stride, padding, dilation, ceil_mode)?;
+    let result = input
+        .data()
+        .max_pool2d(kernel_size, stride, padding, dilation, ceil_mode)?;
     Ok(Variable::wrap(result))
 }
 
@@ -758,15 +777,15 @@ pub fn avg_pool2d(
     ceil_mode: bool,
     count_include_pad: bool,
 ) -> Result<Variable> {
-    let result = input.data().avg_pool2d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
+    let result =
+        input
+            .data()
+            .avg_pool2d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
     Ok(Variable::wrap(result))
 }
 
 /// Adaptive average pooling that outputs a fixed `[H, W]` regardless of input size.
-pub fn adaptive_avg_pool2d(
-    input: &Variable,
-    output_size: [i64; 2],
-) -> Result<Variable> {
+pub fn adaptive_avg_pool2d(input: &Variable, output_size: [i64; 2]) -> Result<Variable> {
     let result = input.data().adaptive_avg_pool2d(output_size)?;
     Ok(Variable::wrap(result))
 }
@@ -779,7 +798,9 @@ pub fn im2col(
     padding: [i64; 2],
     stride: [i64; 2],
 ) -> Result<Variable> {
-    let result = input.data().im2col(kernel_size, dilation, padding, stride)?;
+    let result = input
+        .data()
+        .im2col(kernel_size, dilation, padding, stride)?;
     Ok(Variable::wrap(result))
 }
 
@@ -792,7 +813,9 @@ pub fn col2im(
     padding: [i64; 2],
     stride: [i64; 2],
 ) -> Result<Variable> {
-    let result = input.data().col2im(output_size, kernel_size, dilation, padding, stride)?;
+    let result = input
+        .data()
+        .col2im(output_size, kernel_size, dilation, padding, stride)?;
     Ok(Variable::wrap(result))
 }
 
@@ -812,7 +835,10 @@ pub fn conv3d(
     let result = input.data().conv3d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, dilation, groups,
+        stride,
+        padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -833,7 +859,11 @@ pub fn conv_transpose3d(
     let result = input.data().conv_transpose3d(
         &weight.data(),
         bias_tensor.as_ref(),
-        stride, padding, output_padding, dilation, groups,
+        stride,
+        padding,
+        output_padding,
+        dilation,
+        groups,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -847,7 +877,9 @@ pub fn max_pool1d(
     dilation: i64,
     ceil_mode: bool,
 ) -> Result<Variable> {
-    let result = input.data().max_pool1d(kernel_size, stride, padding, dilation, ceil_mode)?;
+    let result = input
+        .data()
+        .max_pool1d(kernel_size, stride, padding, dilation, ceil_mode)?;
     Ok(Variable::wrap(result))
 }
 
@@ -860,15 +892,15 @@ pub fn avg_pool1d(
     ceil_mode: bool,
     count_include_pad: bool,
 ) -> Result<Variable> {
-    let result = input.data().avg_pool1d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
+    let result =
+        input
+            .data()
+            .avg_pool1d(kernel_size, stride, padding, ceil_mode, count_include_pad)?;
     Ok(Variable::wrap(result))
 }
 
 /// Adaptive max pooling 2D with autograd support.
-pub fn adaptive_max_pool2d(
-    input: &Variable,
-    output_size: [i64; 2],
-) -> Result<Variable> {
+pub fn adaptive_max_pool2d(input: &Variable, output_size: [i64; 2]) -> Result<Variable> {
     let result = input.data().adaptive_max_pool2d(output_size)?;
     Ok(Variable::wrap(result))
 }
@@ -888,9 +920,13 @@ pub fn instance_norm(
     let w = weight.map(|v| v.data());
     let b = bias.map(|v| v.data());
     let result = input.data().instance_norm(
-        w.as_ref(), b.as_ref(),
-        running_mean, running_var,
-        use_input_stats, momentum, eps,
+        w.as_ref(),
+        b.as_ref(),
+        running_mean,
+        running_var,
+        use_input_stats,
+        momentum,
+        eps,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -915,9 +951,7 @@ pub fn bilinear(
     bias: Option<&Variable>,
 ) -> Result<Variable> {
     let b = bias.map(|v| v.data());
-    let result = Tensor::bilinear(
-        &input1.data(), &input2.data(), &weight.data(), b.as_ref(),
-    )?;
+    let result = Tensor::bilinear(&input1.data(), &input2.data(), &weight.data(), b.as_ref())?;
     Ok(Variable::wrap(result))
 }
 
@@ -930,9 +964,9 @@ pub fn grid_sample(
     padding_mode: i32,
     align_corners: bool,
 ) -> Result<Variable> {
-    let result = input.data().grid_sample(
-        &grid.data(), mode, padding_mode, align_corners,
-    )?;
+    let result = input
+        .data()
+        .grid_sample(&grid.data(), mode, padding_mode, align_corners)?;
     Ok(Variable::wrap(result))
 }
 
@@ -954,9 +988,13 @@ pub fn scaled_dot_product_attention(
     scale: Option<f64>,
 ) -> Result<Variable> {
     let result = Tensor::scaled_dot_product_attention(
-        &query.data(), &key.data(), &value.data(),
+        &query.data(),
+        &key.data(),
+        &value.data(),
         attn_mask,
-        dropout_p, is_causal, scale,
+        dropout_p,
+        is_causal,
+        scale,
     )?;
     Ok(Variable::wrap(result))
 }
@@ -969,11 +1007,7 @@ pub fn scaled_dot_product_attention(
 /// disable padding entirely.
 ///
 /// Output shape: `[*indices.shape, embedding_dim]`.
-pub fn embedding(
-    weight: &Variable,
-    indices: &Tensor,
-    padding_idx: i64,
-) -> Result<Variable> {
+pub fn embedding(weight: &Variable, indices: &Tensor, padding_idx: i64) -> Result<Variable> {
     let result = Tensor::embedding(&weight.data(), indices, padding_idx)?;
     Ok(Variable::wrap(result))
 }

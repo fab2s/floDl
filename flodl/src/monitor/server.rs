@@ -27,7 +27,7 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::Value;
 
-use super::record_store::{delivers, RecordStore};
+use super::record_store::{RecordStore, delivers};
 
 /// Per-SSE-client event queue depth. A client that stops reading (stalled
 /// browser tab, dead NAT entry) fills its queue and is disconnected instead
@@ -305,9 +305,7 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
                 // queueing events for it without bound. Path-scoped
                 // subscribers are not epoch consumers, so they are left
                 // alone rather than retained-with-success.
-                senders.retain(|c| {
-                    c.scope.is_some() || c.tx.try_send(event.clone()).is_ok()
-                });
+                senders.retain(|c| c.scope.is_some() || c.tx.try_send(event.clone()).is_ok());
             }
             ServerMsg::Records(records) => {
                 {
@@ -492,8 +490,11 @@ fn serve_record_history(stream: &mut TcpStream, state: &SharedState, query: &str
     // `write_all` and stall every producer behind it.
     let body = {
         let store = state.records.lock().unwrap();
-        let lines: Vec<String> =
-            store.history(&path, n).iter().map(|r| r.to_string()).collect();
+        let lines: Vec<String> = store
+            .history(&path, n)
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
         format!("[{}]", lines.join(","))
     };
     write_json(stream, &body);
@@ -519,8 +520,11 @@ fn serve_html(stream: &mut TcpStream, state: &SharedState) {
     let metadata = state.metadata.lock().unwrap().clone();
     let gpu_init = state.gpu_init.lock().unwrap().clone();
 
-    let has_inject = label.is_some() || hash.is_some() || hardware.is_some()
-        || metadata.is_some() || gpu_init.is_some();
+    let has_inject = label.is_some()
+        || hash.is_some()
+        || hardware.is_some()
+        || metadata.is_some()
+        || gpu_init.is_some();
     let body = if has_inject {
         let label_js = match &label {
             Some(l) => format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")),
@@ -708,8 +712,14 @@ mod tests {
             query_param("path=root%2Fexa%2Frank0", "path").as_deref(),
             Some("root/exa/rank0"),
         );
-        assert_eq!(query_param("path=root/exa", "path").as_deref(), Some("root/exa"));
-        assert_eq!(query_param("n=10&path=root", "path").as_deref(), Some("root"));
+        assert_eq!(
+            query_param("path=root/exa", "path").as_deref(),
+            Some("root/exa")
+        );
+        assert_eq!(
+            query_param("n=10&path=root", "path").as_deref(),
+            Some("root")
+        );
         assert_eq!(query_param("n=10", "path"), None);
         assert_eq!(query_param("", "path"), None);
         // A malformed escape keeps the '%' rather than eating a character.
@@ -806,9 +816,10 @@ mod tests {
                 "the page calls getElementById('{want}') but declares no such id",
             );
         }
-        for handler in ids(&markup, "onclick=\"", '(')
-            .into_iter()
-            .chain(ids(&markup, "onchange=\"", '('))
+        for handler in
+            ids(&markup, "onclick=\"", '(')
+                .into_iter()
+                .chain(ids(&markup, "onchange=\"", '('))
         {
             assert!(
                 js.contains(&format!("function {handler}(")),
@@ -837,12 +848,15 @@ mod tests {
     /// One-shot GET, body only.
     fn get(addr: SocketAddr, target: &str) -> String {
         let mut s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
             .unwrap();
         let mut raw = String::new();
         let _ = s.read_to_string(&mut raw);
-        raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or(raw)
+        raw.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or(raw)
     }
 
     /// Poll a GET until its body contains `needle`, so tests never depend on
@@ -865,7 +879,8 @@ mod tests {
     /// Open an SSE subscription and return the connected stream.
     fn open_sse(addr: SocketAddr, target: &str) -> TcpStream {
         let mut s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(std::time::Duration::from_millis(600))).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_millis(600)))
+            .unwrap();
         s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
             .unwrap();
         s
@@ -950,8 +965,7 @@ mod tests {
         assert_eq!(v.last().unwrap()["tick"], 5);
 
         // `n` caps from the newest end.
-        let v: Vec<Value> =
-            serde_json::from_str(&get(addr, "/history?path=root&n=2")).unwrap();
+        let v: Vec<Value> = serde_json::from_str(&get(addr, "/history?path=root&n=2")).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v.last().unwrap()["tick"], 5);
 
@@ -1007,7 +1021,10 @@ mod tests {
 
         // Host viewer: its own + its rank's metrics, and nothing from the
         // sibling host (not even that host's alert).
-        assert!(exa_feed.contains("\"path\":\"root/exa/rank0\""), "{exa_feed}");
+        assert!(
+            exa_feed.contains("\"path\":\"root/exa/rank0\""),
+            "{exa_feed}"
+        );
         assert!(!exa_feed.contains("\"path\":\"root/pascal\""));
         assert!(!exa_feed.contains("rank_lost"));
 
@@ -1074,7 +1091,8 @@ mod tests {
         srv.shutdown();
 
         // The socket must reach EOF, not hang.
-        sub.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        sub.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         let mut buf = [0u8; 512];
         loop {
             match sub.read(&mut buf) {

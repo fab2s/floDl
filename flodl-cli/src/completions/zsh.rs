@@ -75,15 +75,11 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                         "                {flags}) _values 'value' {}; return ;;\n",
                         cs.join(" ")
                     ),
-                    ValueKind::Path => format!(
-                        "                {flags}) _files; return ;;\n",
-                    ),
+                    ValueKind::Path => format!("                {flags}) _files; return ;;\n",),
                     ValueKind::Completer(c) => format!(
                         "                {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
                     ),
-                    ValueKind::Any => format!(
-                        "                {flags}) return ;;\n",
-                    ),
+                    ValueKind::Any => format!("                {flags}) return ;;\n",),
                     ValueKind::None => continue,
                 };
                 s.push_str(&body);
@@ -92,11 +88,7 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
         }
 
         // Position 3 (after the command name): offer nested sub-commands + options.
-        let option_flags: Vec<String> = cmd
-            .options
-            .iter()
-            .flat_map(|o| o.flag_tokens())
-            .collect();
+        let option_flags: Vec<String> = cmd.options.iter().flat_map(|o| o.flag_tokens()).collect();
         let mut all_flags = option_flags.clone();
         all_flags.push("--help".into());
         all_flags.push("-h".into());
@@ -105,9 +97,7 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
         // Position 3 (env-shifted): first-positional candidates.
         // Presets carry descriptions (zsh can render them via
         // `name:desc` pairs), real sub-commands do not.
-        if !cmd.presets.is_empty()
-            || !cmd.sub_commands.is_empty()
-            || !cmd.tree_commands.is_empty()
+        if !cmd.presets.is_empty() || !cmd.sub_commands.is_empty() || !cmd.tree_commands.is_empty()
         {
             s.push_str("            if (( cword == 3 )); then\n");
             if !cmd.presets.is_empty() {
@@ -123,10 +113,7 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                         format!("'{n}:{safe}'")
                     })
                     .collect();
-                s.push_str(&format!(
-                    "                presets=({})\n",
-                    pairs.join(" ")
-                ));
+                s.push_str(&format!("                presets=({})\n", pairs.join(" ")));
                 s.push_str("                _describe 'preset' presets\n");
             }
             if !cmd.sub_commands.is_empty() {
@@ -150,10 +137,7 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                         format!("'{}:{safe}'", t.name)
                     })
                     .collect();
-                s.push_str(&format!(
-                    "                treecmds=({})\n",
-                    pairs.join(" ")
-                ));
+                s.push_str(&format!("                treecmds=({})\n", pairs.join(" ")));
                 s.push_str("                _describe 'command' treecmds\n");
             }
             s.push_str("            fi\n");
@@ -176,15 +160,15 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                                 "                        {flags}) _values 'value' {}; return ;;\n",
                                 cs.join(" ")
                             ),
-                            ValueKind::Path => format!(
-                                "                        {flags}) _files; return ;;\n",
-                            ),
+                            ValueKind::Path => {
+                                format!("                        {flags}) _files; return ;;\n",)
+                            }
                             ValueKind::Completer(c) => format!(
                                 "                        {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
                             ),
-                            ValueKind::Any => format!(
-                                "                        {flags}) return ;;\n",
-                            ),
+                            ValueKind::Any => {
+                                format!("                        {flags}) return ;;\n",)
+                            }
                             ValueKind::None => continue,
                         };
                         s.push_str(&body);
@@ -202,9 +186,7 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
             }
             s.push_str("            esac\n");
         }
-        s.push_str(&format!(
-            "            _values 'option' {flags_joined}\n"
-        ));
+        s.push_str(&format!("            _values 'option' {flags_joined}\n"));
         s.push_str("            ;;\n");
     }
 
@@ -234,15 +216,11 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                         "                {flags}) _values 'value' {}; return ;;\n",
                         cs.join(" ")
                     ),
-                    ValueKind::Path => format!(
-                        "                {flags}) _files; return ;;\n",
-                    ),
+                    ValueKind::Path => format!("                {flags}) _files; return ;;\n",),
                     ValueKind::Completer(c) => format!(
                         "                {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
                     ),
-                    ValueKind::Any => format!(
-                        "                {flags}) return ;;\n",
-                    ),
+                    ValueKind::Any => format!("                {flags}) return ;;\n",),
                     ValueKind::None => continue,
                 };
                 s.push_str(&body);
@@ -283,15 +261,15 @@ pub(super) fn emit_zsh(data: &CompletionData) -> String {
                                     "                        {flags}) _values 'value' {}; return ;;\n",
                                     cs.join(" ")
                                 ),
-                                ValueKind::Path => format!(
-                                    "                        {flags}) _files; return ;;\n",
-                                ),
+                                ValueKind::Path => {
+                                    format!("                        {flags}) _files; return ;;\n",)
+                                }
                                 ValueKind::Completer(c) => format!(
                                     "                        {flags}) local -a vals; vals=(${{(f)\"$({c})\"}}); _describe 'value' vals; return ;;\n",
                                 ),
-                                ValueKind::Any => format!(
-                                    "                        {flags}) return ;;\n",
-                                ),
+                                ValueKind::Any => {
+                                    format!("                        {flags}) return ;;\n",)
+                                }
                                 ValueKind::None => continue,
                             };
                             s.push_str(&body);

@@ -117,10 +117,7 @@ pub(super) fn emit_fish(data: &CompletionData) -> String {
         let cond = format!("contains -- {} (__fdl_active_command)", cmd.name);
 
         for (name, desc) in &cmd.presets {
-            let safe = desc
-                .as_deref()
-                .unwrap_or("preset")
-                .replace('\'', "\\'");
+            let safe = desc.as_deref().unwrap_or("preset").replace('\'', "\\'");
             s.push_str(&format!(
                 "complete -c fdl -n '{cond}' -a '{name}' -d '{safe}'\n"
             ));
@@ -211,9 +208,7 @@ pub(super) fn emit_fish(data: &CompletionData) -> String {
 
         if has_subs {
             for sub in &b.sub_commands {
-                s.push_str(&format!(
-                    "complete -c fdl -n '{parent_cond}' -a '{sub}'\n"
-                ));
+                s.push_str(&format!("complete -c fdl -n '{parent_cond}' -a '{sub}'\n"));
             }
         }
 
