@@ -71,7 +71,7 @@ Edit the `Cargo.toml` entry directly to switch flavors:
 ### Full HuggingFace experience (default)
 
 ```toml
-flodl-hf = "=0.5.3"
+flodl-hf = "=0.7.0"
 ```
 
 Pulls: `safetensors` + `hf-hub` + `tokenizers`. Everything needed to

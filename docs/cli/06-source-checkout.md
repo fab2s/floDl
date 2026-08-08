@@ -9,12 +9,31 @@ previous section, not built-in commands.
 ```bash
 fdl check              # type-check without building
 fdl build              # debug build
+fdl fmt                # format the workspace (rustfmt)
+fdl fmt-check          # formatting check, byte-for-byte what CI runs
 fdl clippy             # lint (tests + workspace + ddp-bench)
 fdl test               # all CPU tests
 fdl test-release       # tests in release mode
 fdl test-live          # tests needing network / external resources (see below)
 fdl doc                # rustdoc, strict (-D warnings)
+fdl ci                 # the whole CPU job: fmt + build + test + clippy + doc
 ```
+
+`fdl ci` is the closest local equivalent to what CI does to a PR; run it
+before pushing. `fdl test` alone catches neither rustdoc nor formatting
+warnings.
+
+## Coverage
+
+```bash
+fdl coverage           # CPU only -- a FLOOR, it scores GPU code as missed
+fdl coverage-all       # every suite this box can run, and names the ones it can't
+```
+
+A number to look at, never a threshold to clear. `coverage-all` prints a
+`RAN` / `SKIPPED` / `FAILED` roster rather than one percentage, because a
+hardware- or tool-gated suite returns early and reports `ok`: a single
+number can be built entirely out of suites that executed nothing.
 
 ## Live tests
 

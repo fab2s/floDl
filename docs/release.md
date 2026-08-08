@@ -6,13 +6,19 @@ is `make release-check`.
 
 ## Pre-flight
 
-1. Bump the workspace version in `Cargo.toml` (`version = "X.Y.Z"`) —
-   **plus the six hardcoded dep-version companions** (the `=` pins make a
-   miss fail loudly at resolve, but they are part of the bump, not a
-   surprise): `flodl-sys = { version = ... }` + `flodl-hw = { version = ... }`
-   in `flodl/Cargo.toml`, `flodl-cli-macros "=..."` + `flodl-hw "=..."` in
-   `flodl-cli/Cargo.toml`, and `flodl "=..."` + `flodl-cli "=..."` in
-   `flodl-hf/Cargo.toml`.
+1. Bump the workspace version in `Cargo.toml`, in **two** places, both in
+   that one file:
+   - `[workspace.package] version = "X.Y.Z"`, which every member inherits.
+   - the five internal `=X.Y.Z` pins in `[workspace.dependencies]`
+     (`flodl`, `flodl-cli`, `flodl-cli-macros`, `flodl-hw`, `flodl-sys`).
+
+   The pins are exact on purpose: a consumer resolving `flodl` X.Y against
+   `flodl-sys` X.(Y-1) would pair a safe wrapper with a shim it was not
+   built for. Missing one fails loudly at resolve rather than silently, but
+   it is part of the bump, not a surprise. These used to be six hardcoded
+   companions spread across `flodl/`, `flodl-cli/` and `flodl-hf/`
+   manifests; they were hoisted into the workspace table, so the member
+   manifests now say `dep.workspace = true` and hold no version at all.
 2. Rename the `[Unreleased]` CHANGELOG heading to `[X.Y.Z] - YYYY-MM-DD`
    and add a fresh empty `[Unreleased]` above.
 3. Commit both edits on `main`.
@@ -32,7 +38,7 @@ Scripts, in order:
 | # | Script              | Verifies                                                        |
 |---|---------------------|-----------------------------------------------------------------|
 | 01 | `01-git.sh`         | No uncommitted changes; target tag doesn't exist; branch sanity. |
-| 02 | `02-version-sync.sh`| `Cargo.toml` version matches a dated `## [X.Y.Z] - YYYY-MM-DD` CHANGELOG header. |
+| 02 | `02-version-sync.sh`| Everything that names the version agrees with it: a dated `## [X.Y.Z] - YYYY-MM-DD` CHANGELOG header, the five internal `=X.Y.Z` pins in `[workspace.dependencies]`, the version pins quoted in tracked docs, and the minimum Rust version those docs state. |
 | 03 | `03-lint-docs.sh`   | No stale `make <target>` refs, no hardcoded user paths, every `` `fdl <cmd>` `` in docs resolves, and every doc link, heading anchor, code fence and `/guide/` URL is valid. |
 | 04 | `04-shell.sh`       | `sh -n` clean on every tracked `.sh` outside `ci/release/` (those run anyway); `shellcheck` advisory. |
 | 05 | `05-ci.sh`          | Delegates to `fdl ci` (cargo build + test + clippy + strict rustdoc). |
@@ -41,6 +47,7 @@ Scripts, in order:
 | 08 | `08-publish-dry.sh` | `cargo publish --dry-run` per workspace crate in dep order. |
 | 09 | `09-skill-assets.sh`| `flodl-cli/assets/skills/` matches its `ai/` sources, so a released `fdl` does not ship a stale `/port` skill. |
 | 10 | `10-crate-coverage.sh`| Every publishable workspace member is listed in this doc's publish block AND the `Makefile` `docs-rs` target (and neither names a crate that is no longer a member). |
+| 11 | `11-semver-checks.sh`| Public-API breakage, per crate, against the last release on crates.io. Reads the version from `Cargo.toml`, so it must run *after* `02`: before the bump it correctly fails. |
 
 To iterate on a single check without running the whole suite:
 
@@ -50,9 +57,12 @@ sh ci/release/03-lint-docs.sh
 
 ## Common failures
 
-- **`02-version-sync` fails** - you bumped `Cargo.toml` but the
-  `[Unreleased]` header in `CHANGELOG.md` still says `[Unreleased]`.
-  Rename it to `[X.Y.Z] - YYYY-MM-DD`.
+- **`02-version-sync` fails** - three separate causes, and the output says
+  which. The `[Unreleased]` CHANGELOG header still says `[Unreleased]`
+  (rename it to `[X.Y.Z] - YYYY-MM-DD`); the `[workspace.dependencies]`
+  pins still name the previous version; or a doc still quotes it. The
+  last two are the bump's own checklist - the failure lists every file
+  and line, so run it first and work the list.
 - **`03-lint-docs` A (make refs)** - a command was removed from the
   root Makefile but docs still reference it. Update the doc or add a
   new Makefile target.

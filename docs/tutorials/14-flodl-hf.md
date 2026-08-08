@@ -26,7 +26,7 @@ add flodl-hf` exposes two modes that you can combine.
 fdl add flodl-hf --playground   # try it: drops ./flodl-hf/ sandbox crate
 fdl flodl-hf classify           # runs a real fine-tune via AutoModel
 
-fdl add flodl-hf --install      # wire it: appends flodl-hf="=0.5.3" to Cargo.toml
+fdl add flodl-hf --install      # wire it: appends flodl-hf="=0.7.0" to Cargo.toml
 fdl build                       # cargo pulls + compiles the new dep
 ```
 
@@ -36,7 +36,7 @@ runnable commands, and a `flodl-hf:` entry in the root `fdl.yml` so
 `fdl flodl-hf <cmd>` routes from project root. The host project's
 `Cargo.toml` and `fdl.yml` are untouched.
 
-`--install` appends `flodl-hf = "=0.5.3"` (default features = `hub` +
+`--install` appends `flodl-hf = "=0.7.0"` (default features = `hub` +
 `tokenizer`) to the root `Cargo.toml` `[dependencies]` and stops there.
 Idempotent. Edit the entry by hand to switch flavors (see
 [Install](#install) below).
@@ -59,7 +59,7 @@ feature profiles cover the common deployment shapes.
 ### Full HuggingFace experience (default)
 
 ```toml
-flodl-hf = "=0.5.3"
+flodl-hf = "=0.7.0"
 ```
 
 Pulls `safetensors` + `hf-hub` + `tokenizers`. Everything needed to
@@ -122,6 +122,14 @@ The same three-line caller works for `google-bert/bert-base-uncased`,
 `FacebookAI/xlm-roberta-base`, `microsoft/deberta-v3-base`, or any fine-tune on
 top of those. Swap the repo id and the family wiring happens under the
 hood.
+
+> **Use the owner-qualified repo id.** The five checkpoints above also
+> have a pre-2024 short form with no owner segment (`bert-base-uncased`,
+> `roberta-base`, `distilbert-base-uncased`, `albert-base-v2`,
+> `xlm-roberta-base`). The Hub answers those with a 307 redirect to the
+> owner-qualified home, and `hf-hub` 1.0 does not follow it, so a bare
+> name now fails with `Repository not found`. Owner-qualified is the form
+> the Hub itself documents, and the one every example here uses.
 
 Five `AutoModel` entry points cover the supported task shapes:
 

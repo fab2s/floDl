@@ -8,7 +8,7 @@ flodl = "={{FLODL_VERSION}}"
 flodl-hf = "={{FLODL_VERSION}}"
 
 # See README.md for feature flavors:
-# - default ([hub, tokenizer]): full stack, loads "bert-base-uncased" out of the box
+# - default ([hub, tokenizer]): full stack, loads "google-bert/bert-base-uncased" out of the box
 # - vision-only (default-features = false, features = ["hub"]): no tokenizer for ViT-style models
 # - offline (default-features = false): safetensors loader only, no network
 
