@@ -35,13 +35,20 @@ Same GPU kernels as PyTorch. No Python. No GIL. No GC. Just Rust.
 
 ---
 
-> **What's new** - the training monitor became a **recursive portal**:
-> one view repeated at every level of a run (`root` → host → rank),
-> addressed by path. A page subscribes to one level, so watching a
-> 300-rank run costs what watching a 3-rank one costs. The same record
-> plane is also reachable over HTTP, as a bounded JSONL tree on disk,
-> and as one self-contained offline HTML file.
-> See the [CHANGELOG](https://github.com/flodl-labs/flodl/blob/main/CHANGELOG.md)
+> **What's new** - floDl grew a **second GPU vendor**. `flodl-sys` builds
+> and links against a hipified libtorch, the public API says `gpu_*` where
+> it used to say `cuda_*` (33 deprecated aliases keep existing code
+> compiling), and AMD cards are enumerated from the kernel's KFD topology.
+> Training on AMD is **not yet validated on hardware** - compile, link,
+> provisioning and detection are. Alongside it, a run no longer needs a
+> roster: `fdl join` lets a box dial into a discovery window, and
+> `fdl publish` makes the controller the authority for what a run *is*,
+> which is what turns a pile of cloud instances into a cohort.
+> Two changes do not warn at compile time - the Rust floor is now 1.91,
+> and `flodl-hf` needs owner-qualified Hub repo ids - so see
+> [UPGRADE.md](https://github.com/flodl-labs/flodl/blob/main/UPGRADE.md)
+> before bumping, and the
+> [CHANGELOG](https://github.com/flodl-labs/flodl/blob/main/CHANGELOG.md)
 > for everything else in this release.
 
 ---
@@ -526,7 +533,8 @@ membership only shrinks, rejoin/scale-up is not yet implemented).
 > `gpu_device_count()`, no `Module::on_device(CUDA(_))`, no CUDA
 > tensors). The launcher exits without training; touching CUDA there
 > poisons spawned children's contexts on heterogeneous rigs. Use
-> `flodl::sys::detect_gpus()` (CUDA-free) for pre-run GPU queries.
+> `flodl::sys::detect_gpus()` (loads no GPU runtime) for pre-run GPU
+> queries.
 
 See the **[Multi-GPU Tutorial](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/11-multi-gpu.md)**,
 **[Heterogeneous & Multi-Host DDP](https://github.com/flodl-labs/flodl/blob/main/docs/tutorials/12-async-ddp.md)**,
@@ -800,7 +808,7 @@ codegen-units = 1
 | `ElCheConfig` | Anchor tuning, partition ratios, convergence guard, EASGD, meta-controller. |
 | `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
 | `ClusterBuilder` | Programmatic cluster construction (mirrors `fdl.cluster.yml`). |
-| `flodl::sys::detect_gpus` | CUDA-free GPU detection; canonical pre-`Trainer::run` query. |
+| `flodl::sys::detect_gpus` | GPU detection that loads no GPU runtime; vendor-plural (nvidia-smi / KFD), scoped to the build's vendor. Canonical pre-`Trainer::run` query. |
 | `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards - TrendGuard is default. Guard is authoritative over `overhead_target`. |
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |

@@ -1089,7 +1089,7 @@ let x = Tensor::zeros(&[2, 3], opts)?;
 | Aspect | PyTorch | flodl |
 |--------|---------|-------|
 | Device check | `torch.cuda.is_available()` | `gpu_available()` |
-| Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` - CUDA-free, no libtorch init |
+| Device count (pre-`Trainer::run`) | `torch.cuda.device_count()` | `flodl::sys::detect_gpus().len()` - loads no GPU runtime, no libtorch init |
 | Device count (after `Trainer::run`) | `torch.cuda.device_count()` | `gpu_device_count()` - safe inside training; touches libtorch |
 | Model move | `model.to(device)` | `module.move_to_device(device)` |
 | Tensor move | `x.to(device)` | `x.to_device(device)?` |
