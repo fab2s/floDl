@@ -71,8 +71,44 @@ mode_args() {
 }
 
 ts() { date '+%F %T'; }
-cell_done() { grep -q '# total:' "$ABS_OUT/$1/$2/training.log" 2>/dev/null; }
+# A cell counts as done only with EVIDENCE OF WORK, not evidence that the
+# process reached its exit path. `# total:` is written at teardown whether
+# or not anything trained: runs/smoke-splits/olmo/cpu-async-diloco holds two
+# logs that are a hardware header, a blank line and `# total:` with zero
+# epochs. Gating on the footer alone would skip such a cell on every resume
+# and report a complete matrix containing an empty cell. Requiring an
+# `epoch ` line covers both log shapes (solo carries `eval=` inline, cluster
+# carries a separate `final eval=`), so it stays one predicate.
+cell_done() {
+    log="$ABS_OUT/$1/$2/training.log"
+    grep -q '^epoch ' "$log" 2>/dev/null && grep -q '# total:' "$log" 2>/dev/null
+}
 strays() { pgrep -af 'release/ddp-benc[h]' >/dev/null 2>&1; }
+
+# libtorch `[W...] Warning:` lines do NOT fail a run. On a benchmark whose
+# numbers get published they must fail the CELL, or the sweep's own green
+# summary is the thing hiding them.
+warns_in() { grep -cE '\[W[0-9]* ' "$1" 2>/dev/null || true; }
+
+# Per-cell provenance, written from the SUCCESS path only so it exists if
+# and only if the cell holds results. The sweep already echoes `rev=` and
+# `seed=` at SWEEP BEGIN, but only to its own stdout, which survives just
+# where the operator piped it; publish-3gpu is reconstructible today only
+# because this script is committed, and a script changes over time. The
+# olmo cells are the cautionary case: runs/olmo (481.7s, one epoch) and
+# runs/smoke-splits/olmo (149.2s, four splits) cannot be compared at all,
+# because the token budget explaining the 3x spread was never recorded.
+stamp() {
+  d="$ABS_OUT/$1/$2"; mkdir -p "$d"
+  { echo "invocation: $3"
+    echo "git_sha:    $(git rev-parse HEAD 2>/dev/null)"
+    echo "git_dirty:  $(git status --porcelain 2>/dev/null | wc -l) file(s) modified"
+    echo "seed:       42"
+    echo "utc:        $(date -u '+%F %T UTC')"
+    echo "host:       $(hostname)"
+    echo "libtorch:   $(cat libtorch/.active 2>/dev/null || echo unknown)"
+  } > "$d/provenance.txt"
+}
 
 echo "$(ts) SWEEP BEGIN rev=$(git rev-parse --short HEAD) seed=42 out=$OUT"
 echo "$(ts) models: $MODELS"
@@ -93,11 +129,13 @@ for entry in $MODELS; do
     timeout 5400 ./fdl @cluster ddp-bench --model "$m" $(mode_args "$mode") --epochs "$e" --seed 42 --output "$OUT" --save-dashboard 2>&1 | tee "$cell_log"
     rc=${PIPESTATUS[0]}
     degraded=$(grep -c "finished DEGRADED\|child exit(s) tolerated\|device-side assert" "$cell_log")
+    warns=$(warns_in "$cell_log")
     rm -f "$cell_log"
-    if [ $rc -eq 0 ] && [ "$degraded" -eq 0 ] && cell_done "$m" "$mode"; then
+    if [ $rc -eq 0 ] && [ "$degraded" -eq 0 ] && [ "$warns" -eq 0 ] && cell_done "$m" "$mode"; then
+      stamp "$m" "$mode" "fdl @cluster ddp-bench --model $m $(mode_args "$mode") --epochs $e --seed 42 --output $OUT --save-dashboard"
       echo "$(ts) OK $m/$mode"
     else
-      echo "$(ts) FAIL $m/$mode rc=$rc degraded=$degraded"
+      echo "$(ts) FAIL $m/$mode rc=$rc degraded=$degraded libtorch_warnings=$warns"
       rm -rf "${ABS_OUT:?}/$m/$mode"
       # The agent wrapper's own kill-trap needs up to 10s to KILL its
       # child after a rank crash; probing at 5s aborted the whole sweep
@@ -126,12 +164,16 @@ for entry in $MODELS; do
   m=${entry%%:*}; e=${entry##*:}
   if cell_done "$m" "solo-0"; then echo "$(ts) SKIP $m/solo-0 (done)"; continue; fi
   echo "$(ts) START $m/solo-0 (epochs=$e)"
-  timeout 7200 ./fdl ddp-bench --model "$m" --mode solo-0 --epochs "$e" --seed 42 --output "$OUT" --save-dashboard
-  rc=$?
-  if [ $rc -eq 0 ] && cell_done "$m" "solo-0"; then
+  solo_log=$(mktemp)
+  timeout 7200 ./fdl ddp-bench --model "$m" --mode solo-0 --epochs "$e" --seed 42 --output "$OUT" --save-dashboard 2>&1 | tee "$solo_log"
+  rc=${PIPESTATUS[0]}
+  warns=$(warns_in "$solo_log")
+  rm -f "$solo_log"
+  if [ $rc -eq 0 ] && [ "$warns" -eq 0 ] && cell_done "$m" "solo-0"; then
+    stamp "$m" "solo-0" "fdl ddp-bench --model $m --mode solo-0 --epochs $e --seed 42 --output $OUT --save-dashboard"
     echo "$(ts) OK $m/solo-0"
   else
-    echo "$(ts) FAIL $m/solo-0 rc=$rc"
+    echo "$(ts) FAIL $m/solo-0 rc=$rc libtorch_warnings=$warns"
   fi
 done
 echo "$(ts) PHASE2A DONE"
@@ -169,6 +211,10 @@ for entry in $MODELS; do
     ssh -o BatchMode=yes flodl-pascal "tar -C ~/solo-sweep/runs/$m/solo-$pdev -cf - ." \
       | tar -C "$ABS_OUT/$m/$pub" -xf -
     if cell_done "$m" "$pub"; then
+      # Stamped after copy-back, so the provenance describes the cell that
+      # actually landed here. The binary and libtorch named are pascal's,
+      # not this host's -- a solo cell run over there is a different build.
+      stamp "$m" "$pub" "ssh flodl-pascal: LD_LIBRARY_PATH=$PLIB $PBIN --model $m --mode solo-$pdev --epochs $e --seed 42 --data-dir /mnt/rdl/ddp-bench/data --save-dashboard"
       echo "$(ts) OK $m/$pub"
     else
       echo "$(ts) FAIL $m/$pub (no training.log after copy-back)"
