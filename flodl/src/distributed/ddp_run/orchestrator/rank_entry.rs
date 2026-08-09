@@ -525,10 +525,10 @@ impl DdpHandle {
         // corrupts the CUDA context on heterogeneous GPUs; CPU dials the relay
         // data loopback for the reduce channel.
         #[cfg(feature = "gpu")]
-        if matches!(backend, AverageBackend::Nccl) {
-            if let crate::tensor::Device::CUDA(idx) = device {
-                crate::tensor::set_current_gpu_device(idx);
-            }
+        if matches!(backend, AverageBackend::Nccl)
+            && let crate::tensor::Device::CUDA(idx) = device
+        {
+            crate::tensor::set_current_gpu_device(idx);
         }
         let nccl_comm = match backend {
             AverageBackend::Nccl => {

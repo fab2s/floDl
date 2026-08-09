@@ -549,10 +549,10 @@ impl<M: Module> GpuWorker<M> {
 
             // Ensure compute stream waits for async H2D copy to finish
             #[cfg(feature = "gpu")]
-            if let Some(ref event) = prefetched.ready_event {
-                if let Some(ref stream) = self.compute_stream {
-                    stream.wait_event(event)?;
-                }
+            if let Some(ref event) = prefetched.ready_event
+                && let Some(ref stream) = self.compute_stream
+            {
+                stream.wait_event(event)?;
             }
 
             // Cross-stream lifetime pin. The batch's device blocks were
@@ -592,11 +592,9 @@ impl<M: Module> GpuWorker<M> {
             // current stream — pin them to the compute stream for the
             // same freed-block-reuse reason as the uploaded batch.
             #[cfg(feature = "gpu")]
-            if transformed {
-                if let Some(ref stream) = self.compute_stream {
-                    for t in &tensors {
-                        t.record_stream(stream)?;
-                    }
+            if transformed && let Some(ref stream) = self.compute_stream {
+                for t in &tensors {
+                    t.record_stream(stream)?;
                 }
             }
             st.batch_done += 1;
