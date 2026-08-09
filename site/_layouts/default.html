@@ -5,7 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% if page.title %}{{ page.title }} - {{ site.title }}{% else %}{{ site.title }} - Deep learning in Rust{% endif %}</title>
   <meta name="description" content="{{ page.description | default: site.description }}">
-  <link rel="canonical" href="{{ page.url | absolute_url }}">
+  {%- comment -%}
+  Unreleased-channel pages carry noindex: the guide publishes under a version
+  segment permanently, and /guide/main/ documents work nobody can install yet.
+  Superseded release series stay INDEXED on purpose, so a link written against
+  one keeps resolving and keeps its ranking; they are only dropped from the
+  sitemap, which is a crawl-priority signal rather than a removal.
+  {%- endcomment -%}
+  {% if page.noindex %}<meta name="robots" content="noindex">
+  {% endif %}<link rel="canonical" href="{{ page.url | absolute_url }}">
 
   <!-- Open Graph -->
   <meta property="og:title" content="{% if page.title %}{{ page.title }} - {{ site.title }}{% else %}{{ site.title }} - Deep learning in Rust{% endif %}">

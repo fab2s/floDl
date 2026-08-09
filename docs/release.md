@@ -48,6 +48,7 @@ Scripts, in order:
 | 09 | `09-skill-assets.sh`| `flodl-cli/assets/skills/` matches its `ai/` sources, so a released `fdl` does not ship a stale `/port` skill. |
 | 10 | `10-crate-coverage.sh`| Every publishable workspace member is listed in this doc's publish block AND the `Makefile` `docs-rs` target (and neither names a crate that is no longer a member). |
 | 11 | `11-semver-checks.sh`| Public-API breakage, per crate, against the last release on crates.io. Reads the version from `Cargo.toml`, so it must run *after* `02`: before the bump it correctly fails. |
+| 12 | `12-guide-snapshot.sh`| The release series' guide is committed under `site/guide/X.Y.x/` with its sidebar, so flodl.dev serves documentation for the version being cut. |
 
 To iterate on a single check without running the whole suite:
 
@@ -84,6 +85,25 @@ sh ci/release/03-lint-docs.sh
   `fdl init` scaffold).
 - **`08-publish-dry` missing `version =`** - a `path = "../foo"` dep
   without a `version = "X.Y.Z"` companion - crates.io requires both.
+- **`12-guide-snapshot` missing tree** - the release's guide has not been
+  snapshotted. Run it once, before the release commit, naming the SERIES
+  rather than the version:
+
+  ```sh
+  python3 site/build_guide.py --channel 0.8.x
+  git add site/guide/0.8.x site/_includes/sidebar-0.8.x.html site/guide/index.html
+  ```
+
+  The site publishes the guide under a permanent version segment
+  (`/guide/0.8.x/...`) so a link written against a release keeps resolving
+  after `docs/` moves on; bare `/guide/...` paths redirect to whichever
+  series is newest, which is what makes cutting a release move the
+  documentation. This gate exists because a forgotten snapshot is silent:
+  the site still builds and every link still works, the docs are simply a
+  version behind. The committed tree is then patchable in place, so fixing
+  a typo in shipped docs is an ordinary edit rather than a wait for the
+  next release - which is why it must not be regenerated afterwards. Each
+  tree carries a README saying so.
 - **`10-crate-coverage` fails after adding a crate** - add it to the
   publish block above and to the `Makefile` `docs-rs` target. The failure
   names the crate and the list it is missing from. If it fires the other
