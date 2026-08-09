@@ -17,6 +17,12 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - README.md
+  # Anchored at the source root, so the bare `README.md` above covers only
+  # site/README.md. Each frozen version tree carries its own DO-NOT-REGENERATE
+  # README, and without this pattern Jekyll has no front matter to act on and
+  # copies it verbatim: /guide/0.8.x/README.md served the internal note as raw
+  # markdown, with no meta tag available to mark it noindex.
+  - "guide/*/README.md"
 
 permalink: /blog/:slug
 
