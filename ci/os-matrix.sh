@@ -115,6 +115,30 @@ fail() {
     echo "${C_RED}RESULT: $HOST FAILED${C_OFF} (stopped at the first failure)"
     exit 1
 }
+# Retry a package install past a transient mirror failure.
+#
+# Vendor toolkits come off third-party mirrors in the gigabytes (the EL10 ROCm
+# rotation is 39 packages and 3.0 GB from AMD), and those mirrors drop out.
+# Observed twice as `No URLs in mirrorlist`, once at metadata fetch and once
+# mid-download, which are different failures that print the same string.
+#
+# Cheap even at 3 GB: both dnf and apt keep what they already pulled, so an
+# attempt resumes rather than restarting the download.
+#
+# A helper rather than the loop written out at each site, because the first
+# fix for this covered ONE of the call sites and the next flake looked, at a
+# glance, exactly like the fix not working. Retrying is a property of
+# installing from a network, so it belongs where the installs are.
+retry_install() {
+    _ok=0
+    for _attempt in 1 2 3; do
+        if "$@"; then _ok=1; break; fi
+        note "$HOST: install attempt $_attempt failed, retrying in 5s"
+        sleep 5
+    done
+    [ "$_ok" = 1 ]
+}
+
 # Advisory: report, keep going, do not fail the job. For steps running
 # code no host has ever run, so that a red one does not gate the merge
 # queue on day one. Promote to `fail` once green.
@@ -551,8 +575,10 @@ ROCMREPO
         # Weak deps stay on for the same reason recommends do below: the
         # devel packages pull their runtimes, and dodging that would
         # validate a configuration no user has.
+        #
         # shellcheck disable=SC2086
-        $SUDO dnf install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
+        retry_install $SUDO dnf install -y $PKGS \
+            || fail "$HOST: toolkit install failed after 3 attempts: $PKGS"
     else
         if [ "$FEATURE" = rocm ]; then
             $SUDO mkdir -p --mode=0755 /etc/apt/keyrings
@@ -570,7 +596,8 @@ ROCMREPO
         # their runtimes (hipblaslt alone is ~4 GB of Tensile kernels), and
         # dodging that would validate a configuration no user has.
         # shellcheck disable=SC2086
-        $SUDO apt-get install -y $PKGS || fail "$HOST: toolkit install failed: $PKGS"
+        retry_install $SUDO apt-get install -y $PKGS \
+            || fail "$HOST: toolkit install failed after 3 attempts: $PKGS"
     fi
 fi
 endgroup
