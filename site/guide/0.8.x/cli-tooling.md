@@ -1,0 +1,128 @@
+---
+permalink: /guide/0.8.x/cli/tooling
+channel: 0.8.x
+sitemap: true
+layout: guide
+title: "Introspection and Tooling"
+prev_url: /guide/0.8.x/cli/cluster
+prev_title: "Cluster and Hardware Commands"
+next_url: /guide/0.8.x/cli/manifest
+next_title: "The fdl.yml Manifest"
+anchors:
+  - id: "fdl-api-ref"
+    title: "fdl api-ref"
+  - id: "fdl-skill"
+    title: "fdl skill"
+  - id: "fdl-completions--fdl-autocomplete"
+    title: "fdl completions / fdl autocomplete"
+last_modified_at: 2026-07-30T23:28:37+02:00
+---
+
+# Introspection and Tooling Commands
+
+## `fdl api-ref`
+
+Generate a structured API reference from the flodl source. Extracts all
+public types, constructors, methods, builder patterns, trait
+implementations, and doc examples.
+
+```bash
+fdl api-ref                # human-readable (170+ types, 1700+ lines)
+fdl api-ref --json         # structured JSON for tooling
+fdl api-ref --path ~/src   # explicit source path
+```
+
+Source discovery (in order):
+
+1. Walk up from cwd for a flodl checkout.
+2. Cargo registry (`~/.cargo/registry/src/`).
+3. Cached GitHub download (`~/.flodl/api-ref-cache/<version>/`).
+4. Download the latest release source from GitHub (cached for next time).
+
+This means `fdl api-ref` works anywhere, even without a local checkout.
+First run on a fresh machine downloads ~2MB of source; subsequent runs
+use the cache.
+
+Example output (abbreviated):
+
+```
+flodl API Reference v0.5.0
+========================================
+
+## Modules (nn)
+
+### Linear
+  Fully connected layer: `y = x @ W^T + b`.
+  file: nn/linear.rs
+  constructors:
+    pub fn new(in_features: i64, out_features: i64) -> Result<Self>
+    pub fn on_device(in_features: i64, out_features: i64, device: Device) -> Result<Self>
+
+### Conv2d  (implements: Module)
+  file: nn/conv2d.rs
+  constructors:
+    pub fn configure(in_ch: i64, out_ch: i64, kernel: impl Into<KernelSize>) -> Conv2dBuilder
+  builder:
+    .with_stride()  .with_padding()  .with_dilation()  .done()
+```
+
+The JSON output is designed for AI-assisted porting tools. An agent can
+read the full API surface, match PyTorch patterns to flodl equivalents,
+and generate a working port.
+
+## `fdl skill`
+
+Manage AI coding assistant skills. Detects your tool, installs the right
+skill files.
+
+```bash
+fdl skill list                       # show available skills and detected tools
+fdl skill install                    # auto-detect tool, install all skills
+fdl skill install --tool claude      # force Claude Code
+fdl skill install --tool cursor      # force Cursor
+fdl skill install --skill port       # install a single skill only
+```
+
+**Supported tools:**
+
+| Tool        | Detection                       | Install target                  |
+|-------------|---------------------------------|---------------------------------|
+| Claude Code | `.claude/` directory            | `.claude/skills/<skill>/SKILL.md` |
+| Cursor      | `.cursor/` or `.cursorrules`    | `.cursorrules` (appended)       |
+
+**Available skills** (as of v0.5.0):
+
+| Skill  | Description                                                                                     |
+|--------|-------------------------------------------------------------------------------------------------|
+| `port` | Port PyTorch scripts to flodl. Reads source, maps patterns, generates Rust project, validates with `cargo check`. |
+
+After installing, use `/port my_model.py` in Claude Code, or ask
+"Port this PyTorch code to flodl" in Cursor. Skill files are embedded
+in the `fdl` binary, so this works anywhere, even without a flodl
+checkout. Inside the repo, it uses the latest `ai/skills/` files from
+the source tree.
+
+## `fdl completions` / `fdl autocomplete`
+
+Generate shell completion scripts. Completions are project-aware: they
+reflect the current `fdl.yml`'s `commands:` (all three kinds) plus every
+sub-command's own nested entries, and are **value-aware** for flags
+declared with `choices:`.
+
+```bash
+fdl completions bash > ~/.local/share/bash-completion/completions/fdl
+fdl completions zsh  > "${fpath[1]}/_fdl"
+fdl completions fish > ~/.config/fish/completions/fdl.fish
+
+fdl autocomplete    # auto-detect and install into the right shell
+```
+
+Example of value-aware completion:
+
+```bash
+fdl libtorch download --cuda <TAB>   # offers: 12.6  12.8
+fdl ddp-bench quick --model <TAB>    # offers values from fdl.yml `choices:`
+```
+
+Re-running `fdl completions` picks up new entries as `fdl.yml` evolves.
+

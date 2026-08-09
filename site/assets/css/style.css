@@ -1658,3 +1658,50 @@ body > .guide-layout {
   /* `.content table` scrolling is unconditional now (see the Tables rule),
      so there is nothing mobile-specific left to add here. */
 }
+
+/* ── Guide channel banner + version switcher ──────────────────────────────
+   The guide publishes under a permanent version segment, so a reader can land
+   on any version from a search engine or an old link. The banner is what makes
+   that safe: it says which version this is and links to current, rather than
+   redirecting, which would silently lose the page they asked for. */
+.guide-banner {
+  margin: 0 0 1.75rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--dim);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.guide-banner strong { color: var(--text); }
+.guide-banner a { color: var(--accent); }
+.guide-banner-main { border-left-color: var(--yellow); }
+.guide-banner-old  { border-left-color: var(--cyan); }
+
+.sidebar-versions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0 0 0.85rem;
+  margin: 0 0 0.35rem;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-versions label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+.sidebar-versions select {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+}

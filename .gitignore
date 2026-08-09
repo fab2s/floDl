@@ -23,8 +23,17 @@ ddp-bench/data/
 # before it is publishable, so the tree is kept on disk, out of git.
 /research/
 
-# Generated guide pages (built from site/_stubs/ + docs/ by site/build_guide.py)
+# Generated guide pages (built from site/_stubs/ + docs/ by site/build_guide.py).
+# Two of the three channels are generated on every build and ignored:
+#   site/guide/*.md    bare-path redirects to the current release series
+#   site/guide/main/   the unreleased channel
+# Release series (site/guide/0.8.x/ and friends) are the exception and are
+# COMMITTED, because their whole purpose is to keep serving the version they
+# documented after the source has moved on. That also makes them patchable in
+# place: a typo in shipped docs is a normal edit, not a wait for the next
+# release. Do not add a wildcard here that would swallow them.
 site/guide/*.md
+site/guide/main/
 # Jekyll build output and bundle lock
 site/_site/
 site/.jekyll-cache/
@@ -52,3 +61,6 @@ fdl.*.yml
 mempalace.yaml
 entities.json
 /cores/
+
+# Unreleased-channel generated files (release series are committed)
+site/_includes/sidebar-main.html

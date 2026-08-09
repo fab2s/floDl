@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+{%- comment -%}
+Soft redirect from a bare /guide/... path to the current release series.
+
+GitHub Pages serves static files and cannot emit a 301, so this is the whole
+redirect mechanism for the version hop. The pieces do different jobs and all
+three are needed:
+
+  refresh    moves a reader, immediately
+  canonical  tells a search engine which URL owns the content, which is what
+             actually consolidates ranking; the refresh alone would not
+  noindex    keeps this stub itself out of the index, so the versioned page
+             competes rather than the placeholder
+
+Cloudflare still fronts this with real 301s for the older flat paths, so a
+legacy link takes two hops. That is deliberate: pointing the CDN rules
+straight at a version would be one hop, but they would need a manual edit
+every release, and one forgotten edit freezes every legacy link on an old
+version, silently.
+{%- endcomment -%}
+<meta http-equiv="refresh" content="0; url={{ page.redirect_to | relative_url }}">
+<link rel="canonical" href="{{ page.redirect_to | absolute_url }}">
+<meta name="robots" content="noindex">
+<title>Redirecting to {{ page.redirect_to }}</title>
+</head>
+<body>
+<p>This page has moved to <a href="{{ page.redirect_to | relative_url }}">{{ page.redirect_to }}</a>.</p>
+</body>
+</html>

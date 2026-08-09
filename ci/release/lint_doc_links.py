@@ -88,7 +88,16 @@ CODE_SPAN = re.compile(r"(`+)(.+?)\1")
 
 # Check 4. The leading `(?<![\w.-])` keeps the filesystem path `site/guide/...`
 # out of a check about URLs.
-GUIDE_URL = re.compile(r"(?<![\w.-])(/guide/[A-Za-z0-9/_-]*)")
+#
+# A dot is allowed only INSIDE a segment, never at the end. The guide is
+# versioned in the URL (`/guide/0.8.x/tensors`) and a class without the dot
+# stopped at the first one: every such link matched as the nonexistent
+# `/guide/0` and was reported broken, which read as a wave of failures rather
+# than as one missing character. Anchoring the dot between word characters is
+# what keeps sentence-final punctuation ("see /guide/tensors.") out of the URL.
+GUIDE_URL = re.compile(
+    r"(?<![\w.-])(/guide(?:/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)*/?)"
+)
 
 
 def tracked(patterns):
@@ -221,11 +230,29 @@ def links_of(content):
 
 def published_permalinks(root):
     """Every guide URL that exists, read from the stub frontmatter that defines
-    them. `/guide/` itself is the landing page."""
+    them. `/guide/` itself is the landing page.
+
+    Stubs declare the BARE path (`/guide/tensors`); the site publishes each one
+    under a channel segment as well (`/guide/main/tensors`,
+    `/guide/0.8.x/tensors`), because the guide is versioned in the URL so links
+    written against a release keep resolving. Both spellings are legitimate and
+    mean different things: a bare link follows the current release, a
+    channel-prefixed one is pinned. So both are accepted here, and the channel
+    set is read off the published trees rather than hardcoded.
+    """
     urls = {"/guide", "/guide/"}
     stub_dir = os.path.join(root, "site", "_stubs")
     if not os.path.isdir(stub_dir):
         return None
+
+    guide_root = os.path.join(root, "site", "guide")
+    channels = ["main"]
+    if os.path.isdir(guide_root):
+        channels += [d for d in os.listdir(guide_root)
+                     if re.match(r"^\d+\.\d+\.x$", d)
+                     and os.path.isdir(os.path.join(guide_root, d))]
+
+    bare = []
     for name in os.listdir(stub_dir):
         if not name.endswith(".md"):
             continue
@@ -233,8 +260,15 @@ def published_permalinks(root):
             for line in fh:
                 m = re.match(r"^permalink:\s*(\S+)", line)
                 if m:
-                    urls.add(m.group(1).rstrip("/"))
+                    bare.append(m.group(1).rstrip("/"))
                     break
+
+    for url in bare:
+        urls.add(url)
+        for ch in channels:
+            urls.add(url.replace("/guide/", f"/guide/{ch}/", 1))
+    for ch in channels:
+        urls.add(f"/guide/{ch}")
     return urls
 
 

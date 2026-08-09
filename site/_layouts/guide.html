@@ -3,7 +3,12 @@ layout: default
 ---
 
 <div class="guide-layout">
-  {% include sidebar.html %}
+  {%- comment -%}
+  Per-channel sidebar: the nav freezes with the version it documents, so a
+  superseded tree never renders main's navigation.
+  {%- endcomment -%}
+  {%- assign sb = 'sidebar-' | append: page.channel | append: '.html' -%}
+  {% include {{ sb }} %}
   <!-- Narrow-width access to the guide nav. Below 900px the sidebar becomes an
        off-canvas drawer, and this is the only way to reach it, so the handle is
        always present rather than hover- or scroll-dependent. Bottom-left keeps it
@@ -15,6 +20,28 @@ layout: default
   </button>
   <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
   <main class="guide-content content">
+    {%- comment -%}
+    Channel banner. The guide publishes under a permanent version segment, so a
+    reader can land on any version from a search engine or an old link. Telling
+    them which one, with a link to current, is what makes that safe: the
+    alternative, redirecting an old page to the new one, silently loses the
+    page they actually asked for.
+    {%- endcomment -%}
+    {%- assign gv = site.data.guide_versions -%}
+    {%- if page.channel == 'main' -%}
+    <div class="guide-banner guide-banner-main">
+      <strong>Unreleased.</strong> This documents the main branch, which is not
+      published yet. For the current release see
+      <a href="{{ page.url | replace: '/guide/main/', '/guide/' | append: '' | relative_url }}">the released guide</a>.
+    </div>
+    {%- elsif page.channel and gv.current and page.channel != gv.current -%}
+    <div class="guide-banner guide-banner-old">
+      <strong>flodl {{ page.channel }}.</strong> This is a superseded release
+      series, kept so existing links keep working. The current release is
+      <a href="{{ page.url | replace: page.channel, gv.current | relative_url }}">{{ gv.current }}</a>.
+    </div>
+    {%- endif -%}
+
     {{ content }}
 
     {% if page.prev_url or page.next_url %}
