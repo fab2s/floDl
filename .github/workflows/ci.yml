@@ -264,6 +264,9 @@ jobs:
   cuda-build:
     name: CUDA (build + clippy)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -274,31 +277,41 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: buildx-cuda-${{ hashFiles('Dockerfile.cuda') }}
-          restore-keys: buildx-cuda-
-
-      - name: Build CUDA Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.cuda
-          load: true
-          tags: flodl-cuda-ci
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
-
-      # Rotate cache to prevent unbounded growth
-      - name: Rotate buildx cache
+      # Pull what images.yml published for exactly this Dockerfile, and
+      # build it here when there is none.
+      #
+      # The fallback is not a nicety. A PR that EDITS Dockerfile.cuda has
+      # no published image yet, because the publish runs on main: without
+      # it that PR would silently test against the PREVIOUS image and go
+      # green on a Dockerfile nothing ever built. Keying the tag on the
+      # file's content hash is what makes "the right image or none" a
+      # decidable question.
+      #
+      # This replaces a buildx layer cache that held ~6 GiB of the
+      # repository's 10 GiB Actions-cache budget and traded evictions with
+      # the ROCm one run about, taking the cargo and libtorch caches down
+      # with it. A registry pull costs that budget nothing.
+      - name: Resolve the CUDA image
+        id: image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+          owner=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          tag="ghcr.io/$owner/flodl-cuda:${{ hashFiles('Dockerfile.cuda') }}"
+          # Non-fatal: a public package pulls anonymously, and a fork PR's
+          # token may not carry packages:read. Either way the pull below
+          # decides, and a failure there lands on the local build.
+          printf '%s' "$GH_TOKEN" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          if docker pull -q "$tag"; then
+            echo "image=$tag" >> "$GITHUB_OUTPUT"
+            echo "::notice::pulled $tag"
+          else
+            echo "::notice::no published image for this Dockerfile.cuda, building it here"
+            docker build -f Dockerfile.cuda -t flodl-cuda-ci . || exit 1
+            echo "image=flodl-cuda-ci" >> "$GITHUB_OUTPUT"
+          fi
+          df -h /
 
       - name: Cache libtorch download (CUDA)
         id: cache-libtorch-cuda
@@ -319,13 +332,26 @@ jobs:
       # `-D warnings` for the reason spelled out there too: this leg and
       # the ROCm one are where the GPU-gated lints live, so they are the
       # two the old `-W clippy::all` was silently letting through.
+      #
+      # `CARGO_HOME` inside the workspace, here and in the two steps
+      # below, because each `docker run --rm` otherwise gets the image's
+      # baked `/usr/local/cargo` fresh and re-downloads the whole registry:
+      # measured at 3 downloads of every crate per job. It costs seconds
+      # rather than minutes (cargo treats registry sources as immutable
+      # and does not mtime-check them, so nothing RECOMPILES), and it only
+      # spans this job, since the runner is a fresh VM next time. Pointing
+      # it at the bind-mounted workspace is what makes it outlive `--rm`;
+      # mounting over `/usr/local/cargo` instead would hide the toolchain,
+      # which is on PATH there. `target/` needs no such treatment: it
+      # already lives in the workspace.
       - name: Clippy with CUDA feature
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-cuda-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo clippy --features cuda --all-targets -- -D warnings
 
       # `--tests` is what makes this a LINK, not just a compile. The
@@ -344,7 +370,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-cuda-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo build --features cuda --tests
           df -h /
 
@@ -363,12 +390,16 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-cuda-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo test -p flodl --features cuda --lib -- --test-threads=1 --skip leakcheck
 
   rocm-build:
     name: ROCm (build + clippy)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -383,30 +414,29 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache-rocm
-          key: buildx-rocm-${{ hashFiles('Dockerfile.rocm') }}
-          restore-keys: buildx-rocm-
-
-      - name: Build ROCm Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.rocm
-          load: true
-          tags: flodl-rocm-ci
-          cache-from: type=local,src=/tmp/.buildx-cache-rocm
-          cache-to: type=local,dest=/tmp/.buildx-cache-rocm-new,mode=max
-
-      - name: Rotate buildx cache
+      # See the CUDA job for why this pulls rather than builds, and why
+      # the local-build fallback is load-bearing. This leg is where it
+      # matters most: the ~25 GB base made `load: true` an export of the
+      # whole image into the docker daemon on every run, and a cold cache
+      # cost 786s against 313-328s warm.
+      - name: Resolve the ROCm image
+        id: image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rm -rf /tmp/.buildx-cache-rocm
-          mv /tmp/.buildx-cache-rocm-new /tmp/.buildx-cache-rocm
+          owner=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          tag="ghcr.io/$owner/flodl-rocm:${{ hashFiles('Dockerfile.rocm') }}"
+          printf '%s' "$GH_TOKEN" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          if docker pull -q "$tag"; then
+            echo "image=$tag" >> "$GITHUB_OUTPUT"
+            echo "::notice::pulled $tag"
+          else
+            echo "::notice::no published image for this Dockerfile.rocm, building it here"
+            docker build -f Dockerfile.rocm -t flodl-rocm-ci . || exit 1
+            echo "image=flodl-rocm-ci" >> "$GITHUB_OUTPUT"
+          fi
+          df -h /
 
       # The `-so` token encodes the extract SHAPE, not just the libtorch
       # version. actions/cache restores by key alone: without it, an entry
@@ -476,7 +506,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-rocm-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo clippy -p flodl-sys -p flodl --features rocm --all-targets -- -D warnings
 
       # Scoped to the two crates that actually carry the vendor mapping.
@@ -486,7 +517,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-rocm-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo build -p flodl-sys -p flodl --features rocm
 
       # ONE separate integration-test binary, linked but never run (no AMD
@@ -507,7 +539,8 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-rocm-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo build --features rocm -p flodl-hf --test bert_cuda_smoke
           df -h /
 
@@ -522,6 +555,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
             -w /workspace \
-            flodl-rocm-ci \
+            -e CARGO_HOME=/workspace/.cargo-ci \
+            ${{ steps.image.outputs.image }} \
             cargo test -p flodl --features rocm --lib -- --test-threads=1 --skip leakcheck
           df -h /

@@ -1,0 +1,128 @@
+name: CI images
+
+# Builds the CUDA and ROCm toolchain images and pushes them to GHCR, so
+# ci.yml can PULL what it used to rebuild on every run.
+#
+# Why this workflow exists, measured 2026-08-09 rather than assumed. The
+# image build was ci.yml's long pole (406s CUDA, 328s ROCm warm, 786s
+# cold), but the bigger cost was invisible: buildx layer caches held
+# through `actions/cache` consumed most of the repository's 10 GiB cache
+# budget, and the two evicted each other on alternating runs, taking the
+# cargo and libtorch caches down with them. Registry storage does not
+# touch that budget at all, and GHCR is free for public packages.
+#
+# These images carry NO flodl code. They are a vendor toolkit plus rust
+# plus cargo-llvm-cov; libtorch is bind-mounted at runtime by design (see
+# the header of each Dockerfile). So they are versioned by the DOCKERFILE,
+# never by flodl's version: a `flodl-cuda:0.8.0` tag would claim a
+# relationship that does not exist and would force a rebuild every
+# release.
+#
+# The primary tag is the Dockerfile's content hash, which is what makes
+# ci.yml's pull safe: it asks for the image built from exactly the
+# Dockerfile in its own tree, and builds locally when that does not exist
+# yet. Neither Dockerfile has a COPY or ADD, so the file alone determines
+# the image and the build context contributes nothing. ADDING ONE WOULD
+# BREAK THAT and the hash would have to cover the copied paths too.
+#
+# The hash is an identity, not a reproducibility claim: apt and rustup
+# resolve to whatever is current, so the same Dockerfile built twice
+# yields different bytes. That is fine here. It answers "which recipe",
+# and rebuilding is a `workflow_dispatch` away.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.cuda'
+      - 'Dockerfile.rocm'
+      - '.github/workflows/images.yml'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # Both images report. ROCm failing must not hide a CUDA break, and
+      # ci.yml degrades to a local build per image independently anyway.
+      fail-fast: false
+      matrix:
+        include:
+          - name: flodl-cuda
+            dockerfile: Dockerfile.cuda
+          - name: flodl-rocm
+            dockerfile: Dockerfile.rocm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ROCm base is ~25 GB. Same sweep the ci.yml jobs run.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /opt/hostedtoolcache \
+            /usr/local/share/powershell /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Lowercased because a GHCR path must be, and an owner is free to
+      # carry capitals. `hashFiles` is the same function ci.yml uses to
+      # resolve the tag, so the two cannot drift apart.
+      - name: Compose the tags
+        id: tags
+        run: |
+          owner=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          repo="ghcr.io/$owner/${{ matrix.name }}"
+          hash="${{ hashFiles(matrix.dockerfile) }}"
+          # An empty hash means hashFiles matched nothing, which would
+          # push a `repo:` tag or, worse, quietly publish under a name
+          # ci.yml can never ask for. Say so instead.
+          if [ -z "$hash" ]; then
+            echo "::error::hashFiles(${{ matrix.dockerfile }}) is empty; the file is missing or the path is wrong"
+            exit 1
+          fi
+          echo "digest_tag=$repo:$hash" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$repo:latest" >> "$GITHUB_OUTPUT"
+          echo "publishing $repo:$hash"
+
+      # No `load:` and no layer cache, deliberately. Nothing here consumes
+      # the image locally, so buildkit streams it straight to the registry
+      # instead of materializing 25 GB in the docker daemon first, and a
+      # workflow that runs only when a Dockerfile changes has nothing to
+      # gain from caching layers between those changes.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.digest_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+
+      - name: Report
+        run: |
+          echo "pushed ${{ steps.tags.outputs.digest_tag }}"
+          echo "pushed ${{ steps.tags.outputs.latest_tag }}"
+          df -h /
