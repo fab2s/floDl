@@ -20,6 +20,13 @@
   <meta property="og:description" content="{{ page.description | default: site.description }}">
   <meta property="og:type" content="website">
   <meta property="og:url" content="{{ page.url | absolute_url }}">
+  {%- comment -%}
+  No cache-bust token on the social images, deliberately, unlike every other
+  asset here. Scrapers key their previews on this URL and re-fetch on their own
+  schedule; changing it would invalidate cards that are already correct, and a
+  logo is not the asset whose staleness anyone notices. Busting is for assets
+  the page's own correctness depends on.
+  {%- endcomment -%}
   <meta property="og:image" content="{{ '/assets/images/logo.png' | absolute_url }}">
 
   <!-- Twitter Card -->
@@ -28,7 +35,17 @@
   <meta name="twitter:description" content="{{ page.description | default: site.description }}">
   <meta name="twitter:image" content="{{ '/assets/images/logo.png' | absolute_url }}">
 
-  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}">
+  {%- comment -%}
+  `?v=<content hash>` so a CDN cannot serve the previous deploy's stylesheet
+  against the current HTML. This site sits behind a four-hour edge TTL, and a
+  CSS change was otherwise invisible until it expired or somebody purged by
+  hand: the version switcher shipped looking unstyled for exactly that reason,
+  with nothing on the page to say the stylesheet was stale. The token is a
+  hash of the file, not of the build, so an unchanged asset keeps its cache.
+  Written by site/build_guide.py into _data/asset_hashes.yml.
+  {%- endcomment -%}
+  {%- assign css = '/assets/css/style.css' -%}
+  <link rel="stylesheet" href="{{ css | relative_url }}?v={{ site.data.asset_hashes[css] }}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f9e0;</text></svg>">
   <script>
     // Resolve the theme before CSS loads, to prevent a flash.
@@ -70,7 +87,7 @@
 
 <header class="site-header">
   <nav>
-    <a href="{{ '/' | relative_url }}" class="logo"><img src="{{ '/assets/images/logo-nav.png' | relative_url }}" alt="floDl" class="logo-img"></a>
+    <a href="{{ '/' | relative_url }}" class="logo"><img src="{{ '/assets/images/logo-nav.png' | relative_url }}?v={{ site.data.asset_hashes['/assets/images/logo-nav.png'] }}" alt="floDl" class="logo-img"></a>
     <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Menu">
       <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
     </button>
