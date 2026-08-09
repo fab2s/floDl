@@ -192,6 +192,17 @@ jobs:
       # advise about stays out, so the probe assertions run against an
       # honest baseline. GITHUB_RUN_NUMBER rides in for the rotation,
       # GITHUB_ACTIONS for the ::group:: folds.
+      #
+      # The install is retried because Rocky's mirrorlist service returns an
+      # empty list often enough to matter: `Cannot prepare internal
+      # mirrorlist: No URLs in mirrorlist`, seen on EL10's appstream repo in
+      # two of three consecutive runs, with a plain re-run clearing it in
+      # between. That fail-pass-fail pattern is what rules out the
+      # alternative reading, a retired repo path, which no retry could fix.
+      # Retrying rather than tolerating: a leg that is red at random trains
+      # everyone to wave red away, and that is how a real failure gets
+      # missed. Three attempts, then a loud error rather than a silent
+      # continue into a build with no compiler.
       - name: ci/os-matrix.sh in a ${{ matrix.image }} container
         env:
           FDL_CI_VARIANT: ${{ (github.event.inputs.variant == '' || github.event.inputs.variant == 'rotate') && matrix.variant || github.event.inputs.variant }}
@@ -205,7 +216,18 @@ jobs:
             -e FDL_CI_VARIANT -e GITHUB_ACTIONS -e GITHUB_RUN_NUMBER \
             ${{ matrix.image }} bash -c '
               set -e
-              dnf install -y -q git gcc gcc-c++ unzip tar gzip findutils gawk
+              ok=0
+              for attempt in 1 2 3; do
+                if dnf install -y -q git gcc gcc-c++ unzip tar gzip findutils gawk; then
+                  ok=1; break
+                fi
+                echo "dnf attempt $attempt failed (mirrorlist), retrying in 5s"
+                sleep 5
+              done
+              if [ "$ok" != 1 ]; then
+                echo "::error::dnf install failed after 3 attempts"
+                exit 1
+              fi
               if [ ! -x /root/.cargo/bin/cargo ]; then
                 curl -sSf https://sh.rustup.rs \
                   | sh -s -- -y --profile minimal --component clippy
