@@ -45,7 +45,12 @@ fi
 # Scoped to tracked markdown. CHANGELOG.md is excluded: it records
 # historical state, so an old release's entry legitimately quotes an old
 # pin.
-STALE_DOC=$(git grep -nE '(flodl|flodl-cli|flodl-cli-macros|flodl-hw|flodl-hf|flodl-sys) ?= ?"=[0-9]+\.[0-9]+\.[0-9]+"' \
+# Two spellings, and the second one is why this check nearly shipped
+# useless: docs pin BOTH `flodl-hf = "=X.Y.Z"` and the feature-selecting
+# table form `flodl-hf = { version = "=X.Y.Z", default-features = false }`.
+# The original pattern saw only the first, so at the 0.8.0 bump four
+# table-form pins still said 0.5.3 and the gate went green.
+STALE_DOC=$(git grep -nE '(flodl|flodl-cli|flodl-cli-macros|flodl-hw|flodl-hf|flodl-sys) *= *(\{ *version *= *)?"=[0-9]+\.[0-9]+\.[0-9]+"' \
     -- '*.md' ':!CHANGELOG.md' ':!site/_site' ':!site/.jekyll-cache' ':!site/_posts' 2>/dev/null |
     grep -vE "\"=$VERSION\"" || true)
 
