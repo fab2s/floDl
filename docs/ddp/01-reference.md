@@ -127,7 +127,7 @@ trampoline; pick whichever shape your call site prefers.
 > `Module::on_device(CUDA(_))`, no CUDA-Tensor construction in `main()`.
 > Cluster fan-out exits the launcher process without running training;
 > touching CUDA there corrupts spawned children's context on
-> heterogeneous-GPU rigs. Use `flodl::sys::detect_gpus()` (CUDA-free)
+> heterogeneous-GPU rigs. Use `flodl::sys::detect_gpus()` (loads no GPU runtime)
 > for any pre-run GPU query.
 
 ---
@@ -686,7 +686,7 @@ than the whole cluster, so cost does not grow with rank count. See
 
 ---
 
-## CUDA-free GPU detection - `flodl::sys::detect_gpus`
+## GPU detection without a GPU runtime - `flodl::sys::detect_gpus`
 
 `detect_gpus() -> Vec<GpuInfo>` enumerates GPUs without loading
 libtorch, returning per-device `index`, `vendor`, `name`, `arch` and

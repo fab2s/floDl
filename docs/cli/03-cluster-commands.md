@@ -25,7 +25,7 @@ post-deploy smoke test.
 **What it checks:**
 
 - **GPU inventory**: count, name, vendor, arch (sm or gfx), VRAM per
-  device — CUDA-free and libtorch-free by construction (NVIDIA via
+  device — free of any GPU runtime and of libtorch by construction (NVIDIA via
   nvidia-smi, AMD via the kernel's KFD topology), and the sweep's
   findings ride along: an AMD card present with no ROCm runtime is
   reported with the install command, not silently dropped.
