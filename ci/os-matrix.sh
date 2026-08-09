@@ -275,7 +275,7 @@ cargo test -p flodl-cli -p flodl-hw --all-targets || fail "$HOST: cli/hw tests"
 endgroup
 
 group "Clippy (flodl-cli + flodl-hw)"
-cargo clippy -p flodl-cli -p flodl-hw --all-targets -- -W clippy::all \
+cargo clippy -p flodl-cli -p flodl-hw --all-targets -- -D warnings \
     || fail "$HOST: cli/hw clippy"
 endgroup
 
@@ -597,11 +597,11 @@ if [ "$GPU" = 1 ]; then
     # a link check while 60-odd would add ~8 GB beside a libtorch that is
     # 11 GB on the rocm rotation. Linked, never run -- no GPU here.
     BUILD_CMD="cargo build --features $FEATURE"
-    CLIPPY_CMD="cargo clippy --features $FEATURE --all-targets -- -W clippy::all"
+    CLIPPY_CMD="cargo clippy --features $FEATURE --all-targets -- -D warnings"
     LINK_CMD="cargo build --features $FEATURE -p flodl-hf --test bert_cuda_smoke"
 else
     BUILD_CMD="cargo build -p flodl-sys -p flodl"
-    CLIPPY_CMD="cargo clippy -p flodl-sys -p flodl --all-targets -- -W clippy::all"
+    CLIPPY_CMD="cargo clippy -p flodl-sys -p flodl --all-targets -- -D warnings"
     # No separate link command on the CPU legs: the two commands above
     # stop at rlib and at metadata, and the OS-specific link + load +
     # run now happens in the scaffold smoke below, which builds a real

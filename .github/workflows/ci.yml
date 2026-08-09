@@ -157,6 +157,25 @@ jobs:
           unzip -q "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip"
           rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cpu.zip"
 
+      # `-D warnings`, not `-W clippy::all`. The latter is a no-op:
+      # clippy::all is already warn-by-default, so the step could only ever
+      # fail on a compile error the build had covered anyway, and a lint
+      # printed here was advisory. Three GPU-gated `collapsible_if` lints
+      # rode the CUDA and ROCm legs' output that way. `-D warnings` also
+      # covers rustc's own (dead_code, unused_imports), matching what the
+      # doc step already does with RUSTDOCFLAGS.
+      #
+      # Ahead of the build, and that costs nothing: clippy drives workspace
+      # crates through clippy-driver under its own fingerprint but shares
+      # the dependency rlibs, so the workspace compiles twice whichever
+      # order these run in. Only the time-to-failure changes, by minutes.
+      - name: Clippy
+        env:
+          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build
         env:
           LIBTORCH_PATH: ${{ github.workspace }}/libtorch
@@ -225,13 +244,6 @@ jobs:
           ci_path=$(printf '%s' "$report" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["cloud_init_path"])')
           python3 -c "import sys,yaml; d=yaml.safe_load(open(sys.argv[1])); assert isinstance(d,dict) and 'write_files' in d, sorted(d); print('cloud-init parses; top-level keys:', sorted(d))" "$ci_path"
-
-      - name: Clippy
-        env:
-          LIBTORCH_PATH: ${{ github.workspace }}/libtorch
-          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-          LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
-        run: cargo clippy --all-targets -- -W clippy::all
 
       - name: Doc (strict, fails on warnings)
         # Clippy doesn't lint doc comments -- rustdoc is the only validator
@@ -303,10 +315,23 @@ jobs:
           mv libtorch libtorch-ci
           rm "libtorch-shared-with-deps-${LIBTORCH_VERSION}+cu128.zip"
 
+      # Ahead of the build for the reason spelled out in the CPU job, and
+      # `-D warnings` for the reason spelled out there too: this leg and
+      # the ROCm one are where the GPU-gated lints live, so they are the
+      # two the old `-W clippy::all` was silently letting through.
+      - name: Clippy with CUDA feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-cuda-ci \
+            cargo clippy --features cuda --all-targets -- -D warnings
+
       # `--tests` is what makes this a LINK, not just a compile. The
       # workspace's only `[[bin]]` is `fdl`, which is zero-dep on flodl by
       # policy, so a plain `cargo build` produces exactly one executable
-      # and it references no libtorch at all; clippy below runs in check
+      # and it references no libtorch at all; clippy above runs in check
       # mode and never invokes the linker either. Test targets are the
       # only thing here that reaches ld -- and reaching it is the point:
       # the libtorch_cuda force-load and gpu_compat.h's symbol mapping
@@ -340,15 +365,6 @@ jobs:
             -w /workspace \
             flodl-cuda-ci \
             cargo test -p flodl --features cuda --lib -- --test-threads=1 --skip leakcheck
-
-      - name: Clippy with CUDA feature
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}:/workspace" \
-            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
-            -w /workspace \
-            flodl-cuda-ci \
-            cargo clippy --features cuda --all-targets -- -W clippy::all
 
   rocm-build:
     name: ROCm (build + clippy)
@@ -452,6 +468,17 @@ jobs:
           fi
           echo "link set present"
 
+      # Ahead of the build, `-D warnings`: see the CPU job. Scoped to the
+      # same two crates as the build below.
+      - name: Clippy with ROCm feature
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
+            -w /workspace \
+            flodl-rocm-ci \
+            cargo clippy -p flodl-sys -p flodl --features rocm --all-targets -- -D warnings
+
       # Scoped to the two crates that actually carry the vendor mapping.
       - name: Build with ROCm feature
         run: |
@@ -498,12 +525,3 @@ jobs:
             flodl-rocm-ci \
             cargo test -p flodl --features rocm --lib -- --test-threads=1 --skip leakcheck
           df -h /
-
-      - name: Clippy with ROCm feature
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}:/workspace" \
-            -v "${{ github.workspace }}/libtorch-ci:/usr/local/libtorch:ro" \
-            -w /workspace \
-            flodl-rocm-ci \
-            cargo clippy -p flodl-sys -p flodl --features rocm --all-targets -- -W clippy::all

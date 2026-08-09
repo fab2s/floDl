@@ -979,7 +979,7 @@ commands:
     run: cargo check{cpu_svc}
   clippy:
     description: Lint
-    run: cargo clippy -- -W clippy::all{cpu_svc}
+    run: cargo clippy -- -D clippy::all{cpu_svc}
 {shell_block}  # --- GPU {gpu_note} ---
   # $FDL_GPU_FEATURE is exported by fdl from the active libtorch variant,
   # so these stay correct if you switch variants.
