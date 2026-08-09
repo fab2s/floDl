@@ -38,11 +38,18 @@ fi
 
 FAIL=0
 SKIPPED=""
+UNCHECKABLE=""
+# Count what was actually COMPARED, not just what did not fail. A crate
+# with no crates.io baseline is skipped, and a summary that says PASS
+# after skipping everything is a verdict about zero comparisons -- the
+# same shape as a resume marker satisfied without the work.
+CHECKED=0
 for c in $CRATES; do
     OUT=$(DOCS_RS=1 cargo semver-checks check-release -p "$c" 2>&1)
     RC=$?
     if [ "$RC" -eq 0 ]; then
         echo "PASS: $c"
+        CHECKED=$((CHECKED + 1))
         continue
     fi
     # A crate that has never been published has no baseline to compare
@@ -53,15 +60,38 @@ for c in $CRATES; do
         SKIPPED="$SKIPPED $c"
         continue
     fi
-    echo "FAIL: $c requires a larger version bump than Cargo.toml declares"
+    # A proc-macro crate exports no library API surface, so there is
+    # nothing for rustdoc JSON to compare and the tool refuses outright.
+    # Without this branch the catch-all below reports "requires a larger
+    # version bump" for a crate that CANNOT be checked at all -- which is
+    # what it did for flodl-cli-macros on this gate's first real run,
+    # a false alarm that would have blocked the 0.8.0 release.
+    if printf '%s' "$OUT" | grep -qE "no library target|nothing to semver-check"; then
+        echo "SKIP: $c has no library target (proc-macro: no API surface to compare)"
+        UNCHECKABLE="$UNCHECKABLE $c"
+        continue
+    fi
+    # Catch-all. Anything reaching here is a non-zero exit that is NOT a
+    # known non-failure, so it is reported as breakage -- but the message
+    # names the assumption, because a build error or a network failure
+    # would also land here.
+    echo "FAIL: $c requires a larger version bump than Cargo.toml declares (or the check itself errored -- see output)"
     printf '%s\n' "$OUT" | grep -E "^--- failure|^ *Summary|^ *function |^ *struct |^ *enum |^ *method " | head -20 | sed 's/^/    /'
+    CHECKED=$((CHECKED + 1))
     FAIL=1
 done
 
 [ -n "$SKIPPED" ] && echo "NOTE: unpublished, not checked:$SKIPPED"
+[ -n "$UNCHECKABLE" ] && echo "NOTE: no library target, uncheckable by construction:$UNCHECKABLE"
 
-if [ "$FAIL" = 0 ]; then
-    echo "PASS: no public API breakage beyond the declared version"
+if [ "$FAIL" = 0 ] && [ "$CHECKED" -eq 0 ]; then
+    # Every crate skipped: nothing was compared, so there is nothing to
+    # pass. Non-fatal like the missing-tool branch above, but it must not
+    # read as coverage.
+    echo "UNVERIFIED: no crate had a crates.io baseline, so NOTHING was compared"
+elif [ "$FAIL" = 0 ]; then
+    # Scope the claim to what was actually examined.
+    echo "PASS: no public API breakage in the $CHECKED crate(s) with a baseline"
 else
     echo
     echo "Under 0.x, a breaking change needs a MINOR bump (0.7 -> 0.8);"

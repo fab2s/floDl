@@ -26,7 +26,7 @@ add flodl-hf` exposes two modes that you can combine.
 fdl add flodl-hf --playground   # try it: drops ./flodl-hf/ sandbox crate
 fdl flodl-hf classify           # runs a real fine-tune via AutoModel
 
-fdl add flodl-hf --install      # wire it: appends flodl-hf="=0.7.0" to Cargo.toml
+fdl add flodl-hf --install      # wire it: appends flodl-hf="=0.8.0" to Cargo.toml
 fdl build                       # cargo pulls + compiles the new dep
 ```
 
@@ -36,7 +36,7 @@ runnable commands, and a `flodl-hf:` entry in the root `fdl.yml` so
 `fdl flodl-hf <cmd>` routes from project root. The host project's
 `Cargo.toml` and `fdl.yml` are untouched.
 
-`--install` appends `flodl-hf = "=0.7.0"` (default features = `hub` +
+`--install` appends `flodl-hf = "=0.8.0"` (default features = `hub` +
 `tokenizer`) to the root `Cargo.toml` `[dependencies]` and stops there.
 Idempotent. Edit the entry by hand to switch flavors (see
 [Install](#install) below).
@@ -59,7 +59,7 @@ feature profiles cover the common deployment shapes.
 ### Full HuggingFace experience (default)
 
 ```toml
-flodl-hf = "=0.7.0"
+flodl-hf = "=0.8.0"
 ```
 
 Pulls `safetensors` + `hf-hub` + `tokenizers`. Everything needed to
@@ -73,7 +73,7 @@ tokenization. Drops the `tokenizers` crate and its regex + unicode
 surface.
 
 ```toml
-flodl-hf = { version = "=0.5.3", default-features = false, features = ["hub"] }
+flodl-hf = { version = "=0.8.0", default-features = false, features = ["hub"] }
 ```
 
 ### Offline / minimal (safetensors-only)
@@ -83,7 +83,7 @@ checkpoints from local disk. Drops Hub downloads and tokenizers. No
 network, no async runtime, no TLS stack, no regex.
 
 ```toml
-flodl-hf = { version = "=0.5.3", default-features = false }
+flodl-hf = { version = "=0.8.0", default-features = false }
 ```
 
 ### Feature matrix

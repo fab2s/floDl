@@ -4,7 +4,7 @@ exclude = ["benchmarks", "ddp-bench", "hf-ddp"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # Measured, not aspirational: `ci.yml`'s msrv job checks the workspace on
 # exactly this toolchain, so a wrong value here is a failing build rather
@@ -62,11 +62,11 @@ homepage = "https://flodl.dev"
 # the requirement is exact: a consumer resolving flodl 0.8 against
 # flodl-sys 0.7 would pair a safe wrapper with a shim it was not built
 # for. Centralised so a release edits ONE line instead of five.
-flodl = { version = "=0.7.0", path = "flodl" }
-flodl-cli = { version = "=0.7.0", path = "flodl-cli" }
-flodl-cli-macros = { version = "=0.7.0", path = "flodl-cli-macros" }
-flodl-hw = { version = "=0.7.0", path = "flodl-hw" }
-flodl-sys = { version = "=0.7.0", path = "flodl-sys" }
+flodl = { version = "=0.8.0", path = "flodl" }
+flodl-cli = { version = "=0.8.0", path = "flodl-cli" }
+flodl-cli-macros = { version = "=0.8.0", path = "flodl-cli-macros" }
+flodl-hw = { version = "=0.8.0", path = "flodl-hw" }
+flodl-sys = { version = "=0.8.0", path = "flodl-sys" }
 
 # --- third party -----------------------------------------------------
 # bincode's successor, and the reason is not a version bump: bincode 2 is

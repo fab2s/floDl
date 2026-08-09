@@ -71,7 +71,7 @@ Edit the `Cargo.toml` entry directly to switch flavors:
 ### Full HuggingFace experience (default)
 
 ```toml
-flodl-hf = "=0.7.0"
+flodl-hf = "=0.8.0"
 ```
 
 Pulls: `safetensors` + `hf-hub` + `tokenizers`. Everything needed to
@@ -84,7 +84,7 @@ is not needed. Drops the `tokenizers` crate and its regex + unicode
 surface.
 
 ```toml
-flodl-hf = { version = "=0.5.3", default-features = false, features = ["hub"] }
+flodl-hf = { version = "=0.8.0", default-features = false, features = ["hub"] }
 ```
 
 ### Offline / minimal (safetensors-only)
@@ -94,7 +94,7 @@ checkpoints from local disk. Drops both hub downloads and tokenizers. No
 network, no async runtime, no TLS stack, no regex.
 
 ```toml
-flodl-hf = { version = "=0.5.3", default-features = false }
+flodl-hf = { version = "=0.8.0", default-features = false }
 ```
 
 ### Feature matrix

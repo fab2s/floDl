@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-09
+
+> Upgrading from 0.7.0? Most of the surface moved by rename with a
+> deprecated alias left behind, so existing code keeps compiling and
+> starts warning. Two changes do not warn: the Rust floor is now **1.91**,
+> and `flodl-hf` needs **owner-qualified Hub repo ids** (`bert-base-uncased`
+> becomes `google-bert/bert-base-uncased`) because hf-hub 1.0 no longer
+> follows the Hub's redirect. See [UPGRADE.md](UPGRADE.md) for the
+> step-by-step migration.
+
 ### Added
 
 - **AMD (ROCm) GPU support.** `flodl-sys` compiles and links against a hipified libtorch. The vendor is a build-time property (libtorch ships one backend per build) and is reconciled in `flodl-sys/gpu_compat.h`, which maps the shim's CUDA spelling onto `c10/hip` + `ATen/hip` and routes streams through `HIPStreamMasqueradingAsCUDA`. Not yet validated on AMD hardware: this covers compile, link, provisioning and detection only. Provisioning is vendor-plural throughout, including the parts that only a second vendor makes visible: cluster fan-out counts a worker's GPUs for both vendors in one round trip (`nvidia-smi` for NVIDIA, the KFD topology's `vendor_id 4098` for AMD, which is mask-proof) and reduces them with that host's declared `arch:`, since one libtorch build serves one vendor and that field already names which; an undeclared host reporting both vendors is refused by name rather than guessed at, because the controller cannot know which build it will load and a guess assigns ranks to devices nobody addresses.
