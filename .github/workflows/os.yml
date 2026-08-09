@@ -171,13 +171,18 @@ jobs:
       # Rust lives inside the container (mounted from cached host dirs),
       # not on the runner: the toolchain must be the one a rocky user
       # would run, glibc and all.
-      - name: Cache cargo + rustup + build artifacts
+      # Downloads only. `target/` used to be listed here and never once
+      # survived: see the chown step below for why the save always failed,
+      # and note that making it work would spend the Actions-cache budget
+      # that dropping the buildx image caches just freed. What is left is
+      # the registry and the toolchain, which are re-fetches rather than
+      # re-compiles.
+      - name: Cache cargo + rustup
         uses: actions/cache@v4
         with:
           path: |
             ~/.rocky/cargo
             ~/.rocky/rustup
-            target
           key: os-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: os-${{ matrix.name }}-
 
@@ -208,3 +213,17 @@ jobs:
               . /root/.cargo/env
               git config --global --add safe.directory /workspace
               bash ci/os-matrix.sh'
+
+      # The container runs as root, so everything it wrote under ~/.rocky is
+      # root-owned and the host-side cache tar cannot read it. That made the
+      # SAVE fail with exit 2, which actions/cache reports as a `##[warning]`
+      # rather than a failure: no entry was ever created, every restore
+      # missed (restore-key included), and both rocky legs cached nothing for
+      # as long as this job has existed while reporting success. 132 tar
+      # `Permission denied` lines per run were the only symptom.
+      #
+      # `always()` because a red script still leaves a cache worth keeping,
+      # and the save step runs regardless.
+      - name: Reclaim container-written files for the cache
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" ~/.rocky
