@@ -94,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.7.0] - 2026-07-29
 
+> Upgrading from 0.6.0? Additive almost everywhere. The only compile-time
+> breaks are two shapes in `flodl::monitor::record` (`Res` gained two
+> public fields, and `to_record_json` / `flat_records` take `Option<u64>`
+> for `tick`), plus a fifth argument on
+> `distributed::launcher::run_launcher_with_config` for direct callers.
+> Nothing to do if you do not name those. See
+> [UPGRADE.md](UPGRADE.md) for the step-by-step migration.
+
 ### Changed (breaking)
 
 - **`distributed::launcher::run_launcher_with_config` takes a fifth argument**, the `Option<[u8; 32]>` model signature that seeds the join window's coherence check (pass `None` to keep first-member seeding). A compile-time error for direct callers; `Trainer::run` / `Trainer::builder().run()` users are unaffected — the trampoline supplies it.
@@ -201,6 +209,15 @@ else in the crate's public surface was removed or re-signatured.
 - **`fdl <cmd> --refresh-schema` probed the wrong binary for docker-wrapped cargo entries**: the probe ran `<entry> --fdl-schema` from the container's compose-root workdir instead of the command's directory, so `cargo run` built and probed the workspace's default binary (`fdl` itself, which rejects the flag) — the refresh failed and the help schema cache silently rotted against the command's real CLI surface (`fdl ddp-bench -h` was missing options added since the last successful probe). The dockerized probe now `cd`s to the command dir (same relative path on both sides of the mount) before running the entry.
 
 ## [0.6.0] - 2026-07-22
+
+> Upgrading from 0.5.x? **This is the widest break in the project's
+> history.** The in-process multi-GPU engine is gone (multi-GPU is now
+> process-per-rank), and with it the self-driven `Trainer::setup` tier,
+> `DataLoader::distributed`, the NCCL async mode, the graph-embedded loss
+> hook, and the compatibility surface deprecated back in 0.3.0.
+> `cluster.yml` also moved to a structured `controller:` / `workers:`
+> schema. See [UPGRADE.md](UPGRADE.md) for the step-by-step migration,
+> which covers each removal and what replaces it.
 
 The headline of this release is a full re-architecture of the distributed layer from a thread-per-GPU in-process model to a process-per-rank cluster model with an authenticated control plane, dial-in membership, elastic failure handling, controller-driven checkpoint orchestration, and a transparent launcher trampoline. The same single training entry (`Trainer::builder()` / `Trainer::run`) now drives single-device, single-host multi-GPU, and multi-host clusters from one code path. Every cross-host channel shares ONE controller port (workers join through it, training rides it, `fdl status` reads it, and `tunnel: true` routes it through SSH). ElChe (the heterogeneous cadence balancer that landed in 0.5.x) gained a phase machine, a divergence guardrail, an LR-aware meta-controller, delivered-cost scheduling, EASGD elastic averaging on the CPU async path, a pluggable outer optimizer (SlowMo / DiLoCo), and a `Fastest` epoch-callback dispatcher for free-compute eval. `fdl` gained a cluster readiness gate (`fdl probe`), a live run-status command (`fdl status`), a libnccl bridge builder (`fdl nccl build`), a global `--gpus` flag, and a strict cluster.yml schema with controller/worker separation.
 
