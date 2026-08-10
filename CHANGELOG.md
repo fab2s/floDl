@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`fdl join-config --list` and `--dry-run`**, the wizard's read-only companions. `--list` enumerates the project's farms — the union of `fdl.<label>.*` overlays and `.fdl/<label>/` farm dirs — with door, controller and credential state; env overlays that are not farms are reported apart rather than dressed as broken ones, and non-farm `.fdl/` state (schema caches) never lists. `--dry-run` runs the full pass with every write withheld and reports what an apply would `create`, `update` or leave alone, per file; credentials an apply would mint appear as placeholders rather than values the apply would not reproduce. Neither ever prompts (a dry run reads the consent flags exactly as given), both combine with `--json`, and every wizard write now goes through one recorder, so an idle re-run rewrites nothing and the applied report carries the same per-file change list a dry run promises. First consumers: scripts today, the `fdl ui` local web page next.
+
 ## [0.8.0] - 2026-08-09
 
 > Upgrading from 0.7.0? Most of the surface moved by rename with a
