@@ -29,6 +29,18 @@ use crate::config::{self, Schema};
 /// Directory where all schema caches live, relative to the command dir.
 const CACHE_DIR: &str = ".fdl/schema-cache";
 
+/// Records which `fdl` wrote the caches in a directory.
+///
+/// The mtime references answer "did the command change"; they cannot answer
+/// "did the SCHEMA FORMAT change", and that is a real event: the day
+/// `--fdl-schema` began emitting block-structured descriptions (paragraphs and
+/// list items preserved rather than flattened), every existing cache held the
+/// old flat text and no reference file had been touched. Help would have kept
+/// rendering the pre-upgrade shape until someone happened to edit their crate
+/// -- the same silently-stale failure the mtime references were added to fix,
+/// one level up.
+pub(crate) const CACHE_STAMP: &str = ".fdl-version";
+
 /// Directories never worth walking when collecting schema sources: build
 /// output, caches, and data. Skipping `target` is the one that matters —
 /// it dwarfs the source tree.
@@ -118,10 +130,26 @@ pub fn is_stale(cache: &Path, reference_mtimes: &[PathBuf]) -> bool {
     let Some(cache_mtime) = mtime(cache) else {
         return true;
     };
+    if !stamp_matches(cache) {
+        return true;
+    }
     reference_mtimes
         .iter()
         .filter_map(|p| mtime(p))
         .any(|ref_m| ref_m > cache_mtime)
+}
+
+/// Whether the cache dir was written by this `fdl`. See [`CACHE_STAMP`].
+///
+/// A missing stamp counts as a mismatch: caches predating the stamp were
+/// written by an older format by definition.
+fn stamp_matches(cache: &Path) -> bool {
+    let Some(dir) = cache.parent() else {
+        return false;
+    };
+    fs::read_to_string(dir.join(CACHE_STAMP))
+        .map(|s| s.trim() == env!("CARGO_PKG_VERSION"))
+        .unwrap_or(false)
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -133,6 +161,8 @@ pub fn write_cache(path: &Path, schema: &Schema) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+        // Best-effort: a missing stamp only costs one extra probe.
+        let _ = fs::write(parent.join(CACHE_STAMP), env!("CARGO_PKG_VERSION"));
     }
     let json =
         serde_json::to_string_pretty(schema).map_err(|e| format!("schema serialize: {e}"))?;
@@ -438,12 +468,39 @@ mod tests {
         assert!(is_stale(&path, &[]));
     }
 
+    /// A cache written by a different `fdl` is stale however fresh its mtime,
+    /// because the SCHEMA FORMAT may have changed under it. Without this, the
+    /// upgrade that made descriptions carry paragraphs and list items would
+    /// have left every existing cache serving the old flattened text with no
+    /// signal at all.
+    #[test]
+    fn is_stale_when_the_cache_was_written_by_another_fdl() {
+        let tmp = TestDir::new("sc");
+        let cache = cache_path(tmp.path(), "cmd");
+        write_cache(&cache, &minimal_schema()).expect("write");
+        assert!(
+            !is_stale(&cache, &[]),
+            "a cache this fdl just wrote must be fresh"
+        );
+
+        let stamp = cache.parent().unwrap().join(CACHE_STAMP);
+        fs::write(&stamp, "0.0.1-from-the-past").unwrap();
+        assert!(is_stale(&cache, &[]), "version mismatch ⇒ stale");
+
+        fs::remove_file(&stamp).unwrap();
+        assert!(
+            is_stale(&cache, &[]),
+            "a cache predating the stamp is stale by definition"
+        );
+    }
+
     #[test]
     fn is_stale_compares_mtimes() {
         let tmp = TestDir::new("sc");
         let cache = tmp.path().join("cache.json");
         let source = tmp.path().join("fdl.yml");
         fs::write(&cache, "{}").unwrap();
+        fs::write(tmp.path().join(CACHE_STAMP), env!("CARGO_PKG_VERSION")).unwrap();
         // Sleep a moment then touch source so its mtime is newer.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut f = fs::File::create(&source).unwrap();

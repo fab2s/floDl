@@ -353,7 +353,7 @@ impl ClusterCoordinator {
 
         // `drift` alert. The trigger is the guard's own `NudgeDown` verdict,
         // not a raw `d_raw` threshold invented here: the configured guard IS
-        // the divergence threshold (TrendGuard's `divergence_threshold`, MSF's
+        // the divergence threshold (LevelGuard's `divergence_threshold`, GrowthGuard's
         // λ̂, NoGuard's silence), and a second coordinator-side threshold would
         // read a different scale and disagree with it. `SuppressGrowth` is a
         // hold, not a correction, so it stays informational. A sustained bad

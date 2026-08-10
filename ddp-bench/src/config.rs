@@ -140,21 +140,21 @@ pub struct ModelDefaults {
 
 /// Convergence guard selection. Materialised by the harness into a concrete
 /// `flodl::distributed::ddp_run::ConvergenceGuard` and passed through
-/// `DdpBuilder::convergence_guard`. Default is `Trend` at the production
+/// `DdpBuilder::convergence_guard`. Default is `Level` at the production
 /// threshold.
 #[derive(Debug, Clone)]
 pub enum GuardChoice {
     /// Pass-through: no convergence-driven anchor adjustments. ElChe's
     /// overhead auto-tune drives cadence alone.
     None,
-    /// 3-rises-above-threshold rule on `||pre - post|| / ||post||`.
-    /// `None` defers to the library default, which is EASGD-aware
-    /// (0.05 overwrite modes / 0.3 when α-blending keeps a standing
-    /// spread) and absorbs the saved trend history on resume.
-    Trend { threshold: Option<f64> },
-    /// Rate-based detector with soft (`SuppressGrowth`) + hard (`NudgeDown`)
-    /// thresholds on the bias-corrected `λ_ema`.
-    Msf {
+    /// Divergence-LEVEL detector: 3-rises-above-threshold rule on
+    /// `||pre - post|| / ||post||`. `None` defers to the library default,
+    /// which is EASGD-aware (0.05 overwrite modes / 0.3 when α-blending keeps
+    /// a standing spread) and absorbs the saved history on resume.
+    Level { threshold: Option<f64> },
+    /// Divergence-growth-rate detector with soft (`SuppressGrowth`) + hard
+    /// (`NudgeDown`) thresholds on the bias-corrected `λ_ema`.
+    Growth {
         suppress_threshold: f64,
         suppress_sustain: usize,
         nudge_threshold: f64,
@@ -166,7 +166,7 @@ pub enum GuardChoice {
 
 impl Default for GuardChoice {
     fn default() -> Self {
-        GuardChoice::Trend { threshold: None }
+        GuardChoice::Level { threshold: None }
     }
 }
 
@@ -254,7 +254,7 @@ pub struct RunConfig {
     /// epoch boundary. Trend-correlation analyses are robust to that
     /// noise.
     pub per_epoch_eval: bool,
-    /// Convergence-guard configuration. Default = `GuardChoice::Trend`
+    /// Convergence-guard configuration. Default = `GuardChoice::Level`
     /// with production threshold 0.01.
     pub guard: GuardChoice,
     /// Which rank fires user epoch callbacks (`epoch_fn`,

@@ -311,10 +311,9 @@ fn impl_enum_derive(
     });
 
     // render_help(): the root command listing.
-    let header = match description {
-        Some(d) => format!("{d}\n\n"),
-        None => format!("{ident}\n\n"),
-    };
+    let banner = description
+        .map(str::to_string)
+        .unwrap_or_else(|| ident.to_string());
     let command_lines = variants.iter().map(|v| {
         let label = v.name.clone();
         let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
@@ -367,7 +366,7 @@ fn impl_enum_derive(
             }
 
             fn render_help() -> ::std::string::String {
-                let mut out = ::std::string::String::from(#header);
+                let mut out = ::flodl_cli::help::banner_string(#banner);
                 out.push_str(&::flodl_cli::style::yellow("Commands"));
                 out.push_str(":\n");
                 #( #command_lines )*
@@ -1286,6 +1285,37 @@ fn arg_extraction(f: &FieldSpec, idx: usize) -> TokenStream2 {
     }
 }
 
+/// `Option<&str>` as a token stream, so a missing description expands to
+/// `None` rather than to an empty string that would render as a bare `-`.
+fn opt_str(s: Option<&str>) -> TokenStream2 {
+    match s {
+        Some(v) => quote! { ::core::option::Option::Some(#v) },
+        None => quote! { ::core::option::Option::None },
+    }
+}
+
+/// The `[default: ...]` / `[possible: ...]` notes as a `[&str; N]` literal.
+///
+/// `flodl_cli::run` builds the same strings from a schema's JSON values; only
+/// the layout is shared, because only the layout can be. Formatting them at
+/// expand time keeps the generated help allocation-free apart from the
+/// wrapping itself.
+fn annotation_literals(default: Option<&str>, choices: Option<&[String]>) -> TokenStream2 {
+    let mut items: Vec<String> = Vec::new();
+    if let Some(d) = default {
+        items.push(format!("[default: {d}]"));
+    }
+    if let Some(cs) = choices
+        && !cs.is_empty()
+    {
+        items.push(format!("[possible: {}]", cs.join(", ")));
+    }
+    let lits = items
+        .iter()
+        .map(|s| quote! { ::std::string::String::from(#s) });
+    quote! { [#(#lits),*] }
+}
+
 fn build_help_expr(
     fields: &[FieldSpec],
     description: Option<&str>,
@@ -1294,10 +1324,10 @@ fn build_help_expr(
     // Prefer the doc-comment description as the banner; fall back to the
     // struct ident only when no description is present. The struct name is
     // an implementation detail that users shouldn't see in `--help`.
-    let header = match description {
-        Some(d) => format!("{d}\n\n"),
-        None => format!("{struct_name}\n\n"),
-    };
+    // Wrapped at runtime, like every row below: the banner carries the struct's
+    // doc comment, which is the longest prose in the help and was the last part
+    // still emitted as one unwrapped line per paragraph.
+    let banner = description.unwrap_or(struct_name).to_string();
 
     // The help is assembled at runtime so `::flodl_cli::style::*` can check
     // whether stderr is a terminal — piped output stays plain, interactive
@@ -1323,23 +1353,29 @@ fn build_help_expr(
                     _ => format!(" <{}>", value_token(f)),
                 };
                 let label = format!("{short_prefix}--{long}{value_part}");
-                let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
-                let mut tail = String::new();
-                if let Some(d) = &f.description {
-                    tail.push_str(d);
-                }
-                if let Some(d) = &f.default {
-                    tail.push_str(&format!("  [default: {d}]"));
-                }
-                if let Some(choices) = &f.choices {
-                    tail.push_str(&format!("  [possible: {}]", choices.join(", ")));
-                }
+                let label_visible = label.chars().count();
+                let desc = opt_str(f.description.as_deref());
+                let anns = annotation_literals(f.default.as_deref(), f.choices.as_deref());
                 opt_tokens.push(quote! {
-                    out.push_str("    ");
-                    out.push_str(&::flodl_cli::style::green(#label));
-                    out.push_str(#pad);
-                    out.push_str(#tail);
-                    out.push('\n');
+                    {
+                        let row = ::flodl_cli::help::row_string(
+                            "    ",
+                            &::flodl_cli::style::green(#label),
+                            #label_visible,
+                            ::flodl_cli::help::DERIVE_COL,
+                            #desc,
+                            &#anns,
+                        );
+                        // Separate an entry whose description wrapped, so its
+                        // last line cannot read as the next entry's first.
+                        let tall = row.matches('\n').count() > 1;
+                        if !first && (prev_tall || tall) {
+                            out.push('\n');
+                        }
+                        out.push_str(&row);
+                        prev_tall = tall;
+                        first = false;
+                    }
                 });
             }
             FieldKind::Arg => {
@@ -1352,20 +1388,29 @@ fn build_help_expr(
                 } else {
                     format!("[<{name}>]")
                 };
-                let pad = " ".repeat(36usize.saturating_sub(4 + label.chars().count()));
-                let mut tail = String::new();
-                if let Some(d) = &f.description {
-                    tail.push_str(d);
-                }
-                if let Some(d) = &f.default {
-                    tail.push_str(&format!("  [default: {d}]"));
-                }
+                let label_visible = label.chars().count();
+                let desc = opt_str(f.description.as_deref());
+                let anns = annotation_literals(f.default.as_deref(), f.choices.as_deref());
                 arg_tokens.push(quote! {
-                    out.push_str("    ");
-                    out.push_str(&::flodl_cli::style::green(#label));
-                    out.push_str(#pad);
-                    out.push_str(#tail);
-                    out.push('\n');
+                    {
+                        let row = ::flodl_cli::help::row_string(
+                            "    ",
+                            &::flodl_cli::style::green(#label),
+                            #label_visible,
+                            ::flodl_cli::help::DERIVE_COL,
+                            #desc,
+                            &#anns,
+                        );
+                        // Separate an entry whose description wrapped, so its
+                        // last line cannot read as the next entry's first.
+                        let tall = row.matches('\n').count() > 1;
+                        if !first && (prev_tall || tall) {
+                            out.push('\n');
+                        }
+                        out.push_str(&row);
+                        prev_tall = tall;
+                        first = false;
+                    }
                 });
             }
         }
@@ -1377,6 +1422,8 @@ fn build_help_expr(
         quote! {
             out.push_str(&::flodl_cli::style::yellow("Arguments"));
             out.push_str(":\n");
+            let mut first = true;
+            let mut prev_tall = false;
             #(#arg_tokens)*
             out.push('\n');
         }
@@ -1387,6 +1434,8 @@ fn build_help_expr(
         quote! {
             out.push_str(&::flodl_cli::style::yellow("Options"));
             out.push_str(":\n");
+            let mut first = true;
+            let mut prev_tall = false;
             #(#opt_tokens)*
             out.push('\n');
         }
@@ -1394,7 +1443,7 @@ fn build_help_expr(
 
     quote! {
         {
-            let mut out = ::std::string::String::from(#header);
+            let mut out = ::flodl_cli::help::banner_string(#banner);
             #arg_section
             #opt_section
             out
@@ -1414,6 +1463,24 @@ fn value_token(f: &FieldSpec) -> &'static str {
 
 // ── Utilities ───────────────────────────────────────────────────────────
 
+/// Collect a doc comment into the block form the help renderers consume.
+///
+/// Blocks are separated by `\n`; a block that begins with `- ` is a list
+/// item. Within a block, source line breaks are irrelevant (the renderer
+/// re-wraps to the terminal) so they collapse to single spaces.
+///
+/// This used to be `lines.join(" ").split_whitespace().join(" ")`, which
+/// flattened the whole comment into one paragraph. The structure was
+/// therefore destroyed HERE, before any renderer could honor it — which is
+/// why a doc comment carrying a perfectly good bullet list rendered as a
+/// run-on sentence with inline dashes ("Accepts: - `rank-N`: ... - `fastest`:
+/// ..."). Preserving it is only half the fix; see
+/// `flodl_cli::help::wrap_description` for the other half.
+///
+/// A block break is either a blank line or the start of a new bullet, so a
+/// list item spanning several source lines stays ONE item. That is also why
+/// the per-line `trim()` is safe to keep: continuation lines are recognised
+/// by NOT starting a bullet, never by their indent.
 fn extract_doc(attrs: &[Attribute]) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
     for a in attrs {
@@ -1429,15 +1496,63 @@ fn extract_doc(attrs: &[Attribute]) -> Option<String> {
             lines.push(text.trim().to_string());
         }
     }
+    doc_blocks(&lines)
+}
+
+/// The string half of [`extract_doc`], split out so it is testable without
+/// hand-building `syn::Attribute` values.
+fn doc_blocks(lines: &[String]) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    // Join lines with a space; collapse internal whitespace runs.
-    let joined = lines
-        .join(" ")
-        .split_whitespace()
+
+    let mut blocks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in lines {
+        if line.is_empty() {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        // `*` is accepted as a bullet marker on input and normalised to `-`,
+        // so the renderer has one shape to detect. A bare `-`/`*` with no
+        // following space is a word (a negative number, a glob), not a
+        // bullet.
+        let bullet = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .map(str::trim_start);
+        match bullet {
+            Some(rest) => {
+                if !current.is_empty() {
+                    blocks.push(std::mem::take(&mut current));
+                }
+                current.push_str("- ");
+                current.push_str(rest);
+            }
+            None => {
+                // A blank line already flushed `current`, so a non-empty
+                // buffer here always means "continuation of this block".
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(line);
+            }
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    // Collapse whitespace runs inside each block, drop empties, then join
+    // with `\n` so the block boundaries survive into the JSON schema.
+    let joined = blocks
+        .iter()
+        .map(|b| b.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|b| !b.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\n");
     if joined.is_empty() {
         None
     } else {
@@ -1475,7 +1590,81 @@ use syn::spanned::Spanned;
 
 #[cfg(test)]
 mod tests {
-    use super::pascal_to_kebab;
+    use super::{doc_blocks, pascal_to_kebab};
+
+    fn doc(src: &[&str]) -> Option<String> {
+        let lines: Vec<String> = src.iter().map(|s| s.trim().to_string()).collect();
+        doc_blocks(&lines)
+    }
+
+    /// The regression this whole change exists for: a bullet list in a doc
+    /// comment came out as a run-on sentence with inline dashes, because the
+    /// structure was destroyed here rather than at the renderer.
+    #[test]
+    fn doc_blocks_keeps_a_bullet_list_apart() {
+        let out = doc(&[
+            "Which rank fires per-epoch user callbacks (`epoch_fn`,",
+            "`checkpoint_fn`, `eval_fn`). Accepts:",
+            "",
+            "- `rank-N`: explicit rank index (e.g. `rank-0`, `rank-1`).",
+            "  Loud-errors at framework validation if `N >= world_size`.",
+            "- `fastest`: ElChe picks the rank with the lowest",
+            "  smoothed-ms-per-batch at run start, sticky thereafter.",
+            "",
+            "Default: framework default (`Rank(0)`). Solo modes ignore this.",
+        ])
+        .expect("some");
+
+        let blocks: Vec<&str> = out.split('\n').collect();
+        assert_eq!(
+            blocks.len(),
+            4,
+            "lead paragraph + 2 items + trailer: {out:?}"
+        );
+        assert!(blocks[0].ends_with("Accepts:"), "{:?}", blocks[0]);
+        assert!(blocks[1].starts_with("- `rank-N`:"), "{:?}", blocks[1]);
+        assert!(
+            blocks[1].ends_with("if `N >= world_size`."),
+            "a multi-line item must stay ONE block: {:?}",
+            blocks[1]
+        );
+        assert!(blocks[2].starts_with("- `fastest`:"), "{:?}", blocks[2]);
+        assert!(blocks[3].starts_with("Default:"), "{:?}", blocks[3]);
+    }
+
+    /// A new bullet ends the previous block even with no blank line between
+    /// items — the common way lists are actually written.
+    #[test]
+    fn doc_blocks_splits_adjacent_bullets() {
+        let out = doc(&["Modes:", "- one", "- two", "- three"]).expect("some");
+        assert_eq!(out, "Modes:\n- one\n- two\n- three");
+    }
+
+    /// `*` is accepted on input and normalised, so the renderer detects one
+    /// marker shape.
+    #[test]
+    fn doc_blocks_normalises_star_bullets() {
+        let out = doc(&["* alpha", "* beta"]).expect("some");
+        assert_eq!(out, "- alpha\n- beta");
+    }
+
+    /// A lone `-`/`*` with no following space is a word, not a bullet: a
+    /// negative number or a glob must not split a paragraph.
+    #[test]
+    fn doc_blocks_does_not_treat_bare_dash_as_a_bullet() {
+        let out = doc(&["Range is", "-1.0 to 1.0 and", "*.rs is a glob"]).expect("some");
+        assert_eq!(out, "Range is -1.0 to 1.0 and *.rs is a glob");
+    }
+
+    /// The ordinary case must be unchanged: a plain multi-line comment is
+    /// still one reflowable paragraph.
+    #[test]
+    fn doc_blocks_folds_a_plain_comment_into_one_paragraph() {
+        let out = doc(&["Override epoch", "count.", ""]).expect("some");
+        assert_eq!(out, "Override epoch count.");
+        assert!(doc(&[]).is_none());
+        assert!(doc(&["", "  ", ""]).is_none());
+    }
 
     #[test]
     fn pascal_to_kebab_maps_variant_idents() {

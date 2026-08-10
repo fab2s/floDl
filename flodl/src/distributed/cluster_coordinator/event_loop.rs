@@ -872,7 +872,7 @@ impl ClusterCoordinator {
             self.last_aggregated_epoch = Some(epoch_key as usize);
             // Drain the per-epoch d-aggregator and emit `DivergenceEpoch`
             // when at least one AllReduce contributed a sample. Lambda
-            // fields are intentionally None — `ddp-bench/src/analyze/msf.rs`
+            // fields are intentionally None — the offline divergence analysis
             // recomputes guard-specific λ̂ from the per-event Divergence
             // observables.
             let snap = self.take_epoch_d_summary();

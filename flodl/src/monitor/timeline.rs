@@ -160,7 +160,8 @@ pub enum EventKind {
     /// `AnchorChanged`; this event isolates the meta's contribution
     /// with the raw `factor` used.
     MetaNudge { factor: f64, from: usize, to: usize },
-    /// MSF passive observation: per-AllReduce divergence + lambda sample.
+    /// Passive divergence observation: per-AllReduce divergence + growth-rate
+    /// sample.
     ///
     /// Emitted at every `ConvergenceGuard::observe_lambda` call. `d_raw` is
     /// the max normalized delta across ranks; `lambda_raw`/`lambda_ema` are
@@ -183,7 +184,7 @@ pub enum EventKind {
         post_norm: Option<f64>,
         /// Per-rank pre-AllReduce L2 norm `||W_i||`. `None` when not
         /// computed. With `post_norm` and `deltas` this enables the
-        /// cosine-similarity / magnitude-shift decomposition (MSF/SWA
+        /// cosine-similarity / magnitude-shift decomposition (directional vs
         /// directional vs magnitude split).
         pre_norms: Option<Vec<f64>>,
         /// In-flight epoch at the time of this event (= `last_aggregated_epoch
@@ -195,8 +196,8 @@ pub enum EventKind {
     /// Guard-specific diagnostic values for the current AllReduce event.
     /// Emitted by the coordinator after each `report()` call to a
     /// pluggable [`crate::distributed::ddp_run::ConvergenceGuard`]. The key
-    /// set depends on the active guard (e.g. MsfGuard emits
-    /// `lambda_raw` / `lambda_ema`; TrendGuard emits `d_history_last`;
+    /// set depends on the active guard (e.g. GrowthGuard emits
+    /// `lambda_raw` / `lambda_ema`; LevelGuard emits `d_history_last`;
     /// NoGuard emits nothing). Old timelines lack this event entirely;
     /// consumers should treat absence as "no diagnostics available".
     GuardTelemetry {
@@ -204,7 +205,8 @@ pub enum EventKind {
         step: usize,
         values: Vec<(String, f64)>,
     },
-    /// MSF passive observation: per-epoch divergence + lambda aggregates.
+    /// Passive divergence observation: per-epoch divergence + growth-rate
+    /// aggregates.
     ///
     /// Emitted at `on_epoch_aggregated`. Aggregates over all `Divergence`
     /// events in this epoch plus a snapshot of the last sample. The lambda

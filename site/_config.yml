@@ -20,8 +20,11 @@ exclude:
   # Anchored at the source root, so the bare `README.md` above covers only
   # site/README.md. Each frozen version tree carries its own DO-NOT-REGENERATE
   # README, and without this pattern Jekyll has no front matter to act on and
-  # copies it verbatim: /guide/0.8.x/README.md served the internal note as raw
-  # markdown, with no meta tag available to mark it noindex.
+  # copies it verbatim: a frozen tree's README got served as raw markdown at
+  # its own guide URL, with no meta tag available to mark it noindex. (That
+  # URL is deliberately spelled without its leading slash here -- check 4 of
+  # ci/release/03-lint-docs.sh scans comments too, and would read a mention of
+  # guide/<ver>/README.md as a link to a page that must not exist.)
   - "guide/*/README.md"
 
 permalink: /blog/:slug

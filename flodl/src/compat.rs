@@ -1,5 +1,10 @@
-//! Deprecated `cuda_*` / `Cuda*` names, kept so existing code keeps
-//! compiling.
+//! Deprecated names, kept so existing code keeps compiling.
+//!
+//! Two renaming arcs live here. The bulk is the `cuda_*` / `Cuda*` →
+//! `gpu_*` / `Gpu*` sweep documented below; the tail is the convergence-guard
+//! rename (`TrendGuard` →
+//! [`LevelGuard`](crate::distributed::ddp_run::LevelGuard), `MsfGuard` →
+//! [`GrowthGuard`](crate::distributed::ddp_run::GrowthGuard)).
 //!
 //! The GPU vendor is a build-time property of the libtorch you link
 //! against, not something these entry points select: on a ROCm build
@@ -202,6 +207,29 @@ where
     gpu_graph_capture(warmup_runs, pool, f)
 }
 
+// ── Convergence guards ──────────────────────────────────────────────────
+//
+// The guards were named after what inspired them rather than what they
+// measure. `MsfGuard`'s "MSF" was Master Stability Function, borrowed from
+// synchronization theory — a lineage the research review declined to defend,
+// since flodl's ranks are non-identical, stochastic and independently
+// perturbed where the theory assumes identical deterministic oscillators. It
+// was also expanded nowhere in the codebase, so `--guard msf` was undecodable
+// from the inside. `TrendGuard` was merely imprecise, but it is the other half
+// of a pair whose axis is level-versus-rate, and that axis only reads once
+// both names state it.
+
+/// Deprecated alias for [`crate::distributed::ddp_run::LevelGuard`].
+#[deprecated(note = "renamed to `LevelGuard` — it watches the divergence level, \
+                     as against `GrowthGuard`'s growth rate")]
+pub type TrendGuard = crate::distributed::ddp_run::convergence::LevelGuard;
+
+/// Deprecated alias for [`crate::distributed::ddp_run::GrowthGuard`].
+#[deprecated(note = "renamed to `GrowthGuard` — it watches the rate at which \
+                     divergence compounds; the old name stood for Master \
+                     Stability Function, a borrowed framing this does not claim")]
+pub type MsfGuard = crate::distributed::ddp_run::convergence::GrowthGuard;
+
 #[cfg(test)]
 mod tests {
     //! The BC promise is that these names still resolve and forward.
@@ -222,6 +250,19 @@ mod tests {
         }
         assert_eq!(cuda_devices().len(), gpu_devices().len());
         assert_eq!(usable_cuda_devices().len(), usable_gpu_devices().len());
+    }
+
+    #[test]
+    fn deprecated_guard_aliases_resolve() {
+        // Compile-time only: the old guard names must still name the new
+        // types, so a `MsfGuard::default()` in someone's builder call keeps
+        // compiling.
+        fn _assert_level(g: TrendGuard) -> crate::distributed::ddp_run::LevelGuard {
+            g
+        }
+        fn _assert_growth(g: MsfGuard) -> crate::distributed::ddp_run::GrowthGuard {
+            g
+        }
     }
 
     #[test]

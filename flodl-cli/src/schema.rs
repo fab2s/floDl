@@ -158,6 +158,11 @@ pub fn clear_caches(project_root: &Path, filter: Option<&str>) -> Result<Vec<Pat
     touched_dirs.dedup();
     for d in touched_dirs {
         let cache_dir = d.join(".fdl").join("schema-cache");
+        // The version stamp describes the caches, so it goes when the last
+        // one does -- otherwise it is litter that also blocks the prune.
+        if only_holds_stamp(&cache_dir) {
+            let _ = fs::remove_file(cache_dir.join(schema_cache::CACHE_STAMP));
+        }
         if is_empty_dir(&cache_dir) {
             let _ = fs::remove_dir(&cache_dir);
         }
@@ -168,6 +173,18 @@ pub fn clear_caches(project_root: &Path, filter: Option<&str>) -> Result<Vec<Pat
     }
 
     Ok(removed)
+}
+
+/// True when `p`'s only remaining entry is the cache version stamp.
+fn only_holds_stamp(p: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(p) else {
+        return false;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.len() == 1 && names[0] == schema_cache::CACHE_STAMP
 }
 
 fn is_empty_dir(p: &Path) -> bool {
@@ -251,11 +268,15 @@ mod tests {
         }
     }
 
+    /// Write a cache the way `fdl` does, version stamp included — a cache
+    /// with no stamp is stale on principle (see `schema_cache::CACHE_STAMP`),
+    /// which would mask the mtime comparisons these tests are about.
     fn write_cache(dir: &Path, cmd_name: &str, json: &str) -> PathBuf {
         let cache_dir = dir.join(".fdl").join("schema-cache");
         fs::create_dir_all(&cache_dir).unwrap();
         let path = cache_dir.join(format!("{cmd_name}.json"));
         fs::write(&path, json).unwrap();
+        fs::write(cache_dir.join(".fdl-version"), env!("CARGO_PKG_VERSION")).unwrap();
         path
     }
 

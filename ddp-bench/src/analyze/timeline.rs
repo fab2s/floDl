@@ -113,7 +113,7 @@ fn parse_events(val: &serde_json::Value) -> Result<Vec<Event>, String> {
                 from: item["from"].as_u64().unwrap_or(0) as usize,
                 to: item["to"].as_u64().unwrap_or(0) as usize,
             },
-            // "div" / "div_epoch" (MSF passive-observation records) fall
+            // "div" / "div_epoch" (passive divergence-observation records) fall
             // through to the skip: the JSON detail stays available to
             // research tooling, the report no longer consumes it.
             _ => continue, // skip unknown
