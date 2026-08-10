@@ -551,6 +551,17 @@ prompt) rotates key and token together for a new farm instantiation,
 after which workers holding the old ones stop being admitted. `--json`
 emits the machine twin; secrets appear as file paths, never payloads.
 
+Two read-only companions serve scripts and interfaces built on the
+wizard. `--list` enumerates the project's farms — the union of
+`fdl.<label>.*` overlays and `.fdl/<label>/` farm dirs — with door,
+controller and credential state; env overlays that are not farms are
+reported apart rather than dressed as broken ones. `--dry-run` runs
+the full pass with every write withheld and reports what an apply
+would `create`, `update` or leave alone, per file; credentials an
+apply would mint appear as placeholders, never as values the apply
+will not reproduce. Neither ever prompts — a dry run reads the consent
+flags exactly as given — and both combine with `--json`.
+
 Exit code: **0** with the report, **1** on any refusal (contradictory
 flags, a decision needed without a tty, an unfixable permission).
 

@@ -311,6 +311,16 @@ pub struct JoinConfigArgs {
     /// authorized_keys install: that takes the prompt or `--install-key`.
     #[option]
     pub yes: bool,
+    /// List this project's farms (overlays and `.fdl/` dirs) with their
+    /// door, controller and credential state, then exit. Combines with
+    /// `--json`.
+    #[option]
+    pub list: bool,
+    /// The full pass with every write withheld: report what an apply
+    /// would create, update or leave alone. Never prompts — consent
+    /// flags are read exactly as given.
+    #[option]
+    pub dry_run: bool,
     /// Report as JSON on stdout. Secrets appear as file paths, never
     /// payloads.
     #[option]

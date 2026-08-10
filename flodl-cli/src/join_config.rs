@@ -18,6 +18,12 @@
 //! Secret hygiene: the private key goes ONLY to 0600 files under the
 //! farm dir (which self-gitignores); stdout gets the public line and the
 //! worker yml. `--json` reports secrets as file paths, never payloads.
+//!
+//! Two read-only companions serve scripted and GUI callers: `--list`
+//! enumerates the project's farms with their credential state, and
+//! `--dry-run` runs the full pass with every write withheld, reporting
+//! what an apply would create, update or leave alone. Neither ever
+//! prompts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +31,7 @@ use std::process::Command;
 
 use crate::builtins::JoinConfigArgs;
 use crate::context::home_dir;
+use crate::overlay;
 use crate::style;
 use crate::util::platform;
 use crate::util::prompt;
@@ -41,6 +48,9 @@ const WORKER_KEY_PATH: &str = "~/.ssh/flodl-join";
 const SERVED_SUBDIR: &str = ".flodl/run";
 
 pub fn run(cli: &JoinConfigArgs) -> i32 {
+    if cli.list {
+        return run_list(cli);
+    }
     match wizard(cli) {
         Ok(report) => {
             if cli.json {
@@ -132,6 +142,12 @@ struct Report {
     /// Compose services this project dispatches through, when fdl runs on
     /// the host but the work happens in a container.
     docker_services: Vec<String>,
+    /// `--dry-run`: every action reported is prospective — nothing was
+    /// written or installed, and credentials an apply would mint appear
+    /// as placeholders.
+    dry_run: bool,
+    /// Every file the pass wrote or (dry) would write.
+    changes: Vec<Change>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,9 +208,96 @@ impl Endpoint {
     }
 }
 
+/// What a dry run shows where a credential an apply would mint belongs:
+/// displaying a real value the apply will not reproduce would be a lie.
+const PLACEHOLDER_PUB: &str = "<ed25519 public key — minted on apply>";
+const PLACEHOLDER_TOKEN: &str = "<token — minted on apply>";
+const PLACEHOLDER_PRIVATE: &str = "<private key — minted on apply>";
+
+/// How a wizard write relates to what is already on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Create,
+    Update,
+    Unchanged,
+}
+
+impl ChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Create => "create",
+            ChangeKind::Update => "update",
+            ChangeKind::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// One file the pass touched — or, under `--dry-run`, would touch.
+#[derive(Debug, Clone)]
+struct Change {
+    path: PathBuf,
+    kind: ChangeKind,
+    what: &'static str,
+}
+
+/// Write-through recorder: every artifact write goes through here, so
+/// `--dry-run` is the same pass with the writes withheld and the report
+/// carries a faithful change list either way. Identical content is
+/// never rewritten, so an idle re-run leaves every mtime alone.
+struct Changes {
+    dry: bool,
+    entries: Vec<Change>,
+}
+
+impl Changes {
+    fn new(dry: bool) -> Self {
+        Changes {
+            dry,
+            entries: Vec::new(),
+        }
+    }
+
+    fn write(
+        &mut self,
+        path: &Path,
+        content: &str,
+        what: &'static str,
+    ) -> Result<ChangeKind, String> {
+        let kind = match fs::read_to_string(path) {
+            Ok(existing) if existing == content => ChangeKind::Unchanged,
+            Ok(_) => ChangeKind::Update,
+            Err(_) => ChangeKind::Create,
+        };
+        if !self.dry && kind != ChangeKind::Unchanged {
+            fs::write(path, content)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
+        self.note(path, kind, what);
+        Ok(kind)
+    }
+
+    /// Record a mutation that does not flow through [`Changes::write`]
+    /// (key generation, the authorized_keys upsert).
+    fn note(&mut self, path: &Path, kind: ChangeKind, what: &'static str) {
+        self.entries.push(Change {
+            path: path.to_path_buf(),
+            kind,
+            what,
+        });
+    }
+}
+
 fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
+    wizard_at(cli, &cwd)
+}
+
+/// The whole pass from an explicit working directory — what [`wizard`]
+/// resolves for real invocations and what tests pin.
+fn wizard_at(cli: &JoinConfigArgs, cwd: &Path) -> Result<Report, String> {
     let label = resolve_label(cli)?;
     validate_label(&label)?;
+    let mut changes = Changes::new(cli.dry_run);
     // Door and controller are resolved after the farm dir is known: an
     // existing farm's own answers are better defaults than the flag
     // defaults (see `recover_shape`).
@@ -202,32 +305,36 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     // The farm sits beside a base fdl.yml (overlays are siblings). No
     // project at all gets a minimal base, confirm-gated — the /training
     // shape, an operator working next to their script.
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
-    let root = match crate::config::find_project_config(&cwd) {
+    let root = match crate::config::find_project_config(cwd) {
         Some(p) => p
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| cwd.clone()),
+            .unwrap_or_else(|| cwd.to_path_buf()),
         None => {
             let target = cwd.join("fdl.yml");
-            if !confirm(
-                cli,
-                &format!(
-                    "no fdl.yml here — create a minimal one at {} so the farm \
-                     overlay has a base?",
-                    target.display()
-                ),
-            )? {
-                return Err("a farm overlay needs a base fdl.yml to merge onto".into());
+            if cli.dry_run {
+                changes.note(&target, ChangeKind::Create, "minimal base fdl.yml");
+            } else {
+                if !confirm(
+                    cli,
+                    &format!(
+                        "no fdl.yml here — create a minimal one at {} so the farm \
+                         overlay has a base?",
+                        target.display()
+                    ),
+                )? {
+                    return Err("a farm overlay needs a base fdl.yml to merge onto".into());
+                }
+                fs::write(
+                    &target,
+                    "# fdl.yml — created by `fdl join-config` so farm overlays\n\
+                     # (fdl.<label>.yml) have a base to merge onto. Project\n\
+                     # config goes here as it grows.\n",
+                )
+                .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+                changes.note(&target, ChangeKind::Create, "minimal base fdl.yml");
             }
-            fs::write(
-                &target,
-                "# fdl.yml — created by `fdl join-config` so farm overlays\n\
-                 # (fdl.<label>.yml) have a base to merge onto. Project\n\
-                 # config goes here as it grows.\n",
-            )
-            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
-            cwd.clone()
+            cwd.to_path_buf()
         }
     };
 
@@ -248,23 +355,33 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
         },
     };
     let keys_dir = farm_dir.join("keys");
-    fs::create_dir_all(&keys_dir)
-        .map_err(|e| format!("cannot create {}: {e}", keys_dir.display()))?;
+    if !cli.dry_run {
+        fs::create_dir_all(&keys_dir)
+            .map_err(|e| format!("cannot create {}: {e}", keys_dir.display()))?;
+    }
     // The farm dir holds private keys, so it removes ITSELF from git:
-    // a `*` gitignore inside covers everything including the ignore.
+    // a `*` gitignore inside covers everything including the ignore. An
+    // existing one is the user's file and stays untouched.
     let self_ignore = root.join(".fdl").join(".gitignore");
     if !self_ignore.is_file() {
-        fs::write(&self_ignore, "*\n")
-            .map_err(|e| format!("cannot write {}: {e}", self_ignore.display()))?;
+        changes.write(&self_ignore, "*\n", ".fdl self-gitignore")?;
     }
 
     // ── Keys ────────────────────────────────────────────────────────────
     let key_path = keys_dir.join(KEY_NAME);
-    let key_action = ensure_key(cli, &key_path, &label)?;
-    let pub_line = fs::read_to_string(key_path.with_extension("pub"))
-        .map_err(|e| format!("cannot read the generated public key: {e}"))?
-        .trim()
-        .to_string();
+    let key_action = ensure_key(cli, &mut changes, &key_path, &label)?;
+    // A dry run mints nothing, so wherever the (re)generated key would
+    // appear, a placeholder appears instead.
+    let pub_line = if cli.dry_run
+        && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated)
+    {
+        PLACEHOLDER_PUB.to_string()
+    } else {
+        fs::read_to_string(key_path.with_extension("pub"))
+            .map_err(|e| format!("cannot read the generated public key: {e}"))?
+            .trim()
+            .to_string()
+    };
 
     // ── Token + overlay ─────────────────────────────────────────────────
     let overlay_path = root.join(format!("fdl.{label}.yml"));
@@ -277,10 +394,16 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
             let p = PathBuf::from(d);
             if p.is_absolute() { p } else { cwd.join(p) }
         }
-        None => cwd.clone(),
+        None => cwd.to_path_buf(),
     });
-    let (token, overlay_action) =
-        ensure_overlay(cli, &overlay_path, &label, &root, cmd_hint.as_deref())?;
+    let (token, overlay_action) = ensure_overlay(
+        cli,
+        &mut changes,
+        &overlay_path,
+        &label,
+        &root,
+        cmd_hint.as_deref(),
+    )?;
 
     // A yml-referenced identity outside the farm dir is a key shared
     // with something else — legal, but exactly the reuse a per-farm key
@@ -298,7 +421,7 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
             let p = PathBuf::from(d);
             if p.is_absolute() { p } else { cwd.join(p) }
         }
-        None => cwd.clone(),
+        None => cwd.to_path_buf(),
     };
     let (publish_block, bin_caveat, freshness) = match derive_publish(&crate_dir) {
         Ok(Some(d)) => (
@@ -313,42 +436,45 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
     // ── Worker yml ──────────────────────────────────────────────────────
     let worker_yml = render_worker_yml(&label, &controller, &token, door, cli);
     let worker_yml_path = farm_dir.join("worker.yml");
-    fs::write(&worker_yml_path, &worker_yml)
-        .map_err(|e| format!("cannot write {}: {e}", worker_yml_path.display()))?;
+    changes.write(&worker_yml_path, &worker_yml, "worker fdl.yml")?;
 
     // ── Install notes ───────────────────────────────────────────────────
     let notes_path = farm_dir.join("install-notes.md");
     let notes = render_notes(&label, &authorized_line, &match_block, &controller, door);
-    fs::write(&notes_path, notes)
-        .map_err(|e| format!("cannot write {}: {e}", notes_path.display()))?;
+    changes.write(&notes_path, &notes, "install notes")?;
 
     // ── The sshd drop-in ────────────────────────────────────────────────
     // Written as a FILE rather than printed, so the install step is a
     // copy of something reviewable rather than a heredoc pasted blind.
     let plat = platform::Platform::detect();
     let sshd_conf_path = farm_dir.join(format!("sshd-{label}.conf"));
-    fs::write(
-        &sshd_conf_path,
-        render_sshd_conf(&label, door, controller.port, plat),
-    )
-    .map_err(|e| format!("cannot write {}: {e}", sshd_conf_path.display()))?;
+    let sshd_conf = render_sshd_conf(&label, door, controller.port, plat);
+    changes.write(&sshd_conf_path, &sshd_conf, "sshd drop-in")?;
 
     // ── Preflight ───────────────────────────────────────────────────────
     let checks = preflight(door, controller.port, &served_abs, plat);
     let services = docker_services(&root, &label);
 
     // ── The install offer ───────────────────────────────────────────────
-    let install = install_authorized_line(cli, &authorized_line, controller.port)?;
+    let install = install_authorized_line(cli, &mut changes, &authorized_line, controller.port)?;
 
     // ── cloud-init (opt-in) ─────────────────────────────────────────────
     let cloud_init_path = if cli.cloud_init {
         let user = cli.cloud_init_user.as_deref().unwrap_or("ubuntu");
-        let private_key = fs::read_to_string(&key_path)
-            .map_err(|e| format!("cannot read the private key for cloud-init: {e}"))?;
+        let private_key = if cli.dry_run
+            && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated)
+        {
+            PLACEHOLDER_PRIVATE.to_string()
+        } else {
+            fs::read_to_string(&key_path)
+                .map_err(|e| format!("cannot read the private key for cloud-init: {e}"))?
+        };
         let content = render_cloud_init(&label, user, door, &worker_yml, &private_key);
         let path = farm_dir.join("cloud-init.yml");
-        fs::write(&path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        set_mode(&path, 0o600)?;
+        let kind = changes.write(&path, &content, "cloud-init user-data (SECRET)")?;
+        if !cli.dry_run && kind != ChangeKind::Unchanged {
+            set_mode(&path, 0o600)?;
+        }
         Some(path)
     } else {
         None
@@ -380,6 +506,8 @@ fn wizard(cli: &JoinConfigArgs) -> Result<Report, String> {
         plat,
         in_container: platform::Platform::in_container(),
         docker_services: services,
+        dry_run: cli.dry_run,
+        changes: changes.entries,
     })
 }
 
@@ -705,11 +833,15 @@ enum InstallAction {
 /// the audience least equipped to debug an sshd refusal.
 fn install_authorized_line(
     cli: &JoinConfigArgs,
+    changes: &mut Changes,
     line: &str,
     sshd_port: u16,
 ) -> Result<InstallAction, String> {
     if cli.install_key && cli.no_install_key {
         return Err("--install-key and --no-install-key contradict each other".into());
+    }
+    if cli.dry_run {
+        return dry_install_verdict(cli, changes, line);
     }
     // Consent to touch authorized_keys is EXPLICIT: the tty prompt or
     // `--install-key`. `--yes` deliberately does not count — it accepts
@@ -797,7 +929,8 @@ fn install_authorized_line(
         ));
     }
 
-    let content = if ak_path.is_file() {
+    let ak_existed = ak_path.is_file();
+    let content = if ak_existed {
         fix_perms_confirmed(cli, &ak_path, 0o600)?;
         fs::read_to_string(&ak_path)
             .map_err(|e| format!("cannot read {}: {e}", ak_path.display()))?
@@ -807,6 +940,7 @@ fn install_authorized_line(
 
     let (new_content, outcome) = upsert_authorized_line(&content, line)?;
     if outcome == UpsertOutcome::Identical {
+        changes.note(&ak_path, ChangeKind::Unchanged, "authorized_keys (wizard's line)");
         return Ok(InstallAction::AlreadyPresent);
     }
     if outcome == UpsertOutcome::Replaced {
@@ -832,6 +966,15 @@ fn install_authorized_line(
     set_mode(&tmp, 0o600)?;
     fs::rename(&tmp, &ak_path)
         .map_err(|e| format!("cannot move the new authorized_keys into place: {e}"))?;
+    changes.note(
+        &ak_path,
+        if ak_existed {
+            ChangeKind::Update
+        } else {
+            ChangeKind::Create
+        },
+        "authorized_keys (wizard's line)",
+    );
 
     // Best-effort floor check: the door is installed, but is anyone
     // listening where workers will knock?
@@ -855,6 +998,75 @@ fn install_authorized_line(
         UpsertOutcome::Appended => InstallAction::Installed,
         UpsertOutcome::Replaced => InstallAction::Replaced,
         UpsertOutcome::Identical => unreachable!("handled above"),
+    })
+}
+
+/// The `--dry-run` half of the install offer: decide consent from the
+/// flags alone (a dry run never prompts) and classify what an apply
+/// would do to the file, touching nothing — no mkdir, no perms fixes.
+fn dry_install_verdict(
+    cli: &JoinConfigArgs,
+    changes: &mut Changes,
+    line: &str,
+) -> Result<InstallAction, String> {
+    if cli.no_install_key {
+        return Ok(InstallAction::Skipped("declined (--no-install-key)".to_string()));
+    }
+    if !cli.install_key {
+        return Ok(InstallAction::Skipped(
+            "installing needs explicit consent: the prompt on apply, or --install-key".to_string(),
+        ));
+    }
+    let ak_path = match cli.authorized_keys.as_deref() {
+        Some(p) => {
+            let p = match p.strip_prefix("~/") {
+                Some(rest) => home_dir().join(rest),
+                None => PathBuf::from(p),
+            };
+            if p.starts_with("/etc/ssh") {
+                return Err(format!(
+                    "{} is system sshd configuration — the wizard installs \
+                     door keys, never /etc/ssh. Install it there by hand \
+                     (the line is in the install notes)",
+                    p.display(),
+                ));
+            }
+            p
+        }
+        None => home_dir().join(".ssh").join("authorized_keys"),
+    };
+    let exists = ak_path.is_file();
+    let kind = if exists {
+        ChangeKind::Update
+    } else {
+        ChangeKind::Create
+    };
+    // A key an apply would mint cannot be compared against the file
+    // yet; the apply would append its fresh line.
+    if line.contains(PLACEHOLDER_PUB) {
+        changes.note(&ak_path, kind, "authorized_keys (wizard's line)");
+        return Ok(InstallAction::Installed);
+    }
+    let content = if exists {
+        fs::read_to_string(&ak_path)
+            .map_err(|e| format!("cannot read {}: {e}", ak_path.display()))?
+    } else {
+        String::new()
+    };
+    let (_, outcome) = upsert_authorized_line(&content, line)?;
+    Ok(match outcome {
+        UpsertOutcome::Identical => {
+            changes.note(&ak_path, ChangeKind::Unchanged, "authorized_keys (wizard's line)");
+            InstallAction::AlreadyPresent
+        }
+        UpsertOutcome::Replaced => {
+            changes.note(&ak_path, ChangeKind::Update, "authorized_keys (wizard's line)");
+            InstallAction::Replaced
+        }
+        UpsertOutcome::Appended => {
+            changes.note(&ak_path, kind, "authorized_keys (wizard's line)");
+            InstallAction::Installed
+        }
     })
 }
 
@@ -1037,14 +1249,20 @@ fn confirm(cli: &JoinConfigArgs, question: &str) -> Result<bool, String> {
     Ok(prompt::ask_yn(question, true))
 }
 
-fn ensure_key(cli: &JoinConfigArgs, key_path: &Path, label: &str) -> Result<KeyAction, String> {
+fn ensure_key(
+    cli: &JoinConfigArgs,
+    changes: &mut Changes,
+    key_path: &Path,
+    label: &str,
+) -> Result<KeyAction, String> {
     let exists = key_path.is_file() && key_path.with_extension("pub").is_file();
     if exists {
-        // --yes reuses (regeneration is opt-in, never a default) and a
-        // non-tty run cannot be asked, so both fall through to reuse.
+        // --yes reuses (regeneration is opt-in, never a default), and
+        // neither a non-tty run nor a dry run can be asked, so all
+        // three fall through to reuse.
         let regen = if cli.regen {
             true
-        } else if cli.yes || !prompt::has_tty() {
+        } else if cli.yes || cli.dry_run || !prompt::has_tty() {
             false
         } else {
             prompt::ask_yn(
@@ -1057,12 +1275,21 @@ fn ensure_key(cli: &JoinConfigArgs, key_path: &Path, label: &str) -> Result<KeyA
             )
         };
         if !regen {
+            changes.note(key_path, ChangeKind::Unchanged, "join key pair");
             return Ok(KeyAction::Reused);
+        }
+        changes.note(key_path, ChangeKind::Update, "join key pair (regenerated)");
+        if cli.dry_run {
+            return Ok(KeyAction::Regenerated);
         }
         fs::remove_file(key_path).ok();
         fs::remove_file(key_path.with_extension("pub")).ok();
         generate_key(key_path, label)?;
         return Ok(KeyAction::Regenerated);
+    }
+    changes.note(key_path, ChangeKind::Create, "join key pair");
+    if cli.dry_run {
+        return Ok(KeyAction::Generated);
     }
     generate_key(key_path, label)?;
     Ok(KeyAction::Generated)
@@ -1101,25 +1328,31 @@ fn generate_key(key_path: &Path, label: &str) -> Result<(), String> {
 /// happened to the overlay file.
 fn ensure_overlay(
     cli: &JoinConfigArgs,
+    changes: &mut Changes,
     overlay_path: &Path,
     label: &str,
     root: &Path,
     cmd_hint: Option<&str>,
 ) -> Result<(String, OverlayAction), String> {
     if !overlay_path.is_file() {
+        if cli.dry_run {
+            changes.note(overlay_path, ChangeKind::Create, "farm overlay");
+            return Ok((PLACEHOLDER_TOKEN.to_string(), OverlayAction::Scaffolded));
+        }
         let token = fresh_token()?;
         let scaffold = render_overlay_scaffold(label, &token, root, cmd_hint);
-        fs::write(overlay_path, scaffold)
-            .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
+        changes.write(overlay_path, &scaffold, "farm overlay")?;
         return Ok((token, OverlayAction::Scaffolded));
     }
     let content = fs::read_to_string(overlay_path)
         .map_err(|e| format!("cannot read {}: {e}", overlay_path.display()))?;
     match find_token_line(&content) {
         Some(old) => {
+            // Same non-question policy as the key: a dry run reads the
+            // consent flags as given and never asks.
             let regen = if cli.regen {
                 true
-            } else if cli.yes || !prompt::has_tty() {
+            } else if cli.yes || cli.dry_run || !prompt::has_tty() {
                 false
             } else {
                 prompt::ask_yn(
@@ -1132,13 +1365,17 @@ fn ensure_overlay(
                 )
             };
             if !regen {
+                changes.note(overlay_path, ChangeKind::Unchanged, "farm overlay");
                 return Ok((old, OverlayAction::TokenReused));
+            }
+            if cli.dry_run {
+                changes.note(overlay_path, ChangeKind::Update, "farm overlay (token regenerated)");
+                return Ok((PLACEHOLDER_TOKEN.to_string(), OverlayAction::TokenReplaced));
             }
             let token = fresh_token()?;
             let replaced = replace_token_line(&content, &token)
                 .ok_or("token line vanished between read and replace")?;
-            fs::write(overlay_path, replaced)
-                .map_err(|e| format!("cannot write {}: {e}", overlay_path.display()))?;
+            changes.write(overlay_path, &replaced, "farm overlay (token regenerated)")?;
             Ok((token, OverlayAction::TokenReplaced))
         }
         None => {
@@ -1146,7 +1383,17 @@ fn ensure_overlay(
             // not edit prose it does not own — nested surgical inserts
             // into hand-written yml guess too much. The snippet is in
             // the report.
-            Ok((fresh_token()?, OverlayAction::SnippetPrinted))
+            changes.note(
+                overlay_path,
+                ChangeKind::Unchanged,
+                "farm overlay (user-authored, not edited)",
+            );
+            let token = if cli.dry_run {
+                PLACEHOLDER_TOKEN.to_string()
+            } else {
+                fresh_token()?
+            };
+            Ok((token, OverlayAction::SnippetPrinted))
         }
     }
 }
@@ -1838,25 +2085,36 @@ impl Report {
             out.push('\n');
         };
         push(&mut out, "");
+        if self.dry_run {
+            push(
+                &mut out,
+                "  DRY RUN — nothing written, nothing installed; this is what an apply would do.",
+            );
+            push(&mut out, "");
+        }
         push(&mut out, &format!("  farm:      {}", self.label));
         push(
             &mut out,
             &format!("  dir:       {}", self.farm_dir.display()),
         );
-        let overlay = match self.overlay_action {
-            OverlayAction::Scaffolded => "created",
-            OverlayAction::TokenReplaced => "token regenerated",
-            OverlayAction::TokenReused => "token reused",
-            OverlayAction::SnippetPrinted => "NOT edited (user-authored, no token)",
+        let overlay = match (self.overlay_action, self.dry_run) {
+            (OverlayAction::Scaffolded, false) => "created",
+            (OverlayAction::Scaffolded, true) => "would be created",
+            (OverlayAction::TokenReplaced, false) => "token regenerated",
+            (OverlayAction::TokenReplaced, true) => "token would be regenerated",
+            (OverlayAction::TokenReused, _) => "token reused",
+            (OverlayAction::SnippetPrinted, _) => "NOT edited (user-authored, no token)",
         };
         push(
             &mut out,
             &format!("  overlay:   {} ({overlay})", self.overlay_path.display()),
         );
-        let key = match self.key_action {
-            KeyAction::Generated => "generated",
-            KeyAction::Regenerated => "REGENERATED (old key no longer admits)",
-            KeyAction::Reused => "reused",
+        let key = match (self.key_action, self.dry_run) {
+            (KeyAction::Generated, false) => "generated",
+            (KeyAction::Generated, true) => "would be generated",
+            (KeyAction::Regenerated, false) => "REGENERATED (old key no longer admits)",
+            (KeyAction::Regenerated, true) => "would be REGENERATED (old key would stop admitting)",
+            (KeyAction::Reused, _) => "reused",
         };
         push(
             &mut out,
@@ -1870,13 +2128,21 @@ impl Report {
             &mut out,
             &format!("  notes:     {}", self.notes_path.display()),
         );
-        let install = match &self.install {
-            InstallAction::Installed => "line appended to ~/.ssh/authorized_keys".to_string(),
-            InstallAction::Replaced => {
+        let install = match (&self.install, self.dry_run) {
+            (InstallAction::Installed, false) => {
+                "line appended to ~/.ssh/authorized_keys".to_string()
+            }
+            (InstallAction::Installed, true) => {
+                "line would be appended to ~/.ssh/authorized_keys".to_string()
+            }
+            (InstallAction::Replaced, false) => {
                 "line REPLACED in ~/.ssh/authorized_keys (options updated)".to_string()
             }
-            InstallAction::AlreadyPresent => "already in ~/.ssh/authorized_keys".to_string(),
-            InstallAction::Skipped(why) => format!("NOT installed ({why}) — see notes"),
+            (InstallAction::Replaced, true) => {
+                "line would be REPLACED in ~/.ssh/authorized_keys (options differ)".to_string()
+            }
+            (InstallAction::AlreadyPresent, _) => "already in ~/.ssh/authorized_keys".to_string(),
+            (InstallAction::Skipped(why), _) => format!("NOT installed ({why}) — see notes"),
         };
         push(&mut out, &format!("  sshd:      {install}"));
         if let Some(ci) = &self.cloud_init_path {
@@ -1941,6 +2207,25 @@ impl Report {
         if let Some(f) = &self.freshness {
             push(&mut out, "");
             push(&mut out, &format!("  freshness: {f}"));
+        }
+        if self.dry_run {
+            push(&mut out, "");
+            push(&mut out, "  ── changes an apply would make ──");
+            push(&mut out, "");
+            let mut any = false;
+            for c in &self.changes {
+                if c.kind == ChangeKind::Unchanged {
+                    continue;
+                }
+                any = true;
+                push(
+                    &mut out,
+                    &format!("  {:<7} {}  ({})", c.kind.as_str(), c.path.display(), c.what),
+                );
+            }
+            if !any {
+                push(&mut out, "  nothing — the farm is already in this shape");
+            }
         }
         push(&mut out, "");
         for line in self.steps() {
@@ -2171,11 +2456,13 @@ impl Report {
                     KeyAction::Reused => "reused",
                 },
             },
-            "door": match self.door {
-                Door::B => "b",
-                Door::A => "a",
-                Door::Nologin => "nologin",
-            },
+            "door": door_key(self.door),
+            "dry_run": self.dry_run,
+            "changes": self.changes.iter().map(|c| serde_json::json!({
+                "path": c.path.display().to_string(),
+                "action": c.kind.as_str(),
+                "what": c.what,
+            })).collect::<Vec<_>>(),
             "authorized_keys_line": self.authorized_line,
             "platform": self.plat.name(),
             "in_container": self.in_container,
@@ -2214,6 +2501,213 @@ impl Report {
             "reuse_warning": self.reuse_warning,
         })
     }
+}
+
+// ── Farm enumeration (--list) ───────────────────────────────────────────
+
+/// `--list`: every farm of this project — the union of `fdl.<label>.*`
+/// overlays and `.fdl/<label>/` farm dirs — with door, controller and
+/// credential state. Read-only. Env overlays that are not farms (no
+/// farm dir) are reported separately rather than dressed as broken
+/// farms.
+fn run_list(cli: &JoinConfigArgs) -> i32 {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::cli_error!("cannot read cwd: {e}");
+            return 1;
+        }
+    };
+    let root = crate::config::find_project_config(&cwd)
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or(cwd);
+    let (farms, other_envs) = enumerate_farms(&root);
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "root": root.display().to_string(),
+                "farms": farms.iter().map(FarmInfo::to_json).collect::<Vec<_>>(),
+                "other_envs": other_envs,
+            }))
+            .expect("a farm list serializes"),
+        );
+    } else {
+        print!("{}", render_farm_list(&root, &farms, &other_envs));
+    }
+    0
+}
+
+/// One farm's on-disk state, as `--list` reports it.
+struct FarmInfo {
+    label: String,
+    overlay_path: PathBuf,
+    overlay_exists: bool,
+    has_token: bool,
+    farm_dir: PathBuf,
+    key_present: bool,
+    worker_yml: bool,
+    cloud_init: bool,
+    sshd_conf: bool,
+    door: Option<Door>,
+    controller: Option<String>,
+}
+
+/// A directory under `.fdl/` is a farm dir when it looks like the
+/// wizard's output — `worker.yml` or a `keys/` dir — so schema caches
+/// and future non-farm state under `.fdl/` never masquerade as farms.
+fn is_farm_dir(dir: &Path) -> bool {
+    dir.join("worker.yml").is_file() || dir.join("keys").is_dir()
+}
+
+/// The project's farms plus the env overlays that are not farms.
+fn enumerate_farms(root: &Path) -> (Vec<FarmInfo>, Vec<String>) {
+    // Overlay names come from the resolver's own discovery, so `--list`
+    // cannot disagree with what `fdl @<env>` accepts (.yaml/.json too).
+    let base = crate::config::find_project_config(root);
+    let envs = base
+        .as_deref()
+        .map(overlay::list_envs)
+        .unwrap_or_default();
+
+    let mut labels: Vec<String> = Vec::new();
+    let mut other_envs: Vec<String> = Vec::new();
+    for env in envs {
+        if is_farm_dir(&root.join(".fdl").join(&env)) {
+            labels.push(env);
+        } else {
+            other_envs.push(env);
+        }
+    }
+    // Farm dirs without an overlay (half-provisioned, or the overlay
+    // was deleted) still list — their gap is the finding.
+    if let Ok(entries) = fs::read_dir(root.join(".fdl")) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if validate_label(name).is_ok()
+                && is_farm_dir(&e.path())
+                && !labels.iter().any(|l| l == name)
+            {
+                labels.push(name.to_string());
+            }
+        }
+    }
+    labels.sort();
+    let farms = labels
+        .iter()
+        .map(|label| farm_info(root, base.as_deref(), label))
+        .collect();
+    (farms, other_envs)
+}
+
+fn farm_info(root: &Path, base: Option<&Path>, label: &str) -> FarmInfo {
+    let overlay_path = base
+        .and_then(|b| overlay::find_env_file(b, label))
+        .unwrap_or_else(|| root.join(format!("fdl.{label}.yml")));
+    let overlay_exists = overlay_path.is_file();
+    let has_token = overlay_exists
+        && fs::read_to_string(&overlay_path)
+            .ok()
+            .and_then(|c| find_token_line(&c))
+            .is_some();
+    let farm_dir = root.join(".fdl").join(label);
+    let key_path = farm_dir.join("keys").join(KEY_NAME);
+    let shape = recover_shape(&farm_dir);
+    FarmInfo {
+        label: label.to_string(),
+        overlay_path,
+        overlay_exists,
+        has_token,
+        key_present: key_path.is_file() && key_path.with_extension("pub").is_file(),
+        worker_yml: farm_dir.join("worker.yml").is_file(),
+        cloud_init: farm_dir.join("cloud-init.yml").is_file(),
+        sshd_conf: farm_dir.join(format!("sshd-{label}.conf")).is_file(),
+        door: shape.as_ref().map(|s| s.0),
+        controller: shape.map(|s| s.1),
+        farm_dir,
+    }
+}
+
+fn door_key(door: Door) -> &'static str {
+    match door {
+        Door::B => "b",
+        Door::A => "a",
+        Door::Nologin => "nologin",
+    }
+}
+
+impl FarmInfo {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "overlay": {
+                "path": self.overlay_path.display().to_string(),
+                "exists": self.overlay_exists,
+                "token": self.has_token,
+            },
+            "farm_dir": self.farm_dir.display().to_string(),
+            "key_present": self.key_present,
+            "worker_yml": self.worker_yml,
+            "cloud_init": self.cloud_init,
+            "sshd_conf": self.sshd_conf,
+            "door": self.door.map(door_key),
+            "controller": self.controller,
+        })
+    }
+}
+
+fn render_farm_list(root: &Path, farms: &[FarmInfo], other_envs: &[String]) -> String {
+    let mut out = String::new();
+    if farms.is_empty() {
+        out.push_str(&format!(
+            "no farms at {} — create one with `fdl join-config <label>`\n",
+            root.display(),
+        ));
+    } else {
+        out.push_str(&format!("farms at {}:\n\n", root.display()));
+        for f in farms {
+            let door = match f.door {
+                Some(Door::B) => "door b (rrsync source pull)",
+                Some(Door::A) => "door a (sftp data mount)",
+                Some(Door::Nologin) => "door nologin (tunnel only)",
+                None => "door unknown (no wizard worker.yml)",
+            };
+            let controller = f
+                .controller
+                .as_deref()
+                .map(|c| format!(", controller {c}"))
+                .unwrap_or_default();
+            let state = |present: bool| if present { "present" } else { "MISSING" };
+            out.push_str(&format!("  {}\n", style::bold(&f.label)));
+            out.push_str(&format!("    {door}{controller}\n"));
+            out.push_str(&format!(
+                "    overlay: {}   key: {}   token: {}\n",
+                state(f.overlay_exists),
+                state(f.key_present),
+                state(f.has_token),
+            ));
+            let extras: Vec<&str> = [
+                f.worker_yml.then_some("worker.yml"),
+                f.cloud_init.then_some("cloud-init.yml (SECRET)"),
+                f.sshd_conf.then_some("sshd drop-in"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !extras.is_empty() {
+                out.push_str(&format!("    artifacts: {}\n", extras.join(", ")));
+            }
+            out.push('\n');
+        }
+    }
+    if !other_envs.is_empty() {
+        out.push_str(&format!(
+            "env overlays that are not farms: {}\n",
+            other_envs.join(", "),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]

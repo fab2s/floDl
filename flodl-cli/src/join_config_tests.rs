@@ -231,6 +231,8 @@ fn no_flags() -> JoinConfigArgs {
         cloud_init: false,
         cloud_init_user: None,
         yes: false,
+        list: false,
+        dry_run: false,
         json: false,
     }
 }
@@ -479,10 +481,11 @@ fn upsert_appends_replaces_or_leaves_identical() {
 /// flags contradict loudly.
 #[test]
 fn install_needs_explicit_consent() {
+    let mut changes = Changes::new(false);
     let mut cli = no_flags();
     cli.yes = true; // --yes is NOT consent for a security mutation
     let line = OUR_LINE;
-    match install_authorized_line(&cli, line, 1).unwrap() {
+    match install_authorized_line(&cli, &mut changes, line, 1).unwrap() {
         InstallAction::Skipped(why) => {
             assert!(why.contains("--install-key"), "got: {why}")
         }
@@ -491,13 +494,15 @@ fn install_needs_explicit_consent() {
     let mut cli = no_flags();
     cli.no_install_key = true;
     assert!(matches!(
-        install_authorized_line(&cli, line, 1).unwrap(),
+        install_authorized_line(&cli, &mut changes, line, 1).unwrap(),
         InstallAction::Skipped(_),
     ));
     let mut cli = no_flags();
     cli.install_key = true;
     cli.no_install_key = true;
-    assert!(install_authorized_line(&cli, line, 1).is_err());
+    assert!(install_authorized_line(&cli, &mut changes, line, 1).is_err());
+    // Nothing above got as far as touching the file.
+    assert!(changes.entries.is_empty());
 }
 
 #[test]
@@ -554,9 +559,16 @@ fn an_authorized_keys_path_under_etc_ssh_is_refused() {
     let mut cli = no_flags();
     cli.install_key = true;
     cli.authorized_keys = Some("/etc/ssh/authorized_keys.d/op".to_string());
-    let err = install_authorized_line(&cli, "ssh-ed25519 AAAA test", 22).unwrap_err();
+    let mut changes = Changes::new(false);
+    let err =
+        install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
     assert!(err.contains("system sshd configuration"), "got: {err}");
     assert!(err.contains("by hand"), "names the way out: {err}");
+    // The dry half keeps the same promise.
+    cli.dry_run = true;
+    let err =
+        install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
+    assert!(err.contains("system sshd configuration"), "got: {err}");
 }
 
 // ── Generated sshd drop-in ──────────────────────────────────────────────
@@ -658,4 +670,275 @@ fn a_scaffolded_overlay_never_deletes_the_projects_commands() {
         }
         let _ = fs::remove_dir_all(&tmp);
     }
+}
+
+// ── The write-through change recorder ───────────────────────────────────
+
+#[test]
+fn the_recorder_classifies_and_a_dry_one_withholds_the_write() {
+    let tmp = tempdir();
+    let path = tmp.join("artifact.txt");
+
+    let mut real = Changes::new(false);
+    assert_eq!(real.write(&path, "v1\n", "artifact").unwrap(), ChangeKind::Create);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "v1\n");
+    // Identical content is never rewritten.
+    assert_eq!(real.write(&path, "v1\n", "artifact").unwrap(), ChangeKind::Unchanged);
+    assert_eq!(real.write(&path, "v2\n", "artifact").unwrap(), ChangeKind::Update);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
+
+    let missing = tmp.join("never-written.txt");
+    let mut dry = Changes::new(true);
+    assert_eq!(dry.write(&missing, "x\n", "artifact").unwrap(), ChangeKind::Create);
+    assert!(!missing.exists(), "a dry run must not write");
+    // ... but it still classifies against what IS on disk.
+    assert_eq!(dry.write(&path, "v3\n", "artifact").unwrap(), ChangeKind::Update);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+// ── --dry-run ───────────────────────────────────────────────────────────
+
+/// A dry first pass in an empty directory: the full report, placeholder
+/// credentials, a change list of creates, and NOT ONE byte on disk.
+#[test]
+fn a_dry_run_in_an_empty_dir_writes_nothing_and_plans_everything() {
+    let tmp = tempdir();
+    let mut cli = no_flags();
+    cli.label = Some("dryfarm".to_string());
+    cli.dry_run = true;
+
+    let report = wizard_at(&cli, &tmp).unwrap();
+
+    assert!(report.dry_run);
+    assert!(matches!(report.overlay_action, OverlayAction::Scaffolded));
+    assert!(matches!(report.key_action, KeyAction::Generated));
+    // Credentials an apply would mint appear as placeholders, never as
+    // values the apply will not reproduce.
+    assert!(report.authorized_line.contains(PLACEHOLDER_PUB));
+    assert!(report.worker_yml.contains(PLACEHOLDER_TOKEN));
+    // Consent is read from flags, never prompted for.
+    assert!(matches!(report.install, InstallAction::Skipped(_)));
+    // Everything an apply would create is in the plan.
+    assert!(report.changes.iter().all(|c| c.kind == ChangeKind::Create));
+    let planned: Vec<&str> = report.changes.iter().map(|c| c.what).collect();
+    for what in [
+        "minimal base fdl.yml",
+        ".fdl self-gitignore",
+        "join key pair",
+        "farm overlay",
+        "worker fdl.yml",
+        "install notes",
+        "sshd drop-in",
+    ] {
+        assert!(planned.contains(&what), "missing {what} in {planned:?}");
+    }
+    // And the directory is untouched: no base yml, no overlay, no .fdl.
+    let left: Vec<_> = fs::read_dir(&tmp).unwrap().flatten().collect();
+    assert!(left.is_empty(), "dry run left files behind: {left:?}");
+
+    // The JSON twin carries the same facts.
+    let json = report.to_json();
+    assert_eq!(json["dry_run"], serde_json::json!(true));
+    assert!(!json["changes"].as_array().unwrap().is_empty());
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A dry pass over a farm already in shape reports reuse and changes
+/// nothing — the idle re-run a GUI issues before offering an apply.
+#[test]
+fn a_dry_run_over_an_existing_farm_reports_reuse_and_keeps_content() {
+    let tmp = tempdir();
+    fs::write(tmp.join("fdl.yml"), "# base\n").unwrap();
+    let label = "shaped";
+    let farm = tmp.join(".fdl").join(label);
+    fs::create_dir_all(farm.join("keys")).unwrap();
+    fs::write(farm.join("keys/flodl-join"), "PRIVATE\n").unwrap();
+    fs::write(
+        farm.join("keys/flodl-join.pub"),
+        "ssh-ed25519 AAAAexisting flodl-join-shaped\n",
+    )
+    .unwrap();
+    let token = "aaaabbbbccccddddaaaabbbbccccdddd";
+    fs::write(
+        tmp.join(format!("fdl.{label}.yml")),
+        format!("cluster:\n  controller:\n    join:\n      token: {token}\n"),
+    )
+    .unwrap();
+    let ctrl = Endpoint::parse(Some("op@ctrl.example:2222")).unwrap();
+    let mut cli = no_flags();
+    cli.label = Some(label.to_string());
+    let worker = render_worker_yml(label, &ctrl, token, Door::B, &cli);
+    fs::write(farm.join("worker.yml"), &worker).unwrap();
+
+    cli.dry_run = true;
+    let report = wizard_at(&cli, &tmp).unwrap();
+
+    assert!(matches!(report.key_action, KeyAction::Reused));
+    assert!(matches!(report.overlay_action, OverlayAction::TokenReused));
+    // The recovered shape rendered the same worker yml, so it is not a
+    // change; notes + drop-in do not exist yet, so they are.
+    let kind_of = |what: &str| {
+        report
+            .changes
+            .iter()
+            .find(|c| c.what == what)
+            .map(|c| c.kind)
+    };
+    assert_eq!(kind_of("worker fdl.yml"), Some(ChangeKind::Unchanged));
+    assert_eq!(kind_of("join key pair"), Some(ChangeKind::Unchanged));
+    assert_eq!(kind_of("farm overlay"), Some(ChangeKind::Unchanged));
+    assert_eq!(kind_of("install notes"), Some(ChangeKind::Create));
+    assert_eq!(kind_of("sshd drop-in"), Some(ChangeKind::Create));
+    // The real key and token flow into the report (nothing is minted,
+    // so nothing is a placeholder).
+    assert!(report.authorized_line.contains("AAAAexisting"));
+    assert!(report.worker_yml.contains(token));
+    // And disk is exactly as staged: no notes, no drop-in, same worker.
+    assert!(!farm.join("install-notes.md").exists());
+    assert!(!farm.join(format!("sshd-{label}.conf")).exists());
+    assert_eq!(fs::read_to_string(farm.join("worker.yml")).unwrap(), worker);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// `--dry-run --regen` plans the credential swap without touching it.
+#[test]
+fn a_dry_regen_promises_new_credentials_without_minting_them() {
+    let tmp = tempdir();
+    fs::write(tmp.join("fdl.yml"), "# base\n").unwrap();
+    let label = "regenfarm";
+    let farm = tmp.join(".fdl").join(label);
+    fs::create_dir_all(farm.join("keys")).unwrap();
+    fs::write(farm.join("keys/flodl-join"), "PRIVATE\n").unwrap();
+    fs::write(farm.join("keys/flodl-join.pub"), "ssh-ed25519 AAAAold c\n").unwrap();
+    let overlay = format!("cluster:\n  controller:\n    join:\n      token: {}\n", "a".repeat(32));
+    fs::write(tmp.join(format!("fdl.{label}.yml")), &overlay).unwrap();
+
+    let mut cli = no_flags();
+    cli.label = Some(label.to_string());
+    cli.dry_run = true;
+    cli.regen = true;
+    let report = wizard_at(&cli, &tmp).unwrap();
+
+    assert!(matches!(report.key_action, KeyAction::Regenerated));
+    assert!(matches!(report.overlay_action, OverlayAction::TokenReplaced));
+    assert!(report.authorized_line.contains(PLACEHOLDER_PUB));
+    assert!(report.worker_yml.contains(PLACEHOLDER_TOKEN));
+    // The old credentials are still exactly in place.
+    assert_eq!(
+        fs::read_to_string(farm.join("keys/flodl-join.pub")).unwrap(),
+        "ssh-ed25519 AAAAold c\n",
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.join(format!("fdl.{label}.yml"))).unwrap(),
+        overlay,
+    );
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The dry install verdict classifies the file without touching it.
+#[test]
+fn a_dry_install_verdict_reads_the_file_and_never_writes_it() {
+    let tmp = tempdir();
+    let ak = tmp.join("authorized_keys");
+    fs::write(&ak, format!("{OUR_LINE}\n")).unwrap();
+    let before = fs::read_to_string(&ak).unwrap();
+
+    let mut cli = no_flags();
+    cli.dry_run = true;
+    cli.install_key = true;
+    cli.authorized_keys = Some(ak.display().to_string());
+
+    let mut changes = Changes::new(true);
+    // Identical line → already present.
+    assert!(matches!(
+        install_authorized_line(&cli, &mut changes, OUR_LINE, 1).unwrap(),
+        InstallAction::AlreadyPresent,
+    ));
+    // Same key, different options → would replace.
+    let other_opts = OUR_LINE.replace("restrict,", "");
+    assert!(matches!(
+        install_authorized_line(&cli, &mut changes, &other_opts, 1).unwrap(),
+        InstallAction::Replaced,
+    ));
+    // A placeholder key (an apply would mint it) → would append.
+    let placeholder_line = format!("restrict {PLACEHOLDER_PUB}");
+    assert!(matches!(
+        install_authorized_line(&cli, &mut changes, &placeholder_line, 1).unwrap(),
+        InstallAction::Installed,
+    ));
+    // Without consent flags the dry verdict is the same skip as ever.
+    cli.install_key = false;
+    assert!(matches!(
+        install_authorized_line(&cli, &mut changes, OUR_LINE, 1).unwrap(),
+        InstallAction::Skipped(_),
+    ));
+    assert_eq!(fs::read_to_string(&ak).unwrap(), before, "dry run wrote");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+// ── --list ──────────────────────────────────────────────────────────────
+
+/// The union rule: overlays that are farms, farm dirs without overlays,
+/// and env overlays that are not farms — each classified, none dressed
+/// as another. `.fdl/` state that is not a farm (schema caches) never
+/// lists.
+#[test]
+fn farm_enumeration_unions_overlays_and_dirs_and_skips_non_farms() {
+    let tmp = tempdir();
+    fs::write(tmp.join("fdl.yml"), "# base\n").unwrap();
+
+    // A full farm: overlay with token + wizard-shaped dir.
+    let full = tmp.join(".fdl").join("full");
+    fs::create_dir_all(full.join("keys")).unwrap();
+    fs::write(full.join("keys/flodl-join"), "PRIVATE\n").unwrap();
+    fs::write(full.join("keys/flodl-join.pub"), "ssh-ed25519 AAAA c\n").unwrap();
+    let ctrl = Endpoint::parse(Some("op@ctrl.example:2222")).unwrap();
+    fs::write(
+        full.join("worker.yml"),
+        render_worker_yml("full", &ctrl, "tok", Door::A, &no_flags()),
+    )
+    .unwrap();
+    fs::write(
+        tmp.join("fdl.full.yml"),
+        format!("cluster:\n  controller:\n    join:\n      token: {}\n", "b".repeat(32)),
+    )
+    .unwrap();
+
+    // A half farm: keys only, overlay deleted.
+    let half = tmp.join(".fdl").join("half");
+    fs::create_dir_all(half.join("keys")).unwrap();
+
+    // An env overlay that is no farm at all.
+    fs::write(tmp.join("fdl.cluster.yml"), "cluster: {}\n").unwrap();
+
+    // Non-farm .fdl state must not masquerade as a farm.
+    fs::create_dir_all(tmp.join(".fdl").join("schema-cache")).unwrap();
+
+    let (farms, other_envs) = enumerate_farms(&tmp);
+    let labels: Vec<&str> = farms.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(labels, vec!["full", "half"]);
+    assert_eq!(other_envs, vec!["cluster".to_string()]);
+
+    let full_info = &farms[0];
+    assert!(full_info.overlay_exists && full_info.has_token && full_info.key_present);
+    assert!(full_info.worker_yml && !full_info.cloud_init);
+    assert_eq!(full_info.door, Some(Door::A));
+    assert_eq!(full_info.controller.as_deref(), Some("op@ctrl.example:2222"));
+
+    let half_info = &farms[1];
+    assert!(!half_info.overlay_exists && !half_info.has_token && !half_info.key_present);
+    assert_eq!(half_info.door, None);
+
+    // The JSON twin says the same.
+    let json = full_info.to_json();
+    assert_eq!(json["door"], serde_json::json!("a"));
+    assert_eq!(json["overlay"]["token"], serde_json::json!(true));
+
+    // Human render: farms present, MISSING called out, non-farms aside.
+    let text = render_farm_list(&tmp, &farms, &other_envs);
+    assert!(text.contains("full"), "{text}");
+    assert!(text.contains("MISSING"), "{text}");
+    assert!(text.contains("not farms: cluster"), "{text}");
+    let _ = fs::remove_dir_all(&tmp);
 }
