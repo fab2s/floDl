@@ -610,29 +610,48 @@ proxied through the ui's own port — so a headless controller needs
 exactly **one** `ssh -L` forward for the whole experience, ops page
 and live dashboard together. The proxy forwards the dashboard's own
 routes verbatim to a loopback port only (the host is not configurable,
-so it cannot be aimed off-box). The **history tab** lists persisted
-dashboards found on disk (`dashboard*.html` / `timeline*.html` under
-the project, rustdoc lookalikes excluded) and serves them into the
-same kind of slot, plus the run ledger once the launch slice writes
-it; archive serving is double-bounded (the path must resolve inside
-the project root AND look like a run artifact).
+so it cannot be aimed off-box). The **history tab** is training
+history alone: the dashboards runs persisted on disk (`dashboard*.html`
+/ `timeline*.html` under the project, rustdoc lookalikes and templates
+excluded), grouped one row per run directory since artifacts sharing a
+directory are one run, filtered by space-separated terms, newest 15 by
+default, and served into the same kind of slot — which the browser list
+yields to while you are viewing one. Archive serving is double-bounded
+(the path must resolve inside the project root AND look like a run
+artifact).
 
 The **launch tab** runs the project's own configured commands (the
 `fdl.yml` `commands:` tree, under a farm overlay when one is selected —
 which is where a farm's `cluster: true` run command lives). A command
-whose binary implements the `--fdl-schema` contract gets a **form
-generated from its cached schema** — checkboxes for bools, selects for
-choices, typed hints and defaults on everything else, and only the
-fields the operator actually sets become argv (defaults stay the
-binary's own). No cached schema degrades to a freeform args field: the
-options live in the command's code, and that is fine. Launching streams
+that resolves a schema — cached `--fdl-schema` output in its own
+directory, or an inline `schema:` block — gets a **form generated from
+it**: checkboxes for bools, selects for choices, typed hints and
+defaults on everything else, and only the fields the operator actually
+sets become argv (defaults stay the binary's own). Without one the form
+degrades to a freeform args field, and the hint says which kind of
+absence it is: a `run:` command is a shell line and never grows a form,
+while a path command whose cache is stale or missing grows one after
+`fdl <cmd> --refresh-schema` (a page load never triggers that compile
+itself). **fdl's own
+options ride alongside** — verbosity (`-q` / `-v` / `-vv` / `-vvv`),
+`--gpus`, `--no-append`, `--no-prebuild` — grouped with the env select
+because they are the same fdl-level scope and, like `--env`, precede
+the command; they are no command's schema, so the form has to carry
+them or they are unreachable from the page. A **help** button runs the
+command with `--help`, which is the only way to see a schema-less
+command's surface from the browser; it streams like a launch but never
+enters the run ledger, since asking what something takes is not
+running it. Launching streams
 the run's output live through the same job machinery as publish (one
 job at a time; a closed tab never kills the run; "Follow last job"
 reconnects), a `--monitor <port>` in the args automatically points the
 run tab's dashboard slot at the run, and **each completed launch
 appends one line to the run ledger** (`.fdl/ui/runs.jsonl`: timestamp,
-duration, farm, exact argv, exit code) — the durable history the
-history tab lists. Deliberately absent: a stop button. A killed cluster
+duration, farm, exact argv, exit code), which is listed **beside the
+form** in a scrolling column: a command history belongs next to the
+thing that runs commands. Clicking an entry *proposes* it again — the
+recorded argv replayed verbatim behind an explicit confirm, never
+launched by the click itself. Deliberately absent: a stop button. A killed cluster
 run leaves ports held and remote ranks spinning (the rig-hygiene
 protocol exists for a reason), and a button that pretends otherwise
 would be a lie; stopping stays a deliberate act.
