@@ -22,7 +22,7 @@ use crate::tensor::Result;
 /// Mirrors the guard-construction precedence used by the legacy
 /// `run_cluster_rank_cadence_nccl` worker-side path: user-supplied
 /// [`ConvergenceGuard`] wins, otherwise [`NoGuard`] when
-/// `no_divergence_guard` is set, otherwise a [`TrendGuard`] at the
+/// `no_divergence_guard` is set, otherwise a [`LevelGuard`] at the
 /// user threshold or the EASGD-aware default
 /// ([`default_trend_threshold`]).
 ///
@@ -30,7 +30,7 @@ use crate::tensor::Result;
 ///     crate::distributed::cluster_coordinator::ClusterCoordinatorConfig
 /// [`ConvergenceGuard`]: convergence::ConvergenceGuard
 /// [`NoGuard`]: convergence::NoGuard
-/// [`TrendGuard`]: convergence::TrendGuard
+/// [`LevelGuard`]: convergence::LevelGuard
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_coord_config_from_builder(
     policy: ApplyPolicy,
@@ -52,7 +52,7 @@ pub(crate) fn build_coord_config_from_builder(
     let epoch_splits = config.epoch_splits.max(1);
 
     // Resume: read the meta sidecar before anything else so the saved
-    // ElChe / TrendGuard / trajectory state can feed the constructors
+    // ElChe / LevelGuard / trajectory state can feed the constructors
     // below. Missing file or schema mismatch surfaces loudly here
     // rather than partially seeding the controller.
     let resume_meta: Option<crate::distributed::CheckpointMeta> = match config.resume_from {
@@ -97,8 +97,8 @@ pub(crate) fn build_coord_config_from_builder(
         .partition_ratios(config.elche.partition_ratios.clone());
 
     // Guard precedence: user override > NoGuard (if flagged) >
-    // TrendGuard with user threshold or 0.05 default. On resume, the
-    // default-built TrendGuard absorbs the saved divergence ring
+    // LevelGuard with user threshold or 0.05 default. On resume, the
+    // default-built LevelGuard absorbs the saved divergence ring
     // buffer so the first 3 cycles after resume don't silently emit
     // `Stable` regardless of live trajectory. User-supplied guards are
     // passed through unchanged — the caller owns their guard's resume
@@ -113,7 +113,7 @@ pub(crate) fn build_coord_config_from_builder(
             if config.elche.no_divergence_guard {
                 Box::new(convergence::NoGuard)
             } else {
-                let mut tg = convergence::TrendGuard::new(
+                let mut tg = convergence::LevelGuard::new(
                     config
                         .elche
                         .divergence_threshold
@@ -228,7 +228,7 @@ pub(crate) fn build_coord_config_from_builder(
     Ok(coord_config)
 }
 
-/// Default [`TrendGuard`](convergence::TrendGuard) threshold when the user
+/// Default [`LevelGuard`](convergence::LevelGuard) threshold when the user
 /// set none, keyed on the param-adoption semantics.
 ///
 /// Full-overwrite modes (Sync / Cadence / un-blended Async) snap every rank
@@ -238,7 +238,7 @@ pub(crate) fn build_coord_config_from_builder(
 /// an elastic spread around the consensus — the measured divergence carries
 /// a standing baseline (~0.1 at α=0.5) that IS the operating point, not
 /// drift toward failure. An overwrite-calibrated floor sits inside that
-/// band and keeps the trend rule permanently armed on a healthy run
+/// band and keeps the level rule permanently armed on a healthy run
 /// (measured 2026-07-22, resnet-graph 3-seed probe: suppression at the low
 /// floor bought no convergence and cost ~35% extra reduces). Blended modes
 /// therefore calibrate the floor above the elastic band; a genuine

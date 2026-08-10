@@ -82,7 +82,7 @@ impl ClusterCoordinator {
         self.cycle.reset_upload_markers();
         // CpuAvgStart: open the Pending window. Closed in
         // `finish_averaging_cpu` via the machine's `pending_since`
-        // so MSF / dashboard see the same `CpuAvgEnd
+        // so divergence analysis / dashboard see the same `CpuAvgEnd
         // { duration_ms }` payload shape on cluster runs.
         //
         // DELIBERATE SEMANTICS: this clock starts at the TRIGGER, so

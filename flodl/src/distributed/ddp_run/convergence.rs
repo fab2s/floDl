@@ -6,13 +6,26 @@
 //!
 //! - [`NoGuard`]: passive baseline, always [`ConvergenceAction::Stable`]. Use
 //!   to collect an unconditioned trajectory for fair guard comparison.
-//! - [`TrendGuard`]: production default. Three-rises-above-threshold rule on
-//!   the per-rank `||pre - post|| / ||post||` ring buffer. Returns
+//! - [`LevelGuard`]: production default. Watches the divergence **level** —
+//!   three-rises-above-threshold rule on the per-rank
+//!   `||pre - post|| / ||post||` ring buffer. Returns
 //!   [`ConvergenceAction::SuppressGrowth`] on persistent rising drift.
-//! - [`MsfGuard`]: rate-based detector built on the across-event MSF proxy
-//!   `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds:
-//!   sustained `λ_ema > suppress_threshold` → `SuppressGrowth`; sustained
-//!   `λ_ema > nudge_threshold` → [`ConvergenceAction::NudgeDown`].
+//! - [`GrowthGuard`]: watches the divergence **growth rate** —
+//!   `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`, the per-rank-step
+//!   exponential rate at which replica divergence compounds. Soft + hard
+//!   thresholds: sustained `λ_ema > suppress_threshold` → `SuppressGrowth`;
+//!   sustained `λ_ema > nudge_threshold` → [`ConvergenceAction::NudgeDown`].
+//!
+//! Level versus rate is the whole distinction, and it is why only
+//! [`GrowthGuard`] has downward authority: a level that is high but flat wants
+//! holding, while one that is compounding wants the anchor cut.
+//!
+//! The two were once `TrendGuard` and `MsfGuard`. "MSF" stood for Master
+//! Stability Function, from synchronization theory — a lineage the research
+//! review declined to defend (flodl's ranks are non-identical, stochastic and
+//! independently perturbed, where the theory assumes identical deterministic
+//! oscillators), and one that appeared nowhere in this code but the name.
+//! Deprecated aliases live in [`crate::compat`].
 //!
 //! All three implement [`ConvergenceGuard`]. The Trainer accepts any
 //! `impl ConvergenceGuard + 'static` via `DdpBuilder::convergence_guard`;
@@ -176,8 +189,8 @@ pub trait ConvergenceGuard: Send + Sync {
     /// divergence trajectory (the `history.len() < 3` warm-up window).
     ///
     /// Default `None`: guards without persisted state (`NoGuard`,
-    /// `MsfGuard` — its EMA + streak counters re-warm from scratch).
-    /// `TrendGuard` returns its divergence ring buffer.
+    /// `GrowthGuard` — its EMA + streak counters re-warm from scratch).
+    /// `LevelGuard` returns its divergence ring buffer.
     fn trend_history(&self) -> Option<Vec<f64>> {
         None
     }
@@ -196,10 +209,10 @@ impl Clone for Box<dyn ConvergenceGuard> {
 }
 
 // ---------------------------------------------------------------------------
-// MSF lambda estimator (used by MsfGuard)
+// Divergence-growth-rate estimator (used by GrowthGuard)
 // ---------------------------------------------------------------------------
 
-/// Per-event sample of the across-event transversal Lyapunov proxy.
+/// Per-event sample of the divergence growth rate.
 ///
 /// `lambda_raw_t = (1/k_max) * log(D_t / D_{t-1})` where `k_max` is the
 /// per-rank step count of the slowest rank between consecutive AllReduces
@@ -336,28 +349,28 @@ impl ConvergenceGuard for NoGuard {
 }
 
 // ---------------------------------------------------------------------------
-// TrendGuard (production default)
+// LevelGuard (production default)
 // ---------------------------------------------------------------------------
 
 /// Production guard: 3-consecutive-rises-above-threshold rule on
 /// `max_relative_delta` history. Suppresses anchor growth on persistent
 /// rising drift. Does not currently issue [`ConvergenceAction::NudgeDown`]
-/// — adding that is a separate decision (the trend signal is too noisy on
+/// — adding that is a separate decision (the level signal is too noisy on
 /// its own to drive aggressive anchor reduction).
 #[derive(Clone)]
-pub struct TrendGuard {
+pub struct LevelGuard {
     threshold: f64,
     /// Ring buffer of `max_relative_delta` from recent sync intervals (up to 5).
     history: VecDeque<f64>,
 }
 
-impl Default for TrendGuard {
+impl Default for LevelGuard {
     fn default() -> Self {
         Self::new(0.01)
     }
 }
 
-impl TrendGuard {
+impl LevelGuard {
     /// Build with the given divergence threshold.
     ///
     /// Set high (e.g. 1.0) for log-only mode during calibration.
@@ -419,7 +432,7 @@ impl TrendGuard {
     }
 }
 
-impl ConvergenceGuard for TrendGuard {
+impl ConvergenceGuard for LevelGuard {
     fn clone_box(&self) -> Box<dyn ConvergenceGuard> {
         Box::new(self.clone())
     }
@@ -435,7 +448,7 @@ impl ConvergenceGuard for TrendGuard {
 
     fn telemetry(&self) -> Vec<(&'static str, f64)> {
         // Latest observation only — mirror the production signal in the
-        // timeline so dashboards can plot the trend buffer's head.
+        // timeline so dashboards can plot the level buffer's head.
         match self.history.back() {
             Some(&d) => vec![("d_history_last", d)],
             None => Vec::new(),
@@ -456,10 +469,11 @@ impl ConvergenceGuard for TrendGuard {
 }
 
 // ---------------------------------------------------------------------------
-// MsfGuard
+// GrowthGuard
 // ---------------------------------------------------------------------------
 
-/// MSF-based rate detector with soft (suppress) + hard (nudge) thresholds.
+/// Divergence-growth-rate detector with soft (suppress) + hard (nudge)
+/// thresholds.
 ///
 /// Tracks `λ_ema` (bias-corrected EMA of `(1/k_max) * log(D_t / D_{t-1})`)
 /// and escalates:
@@ -475,9 +489,9 @@ impl ConvergenceGuard for TrendGuard {
 /// suppress as `λ_ema` decays.
 ///
 /// Disable nudge by setting `nudge_threshold = f64::INFINITY` (or via
-/// [`MsfGuard::without_nudge`]).
+/// [`GrowthGuard::without_nudge`]).
 #[derive(Clone)]
-pub struct MsfGuard {
+pub struct GrowthGuard {
     estimator: LambdaEstimator,
     suppress_threshold: f64,
     suppress_sustain: usize,
@@ -490,7 +504,7 @@ pub struct MsfGuard {
     last_sample: Option<LambdaSample>,
 }
 
-impl Default for MsfGuard {
+impl Default for GrowthGuard {
     fn default() -> Self {
         Self {
             estimator: LambdaEstimator::default(),
@@ -506,7 +520,7 @@ impl Default for MsfGuard {
     }
 }
 
-impl MsfGuard {
+impl GrowthGuard {
     /// Builder: set EMA smoothing coefficient (0.0-1.0). Default 0.9.
     pub fn with_alpha(mut self, alpha: f64) -> Self {
         self.estimator = LambdaEstimator::with_alpha(alpha);
@@ -542,7 +556,7 @@ impl MsfGuard {
     }
 }
 
-impl ConvergenceGuard for MsfGuard {
+impl ConvergenceGuard for GrowthGuard {
     fn clone_box(&self) -> Box<dyn ConvergenceGuard> {
         Box::new(self.clone())
     }
@@ -577,7 +591,7 @@ impl ConvergenceGuard for MsfGuard {
         if self.nudge_streak >= self.nudge_sustain && self.nudge_threshold.is_finite() {
             self.nudge_streak = 0;
             crate::verbose!(
-                "  ddp: msf λ_ema={:.4e} sustained > nudge_threshold {:.4e} | nudging anchor down by {:.2}",
+                "  ddp: growth λ_ema={:.4e} sustained > nudge_threshold {:.4e} | nudging anchor down by {:.2}",
                 lema,
                 self.nudge_threshold,
                 self.nudge_factor,
@@ -589,7 +603,7 @@ impl ConvergenceGuard for MsfGuard {
         if self.suppress_streak >= self.suppress_sustain {
             self.suppress_streak = 0;
             crate::verbose!(
-                "  ddp: msf λ_ema={:.4e} sustained > suppress_threshold {:.4e} | suppressing growth",
+                "  ddp: growth λ_ema={:.4e} sustained > suppress_threshold {:.4e} | suppressing growth",
                 lema,
                 self.suppress_threshold,
             );
@@ -700,11 +714,11 @@ mod tests {
         assert!(g.telemetry().is_empty());
     }
 
-    // --- TrendGuard ---
+    // --- LevelGuard ---
 
     #[test]
     fn trend_default_threshold_is_0_01() {
-        let g = TrendGuard::default();
+        let g = LevelGuard::default();
         // Behavioural check: 3 rising values just above 0.01 should fire.
         let mut g = g;
         g.report(&make_report(&[0.011]), 8, 4);
@@ -717,7 +731,7 @@ mod tests {
 
     #[test]
     fn trend_3_rises_above_threshold_suppress() {
-        let mut g = TrendGuard::new(0.01);
+        let mut g = LevelGuard::new(0.01);
         assert_eq!(
             g.report(&make_report(&[0.02]), 8, 4),
             ConvergenceAction::Stable
@@ -734,7 +748,7 @@ mod tests {
 
     #[test]
     fn trend_non_rising_is_stable() {
-        let mut g = TrendGuard::new(0.01);
+        let mut g = LevelGuard::new(0.01);
         g.report(&make_report(&[0.05]), 8, 4);
         g.report(&make_report(&[0.04]), 8, 4); // dropped
         assert_eq!(
@@ -745,7 +759,7 @@ mod tests {
 
     #[test]
     fn trend_below_threshold_is_stable() {
-        let mut g = TrendGuard::new(0.10);
+        let mut g = LevelGuard::new(0.10);
         g.report(&make_report(&[0.01]), 8, 4);
         g.report(&make_report(&[0.02]), 8, 4);
         assert_eq!(
@@ -756,7 +770,7 @@ mod tests {
 
     #[test]
     fn trend_history_capped_at_5() {
-        let mut g = TrendGuard::new(0.01);
+        let mut g = LevelGuard::new(0.01);
         for i in 0..10 {
             g.report(&make_report(&[i as f64 * 0.01]), 8, 4);
         }
@@ -765,7 +779,7 @@ mod tests {
 
     #[test]
     fn trend_reset_clears_history() {
-        let mut g = TrendGuard::new(0.01);
+        let mut g = LevelGuard::new(0.01);
         for _ in 0..5 {
             g.report(&make_report(&[0.05]), 8, 4);
         }
@@ -777,14 +791,14 @@ mod tests {
     // ring, and `with_history` rehydrates an equivalent guard.
     #[test]
     fn trend_history_snapshot_roundtrip() {
-        let mut g = TrendGuard::new(0.01);
+        let mut g = LevelGuard::new(0.01);
         for v in [0.01, 0.02, 0.03, 0.04, 0.05] {
             g.report(&make_report(&[v]), 8, 4);
         }
         let snap = g.trend_history().expect("non-empty history");
         assert_eq!(snap, vec![0.01, 0.02, 0.03, 0.04, 0.05]);
 
-        let restored = TrendGuard::new(0.01).with_history(snap);
+        let restored = LevelGuard::new(0.01).with_history(snap);
         assert_eq!(g.history(), restored.history());
     }
 
@@ -797,7 +811,7 @@ mod tests {
         let pre_crash = vec![0.02, 0.03, 0.04];
 
         // Without restore: first observation can't fire (only 1 entry).
-        let mut cold = TrendGuard::new(0.01);
+        let mut cold = LevelGuard::new(0.01);
         assert_eq!(
             cold.report(&make_report(&[0.05]), 8, 4),
             ConvergenceAction::Stable
@@ -807,7 +821,7 @@ mod tests {
         // observation now form a 4-long ring, the last 3 of which are
         // strictly rising and above threshold → SuppressGrowth fires
         // immediately on the first post-resume cycle.
-        let mut warm = TrendGuard::new(0.01).with_history(pre_crash);
+        let mut warm = LevelGuard::new(0.01).with_history(pre_crash);
         assert_eq!(
             warm.report(&make_report(&[0.05]), 8, 4),
             ConvergenceAction::SuppressGrowth
@@ -819,7 +833,7 @@ mod tests {
     #[test]
     fn trend_with_history_truncates_oversize_input() {
         let oversize: Vec<f64> = (0..10).map(|i| i as f64).collect();
-        let g = TrendGuard::new(0.01).with_history(oversize);
+        let g = LevelGuard::new(0.01).with_history(oversize);
         assert_eq!(g.history().len(), 5);
         // Front-truncate keeps the most recent observations.
         let restored: Vec<f64> = g.history().iter().copied().collect();
@@ -828,7 +842,7 @@ mod tests {
 
     #[test]
     fn trend_history_empty_returns_none() {
-        let g = TrendGuard::default();
+        let g = LevelGuard::default();
         assert!(g.trend_history().is_none());
     }
 
@@ -840,7 +854,7 @@ mod tests {
 
     #[test]
     fn msf_guard_trend_history_is_none() {
-        let g = MsfGuard::default();
+        let g = GrowthGuard::default();
         assert!(g.trend_history().is_none());
     }
 
@@ -926,11 +940,11 @@ mod tests {
         assert!((e.ema_raw - 1.0).abs() < 1e-3, "raw_ema = {}", e.ema_raw);
     }
 
-    // --- MsfGuard ---
+    // --- GrowthGuard ---
 
     #[test]
     fn msf_default_starts_stable() {
-        let mut g = MsfGuard::default();
+        let mut g = GrowthGuard::default();
         let s = g.report(&make_report(&[0.01]), 8, 4);
         assert_eq!(s, ConvergenceAction::Stable);
     }
@@ -939,9 +953,10 @@ mod tests {
     fn msf_suppress_fires_after_sustain() {
         // Feed an exponentially-rising D so λ_ema climbs quickly and stays
         // above suppress_threshold for ≥ suppress_sustain events.
-        let mut g = MsfGuard::default()
-            .with_suppress(1.0e-3, 3)
-            .with_nudge(f64::INFINITY, 3, 0.5); // disable nudge
+        let mut g =
+            GrowthGuard::default()
+                .with_suppress(1.0e-3, 3)
+                .with_nudge(f64::INFINITY, 3, 0.5); // disable nudge
         // Drive λ_raw ≈ ln(2)/4 ≈ 0.173 every event so EMA quickly clears 1e-3.
         let mut prev = 1.0e-4;
         let mut fired = false;
@@ -962,7 +977,7 @@ mod tests {
         // Same shape but nudge_threshold is also 1e-3 → fires immediately
         // once λ_ema clears the bar (default suppress 1e-3 fires too, but
         // nudge wins when both trigger on the same event).
-        let mut g = MsfGuard::default()
+        let mut g = GrowthGuard::default()
             .with_suppress(1.0e-3, 3)
             .with_nudge(1.0e-3, 3, 0.5);
         let mut prev = 1.0e-4;
@@ -984,7 +999,7 @@ mod tests {
     fn msf_decaying_lambda_does_not_fire() {
         // Feed a halving D every event → λ_raw ≈ -ln(2)/4 < 0; neither trigger
         // should ever fire.
-        let mut g = MsfGuard::default();
+        let mut g = GrowthGuard::default();
         let mut prev = 0.5;
         for _ in 0..30 {
             let next = prev * 0.5;
@@ -996,7 +1011,9 @@ mod tests {
 
     #[test]
     fn msf_without_nudge_disables_hard_trigger() {
-        let mut g = MsfGuard::default().with_suppress(1.0e-3, 3).without_nudge();
+        let mut g = GrowthGuard::default()
+            .with_suppress(1.0e-3, 3)
+            .without_nudge();
         let mut prev = 1.0e-4;
         let mut nudge_fires = 0;
         for _ in 0..20 {
@@ -1014,7 +1031,7 @@ mod tests {
 
     #[test]
     fn msf_telemetry_carries_lambda_after_first_observation() {
-        let mut g = MsfGuard::default();
+        let mut g = GrowthGuard::default();
         g.report(&make_report(&[0.01]), 8, 4);
         g.report(&make_report(&[0.02]), 8, 4);
         let t = g.telemetry();
@@ -1024,7 +1041,7 @@ mod tests {
 
     #[test]
     fn msf_reset_clears_state() {
-        let mut g = MsfGuard::default();
+        let mut g = GrowthGuard::default();
         g.report(&make_report(&[0.01]), 8, 4);
         g.report(&make_report(&[0.02]), 8, 4);
         g.reset();

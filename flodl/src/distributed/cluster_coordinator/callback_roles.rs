@@ -29,7 +29,7 @@ impl ClusterCoordinator {
     /// `AnchorChanged` event emitted from `finish_averaging_*` (covers
     /// meta nudge composed with any guard-driven adjustment).
     /// `MetaNudge` here isolates the meta's contribution with the raw
-    /// `factor` so MSF / dashboard tooling can attribute the cycle's
+    /// `factor` so divergence-analysis / dashboard tooling can attribute the cycle's
     /// anchor delta between the two sources.
     pub(super) fn observe_meta(
         &mut self,

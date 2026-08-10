@@ -11,6 +11,7 @@ use std::process::{ExitCode, Stdio};
 use crate::builtins;
 use crate::cli_error;
 use crate::config::{self, ArgSpec, CommandConfig, OptionSpec, ResolvedConfig, Schema};
+use crate::help;
 use crate::libtorch;
 use crate::style;
 
@@ -1070,7 +1071,7 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     let preset_slot = cmd_config.arg_name.as_deref().unwrap_or("preset");
 
     // Wrap descriptions to the terminal width (or COLUMNS / a sane default).
-    let width = help_width();
+    let width = help::help_width();
 
     print_title(cmd_config, name);
     print_usage_line(cmd_config, name, &presets, &sub_cmds, preset_slot);
@@ -1079,6 +1080,7 @@ pub fn print_command_help(cmd_config: &CommandConfig, name: &str) {
     print_schema_commands_section(cmd_config, name);
     print_options_section(cmd_config, width);
     print_entry_section(cmd_config);
+    print_fdl_flags_section(cmd_config, width);
     print_defaults_section(cmd_config);
 }
 
@@ -1214,10 +1216,23 @@ fn print_options_section(cmd_config: &CommandConfig, width: usize) {
     eprintln!();
     eprintln!("{}:", style::yellow("Options"));
     let avail = width.saturating_sub(4);
-    for (long, spec) in &schema.options {
-        for line in format_option(long, spec, avail) {
+    // A blank line follows any option whose rendering ran to several lines.
+    // Without it a wrapped description butts straight against the next
+    // flag, and the next flag's first line reads as part of the previous
+    // description -- the way `--output`'s `[default: runs]` looked like it
+    // belonged to `--outer-optimizer`. Short one-line options stay dense,
+    // so a simple CLI's help is unchanged.
+    let mut prev_was_tall = false;
+    for (i, (long, spec)) in schema.options.iter().enumerate() {
+        let lines = format_option(long, spec, avail);
+        let tall = lines.len() > 1;
+        if i > 0 && (prev_was_tall || tall) {
+            eprintln!();
+        }
+        for line in &lines {
             eprintln!("    {line}");
         }
+        prev_was_tall = tall;
     }
 }
 
@@ -1250,6 +1265,51 @@ fn print_entry_section(cmd_config: &CommandConfig) {
             "    Any extra {} are forwarded to the entry point.",
             style::dim("[options]")
         );
+    }
+}
+
+/// The flags `fdl` answers itself at a sub-command's level, as opposed to
+/// forwarding to the entry.
+///
+/// Renders directly under `Entry`, because that section's closing line
+/// promises everything undeclared is "forwarded as-is" and these are the
+/// exceptions. `--refresh-schema` in particular existed, worked, and was
+/// documented in no `--help` at all — discoverable only by reading
+/// `dispatch.rs` or the strict-mode universals table.
+fn print_fdl_flags_section(cmd_config: &CommandConfig, width: usize) {
+    if cmd_config.entry.is_none() {
+        return;
+    }
+    eprintln!();
+    eprintln!("{}:", style::yellow("fdl flags"));
+    eprintln!(
+        "    {}  Show this help",
+        style::green(&format!("{:<20}", "-h, --help"))
+    );
+    eprintln!(
+        "    {}  Re-probe the entry's {} and rewrite the cached surface",
+        style::green(&format!("{:<20}", "--refresh-schema")),
+        style::dim("--fdl-schema")
+    );
+    // The cache is normally maintained for you; say so, or the flag reads as
+    // a step every run needs. The one case where it IS needed by hand is a
+    // cargo entry that has not opted into `compile: true` -- for anything
+    // else (a script, a pre-built binary, or an opted-in cargo entry) a stale
+    // cache re-probes on its own.
+    let needs_manual = cmd_config
+        .entry
+        .as_deref()
+        .is_some_and(crate::schema_cache::is_cargo_entry)
+        && !cmd_config.compile.unwrap_or(false);
+    let hint = if needs_manual {
+        "run it after a rebuild: a cargo entry is not probed on its own, since \
+         that would put a compile behind every `-h`. `compile: true` in its \
+         fdl.yml opts in."
+    } else {
+        "rarely needed by hand: the cache re-probes itself once this command changes."
+    };
+    for line in help::wrap_text(&format!("({hint})"), width.saturating_sub(4)) {
+        eprintln!("    {}", style::dim(&line));
     }
 }
 
@@ -1614,19 +1674,18 @@ fn format_arg_usage(a: &ArgSpec) -> String {
     }
 }
 
-/// Label-column width for the `Arguments` section (chars, after the
-/// section's own left indent). Descriptions wrap into the column to the
-/// right of this.
-const ARG_COL: usize = 22;
-/// Label-column width for the `Options` section (option flags run wider
-/// than positional args, so they get a roomier column).
-const OPT_COL: usize = 30;
-
 fn format_arg(a: &ArgSpec, avail_width: usize) -> Vec<String> {
     let left = format_arg_usage(a);
-    let visible = visible_width(&left);
-    let segs = desc_segments(a.description.as_deref(), &a.default, &a.choices, &a.ty);
-    format_row(&left, visible, ARG_COL, &segs, avail_width)
+    let visible = help::visible_width(&left);
+    let anns = annotations(&a.default, &a.choices, &a.ty);
+    help::row(
+        &left,
+        visible,
+        help::ARG_COL,
+        a.description.as_deref(),
+        &anns,
+        avail_width,
+    )
 }
 
 /// Format an option row into one or more display lines: the flag (with its
@@ -1647,67 +1706,42 @@ fn format_option(long: &str, spec: &OptionSpec, avail_width: usize) -> Vec<Strin
             flag.chars().count() + 1 + placeholder.chars().count(),
         )
     };
-    let segs = desc_segments(
+    let anns = annotations(&spec.default, &spec.choices, &spec.ty);
+    let mut out = help::row(
+        &left,
+        visible,
+        help::OPT_COL,
         spec.description.as_deref(),
-        &spec.default,
-        &spec.choices,
-        &spec.ty,
+        &anns,
+        avail_width,
     );
-    let mut out = format_row(&left, visible, OPT_COL, &segs, avail_width);
     if let Some(env) = &spec.env {
         out.push(format!(
             "{}{}",
-            " ".repeat(OPT_COL),
+            " ".repeat(help::OPT_COL),
             style::dim(&format!("[env: {env}]"))
         ));
     }
     out
 }
 
-/// A word/segment for description wrapping: `text` is the visible content
-/// (what counts toward the wrap width), `styled` is what actually gets
-/// printed (may carry ANSI escapes, which have zero visible width).
-struct Seg {
-    text: String,
-    styled: String,
-}
-
-impl Seg {
-    fn plain(s: &str) -> Seg {
-        Seg {
-            text: s.to_string(),
-            styled: s.to_string(),
-        }
-    }
-    fn dim(s: &str) -> Seg {
-        Seg {
-            text: s.to_string(),
-            styled: style::dim(s),
-        }
-    }
-}
-
-/// Break a description (plus its `[default:]` / `[possible:]` / list-type
-/// annotations) into wrap units. Free-text words split on whitespace so
-/// they reflow; each annotation stays whole (a `[possible: a, b, c]` list
-/// reads better unbroken than reflowed mid-item).
-fn desc_segments(
-    description: Option<&str>,
+/// The `[default: ...]` / `[possible: ...]` notes that trail a description.
+///
+/// Kept here rather than in [`help`] because they are rendered from a
+/// schema's JSON values; the derive builds the same strings from its own
+/// literals. Only the layout is shared.
+fn annotations(
     default: &Option<serde_json::Value>,
     choices: &Option<Vec<serde_json::Value>>,
     ty: &str,
-) -> Vec<Seg> {
-    let mut segs: Vec<Seg> = description
-        .unwrap_or("-")
-        .split_whitespace()
-        .map(Seg::plain)
-        .collect();
+) -> Vec<String> {
+    let mut out = Vec::new();
     if let Some(d) = default {
         // Skip noisy defaults: bool false, empty list, null.
         let is_empty_list = matches!(d, serde_json::Value::Array(a) if a.is_empty());
         let is_false = matches!(d, serde_json::Value::Bool(false));
         if !d.is_null() && !is_false && !is_empty_list {
-            segs.push(Seg::dim(&format!("[default: {}]", format_value(d))));
+            out.push(format!("[default: {}]", format_value(d)));
         }
     }
     if let Some(choices) = choices
@@ -1718,83 +1752,11 @@ fn desc_segments(
             .map(format_value)
             .collect::<Vec<_>>()
             .join(", ");
-        segs.push(Seg::dim(&format!("[possible: {list}]")));
+        out.push(format!("[possible: {list}]"));
     }
     // Annotate list types so users know about repeat/comma semantics.
     if ty.starts_with("list[") {
-        segs.push(Seg::dim("(repeat or comma-separate)"));
-    }
-    segs
-}
-
-/// Greedily pack segments into lines no wider than `width` visible chars,
-/// one space between words. A single segment wider than `width` (e.g. a
-/// long unbreakable annotation) gets its own overflowing line rather than
-/// being split.
-fn wrap_segments(segs: &[Seg], width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_w = 0usize;
-    for seg in segs {
-        let w = seg.text.chars().count();
-        if cur_w == 0 {
-            cur.push_str(&seg.styled);
-            cur_w = w;
-        } else if cur_w + 1 + w <= width {
-            cur.push(' ');
-            cur.push_str(&seg.styled);
-            cur_w += 1 + w;
-        } else {
-            lines.push(std::mem::take(&mut cur));
-            cur.push_str(&seg.styled);
-            cur_w = w;
-        }
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-/// Lay out a two-column help row: a `label` of visible width
-/// `label_visible` in a column `desc_col` chars wide, then `segs` wrapped
-/// into the description column to its right. `avail_width` is the printable
-/// width the section has after its own left indent. Continuation lines
-/// align under the description column; a label too wide for its column
-/// drops the description to the next line.
-fn format_row(
-    label: &str,
-    label_visible: usize,
-    desc_col: usize,
-    segs: &[Seg],
-    avail_width: usize,
-) -> Vec<String> {
-    // Floor so a narrow terminal still leaves a usable description column.
-    const MIN_DESC: usize = 20;
-    let desc_width = avail_width.saturating_sub(desc_col).max(MIN_DESC);
-    let desc_lines = wrap_segments(segs, desc_width);
-    let pad = " ".repeat(desc_col);
-    let mut out: Vec<String> = Vec::with_capacity(desc_lines.len() + 1);
-    if label_visible < desc_col {
-        let gap = " ".repeat(desc_col - label_visible);
-        out.push(format!("{label}{gap}{}", desc_lines[0]));
-    } else {
-        // Label overflows its column: give it its own line, description below.
-        out.push(label.to_string());
-        out.push(format!("{pad}{}", desc_lines[0]));
-    }
-    for line in &desc_lines[1..] {
-        out.push(format!("{pad}{line}"));
-    }
-    // Drop trailing padding (e.g. a "-" placeholder leaves a padded blank).
-    for line in &mut out {
-        while line.ends_with(' ') {
-            line.pop();
-        }
+        out.push("(repeat or comma-separate)".to_string());
     }
     out
 }
@@ -1818,171 +1780,10 @@ fn format_value(v: &serde_json::Value) -> String {
     }
 }
 
-/// Rough visible width helper: styled strings wrap their visible content
-/// in ANSI escapes, so we use the unstyled inputs we started from.
-fn visible_width(s: &str) -> usize {
-    // The inputs we pass here come from pre-styling helpers that already
-    // know the raw length. Strip ANSI to be safe.
-    strip_ansi(s).chars().count()
-}
-
-/// Printable width to wrap help output to. Precedence: an explicit
-/// `COLUMNS` env var (lets CI and pipelines pin it), else the controlling
-/// terminal's width when stderr is a TTY, else a readable default. Clamped
-/// so ultra-wide terminals don't stretch descriptions past comfortable
-/// reading length and narrow ones stay usable.
-fn help_width() -> usize {
-    const DEFAULT: usize = 100;
-    const MIN: usize = 60;
-    const MAX: usize = 120;
-    let raw = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&c| c > 0)
-        .or_else(term_cols)
-        .unwrap_or(DEFAULT);
-    raw.clamp(MIN, MAX)
-}
-
-/// The controlling terminal's column count via `TIOCGWINSZ`, or `None`
-/// when stderr is not a TTY (help is piped/redirected) or the query fails.
-/// Dep-free: the minimal-deps policy precludes a terminal-size crate, so we
-/// declare the one `ioctl` we need. Non-unix targets have no equivalent
-/// here and fall back to the default width.
-#[cfg(unix)]
-fn term_cols() -> Option<usize> {
-    use std::io::IsTerminal;
-    use std::os::unix::io::AsRawFd;
-
-    let stderr = std::io::stderr();
-    if !stderr.is_terminal() {
-        return None;
-    }
-    #[repr(C)]
-    struct Winsize {
-        row: u16,
-        col: u16,
-        xpixel: u16,
-        ypixel: u16,
-    }
-    // TIOCGWINSZ request code: 0x5413 on Linux/Android (incl. WSL), the
-    // packed 0x4008_7468 on the BSDs/macOS.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
-    unsafe extern "C" {
-        fn ioctl(
-            fd: std::os::raw::c_int,
-            request: std::os::raw::c_ulong,
-            ...
-        ) -> std::os::raw::c_int;
-    }
-    let mut ws = Winsize {
-        row: 0,
-        col: 0,
-        xpixel: 0,
-        ypixel: 0,
-    };
-    // SAFETY: `ioctl(TIOCGWINSZ, &Winsize)` writes the window size into the
-    // struct; the fd is stderr, verified above to be a terminal.
-    let rc = unsafe { ioctl(stderr.as_raw_fd(), TIOCGWINSZ, &mut ws as *mut Winsize) };
-    (rc == 0 && ws.col > 0).then_some(ws.col as usize)
-}
-
-#[cfg(not(unix))]
-fn term_cols() -> Option<usize> {
-    None
-}
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::util::test_env::env_lock;
-
-    // Help-column wrapping. Plain segments keep these independent of the
-    // color state (no `style::*` calls), so they need no style lock.
-    fn plain_segs(words: &[&str]) -> Vec<Seg> {
-        words.iter().map(|w| Seg::plain(w)).collect()
-    }
-
-    #[test]
-    fn wrap_segments_packs_words_within_width() {
-        let segs = plain_segs(&["alpha", "beta", "gamma", "delta"]);
-        // width 12: "alpha beta" (10) fits, +" gamma" (16) does not.
-        let lines = wrap_segments(&segs, 12);
-        assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
-        for line in &lines {
-            assert!(line.chars().count() <= 12);
-        }
-    }
-
-    #[test]
-    fn wrap_segments_oversized_segment_gets_its_own_line() {
-        let segs = plain_segs(&["short", "supercalifragilistic", "tail"]);
-        let lines = wrap_segments(&segs, 10);
-        // The oversized word overflows alone rather than being split.
-        assert_eq!(lines, vec!["short", "supercalifragilistic", "tail"]);
-    }
-
-    #[test]
-    fn format_row_aligns_continuation_under_description_column() {
-        // desc_col 8, avail 28 → desc width 20 (the MIN_DESC floor).
-        let segs = plain_segs(&["aaaa", "bbbb", "cccc", "dddd", "eeee"]);
-        let rows = format_row("--x", 3, 8, &segs, 28);
-        // "aaaa bbbb cccc dddd" = 19 ≤ 20 fits; " eeee" would be 24, wraps.
-        assert_eq!(rows[0], "--x     aaaa bbbb cccc dddd"); // 3 + 5 spaces = column 8
-        assert_eq!(rows[1], format!("{}eeee", " ".repeat(8)));
-        // Continuation lines are indented exactly to the column.
-        for row in &rows[1..] {
-            assert!(row.starts_with(&" ".repeat(8)));
-            assert!(!row.starts_with(&" ".repeat(9)));
-        }
-    }
-
-    #[test]
-    fn format_row_overflowing_label_drops_description_below() {
-        let segs = plain_segs(&["desc"]);
-        // Label wider than the 8-char column → own line, desc aligned below.
-        let rows = format_row("--a-very-long-flag", 18, 8, &segs, 40);
-        assert_eq!(rows[0], "--a-very-long-flag");
-        assert_eq!(rows[1], format!("{}desc", " ".repeat(8)));
-    }
-
-    #[test]
-    fn help_width_honors_columns_env_within_clamp() {
-        let _lock = env_lock();
-        let prev = std::env::var("COLUMNS").ok();
-        // SAFETY: guarded by the process-wide env lock.
-        unsafe { std::env::set_var("COLUMNS", "90") };
-        assert_eq!(help_width(), 90);
-        unsafe { std::env::set_var("COLUMNS", "9999") };
-        assert_eq!(help_width(), 120); // clamped to MAX
-        unsafe { std::env::set_var("COLUMNS", "10") };
-        assert_eq!(help_width(), 60); // clamped to MIN
-        match prev {
-            Some(v) => unsafe { std::env::set_var("COLUMNS", v) },
-            None => unsafe { std::env::remove_var("COLUMNS") },
-        }
-    }
 
     fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

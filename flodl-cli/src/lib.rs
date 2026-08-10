@@ -75,6 +75,11 @@ pub mod cluster;
 /// and no `cluster:` block is configured in YAML.
 pub mod gpus;
 
+/// Help-text layout shared by `fdl <cmd> --help` and the help that
+/// `#[derive(FdlArgs)]` generates, so one description renders identically
+/// from either entry point.
+pub mod help;
+
 /// Cross-cutting context passed to sub-command handlers (resolved config,
 /// verbosity, overlay selection, working directory, ...).
 pub mod context;

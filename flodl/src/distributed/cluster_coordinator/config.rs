@@ -10,7 +10,7 @@
 use std::sync::{Arc, mpsc};
 
 use crate::distributed::ddp::ElChe;
-use crate::distributed::ddp_run::convergence::{ConvergenceGuard, NoGuard, TrendGuard};
+use crate::distributed::ddp_run::convergence::{ConvergenceGuard, LevelGuard, NoGuard};
 use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 
 use super::NCCL_RENDEZVOUS_TIMEOUT_SECS;
@@ -30,7 +30,7 @@ pub struct ClusterCoordinatorConfig {
     pub backend: AverageBackend,
     pub world_size: usize,
     pub el_che: ElChe,
-    /// Boxed convergence guard. Defaults to [`TrendGuard::default()`]
+    /// Boxed convergence guard. Defaults to [`LevelGuard::default()`]
     /// when omitted in the builder; set [`NoGuard`] to disable.
     pub convergence_guard: Box<dyn ConvergenceGuard>,
     /// Allow ElChe anchor relax-up on Stable convergence verdicts.
@@ -356,7 +356,7 @@ pub struct ClusterCoordinatorConfig {
 }
 
 impl ClusterCoordinatorConfig {
-    /// Construct with sensible defaults: TrendGuard with default
+    /// Construct with sensible defaults: LevelGuard with default
     /// threshold, no anchor relax-up, overshoot_initial=3, ceiling=15.
     pub fn new(
         policy: ApplyPolicy,
@@ -369,7 +369,7 @@ impl ClusterCoordinatorConfig {
             backend,
             world_size,
             el_che,
-            convergence_guard: Box::new(TrendGuard::default()),
+            convergence_guard: Box::new(LevelGuard::default()),
             elche_relax_up: false,
             overshoot_initial: 3,
             overshoot_ceiling: 15,

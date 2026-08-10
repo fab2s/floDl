@@ -76,9 +76,13 @@ mod orchestrator;
 mod shared;
 
 pub use convergence::{
-    ConvergenceAction, ConvergenceGuard, DivergenceReport, LambdaEstimator, LambdaSample, MsfGuard,
-    NoGuard, TrendGuard,
+    ConvergenceAction, ConvergenceGuard, DivergenceReport, GrowthGuard, LambdaEstimator,
+    LambdaSample, LevelGuard, NoGuard,
 };
+// The guards' pre-rename spellings, re-exported at the path they used to live
+// at so existing code keeps compiling. See `crate::compat`.
+#[allow(deprecated)]
+pub use crate::compat::{MsfGuard, TrendGuard};
 pub use cooperative::{StepOutcome, Worker};
 pub use orchestrator::*;
 pub(crate) use shared::{
@@ -664,7 +668,7 @@ pub struct DdpRunConfig {
     /// Checkpoint bundle stem for resume. When set, the cluster
     /// orchestrator reads `<stem>.meta.json` at `.run()` time, seeds
     /// the controller with the saved trajectory state (epoch,
-    /// global_step, sync_round, ElChe state including TrendGuard
+    /// global_step, sync_round, ElChe state including LevelGuard
     /// history), and kicks the launcher off at `meta.epoch` instead of
     /// `0`.
     ///
@@ -816,7 +820,7 @@ impl DdpRunConfig {
         self
     }
 
-    /// Set the divergence threshold for the trend guardrail.
+    /// Set the divergence threshold for the level guardrail.
     pub fn with_divergence_threshold(mut self, threshold: f64) -> Self {
         self.elche.divergence_threshold = Some(threshold);
         self
@@ -1136,7 +1140,7 @@ pub(crate) enum TimingMsg {
         post_norm: Option<f64>,
         /// Pre-AllReduce per-rank L2 norm `||params_before||_i`. With
         /// `divergence` and `post_norm` this gives the cosine-similarity /
-        /// magnitude-shift decomposition (MSF/SWA directional vs magnitude
+        /// magnitude-shift decomposition (directional vs magnitude
         /// split). `None` when divergence is also `None`.
         pre_norm: Option<f64>,
     },

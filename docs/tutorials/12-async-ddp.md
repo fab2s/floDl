@@ -82,8 +82,8 @@ monitors weight-space divergence between replicas and pulls back.
 
 | Guard | Behavior | When to pick |
 |---|---|---|
-| `TrendGuard::new(thresh)` | **Production default.** Three-rises-above-threshold rule on the `\|\|pre - post\|\| / \|\|post\|\|` ring buffer. Returns `SuppressGrowth` on persistent rising drift. | Almost everyone. |
-| `MsfGuard::default().with_suppress(s, n).with_nudge(t, n, f)` | Rate-based detector built on the across-event MSF proxy `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds escalate from `SuppressGrowth` to `NudgeDown`. | When you have time to tune thresholds for your specific architecture; can react faster than TrendGuard on sharp divergence spikes. |
+| `LevelGuard::new(thresh)` | **Production default.** Watches the divergence **level**: three-rises-above-threshold rule on the `\|\|pre - post\|\| / \|\|post\|\|` ring buffer. Returns `SuppressGrowth` on persistent rising drift; never reduces the anchor. | Almost everyone. |
+| `GrowthGuard::default().with_suppress(s, n).with_nudge(t, n, f)` | Watches the **growth rate** instead: `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`, the per-rank-step rate at which divergence compounds. Soft + hard thresholds escalate from `SuppressGrowth` to `NudgeDown`, so this is the only guard with downward authority. | When you have time to tune thresholds for your specific architecture; can react faster than `LevelGuard` on sharp divergence spikes. |
 | `NoGuard` | Always `Stable`. | Instrumentation runs that want an unconditioned trajectory (every overhead-tune proposal commits unconditionally). |
 
 ### Guard authority over `overhead_target`
@@ -377,7 +377,7 @@ TrainerConfig::new(dataset)
 | `.relax_up(true)` | `false` | Grow anchor by 1 on Stable verdict (in addition to overhead-tune proposals). |
 | `.partition_ratios([...])` | auto | Static split - Sync mode only. |
 | `.meta_controller(false)` | `true` | Opt out of LR-aware meta-controller. |
-| `.convergence_guard(g)` | `TrendGuard::new(0.05)` | `NoGuard`, `TrendGuard`, or `MsfGuard`. |
+| `.convergence_guard(g)` | `LevelGuard::new(0.05)` | `NoGuard`, `LevelGuard`, or `GrowthGuard`. |
 | `.easgd_alpha(α)` | `None` | EASGD elastic blend - `CpuAsync` only. |
 
 ### Cluster launch

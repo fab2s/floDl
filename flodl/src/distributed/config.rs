@@ -177,19 +177,19 @@ pub struct ElCheConfig {
     /// `.meta_controller(false)` when collecting an unconditioned
     /// trajectory.
     pub meta_controller: bool,
-    /// Divergence guardrail. `None` = `TrendGuard` at the EASGD-aware
+    /// Divergence guardrail. `None` = `LevelGuard` at the EASGD-aware
     /// default threshold (0.05 for overwrite modes; 0.3 when
     /// `easgd_alpha` is set, whose elastic standing spread would keep a
     /// lower floor permanently armed); set to a custom guard to
     /// override threshold or replace behavior. See
     /// [`crate::distributed::ddp_run::NoGuard`] /
-    /// [`crate::distributed::ddp_run::TrendGuard`].
+    /// [`crate::distributed::ddp_run::LevelGuard`].
     pub convergence_guard: Option<Box<dyn ConvergenceGuard>>,
     /// EASGD elastic-averaging weight (0.0 < α ≤ 1.0). Honored on the
     /// CpuAsync path only; ignored elsewhere.
     pub easgd_alpha: Option<f64>,
     /// Divergence threshold for the default convergence guard
-    /// ([`crate::distributed::ddp_run::TrendGuard`]). `None` = framework
+    /// ([`crate::distributed::ddp_run::LevelGuard`]). `None` = framework
     /// default, keyed on param-adoption semantics: 0.05 for overwrite
     /// modes, 0.3 when [`Self::easgd_alpha`] is set (elastic blending
     /// keeps a deliberate standing spread ~0.1 that a lower floor would
@@ -300,7 +300,7 @@ impl ElCheConfig {
             meta_controller: true,
             convergence_guard: None,
             // cpu-async defaults to the EASGD elastic blend (α=0.5, the
-            // value the MSF study used). The `None`/full-overwrite path
+            // value the cadence-control study used). The `None`/full-overwrite path
             // is α=1.0, which discards the ahead-of-sync local progress
             // cpu-async accumulates between reduces — the degenerate
             // mode. Mode-gated: `easgd_alpha` drives `load_averaged`'s

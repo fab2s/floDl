@@ -1,5 +1,15 @@
 # MSF Cadence Control v2: Two-Scale Framing
 
+> **Naming note (2026-08-10).** The guard this program produced shipped as
+> `MsfGuard` / `--guard msf` and has since been renamed to `GrowthGuard` /
+> `--guard growth`, alongside `TrendGuard` → `LevelGuard`. The names now say
+> what each one measures (the divergence level, versus the rate at which it
+> compounds) rather than what inspired it: the MSF framing is a hypothesis this
+> program tested and did not confirm, so keeping it in a user-facing flag name
+> asserted more than the evidence does. This document keeps the original
+> vocabulary throughout — it is the dated record of the investigation, not a
+> description of the current API.
+
 **Status:** refinement of [msf-cadence-control.md](msf-cadence-control.md)
 after Phase 1 passive observation (5-seed sweep, ResNet-20 / CIFAR-10 /
 3-GPU heterogeneous, 2026-05-04). The original document framed DDP as a

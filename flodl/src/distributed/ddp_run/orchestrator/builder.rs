@@ -221,7 +221,7 @@ where
         self
     }
 
-    /// Set the divergence threshold for the trend guardrail.
+    /// Set the divergence threshold for the level guardrail.
     pub fn divergence_threshold(mut self, threshold: f64) -> Self {
         self.config = self.config.with_divergence_threshold(threshold);
         self
@@ -242,13 +242,13 @@ where
     /// When set, takes precedence over the legacy `divergence_threshold` and
     /// `no_divergence_guard` settings. Three concrete impls ship in flodl:
     /// [`crate::distributed::ddp_run::NoGuard`],
-    /// [`crate::distributed::ddp_run::TrendGuard`] (production default), and
-    /// [`crate::distributed::ddp_run::MsfGuard`] (rate-based detector with
+    /// [`crate::distributed::ddp_run::LevelGuard`] (production default), and
+    /// [`crate::distributed::ddp_run::GrowthGuard`] (rate-based detector with
     /// soft+hard thresholds).
     ///
     /// ```text
     /// .convergence_guard(
-    ///     MsfGuard::default()
+    ///     GrowthGuard::default()
     ///         .with_suppress(1e-3, 3)
     ///         .with_nudge(1e-2, 3, 0.5),
     /// )
@@ -378,7 +378,7 @@ where
     /// - `global_step` and `sync_round` so the LR scheduler picks up where
     ///   it left off,
     /// - the [`crate::distributed::ElCheState`] snapshot including
-    ///   [`crate::distributed::ddp_run::convergence::TrendGuard`] history,
+    ///   [`crate::distributed::ddp_run::convergence::LevelGuard`] history,
     ///   so cadence + divergence trajectories don't re-warm from scratch.
     ///
     /// Model parameters and optimizer state are NOT auto-loaded here —

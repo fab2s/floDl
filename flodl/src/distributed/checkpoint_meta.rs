@@ -36,7 +36,7 @@ use crate::tensor::{Result, TensorError};
 ///   defaults to `None` via serde's `default`.
 /// - 3: adds `ElCheState.trend_history` for full-fidelity resume of
 ///   [`crate::distributed::ddp_run::convergence::ConvergenceGuard`] state (currently just the
-///   `TrendGuard` divergence ring buffer; other guards return `None`).
+///   `LevelGuard` divergence ring buffer; other guards return `None`).
 ///   v2 files still parse — the field defaults to `None`.
 /// - 4: adds optional `coverage` ([`CoverageBlock`]) for coverage-granular
 ///   async resume (per in-progress epoch: the uncovered offset ranges + the
@@ -165,16 +165,16 @@ pub struct ElCheState {
     /// phase-transition logic (Warmup → Stable → Mature) on resume.
     pub calibration_count: u64,
     /// [`crate::distributed::ddp_run::convergence::ConvergenceGuard`] resume buffer (currently
-    /// `TrendGuard`'s divergence ring). Captured from the controller's
+    /// `LevelGuard`'s divergence ring). Captured from the controller's
     /// boxed guard via
     /// [`crate::distributed::ddp_run::convergence::ConvergenceGuard::trend_history`] on
     /// `ShutdownWithSave`; rebuilt via
-    /// [`crate::distributed::ddp_run::convergence::TrendGuard::with_history`] on resume so the
+    /// [`crate::distributed::ddp_run::convergence::LevelGuard::with_history`] on resume so the
     /// first 3 cycles after resume don't silently emit `Stable` while
     /// waiting for the ring to refill (the `history.len() < 3` warm-up
-    /// window inside `TrendGuard::check_trend`).
+    /// window inside `LevelGuard::check_trend`).
     ///
-    /// `None` for guards without persisted state (`NoGuard`, `MsfGuard`)
+    /// `None` for guards without persisted state (`NoGuard`, `GrowthGuard`)
     /// and for empty-ring snapshots (guard never observed a divergence
     /// event). v2 files default this to `None` via serde.
     #[serde(default)]

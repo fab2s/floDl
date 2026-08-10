@@ -99,6 +99,31 @@ pub fn yellow(s: &str) -> String {
     }
 }
 
+/// The palette's amber, for inline literals in help text (flag names, code
+/// spans, enum values quoted mid-sentence).
+///
+/// 256-colour index 179 is `#d7af5f`, which is where `--cost: #d9a05b` from
+/// `site/assets/css/flodl-tokens.css` lands in the xterm cube — so the
+/// terminal carries the same hue as the site, the live dashboard and `fdl ui`
+/// rather than an eyeballed approximation. Note the CSS drift gate
+/// (`ci/release/13-design-tokens.sh`) cannot see this constant: it compares
+/// vendored copies of that stylesheet, and an ANSI index is not one. If the
+/// amber token ever moves, grep the hex.
+///
+/// The palette assigns amber to cost/hazard, which a code span is not. That
+/// mapping is a web-surface convention and the terminal already departs from
+/// it (green marks a flag here, not a good state); what carries over is the
+/// hue, so the two surfaces do not drift into two different oranges. A
+/// terminal without 256-colour support ignores the sequence rather than
+/// printing it, since it is still a well-formed SGR.
+pub fn amber(s: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[38;5;179m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn bold(s: &str) -> String {
     if color_enabled() {
         format!("\x1b[1m{s}\x1b[0m")
@@ -160,6 +185,22 @@ mod tests {
         reset();
         set_color_choice(ColorChoice::Always);
         assert!(color_enabled());
+        reset();
+    }
+
+    /// The amber index is a claim about the shared palette, not a taste
+    /// choice: 179 is `#d7af5f`, where `--cost: #d9a05b` from
+    /// `site/assets/css/flodl-tokens.css` lands in the xterm-256 cube. The CSS
+    /// drift gate compares vendored stylesheets and structurally cannot see an
+    /// ANSI index, so the alignment is pinned here or nowhere.
+    #[test]
+    fn amber_carries_the_shared_palette_hue() {
+        let _g = LOCK.lock().unwrap();
+        reset();
+        set_color_choice(ColorChoice::Always);
+        assert_eq!(amber("x"), "\x1b[38;5;179mx\x1b[0m");
+        set_color_choice(ColorChoice::Never);
+        assert_eq!(amber("x"), "x", "colour off must leave the text bare");
         reset();
     }
 

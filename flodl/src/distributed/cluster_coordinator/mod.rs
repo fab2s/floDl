@@ -166,7 +166,7 @@ fn initial_callback_role(
 // ClusterCoordinator
 // ---------------------------------------------------------------------------
 
-/// Drained payload of the per-epoch d-aggregator, shaped so MSF
+/// Drained payload of the per-epoch d-aggregator, shaped so divergence
 /// analysis sees a consistent `DivergenceEpoch` regardless of backend.
 /// `count == 0` means no AllReduce happened in the epoch (e.g. final
 /// pure-Sync epoch with one batch per rank) and the caller should skip
@@ -345,7 +345,7 @@ pub struct ClusterCoordinator {
     epoch_d_count: usize,
     /// Most-recent `d_raw` sample in the current epoch. Surfaced as the
     /// `d_at_epoch_end` payload field on `EventKind::DivergenceEpoch`
-    /// so MSF analysis can read the last observation of the epoch
+    /// so divergence analysis can read the last observation of the epoch
     /// without scanning all per-event samples.
     epoch_last_d: f64,
     /// `k_max` from the most-recent AllReduce in the current epoch.

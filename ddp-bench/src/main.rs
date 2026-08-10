@@ -82,7 +82,7 @@ struct Cli {
     /// Training data source: "ram" parses the dataset into memory up
     /// front; "disk" reads per sample from the raw files through
     /// flodl's DataSet layer (CIFAR-10 models: resnet, resnet-graph).
-    #[option(default = "ram")]
+    #[option(default = "ram", choices = &["ram", "disk"])]
     data_source: String,
 
     /// Live dashboard port.
@@ -162,9 +162,9 @@ struct Cli {
 
     /// Override ElChe's anchor upper bound (`max_anchor`, library default
     /// 200). When set, passed to `DdpBuilder::max_anchor(N)`. Used by
-    /// Sweep C of the MSF cadence-control program to bracket the
-    /// Pecora-Carroll synchronization threshold by walking the cap across
-    /// multiples of the default (e.g. 200, 300, 400, 800).
+    /// the cadence-control study to bracket the point where cadence stops
+    /// converging, by walking the cap across multiples of the default (e.g.
+    /// 200, 300, 400, 800).
     ///
     /// Honored in Cadence/Async modes only; ignored by Sync and solo modes.
     #[option]
@@ -174,9 +174,9 @@ struct Cli {
     /// initial anchor). Forces the overhead auto-tune above its natural
     /// equilibrium. Combined with `--max-anchor N` (same value) plus
     /// `--guard none`, pins the cadence at exactly N batches per cycle —
-    /// the fixed-k probe used by Sweep B of the MSF cadence-control
-    /// program to walk past the auto-tune's preferred operating point and
-    /// locate the synchronization threshold k*(LR). The convergence
+    /// the fixed-k probe used by the cadence-control study to walk past the
+    /// auto-tune's preferred operating point and locate the cadence ceiling
+    /// k*(LR) beyond which a run stops converging. The convergence
     /// guard's `NudgeDown` is the only path that bypasses `min_anchor`;
     /// disabling it via `--guard none` is sufficient for hard pinning.
     ///
@@ -217,7 +217,7 @@ struct Cli {
     /// round; param adoption follows the mode, EASGD-blended on cpu-async).
     /// Honored on both CPU (controller-forged consensus) and NCCL (per-rank
     /// replicated step); pair with `--outer-lr` / `--outer-mu`.
-    #[option]
+    #[option(default = "none", choices = &["none", "slowmo", "diloco"])]
     outer_optimizer: Option<String>,
 
     /// Outer learning rate for slowmo/diloco. Default 1.0 (slowmo) / 0.7 (diloco).
@@ -322,12 +322,12 @@ struct Cli {
     /// (`prefers-color-scheme`), exactly as the live dashboard does. Pass
     /// "light" when the artifact is headed for a paper — a figure should not
     /// change appearance with the reviewer's OS. Requires `--save-dashboard`.
-    #[option]
+    #[option(choices = &["light", "dark", "auto"])]
     dashboard_theme: Option<String>,
 
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
-    /// `eval=X.XXXX` into `training.log`. Required for the MSF
-    /// kill-criterion correlation `λ̂ → held-out accuracy`. Default off.
+    /// `eval=X.XXXX` into `training.log`. Required to correlate the
+    /// divergence growth rate `λ̂` against held-out accuracy. Default off.
     ///
     /// Adds an eval pass per epoch on rank 0 (Sync: consensus params;
     /// Cadence/Async: rank-local at start of next epoch — near-consensus,
@@ -345,53 +345,56 @@ struct Cli {
     ///
     /// Honored on the DDP `Builder` modes (nccl-*/cpu-*); solo modes ignore
     /// it. `--per-epoch-eval` is managed-only for now.
-    #[option(default = "managed")]
+    #[option(default = "managed", choices = &["managed", "cooperative"])]
     tier: String,
 
-    /// Convergence guard selector. Default: `trend` (production behavior,
-    /// 3-rises-above-threshold rule).
+    /// Convergence guard selector. The two active guards differ in what they
+    /// watch, which is why only `growth` may cut the anchor:
     ///
     /// - `none`: passive baseline; ElChe overhead-tune drives cadence.
-    /// - `trend`: production guard (TrendGuard).
-    /// - `msf`: MSF rate-based guard with soft (suppress) + hard (nudge)
-    ///   thresholds on the bias-corrected `λ_ema`.
-    #[option]
+    /// - `level`: the divergence LEVEL, via a 3-rises-above-threshold rule.
+    ///   Holds anchor growth; never reduces it.
+    /// - `growth`: the RATE at which divergence compounds,
+    ///   `λ_ema = EMA((1/k_max)·log(D_t/D_{t-1}))`, with a soft (suppress) and
+    ///   a hard (nudge-down) threshold.
+    #[option(default = "level", choices = &["none", "level", "growth"])]
     guard: Option<String>,
 
-    /// Primary divergence threshold. Trend: 3-rises-above-threshold cut-off
-    /// (default: library default — 0.05, raised to 0.3 when EASGD blending
-    /// is active, i.e. cpu-async, whose elastic standing spread would
-    /// otherwise keep the guard permanently armed). MSF: soft
+    /// Primary divergence threshold. `level`: the 3-rises-above-threshold
+    /// cut-off (default: library default — 0.05, raised to 0.3 when EASGD
+    /// blending is active, i.e. cpu-async, whose elastic standing spread would
+    /// otherwise keep the guard permanently armed). `growth`: soft
     /// (`SuppressGrowth`) threshold on `λ_ema` (default 1e-3).
     #[option]
     guard_threshold: Option<f64>,
 
-    /// MSF only: number of consecutive events `λ_ema` must remain above
-    /// `--guard-threshold` before `SuppressGrowth` fires. Default 3.
+    /// `--guard growth` only: number of consecutive events `λ_ema` must remain
+    /// above `--guard-threshold` before `SuppressGrowth` fires. Default 3.
     #[option]
     guard_sustain: Option<usize>,
 
-    /// MSF only: hard (`NudgeDown`) threshold on `λ_ema`. Default 1e-2.
-    /// Set to a very large value (or use `--guard-no-nudge`) to disable.
+    /// `--guard growth` only: hard (`NudgeDown`) threshold on `λ_ema`.
+    /// Default 1e-2. Set very large (or use `--guard-no-nudge`) to disable.
     #[option]
     guard_nudge_threshold: Option<f64>,
 
-    /// MSF only: consecutive events `λ_ema` must remain above
+    /// `--guard growth` only: consecutive events `λ_ema` must remain above
     /// `--guard-nudge-threshold` before `NudgeDown` fires. Default 3.
     #[option]
     guard_nudge_sustain: Option<usize>,
 
-    /// MSF only: anchor reduction factor on `NudgeDown` (0.0-1.0).
-    /// Default 0.5 (halve the anchor).
+    /// `--guard growth` only: anchor reduction factor on `NudgeDown`
+    /// (0.0-1.0). Default 0.5 (halve the anchor).
     #[option]
     guard_nudge_factor: Option<f64>,
 
-    /// MSF only: disable the hard (`NudgeDown`) trigger entirely. Soft
-    /// (`SuppressGrowth`) trigger remains active.
+    /// `--guard growth` only: disable the hard (`NudgeDown`) trigger
+    /// entirely. The soft (`SuppressGrowth`) trigger remains active.
     #[option]
     guard_no_nudge: bool,
 
-    /// MSF only: EMA smoothing coefficient (0.0-1.0). Default 0.9.
+    /// `--guard growth` only: EMA smoothing coefficient (0.0-1.0).
+    /// Default 0.9.
     #[option]
     guard_alpha: Option<f64>,
 
@@ -536,24 +539,29 @@ fn parse_partition_ratios(spec: &str) -> flodl::tensor::Result<Vec<f64>> {
 ///
 /// Loud-error policy: every guard-specific flag that doesn't apply to the
 /// selected `--guard` exits with a clear message rather than being silently
-/// ignored. Default guard is `trend` (production behavior).
+/// ignored. Default guard is `level` (production behavior).
 fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::GuardChoice> {
     use crate::config::GuardChoice;
-    let kind = cli.guard.as_deref().unwrap_or("trend").trim().to_lowercase();
-    let only_msf = |name: &str, present: bool| -> flodl::tensor::Result<()> {
-        if present && kind != "msf" {
+    let kind = cli
+        .guard
+        .as_deref()
+        .unwrap_or("level")
+        .trim()
+        .to_lowercase();
+    let only_growth = |name: &str, present: bool| -> flodl::tensor::Result<()> {
+        if present && kind != "growth" {
             return Err(flodl::tensor::TensorError::new(&format!(
-                "--{name} is only valid with --guard msf (current: --guard {kind})",
+                "--{name} is only valid with --guard growth (current: --guard {kind})",
             )));
         }
         Ok(())
     };
-    only_msf("guard-sustain", cli.guard_sustain.is_some())?;
-    only_msf("guard-nudge-threshold", cli.guard_nudge_threshold.is_some())?;
-    only_msf("guard-nudge-sustain", cli.guard_nudge_sustain.is_some())?;
-    only_msf("guard-nudge-factor", cli.guard_nudge_factor.is_some())?;
-    only_msf("guard-no-nudge", cli.guard_no_nudge)?;
-    only_msf("guard-alpha", cli.guard_alpha.is_some())?;
+    only_growth("guard-sustain", cli.guard_sustain.is_some())?;
+    only_growth("guard-nudge-threshold", cli.guard_nudge_threshold.is_some())?;
+    only_growth("guard-nudge-sustain", cli.guard_nudge_sustain.is_some())?;
+    only_growth("guard-nudge-factor", cli.guard_nudge_factor.is_some())?;
+    only_growth("guard-no-nudge", cli.guard_no_nudge)?;
+    only_growth("guard-alpha", cli.guard_alpha.is_some())?;
     if kind == "none" && cli.guard_threshold.is_some() {
         return Err(flodl::tensor::TensorError::new(
             "--guard-threshold is not used by --guard none",
@@ -561,10 +569,10 @@ fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::G
     }
     match kind.as_str() {
         "none" => Ok(GuardChoice::None),
-        "trend" => Ok(GuardChoice::Trend {
+        "level" => Ok(GuardChoice::Level {
             threshold: cli.guard_threshold,
         }),
-        "msf" => Ok(GuardChoice::Msf {
+        "growth" => Ok(GuardChoice::Growth {
             suppress_threshold: cli.guard_threshold.unwrap_or(1.0e-3),
             suppress_sustain: cli.guard_sustain.unwrap_or(3),
             nudge_threshold: if cli.guard_no_nudge {
@@ -577,7 +585,7 @@ fn validate_guard_selection(cli: &Cli) -> flodl::tensor::Result<crate::config::G
             alpha: cli.guard_alpha.unwrap_or(0.9),
         }),
         other => Err(flodl::tensor::TensorError::new(&format!(
-            "unknown --guard '{other}' (expected: none, trend, msf)",
+            "unknown --guard '{other}' (expected: none, level, growth)",
         ))),
     }
 }
@@ -806,16 +814,29 @@ fn run() -> flodl::tensor::Result<()> {
     };
 
     if list {
-        eprintln!("Models:");
+        // Styled through `flodl_cli::style` so `--list` looks like the rest
+        // of the CLI. It auto-detects (stderr TTY, NO_COLOR, FORCE_COLOR), so
+        // a piped `--list` stays plain with no flag of its own -- and the
+        // detection happens in whichever container the run lands in, which is
+        // the only place that can answer it.
+        use flodl_cli::style;
+        eprintln!("{}:", style::yellow("Models"));
         for name in models::model_names() {
             if let Some(m) = models::find_model(name) {
-                eprintln!("  {:<16} {}", m.name, m.description);
+                eprintln!("  {}  {}", style::green(&format!("{:<16}", m.name)), m.description);
             }
         }
-        eprintln!("\nModes:");
+        eprintln!();
+        eprintln!("{}:", style::yellow("Modes"));
         for name in DdpMode::all_names() {
-            eprintln!("  {name}");
+            eprintln!("  {}", style::green(name));
         }
+        eprintln!();
+        eprintln!(
+            "Pass either to {} / {}, or \"all\".",
+            style::dim("--model"),
+            style::dim("--mode")
+        );
         return Ok(());
     }
 

@@ -1106,20 +1106,20 @@ fn run_unified(
         config.elche_relax_up,
     );
 
-    // Materialize the configured convergence guard. NoGuard / TrendGuard /
-    // MsfGuard each implement the trait; we pass through the generic
+    // Materialize the configured convergence guard. NoGuard / LevelGuard /
+    // GrowthGuard each implement the trait; we pass through the generic
     // `convergence_guard` builder method which boxes internally.
     builder = match &config.guard {
         GuardChoice::None => builder
             .convergence_guard(flodl::distributed::ddp_run::NoGuard),
         // No explicit threshold defers to the library default, which is
         // EASGD-aware (higher floor when α-blending keeps a standing
-        // spread) and absorbs the saved trend history on resume — an
+        // spread) and absorbs the saved level history on resume — an
         // always-constructed override here would bypass both.
-        GuardChoice::Trend { threshold: Some(t) } => builder
-            .convergence_guard(flodl::distributed::ddp_run::TrendGuard::new(*t)),
-        GuardChoice::Trend { threshold: None } => builder,
-        GuardChoice::Msf {
+        GuardChoice::Level { threshold: Some(t) } => builder
+            .convergence_guard(flodl::distributed::ddp_run::LevelGuard::new(*t)),
+        GuardChoice::Level { threshold: None } => builder,
+        GuardChoice::Growth {
             suppress_threshold,
             suppress_sustain,
             nudge_threshold,
@@ -1127,7 +1127,7 @@ fn run_unified(
             nudge_factor,
             alpha,
         } => {
-            let g = flodl::distributed::ddp_run::MsfGuard::default()
+            let g = flodl::distributed::ddp_run::GrowthGuard::default()
                 .with_alpha(*alpha)
                 .with_suppress(*suppress_threshold, *suppress_sustain)
                 .with_nudge(*nudge_threshold, *nudge_sustain, *nudge_factor);

@@ -211,11 +211,11 @@ let elche = ElCheConfig {
 | `.relax_up(bool)` | `false` | Allow ElChe to grow the anchor in `Phase::Stable` when convergence stays clean. |
 | `.partition_ratios(Vec<f64>)` | auto | Static per-rank data split (e.g. `[0.7, 0.3]`). **Honored on `Sync` policy only**; Cadence/Async use progressive dispatch driven by ElChe and ignore the static ratios. For dynamic heterogeneous scheduling under those policies, ElChe's throughput-based auto-rebalancing is the intended path. |
 | `.meta_controller(bool)` | `true` | LR-aware meta-controller - watches LR + anchor + divergence; nudges anchor down on sharp LR drops or sustained divergence. On by default (LR drops are always worth catching); opt out for unconditioned-trajectory instrumentation. |
-| `.convergence_guard(g)` | `TrendGuard` at the EASGD-aware threshold | Divergence guardrail. `NoGuard`, `TrendGuard`, or `MsfGuard` (rate-based). The default threshold is keyed on param-adoption semantics: `0.05` for overwrite modes, `0.3` when `easgd_alpha` is set (elastic blending keeps a deliberate standing spread that a lower floor would read as permanent divergence). |
+| `.convergence_guard(g)` | `LevelGuard` at the EASGD-aware threshold | Divergence guardrail. `NoGuard`, `LevelGuard` (level), or `GrowthGuard` (growth rate). The default threshold is keyed on param-adoption semantics: `0.05` for overwrite modes, `0.3` when `easgd_alpha` is set (elastic blending keeps a deliberate standing spread that a lower floor would read as permanent divergence). |
 | `.easgd_alpha(α)` | `Some(0.5)` on `CpuAsync`; `None` elsewhere | EASGD elastic blend on the `CpuAsync` path (`0 < α ≤ 1.0`) - on by default there (full overwrite is the degenerate α=1.0 case). Ignored outside `CpuAsync`. |
 | `.gamma(γ)` | `1.0` | Consensus allocation-weighting exponent applied when the outer optimizer / averaging weights ranks by work. `1.0` = pre-gamma (plain work-weighting). |
 | `.bf16_wire(bool)` | `false` | Ship the CPU-averaging plane's model traffic as bfloat16: halves pinned snapshots, relay fold traffic, and wire payloads both directions. Averaging still accumulates in f32 (bf16 exists only at the wire/buffer boundary); control traffic, checkpoints, and the final trained weights stay exact f32. CPU averaging modes only - `.run()` errors loudly on NCCL modes. Must match across the cohort. |
-| `.divergence_threshold(f)` | `None` | Legacy primitive feeding the default `TrendGuard` threshold when no explicit `convergence_guard` is set. Prefer `.convergence_guard(...)`. |
+| `.divergence_threshold(f)` | `None` | Legacy primitive feeding the default `LevelGuard` threshold when no explicit `convergence_guard` is set. Prefer `.convergence_guard(...)`. |
 | `.no_divergence_guard()` | `false` | Disable the divergence guardrail entirely (overhead auto-tune drives cadence alone). Use only when the workload is known stable. |
 | `.max_overshoot(n)` | `None` (auto) | Max batches a rank may run past its planned sync point before being held. **`CpuAsync` only**; ignored by Sync/Cadence. |
 
@@ -230,12 +230,12 @@ anchor.
 | Guard | Behavior |
 |---|---|
 | `NoGuard` | Passive baseline - always `Stable`. Use for instrumented runs that want an unconditioned trajectory. |
-| `TrendGuard::new(thresh)` | **Production default.** Three-rises-above-threshold rule on the per-rank `\|\|pre - post\|\| / \|\|post\|\|` ring buffer (last 5 events). Returns `SuppressGrowth` on persistent rising drift. |
-| `MsfGuard::default().with_suppress(s, n).with_nudge(t, n, factor)` | Rate-based detector built on the across-event MSF proxy `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`. Soft + hard thresholds: sustained `λ_ema > suppress_threshold` → `SuppressGrowth`; sustained `λ_ema > nudge_threshold` → `NudgeDown` with `factor` (`0.5` halves the anchor). Opt-in. |
+| `LevelGuard::new(thresh)` | **Production default.** Watches the divergence **level**: three-rises-above-threshold rule on the per-rank `\|\|pre - post\|\| / \|\|post\|\|` ring buffer (last 5 events). Returns `SuppressGrowth` on persistent rising drift, and never reduces the anchor. |
+| `GrowthGuard::default().with_suppress(s, n).with_nudge(t, n, factor)` | Watches the **growth rate**: `λ_ema = EMA((1/k_max) * log(D_t / D_{t-1}))`, the per-rank-step rate at which divergence compounds. Soft + hard thresholds: sustained `λ_ema > suppress_threshold` → `SuppressGrowth`; sustained `λ_ema > nudge_threshold` → `NudgeDown` with `factor` (`0.5` halves the anchor). Opt-in. |
 
-`TrendGuard` state (the divergence ring buffer) is part of
+`LevelGuard` state (the divergence ring buffer) is part of
 `ElCheState` and round-trips through `resume_from` - a resumed run
-inherits the calibration trajectory. `MsfGuard`'s EMA + streak
+inherits the calibration trajectory. `GrowthGuard`'s EMA + streak
 counters re-warm from scratch across resume (by design, since the
 across-event proxy is a derivative signal that recovers quickly).
 

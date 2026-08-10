@@ -144,7 +144,7 @@ fn test_builder_missing_num_epochs_panics() {
 // -----------------------------------------------------------------------
 // Trainer::resume_from end-to-end: write a meta sidecar to disk, build
 // the orchestrator's coord config via the resume_from path, and
-// confirm the trajectory + ElChe state + TrendGuard history all
+// confirm the trajectory + ElChe state + LevelGuard history all
 // transit cleanly.
 // -----------------------------------------------------------------------
 
@@ -200,12 +200,12 @@ fn resume_from_loads_meta_and_seeds_coord_config() {
         "ElCheState carries through resume_from"
     );
 
-    // Guard rebuilt with restored trend history (default TrendGuard
+    // Guard rebuilt with restored trend history (default LevelGuard
     // path: user did NOT supply an explicit guard).
     let history = coord_config
         .convergence_guard
         .trend_history()
-        .expect("TrendGuard surfaces a non-empty history after resume");
+        .expect("LevelGuard surfaces a non-empty history after resume");
     assert_eq!(history, vec![0.005, 0.01, 0.02, 0.025]);
 
     std::fs::remove_dir_all(&dir).ok();

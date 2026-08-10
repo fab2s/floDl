@@ -231,9 +231,11 @@ fn touching_a_source_file_invalidates_a_compiled_commands_schema() {
     let main_rs = cmd_dir.join("src").join("main.rs");
     std::fs::write(&main_rs, "fn main(){}\n").unwrap();
 
+    // Written through `write_cache` so the cache carries this fdl's version
+    // stamp; a hand-written file would read as "some other fdl wrote this"
+    // and be stale before the source edit under test.
     let cache = crate::schema_cache::cache_path(&cmd_dir, "srcwatch");
-    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-    std::fs::write(&cache, "{\"options\":{}}").unwrap();
+    crate::schema_cache::write_cache(&cache, &crate::config::Schema::default()).unwrap();
 
     let refs = {
         let mut r: Vec<std::path::PathBuf> = vec![cmd_dir.join("fdl.yml")];
