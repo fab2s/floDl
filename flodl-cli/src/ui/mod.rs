@@ -125,6 +125,7 @@ pub fn run(cli: &UiArgs) -> i32 {
         fdl_bin,
         port,
         job: JobSlot::default(),
+        run_target: Mutex::new(None),
     });
 
     eprintln!("fdl ui — serving {}", root.display());
@@ -172,6 +173,10 @@ struct UiServer {
     /// time on purpose: two concurrent publishes race the manifest
     /// commit point.
     job: JobSlot,
+    /// The dashboard slot's proxy target: a loopback PORT, set from the
+    /// run tab. Port-only by construction — the host is always
+    /// 127.0.0.1, so the proxy cannot be aimed off-box.
+    run_target: Mutex<Option<u16>>,
 }
 
 fn handle(mut stream: TcpStream, server: &UiServer) {
@@ -184,6 +189,7 @@ fn handle(mut stream: TcpStream, server: &UiServer) {
         }
         Reply::StartJob(argv) => stream_job(stream, server, argv),
         Reply::FollowJob => follow_job(stream, server),
+        Reply::Proxy(target) => proxy_dashboard(stream, server, &target),
     }
 }
 
@@ -195,6 +201,9 @@ enum Reply {
     Bytes(Vec<u8>),
     StartJob(Vec<String>),
     FollowJob,
+    /// Forward this request target to the dashboard slot's loopback
+    /// port and stream the response back.
+    Proxy(String),
 }
 
 impl From<Vec<u8>> for Reply {
@@ -244,7 +253,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut query = HashMap::new();
     for pair in query_str.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        query.insert(k.to_string(), v.to_string());
+        query.insert(percent_decode(k), percent_decode(v));
     }
     let mut host = None;
     let mut token = None;
@@ -310,6 +319,43 @@ fn respond(req: &Request, server: &UiServer) -> Reply {
                 .replace("__FDL_ROOT__", &server.root.display().to_string());
             http("200 OK", "text/html; charset=utf-8", page.as_bytes()).into()
         }
+        // The dashboard slot. `/run` is the page, the rest are the
+        // dashboard's own root-relative routes, forwarded verbatim so
+        // the embedded page's fetches work unrewritten. Host-gated but
+        // token-free BY NECESSITY (an iframe cannot send headers) and
+        // by proportion: this is exactly the content the dashboard
+        // already serves with no auth at all on its own port. The
+        // dashboard's legacy `/api/history` route is deliberately NOT
+        // forwarded — dashboard.html never fetches it, and `/api/` is
+        // this server's own namespace.
+        "/run" | "/events" | "/graph.svg" | "/node" | "/history" | "/paths" | "/stream" => {
+            if req.method != "GET" {
+                return error_json("405 Method Not Allowed", "GET only").into();
+            }
+            let upstream_path = if req.path == "/run" { "/" } else { &req.path };
+            let query = req
+                .query
+                .iter()
+                .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let target = if query.is_empty() {
+                upstream_path.to_string()
+            } else {
+                format!("{upstream_path}?{query}")
+            };
+            Reply::Proxy(target)
+        }
+        // Archived dashboards from disk — an iframe src, so Host-gated
+        // like the proxy. What it can serve is bounded twice: the path
+        // must resolve inside the project root, and the file must look
+        // like a run artifact (the same predicate the scan uses).
+        "/archive" => {
+            if req.method != "GET" {
+                return error_json("405 Method Not Allowed", "GET only").into();
+            }
+            serve_archive(req, server).into()
+        }
         path if path.starts_with("/api/") => {
             // Every API route needs the session token: the page holds
             // it, a cross-site request cannot.
@@ -326,7 +372,9 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
     // Method per route: reads are GET, mutations are POST. A mutation
     // arriving as GET is refused even though the token already proved
     // the caller — links and prefetchers must never mutate.
-    let want_post = matches!(path, "/api/join-config" | "/api/publish");
+    // (`/api/run-target` legitimately speaks both: GET reads, POST sets.)
+    let want_post = matches!(path, "/api/join-config" | "/api/publish")
+        || (path == "/api/run-target" && req.method == "POST");
     let expected = if want_post { "POST" } else { "GET" };
     if req.method != expected {
         return error_json("405 Method Not Allowed", &format!("{expected} only")).into();
@@ -367,8 +415,47 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
         // Reconnect road: replay the current/last job from its start
         // and follow it live.
         "/api/jobs/last" => Reply::FollowJob,
+        // The dashboard slot's target: GET = current port + a
+        // reachability probe, POST = set (or clear with null).
+        "/api/run-target" => run_target_route(req, server).into(),
+        // Archived dashboards discovered on disk, newest first.
+        "/api/archives" => json_ok(&serde_json::json!({
+            "archives": scan_archives(&server.root),
+        }))
+        .into(),
+        // The run ledger (written by the launch slice; empty until it
+        // exists is the honest answer, not an error).
+        "/api/runs" => {
+            json_ok(&serde_json::json!({ "runs": read_runs_ledger(&server.root) })).into()
+        }
         _ => error_json("404 Not Found", "unknown api route").into(),
     }
+}
+
+fn run_target_route(req: &Request, server: &UiServer) -> Vec<u8> {
+    if req.method == "POST" {
+        let body = match parse_body(&req.body) {
+            Ok(b) => b,
+            Err(why) => return error_json("400 Bad Request", &why),
+        };
+        let port = match body.get("port") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_u64().filter(|p| (1..=65535).contains(p)) {
+                Some(p) => Some(p as u16),
+                None => return error_json("400 Bad Request", "port: expected 1..=65535 or null"),
+            },
+        };
+        *server.run_target.lock().expect("run target lock") = port;
+    }
+    let port = *server.run_target.lock().expect("run target lock");
+    let reachable = port.is_some_and(|p| {
+        TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+    });
+    json_ok(&serde_json::json!({ "port": port, "reachable": reachable }))
 }
 
 /// A farm's shareable artifacts, for the page's copy buttons. The
@@ -752,6 +839,227 @@ fn follow(stream: &mut TcpStream, job: &JobState) {
     }
 }
 
+// ── The dashboard slot: loopback proxy + archives ───────────────────────
+
+/// Forward one GET to the dashboard's loopback port and relay the raw
+/// response until either side closes. No rewriting: the dashboard's
+/// routes are forwarded under their own paths, so its root-relative
+/// fetches resolve correctly from inside the iframe. The upstream read
+/// gets NO timeout on purpose — `/events` and `/stream` are SSE legs
+/// that legitimately sit idle between window ticks.
+fn proxy_dashboard(mut stream: TcpStream, server: &UiServer, target: &str) {
+    let Some(port) = *server.run_target.lock().expect("run target lock") else {
+        let _ = stream.write_all(&error_json(
+            "502 Bad Gateway",
+            "no dashboard target set — set the port on the run tab",
+        ));
+        return;
+    };
+    let upstream = TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500),
+    );
+    let Ok(mut upstream) = upstream else {
+        let _ = stream.write_all(&error_json(
+            "502 Bad Gateway",
+            &format!("nothing answering on 127.0.0.1:{port} — is the run up?"),
+        ));
+        return;
+    };
+    if upstream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .is_err()
+    {
+        let _ = stream.write_all(&error_json("502 Bad Gateway", "dashboard hung up"));
+        return;
+    }
+    let mut buf = [0u8; 8192];
+    loop {
+        match upstream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What counts as a servable run artifact — the single predicate both
+/// the scan and `/archive` apply, so the list can never offer a file
+/// the endpoint then refuses (or vice versa). Exactly the names the
+/// harness writes: `dashboard.html` / `timeline.html`, bare or with a
+/// `_<timestamp>` suffix. A dotted stem is refused — rustdoc source
+/// pages are named `timeline.rs.html` and must never list.
+fn is_archive_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".html") else {
+        return false;
+    };
+    if stem.contains('.') {
+        return false;
+    }
+    ["dashboard", "timeline"].iter().any(|prefix| {
+        stem == *prefix
+            || stem
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('_'))
+    })
+}
+
+/// Walk the project for persisted dashboards/timelines, newest first.
+/// Bounded: heavy build/vendor trees are skipped, depth is capped, and
+/// the result is truncated (newest wins) with the truncation visible in
+/// the count.
+fn scan_archives(root: &Path) -> Vec<serde_json::Value> {
+    // Dot-dirs are skipped wholesale (.git, .fdl, .target-docsrs,
+    // .cargo-cache*, ...): no run artifact ever lives in hidden state,
+    // and rustdoc trees under them are exactly the false-positive farm.
+    // `src` is skipped because a crate's sources are where the
+    // dashboard/timeline TEMPLATES live (flodl/src/monitor/), and a
+    // template is an empty page, not a run.
+    const SKIP: &[&str] = &["target", "libtorch", "node_modules", "_site", "src"];
+    const MAX_DEPTH: usize = 6;
+    const MAX_RESULTS: usize = 200;
+    let mut found: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if path.is_dir() {
+                if depth < MAX_DEPTH && !name.starts_with('.') && !SKIP.contains(&name) {
+                    stack.push((path, depth + 1));
+                }
+            } else if is_archive_name(name)
+                && let Ok(meta) = entry.metadata()
+            {
+                found.push((
+                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    path,
+                    meta.len(),
+                ));
+            }
+        }
+    }
+    found.sort_by_key(|(mtime, _, _)| std::cmp::Reverse(*mtime));
+    found.truncate(MAX_RESULTS);
+    found
+        .into_iter()
+        .map(|(mtime, path, size)| {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            serde_json::json!({
+                "path": rel,
+                "mtime": mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                "size": size,
+            })
+        })
+        .collect()
+}
+
+/// Serve one archived dashboard file. The ?path= is project-relative;
+/// absolute paths and any `..` component are refused before the
+/// filesystem is touched, the resolved file must still live under the
+/// project root, and it must pass the same name predicate the scan
+/// applies.
+fn serve_archive(req: &Request, server: &UiServer) -> Vec<u8> {
+    let Some(rel) = req.query.get("path") else {
+        return error_json("400 Bad Request", "missing ?path=");
+    };
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return error_json("400 Bad Request", "path: project-relative, no `..`");
+    }
+    let name = rel_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !is_archive_name(name) {
+        return error_json("400 Bad Request", "path: not a run artifact");
+    }
+    let Ok(full) = server.root.join(rel_path).canonicalize() else {
+        return error_json("404 Not Found", "no such archive");
+    };
+    let Ok(root) = server.root.canonicalize() else {
+        return error_json("404 Not Found", "project root vanished");
+    };
+    if !full.starts_with(&root) {
+        return error_json("400 Bad Request", "path: escapes the project root");
+    }
+    match std::fs::read(&full) {
+        Ok(bytes) => http("200 OK", "text/html; charset=utf-8", &bytes),
+        Err(_) => error_json("404 Not Found", "no such archive"),
+    }
+}
+
+/// The run ledger, if the launch slice has written one yet. Bad lines
+/// are skipped, not fatal — an append-only file's tail can be mid-write.
+fn read_runs_ledger(root: &Path) -> Vec<serde_json::Value> {
+    let Ok(content) = std::fs::read_to_string(root.join(".fdl/ui/runs.jsonl")) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Re-encode one query value for the upstream request line (the parse
+/// decoded it). Conservative: everything but unreserved characters is
+/// escaped.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Percent-decode one query component (browsers encode `/`, `@`, `:`
+/// in values like archive paths). `+` stays literal — these are path
+/// components, not form encoding. Malformed escapes pass through
+/// verbatim and fail whatever validation comes next.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Both spellings a loopback browser sends, port included — we never
 /// serve on 80, so a portless Host is nothing we produced.
 fn host_is_local(host: Option<&str>, port: u16) -> bool {
@@ -828,6 +1136,7 @@ mod tests {
             fdl_bin: PathBuf::from("fdl-never-spawned"),
             port,
             job: JobSlot::default(),
+            run_target: Mutex::new(None),
         });
         std::thread::spawn(move || serve(listener, server));
         (port, "tok-test".to_string())
@@ -1154,6 +1463,190 @@ mod tests {
             get(port, "/api/farm?label=absent", Some(&local), Some(&token))
                 .starts_with("HTTP/1.1 404"),
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── PR4: the dashboard slot ─────────────────────────────────────
+
+    #[test]
+    fn query_components_percent_decode_and_reencode() {
+        assert_eq!(percent_decode("a%2Fb%40c"), "a/b@c");
+        assert_eq!(percent_decode("plain"), "plain");
+        // Malformed escapes pass through and fail later validation.
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_encode("root/exa cuda"), "root/exa%20cuda");
+        // A decoded slash in an env name is still refused by the label
+        // gate — decoding must not widen what validation sees.
+        let tmp = tempdir();
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+        let bad = get(
+            port,
+            "/api/status?env=no%2Fslash",
+            Some(&local),
+            Some(&token),
+        );
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_run_target_is_a_loopback_port_or_nothing() {
+        let tmp = tempdir();
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+        // Unset by default, and honestly unreachable.
+        let out = get(port, "/api/run-target", Some(&local), Some(&token));
+        assert!(out.contains("\"port\":null"), "{out}");
+        assert!(out.contains("\"reachable\":false"), "{out}");
+        // A nonsense port is refused by name.
+        let bad = post(port, "/api/run-target", Some(&token), r#"{"port":0}"#);
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        // Setting reflects back; clearing with null unsets.
+        let set = post(port, "/api/run-target", Some(&token), r#"{"port":8099}"#);
+        assert!(set.contains("\"port\":8099"), "{set}");
+        let cleared = post(port, "/api/run-target", Some(&token), r#"{"port":null}"#);
+        assert!(cleared.contains("\"port\":null"), "{cleared}");
+        // With no target, the slot answers 502, not a hang.
+        let run = get(port, "/run", Some(&local), None);
+        assert!(run.starts_with("HTTP/1.1 502"), "{run}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_proxy_forwards_dashboard_routes_verbatim_and_relays_bytes() {
+        let tmp = tempdir();
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+
+        // A fake dashboard: answers two connections, recording the
+        // request lines it saw.
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let up_port = upstream.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_up = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            // Serves until the test binary exits; the run-target
+            // reachability probe connects and immediately hangs up, so
+            // an empty read is skipped, not recorded.
+            for conn in upstream.incoming() {
+                let Ok(mut s) = conn else { break };
+                let mut buf = [0u8; 2048];
+                let Ok(n) = s.read(&mut buf) else { continue };
+                if n == 0 {
+                    continue;
+                }
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                seen_up
+                    .lock()
+                    .unwrap()
+                    .push(head.lines().next().unwrap_or("").to_string());
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nDASH-BODY",
+                );
+            }
+        });
+
+        let set = post(
+            port,
+            "/api/run-target",
+            Some(&token),
+            &format!(r#"{{"port":{up_port}}}"#),
+        );
+        assert!(set.contains("\"reachable\":true"), "{set}");
+
+        // `/run` lands on the dashboard's root, response relayed raw.
+        let page = get(port, "/run", Some(&local), None);
+        assert!(page.ends_with("DASH-BODY"), "{page}");
+        // A scoped route keeps its path and its (re-encoded) query.
+        let node = get(port, "/node?path=root%2Fexa", Some(&local), None);
+        assert!(node.ends_with("DASH-BODY"), "{node}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], "GET / HTTP/1.1");
+        // `/` is legal in a query and the dashboard resolves encoded
+        // and raw ?path= to the same scope by design, so the decoded
+        // spelling forwards as-is.
+        assert_eq!(seen[1], "GET /node?path=root/exa HTTP/1.1");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archives_are_scanned_and_served_inside_the_root_only() {
+        let tmp = tempdir();
+        let run_dir = tmp.join("ddp-bench/runs/mlp/nccl-sync");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("dashboard.html"), "<html>ARCHIVE</html>").unwrap();
+        std::fs::write(run_dir.join("timeline_1.html"), "<html>TL</html>").unwrap();
+        std::fs::write(run_dir.join("notes.html"), "not a run artifact").unwrap();
+        // Heavy trees are never walked, dot-dirs wholesale — and a
+        // rustdoc source page named `timeline.rs.html` is not a run
+        // artifact (both found live on the real repo before the
+        // predicate learned to refuse them).
+        let hidden = tmp.join("target/debug");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("dashboard.html"), "build junk").unwrap();
+        let docsrs = tmp.join(".target-docsrs/doc");
+        std::fs::create_dir_all(&docsrs).unwrap();
+        std::fs::write(docsrs.join("dashboard.html"), "rustdoc junk").unwrap();
+        std::fs::write(run_dir.join("timeline.rs.html"), "rustdoc source page").unwrap();
+        // The templates themselves live under a crate's src/ — an
+        // empty page is not a run (found live: flodl/src/monitor).
+        let templates = tmp.join("flodl/src/monitor");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("dashboard.html"), "the template").unwrap();
+
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+        let list = get(port, "/api/archives", Some(&local), Some(&token));
+        assert!(list.contains("dashboard.html"), "{list}");
+        assert!(list.contains("timeline_1.html"), "{list}");
+        assert!(!list.contains("notes.html"), "{list}");
+        assert!(!list.contains("target"), "{list}");
+        assert!(!list.contains("timeline.rs.html"), "{list}");
+        assert!(!list.contains("monitor"), "{list}");
+
+        // Served by relative path (encoded slashes, like a browser).
+        let path = "ddp-bench%2Fruns%2Fmlp%2Fnccl-sync%2Fdashboard.html";
+        let served = get(port, &format!("/archive?path={path}"), Some(&local), None);
+        assert!(served.ends_with("<html>ARCHIVE</html>"), "{served}");
+
+        // The two refusal classes: not-an-artifact, and escape attempts.
+        let bad_name = get(
+            port,
+            "/archive?path=ddp-bench%2Fruns%2Fmlp%2Fnccl-sync%2Fnotes.html",
+            Some(&local),
+            None,
+        );
+        assert!(bad_name.starts_with("HTTP/1.1 400"), "{bad_name}");
+        for escape in [
+            "..%2Fdashboard.html",
+            "%2Fetc%2Fpasswd",
+            "a%2F..%2F..%2Fdashboard.html",
+        ] {
+            let out = get(port, &format!("/archive?path={escape}"), Some(&local), None);
+            assert!(out.starts_with("HTTP/1.1 400"), "{escape}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_runs_ledger_reads_when_present_and_answers_empty_when_not() {
+        let tmp = tempdir();
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+        let empty = get(port, "/api/runs", Some(&local), Some(&token));
+        assert!(empty.contains("\"runs\":[]"), "{empty}");
+
+        std::fs::create_dir_all(tmp.join(".fdl/ui")).unwrap();
+        std::fs::write(
+            tmp.join(".fdl/ui/runs.jsonl"),
+            "{\"v\":1,\"farm\":\"rig\",\"exit\":0}\nnot json — a torn tail line\n{\"v\":1,\"farm\":\"b300\"}\n",
+        )
+        .unwrap();
+        let runs = get(port, "/api/runs", Some(&local), Some(&token));
+        assert!(runs.contains("\"farm\":\"rig\""), "{runs}");
+        assert!(runs.contains("\"farm\":\"b300\""), "{runs}");
+        assert!(!runs.contains("torn tail"), "{runs}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

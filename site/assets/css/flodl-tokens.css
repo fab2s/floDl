@@ -1,0 +1,37 @@
+/* floDl design tokens: one palette across the site, the live dashboard
+   and fdl ui. Colour marks a ROLE, matching the mermaid convention in
+   CLAUDE.md: indigo = an actor, green = a good/cheap state, amber = a
+   cost/hazard. Dark-first, light via prefers-color-scheme.
+   Canonical home: site/assets/css/flodl-tokens.css. Consumers vendor
+   this file verbatim between the marker comments;
+   ci/release/13-design-tokens.sh fails on drift. */
+:root {
+  --bg: #12161d;
+  --panel: #1a2028;
+  --line: #2a323d;
+  --ink: #d7dee8;
+  --muted: #8b96a5;
+  --actor: #7986cb;
+  --good: #66bb6a;
+  --cost: #d9a05b;
+  --prompt-bg: #0d1117;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+/* Light rides data-theme, not a media query: the shared pre-paint
+   script resolves localStorage('flodl-theme') -> prefers-color-scheme
+   -> dark, and the toggle flips the attribute. Same key, same
+   attribute as the site and the live dashboard, so every surface
+   aligns (the proxied dashboard even shares the ui's origin, hence
+   the very same stored value). */
+:root[data-theme="light"] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --line: #d9dfe7;
+  --ink: #26303b;
+  --muted: #5f6b79;
+  --actor: #5c6bc0;
+  --good: #2e7d32;
+  --cost: #8a5320;
+  --prompt-bg: #eceff3;
+}

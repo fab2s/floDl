@@ -602,6 +602,21 @@ fdl ui                # serve http://127.0.0.1:1338/
 fdl ui --port 8040    # any free loopback port
 ```
 
+The **run tab** is one slot whose backing follows the run's lifecycle:
+before anything answers on the dashboard port it shows the admission
+view (`fdl status`, re-probing quietly); the moment the run's live
+dashboard comes up, the same slot becomes that dashboard, reverse-
+proxied through the ui's own port — so a headless controller needs
+exactly **one** `ssh -L` forward for the whole experience, ops page
+and live dashboard together. The proxy forwards the dashboard's own
+routes verbatim to a loopback port only (the host is not configurable,
+so it cannot be aimed off-box). The **history tab** lists persisted
+dashboards found on disk (`dashboard*.html` / `timeline*.html` under
+the project, rustdoc lookalikes excluded) and serves them into the
+same kind of slot, plus the run ledger once the launch slice writes
+it; archive serving is double-bounded (the path must resolve inside
+the project root AND look like a run artifact).
+
 **The page drives the CLI, it never reimplements it.** Every panel that
 runs something spawns `fdl` itself with `--json` and renders argv, exit
 code and output verbatim — the exact command line sits above each
