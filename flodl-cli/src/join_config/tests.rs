@@ -1,3 +1,17 @@
+use super::authorized_keys::{
+    UpsertOutcome, install_authorized_line, key_material, upsert_authorized_line,
+};
+use super::cloud_init::render_cloud_init;
+use super::credentials::{find_token_line, recover_shape, replace_token_line, validate_label};
+use super::list::{enumerate_farms, render_farm_list};
+use super::publish_recipe::{
+    common_ancestor, declares_gpu_features, derive_publish, flodl_path_dep, freshness_report,
+    normalize, package_name,
+};
+use super::render::{
+    authorized_keys_line, render_overlay_scaffold, render_sshd_conf, render_worker_yml,
+};
+use super::wizard::wizard_at;
 use super::*;
 
 fn tempdir() -> PathBuf {
