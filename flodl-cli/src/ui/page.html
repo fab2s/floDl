@@ -252,6 +252,32 @@ button:disabled { opacity: 0.5; cursor: wait; }
   overflow-wrap: anywhere;
 }
 .log .err { color: var(--cost); }
+/* Terminal colours, honoured from the child's own ANSI output. Kept
+   local to this page rather than added to the shared design tokens: the
+   16-colour terminal palette is a console convention, not part of the
+   brand the site and dashboard share. */
+:root {
+  --ansi-black: #5c6773; --ansi-red: #e06c75; --ansi-green: #98c379;
+  --ansi-yellow: #e5c07b; --ansi-blue: #61afef; --ansi-magenta: #c678dd;
+  --ansi-cyan: #56b6c2; --ansi-white: #d7dee8;
+}
+:root[data-theme="light"] {
+  --ansi-black: #6b7684; --ansi-red: #b3261e; --ansi-green: #216e39;
+  --ansi-yellow: #8a5320; --ansi-blue: #2f5fd0; --ansi-magenta: #8e24aa;
+  --ansi-cyan: #00727f; --ansi-white: #26303b;
+}
+.a-black { color: var(--ansi-black); }
+.a-red { color: var(--ansi-red); }
+.a-green { color: var(--ansi-green); }
+.a-yellow { color: var(--ansi-yellow); }
+.a-blue { color: var(--ansi-blue); }
+.a-magenta { color: var(--ansi-magenta); }
+.a-cyan { color: var(--ansi-cyan); }
+.a-white { color: var(--ansi-white); }
+.a-bold { font-weight: 600; }
+.a-dim { opacity: 0.65; }
+.a-italic { font-style: italic; }
+.a-underline { text-decoration: underline; }
 .slot-frame {
   width: 100%;
   height: 78vh;
@@ -598,6 +624,95 @@ function badge(label, on) {
   return el("span", "badge " + (on ? "on" : "off"), label + (on ? "" : " missing"));
 }
 
+// ── ANSI: render the colours the command actually emitted ──────────
+// Colouring by STREAM was wrong and actively misleading: cargo writes
+// its whole progress narration to stderr, so every ordinary
+// "Compiling …" line came out amber — the palette's hazard colour — while
+// real errors looked the same. The command already says what it means in
+// SGR codes; the console's job is to honour that, not to re-invent it.
+const ANSI_FG = {
+  30: "black", 31: "red", 32: "green", 33: "yellow",
+  34: "blue", 35: "magenta", 36: "cyan", 37: "white",
+  90: "black", 91: "red", 92: "green", 93: "yellow",
+  94: "blue", 95: "magenta", 96: "cyan", 97: "white",
+};
+
+// Only SGR (`…m`) sequences carry colour. Every other escape is
+// control - cursor moves, erase-line, OSC titles - and must be dropped
+// rather than printed as mojibake. A pipe keeps most tools from emitting
+// them at all; this is for whatever slips through.
+// eslint-disable-next-line no-control-regex
+const ANSI_CSI = /\u001b\[[0-9;?]*[A-Za-z]/g;
+// eslint-disable-next-line no-control-regex
+const ANSI_OSC = /\u001b(?:\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[()][0-9A-Za-z])/g;
+// eslint-disable-next-line no-control-regex
+const ANSI_SGR = /\u001b\[([0-9;]*)m/g;
+
+function ansiNodes(text) {
+  // A carriage return rewrites the line in a terminal; keep the last
+  // revision so a progress redraw reads as its final state.
+  let s = text.includes("\r") ? text.split("\r").filter(Boolean).pop() || "" : text;
+  // Keep the SGR sequences (parsed below), drop the other escapes. A
+  // replacer rather than a "any letter but m" character class: JS has no
+  // class intersection, and spelling it as one silently ate the very
+  // colours this function exists to preserve.
+  s = s.replace(ANSI_CSI, seq => (seq.endsWith("m") ? seq : "")).replace(ANSI_OSC, "");
+  const frag = document.createDocumentFragment();
+  let state = { fg: null, bold: false, dim: false, italic: false, underline: false, rgb: null };
+  let last = 0;
+  let m;
+  const emit = (chunk, st) => {
+    if (!chunk) return;
+    const classes = [];
+    if (st.fg) classes.push("a-" + st.fg);
+    if (st.bold) classes.push("a-bold");
+    if (st.dim) classes.push("a-dim");
+    if (st.italic) classes.push("a-italic");
+    if (st.underline) classes.push("a-underline");
+    const span = el("span", classes.join(" "), chunk);
+    if (st.rgb) span.style.color = st.rgb;
+    frag.append(span);
+  };
+  ANSI_SGR.lastIndex = 0;
+  while ((m = ANSI_SGR.exec(s)) !== null) {
+    emit(s.slice(last, m.index), state);
+    last = m.index + m[0].length;
+    const codes = (m[1] === "" ? "0" : m[1]).split(";").map(Number);
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i];
+      if (c === 0) state = { fg: null, bold: false, dim: false, italic: false, underline: false, rgb: null };
+      else if (c === 1) state.bold = true;
+      else if (c === 2) state.dim = true;
+      else if (c === 3) state.italic = true;
+      else if (c === 4) state.underline = true;
+      else if (c === 22) { state.bold = false; state.dim = false; }
+      else if (c === 23) state.italic = false;
+      else if (c === 24) state.underline = false;
+      else if (c === 39) { state.fg = null; state.rgb = null; }
+      else if (ANSI_FG[c]) { state.fg = ANSI_FG[c]; state.rgb = null; }
+      else if (c === 38 && codes[i + 1] === 5) {
+        // 256-colour: the first 16 map onto the base palette; the rest
+        // are approximated by luminance rather than guessed at.
+        const n = codes[i + 2];
+        i += 2;
+        state.rgb = null;
+        state.fg = n < 16 ? ANSI_FG[(n % 8) + 30] : n >= 244 ? "white" : "black";
+      } else if (c === 38 && codes[i + 1] === 2) {
+        const [r, g, b] = [codes[i + 2], codes[i + 3], codes[i + 4]];
+        i += 4;
+        // Numeric-validated before it becomes a style value.
+        if ([r, g, b].every(v => Number.isInteger(v) && v >= 0 && v <= 255)) {
+          state.fg = null;
+          state.rgb = `rgb(${r},${g},${b})`;
+        }
+      }
+      // Backgrounds and anything else: consumed, not rendered.
+    }
+  }
+  emit(s.slice(last), state);
+  return frag;
+}
+
 // ── Tabs: each panel owns the full width; a dot marks hidden work ───
 const tabs = [...document.querySelectorAll("#tabs button")];
 function showTab(id) {
@@ -694,11 +809,20 @@ function renderRun(box, r) {
 
   const pre = el("pre");
   let body = r.stdout;
-  try { body = JSON.stringify(JSON.parse(r.stdout), null, 2); } catch { /* not JSON: show as-is */ }
-  pre.append(el("span", "", body));
+  let json = false;
+  try { body = JSON.stringify(JSON.parse(r.stdout), null, 2); json = true; } catch { /* not JSON: show as-is */ }
+  // JSON is machine output and never carries escapes; anything else may,
+  // so it goes through the same renderer as a streamed line.
+  pre.append(json ? el("span", "", body) : ansiNodes(body));
   if (r.stderr.trim()) {
     if (body.trim()) pre.append("\n");
-    pre.append(el("span", "stderr", r.stderr.trimEnd()));
+    // Amber for the whole block, because in a one-answer pane stderr IS
+    // the diagnostic channel — unlike a build log, where stderr is just
+    // where progress happens to go. Any colour the command emitted still
+    // wins: the spans carry their own `color`, the plain text inherits.
+    const err = el("span", "stderr");
+    err.append(ansiNodes(r.stderr.trimEnd()));
+    pre.append(err);
   }
   if (!body.trim() && !r.stderr.trim()) pre.append(el("span", "", "(no output)"));
   box.append(pre);
@@ -926,7 +1050,13 @@ async function streamJob(out, url, init) {
       }
     } else if ("t" in ev) {
       if (!pending) pending = document.createDocumentFragment();
-      pending.append(el("span", ev.s === "err" ? "err" : "", ev.t + "\n"));
+      if (ev.s === "ui") {
+        // fdl ui's own voice — the one thing in this log that is not
+        // the command speaking, so it keeps the amber.
+        pending.append(el("span", "err", ev.t + "\n"));
+      } else {
+        pending.append(ansiNodes(ev.t), document.createTextNode("\n"));
+      }
     }
   };
   // Every buffered line carries its absolute index `i`; tracking the

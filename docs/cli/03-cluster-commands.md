@@ -656,6 +656,17 @@ run leaves ports held and remote ranks spinning (the rig-hygiene
 protocol exists for a reason), and a button that pretends otherwise
 would be a lie; stopping stays a deliberate act.
 
+The consoles **honour the colours the command emits**: every driven
+command runs with the conventional colour-forcing env (forwarded across
+the docker boundary, so cargo's greens and reds survive, and so `fdl
+config show` keeps its coloured keys and provenance comments), and the
+page renders that ANSI while dropping cursor-control escapes. Colour
+therefore means what the tool meant by it, not which file descriptor a
+line came out of — cargo narrates progress on stderr, so painting
+stderr amber made every `Compiling` line look like a warning. `fdl ui`'s
+own notes keep the amber, being the one thing in a log that is not the
+command speaking.
+
 **The page drives the CLI, it never reimplements it.** Every panel that
 runs something spawns `fdl` itself with `--json` and renders argv, exit
 code and output verbatim — the exact command line sits above each

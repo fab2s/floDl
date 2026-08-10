@@ -693,11 +693,32 @@ fn route_argv(path: &str, env: Option<&str>) -> Vec<String> {
     argv
 }
 
+/// Ask a driven command for the colours it would use on a terminal.
+///
+/// Every driven command gets this, not just the streamed ones: a pane
+/// is a human reading output too, and `fdl config show` renders its keys
+/// and per-key provenance in colour that a pipe would otherwise discard.
+/// Safe for the `--json` routes because fdl never styles a JSON body —
+/// the styling lives on the human paths and on stderr, both of which the
+/// page renders through its ANSI reader.
+///
+/// `run.rs` forwards these across the docker boundary when they are set,
+/// which is what keeps a containerized tool's colours (cargo's) alive.
+fn ask_for_color(cmd: &mut Command) -> &mut Command {
+    cmd.env("FORCE_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .env("CARGO_TERM_COLOR", "always")
+}
+
 /// Drive one `fdl` subcommand and report it verbatim: argv (the
 /// reproducible command line the page displays), exit code, both
 /// streams. Never an error shape — a failed command IS the result.
 fn run_fdl(fdl_bin: &Path, root: &Path, args: &[&str]) -> serde_json::Value {
-    let out = Command::new(fdl_bin).args(args).current_dir(root).output();
+    let mut cmd = Command::new(fdl_bin);
+    let out = ask_for_color(&mut cmd)
+        .args(args)
+        .current_dir(root)
+        .output();
     let mut cmd = vec!["fdl".to_string()];
     cmd.extend(args.iter().map(|s| s.to_string()));
     match out {
@@ -992,7 +1013,8 @@ fn stream_job(
     cmd_line.extend(argv.iter().cloned());
     job.push(serde_json::json!({ "cmd": cmd_line }));
 
-    let spawned = Command::new(&server.fdl_bin)
+    let mut cmd = Command::new(&server.fdl_bin);
+    let spawned = ask_for_color(&mut cmd)
         .args(&argv)
         .current_dir(&server.root)
         .stdin(Stdio::null())
@@ -1059,7 +1081,7 @@ fn stream_job(
         }
         Err(e) => {
             job.push(serde_json::json!({
-                "s": "err",
+                "s": "ui",
                 "t": format!("cannot spawn {}: {e}", server.fdl_bin.display()),
             }));
             job.push_final(serde_json::json!({ "exit": serde_json::Value::Null }));
@@ -1119,7 +1141,7 @@ fn follow(stream: &mut TcpStream, job: &JobState, from: usize) {
         };
         if dropped > 0 {
             let gap = serde_json::json!({
-                "s": "err",
+                "s": "ui",
                 "t": format!(
                     "({dropped} earlier lines fell out of the buffer — it keeps \
                      the most recent {JOB_MAX_LINES})",
