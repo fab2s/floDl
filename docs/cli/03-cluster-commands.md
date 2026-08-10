@@ -576,6 +576,38 @@ mean something. Running the wizard inside a container works for
 `authorized_keys` install step must run where the workers' sshd
 actually lives, which is not the container's `~/.ssh`.
 
+## `fdl ui`
+
+The local operations page: one loopback web page showing the project's
+farms, hardware probe, cluster run status and resolved config — the
+browser counterpart of the walk-in CLI surface. Read-only today;
+actions (the wizard form as a form, publish with a streamed gate build)
+arrive on the same server.
+
+```bash
+fdl ui                # serve http://127.0.0.1:1338/
+fdl ui --port 8040    # any free loopback port
+```
+
+**The page drives the CLI, it never reimplements it.** Every panel that
+runs something spawns `fdl` itself with `--json` and renders argv, exit
+code and output verbatim — the exact command line sits above each
+result with a copy button, so anything the page does is reproducible in
+a terminal, and the page structurally cannot drift from the CLI. The
+farm list is the one pure local read, and it calls the same function
+`fdl join-config --list --json` prints from.
+
+Security: binds `127.0.0.1` only, and on top of the bind every request
+must carry the loopback `Host` it was served on (which stops
+DNS-rebinding pages that resolve an attacker domain to 127.0.0.1), and
+every API route requires the per-session token minted at startup and
+injected into the served page (which stops blind cross-site requests).
+Reaching the page from another box is an ssh forward — `ssh -L
+1338:127.0.0.1:1338 <controller>` — the same trust story as the
+cluster itself. There is no auth beyond that on purpose: the page has
+exactly the authority of the user's own shell on that box, so the
+boundary worth defending is the box, not the page.
+
 ## `fdl nccl`
 
 Build NVIDIA's `libnccl` from source. Required for heterogeneous-rig

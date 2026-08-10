@@ -327,6 +327,23 @@ pub struct JoinConfigArgs {
     pub json: bool,
 }
 
+/// Serve the local operations page: one loopback web page showing this
+/// project's farms, hardware probe, cluster run status and resolved
+/// config — the browser counterpart of the walk-in CLI surface. Read-only
+/// today; actions (the wizard form, publish) arrive on top of the same
+/// server. Every panel that runs a command shows the exact `fdl` argv it
+/// ran: the page drives the CLI, it never reimplements it.
+///
+/// Binds 127.0.0.1 only. Reaching it from another box is an ssh forward
+/// (`ssh -L 1338:127.0.0.1:1338 <controller>`), the same trust story as
+/// the cluster itself.
+#[derive(crate::FdlArgs, Debug)]
+pub struct UiArgs {
+    /// Port to serve on (loopback only).
+    #[option(default = "1338")]
+    pub port: u16,
+}
+
 /// Publish a training run for a fleet to pull.
 ///
 /// The controller side of compiling on the node: resolves a source spec
@@ -721,6 +738,11 @@ pub fn registry() -> &'static [BuiltinSpec] {
             schema_fn: Some(JoinConfigArgs::schema),
         },
         BuiltinSpec {
+            path: &["ui"],
+            description: Some("Serve the local operations page (loopback web UI)"),
+            schema_fn: Some(UiArgs::schema),
+        },
+        BuiltinSpec {
             path: &["install"],
             description: Some("Install or update fdl globally"),
             schema_fn: Some(InstallArgs::schema),
@@ -879,6 +901,7 @@ mod tests {
             "publish",
             "join",
             "join-config",
+            "ui",
             "api-ref",
             "init",
             "add",
@@ -918,6 +941,7 @@ mod tests {
                 "publish",
                 "join",
                 "join-config",
+                "ui",
                 "install",
                 "skill",
                 "api-ref",

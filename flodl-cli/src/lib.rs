@@ -103,6 +103,10 @@ pub mod join;
 /// credentials, guardrail artifacts, worker yml, publish recipe.
 pub mod join_config;
 
+/// The local operations page (`fdl ui`): a loopback web server whose
+/// panels drive the CLI itself, never a reimplementation of it.
+pub mod ui;
+
 /// Training preparation for a dial-in worker: the GPU gate, the dataset
 /// source root, libtorch, the training binary, and the node-local
 /// directories the data plane writes. Runs before this box dials in,

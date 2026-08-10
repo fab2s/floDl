@@ -57,8 +57,11 @@ commands:
     run: cargo fmt --all --check
     docker: dev
   clippy:
-    description: Lint (all targets incl. tests + examples, workspace + ddp-bench)
-    run: cargo clippy --all-targets -- -D warnings && cd ddp-bench && cargo clippy --tests -- -D warnings
+    description: Style gate (rustfmt check, then clippy on all targets, workspace + ddp-bench)
+    # fmt-check rides first: formatting and lints are one style gate, so
+    # the habitual `fdl clippy` cannot go green on a tree CI will refuse.
+    # It is cheap and fails fast; `fdl fmt` writes the fix.
+    run: cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cd ddp-bench && cargo clippy --tests -- -D warnings
     docker: dev
   doc:
     description: Generate API docs (strict, fails on warnings)
