@@ -260,6 +260,40 @@ button:disabled { opacity: 0.5; cursor: wait; }
   background: var(--panel);
 }
 .slot-note { color: var(--muted); font: 12px var(--mono); margin: 0 0 8px; }
+/* Launch: the form owns the width, the ledger sits beside it and
+   scrolls on its own so a long history never pushes the run's output
+   off the screen. */
+.launch-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; align-items: start; }
+@media (max-width: 1100px) { .launch-grid { grid-template-columns: minmax(0, 1fr); } }
+.launch-main { min-width: 0; }
+.controls.globals { margin-top: -4px; }
+.controls .scope {
+  font: 11px var(--mono);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+label.inline { font: 12px var(--mono); color: var(--muted); display: flex; gap: 4px; align-items: center; }
+.launch-side { min-width: 0; border-left: 1px solid var(--line); padding-left: 14px; }
+.launch-side h3 { margin: 0 0 8px; font: 600 11px var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.side-scroll { max-height: 46vh; overflow-y: auto; }
+.ln-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 4px 6px;
+  font: 12px var(--mono);
+  color: var(--ink);
+  cursor: pointer;
+}
+.ln-row:hover { border-color: var(--actor); }
+.ln-row .when { color: var(--muted); font-size: 11px; }
+.ln-row .line { display: block; overflow-wrap: anywhere; }
+.ln-row .exit { font-size: 11px; }
 .arch-row {
   display: flex;
   gap: 12px;
@@ -421,16 +455,43 @@ button:disabled { opacity: 0.5; cursor: wait; }
 
   <section id="launch-panel" hidden>
     <h2>Launch training</h2>
-    <div class="controls">
-      <select id="ln-env" aria-label="Environment to launch under"></select>
-      <select id="ln-cmd" aria-label="Command to launch"></select>
+    <div class="launch-grid">
+      <div class="launch-main">
+        <div class="controls">
+          <select id="ln-env" aria-label="Environment to launch under"></select>
+          <select id="ln-cmd" aria-label="Command to launch"></select>
+        </div>
+        <!-- fdl's own options: they precede the command and apply to
+             every one, so they sit with the env select (also a global)
+             rather than among a command's schema fields. -->
+        <div class="controls globals">
+          <span class="scope">fdl</span>
+          <select id="ln-verbosity" aria-label="Verbosity" title="fdl's log level, forwarded into the container">
+            <option value="">default verbosity</option>
+            <option value="-q">-q quiet (hides container chatter)</option>
+            <option value="-v">-v verbose</option>
+            <option value="-vv">-vv debug</option>
+            <option value="-vvv">-vvv trace</option>
+          </select>
+          <input type="text" id="ln-gpus" size="8" placeholder="--gpus 0,1" title="Scope visible GPUs: a device list like 0,1, or all"
+                 style="font:13px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;">
+          <label class="inline"><input type="checkbox" id="ln-no-append"> --no-append</label>
+          <label class="inline"><input type="checkbox" id="ln-no-prebuild"> --no-prebuild</label>
+        </div>
+        <div id="ln-form" class="form"></div>
+        <div id="ln-again" hidden class="controls"></div>
+        <div class="actions">
+          <button id="ln-run">Launch</button>
+          <button id="ln-help" title="Run the command with --help">help</button>
+          <span class="slot-note" id="ln-hint"></span>
+        </div>
+        <div id="ln-out" class="result"></div>
+      </div>
+      <aside class="launch-side">
+        <h3>Recent launches</h3>
+        <div id="ln-history" class="side-scroll"><span class="spin">loading</span></div>
+      </aside>
     </div>
-    <div id="ln-form" class="form"></div>
-    <div class="actions">
-      <button id="ln-run">Launch</button>
-      <span class="slot-note" id="ln-hint"></span>
-    </div>
-    <div id="ln-out" class="result"></div>
   </section>
 
   <section id="run-panel" hidden>
@@ -446,11 +507,9 @@ button:disabled { opacity: 0.5; cursor: wait; }
   </section>
 
   <section id="history-panel" hidden>
-    <h2>History</h2>
+    <h2>Training history — persisted dashboards on disk</h2>
     <div id="hist-viewing" hidden class="controls"></div>
     <div id="hist-browser">
-      <div id="hist-runs"></div>
-      <h2 style="margin-top:14px">Persisted dashboards on disk</h2>
       <div class="controls">
         <input type="text" id="hist-filter" placeholder="filter runs — space-separated terms, all must match"
                style="font:13px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;flex:1;max-width:560px;">
@@ -546,16 +605,24 @@ function showTab(id) {
   for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== id;
   if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
 }
-for (const b of tabs) b.addEventListener("click", () => {
-  showTab(b.dataset.tab);
-  if (b.dataset.tab === "run-panel") refreshRunSlot();
-  if (b.dataset.tab === "launch-panel") loadCommands();
-  if (b.dataset.tab === "history-panel") loadHistory();
-});
-{
-  const initial = location.hash.slice(1);
-  showTab(tabs.some(b => b.dataset.tab === initial) ? initial : "farms-panel");
+// A tab's data loads when the tab is ENTERED, however it was entered.
+// Wiring the loaders to the click handler alone meant a reload (or a
+// shared `#history-panel` link) painted an empty panel that only filled
+// after clicking away and back.
+function enterTab(id) {
+  showTab(id);
+  const load = TAB_LOADERS[id];
+  if (load) load();
 }
+for (const b of tabs) b.addEventListener("click", () => enterTab(b.dataset.tab));
+// Paint the right panel immediately; its loader runs from the bootstrap
+// at the end of this script, once every function it needs exists.
+const INITIAL_TAB = (() => {
+  const want = location.hash.slice(1);
+  const id = tabs.some(b => b.dataset.tab === want) ? want : "farms-panel";
+  showTab(id);
+  return id;
+})();
 
 // Work running in a non-active tab stays visible as a dot on its tab.
 function setBusy(node, on) {
@@ -979,7 +1046,11 @@ function renderLaunchForm() {
     form.append(d);
   }
   if (!cmd.schema) {
-    // No --fdl-schema: the options live in the command's own code.
+    // No schema resolved. Why depends on the command's kind, and
+    // saying the wrong reason sends the reader off to run a command
+    // that cannot help them: a `run:` command is a shell line and
+    // never grows a form, while a path command with a stale cache does
+    // (a page load deliberately never triggers the compile itself).
     const label = el("label", "", "args");
     label.htmlFor = "ln-freeform";
     const input = el("input");
@@ -987,7 +1058,9 @@ function renderLaunchForm() {
     input.id = "ln-freeform";
     input.placeholder = "space-separated, no quoting";
     form.append(label, input);
-    hint.textContent = "no schema cached for this command — a cargo command grows a form after `fdl " + cmd.name + " --refresh-schema`";
+    hint.textContent = cmd.kind === "run"
+      ? "a shell command — its arguments are whatever the script takes"
+      : "no schema for this command yet — it grows a form once `fdl " + cmd.name + " --refresh-schema` caches one";
     return;
   }
   for (const arg of cmd.schema.args || []) {
@@ -1052,16 +1125,139 @@ function assembleLaunchArgs() {
   return [...positionals, ...flags];
 }
 
+// The ledger beside the form: what this project has launched, newest
+// first. Clicking one PROPOSES it again — the recorded argv is replayed
+// verbatim through the same validated route rather than reconstructed
+// from form state, so "run that again" means exactly that.
+async function loadLaunchHistory() {
+  const box = document.getElementById("ln-history");
+  try {
+    const { runs } = await api("/api/runs");
+    box.replaceChildren();
+    if (!runs.length) {
+      box.append(el("p", "empty", "Nothing launched from this page yet."));
+      return;
+    }
+    for (const r of runs.slice().reverse()) {
+      const line = Array.isArray(r.argv) ? r.argv.join(" ") : "";
+      const row = el("button", "ln-row");
+      const head = el("span", "when",
+        (r.ts ? new Date(r.ts * 1000).toLocaleString() : "") +
+        (r.dur_s !== undefined ? "  ·  " + fmtDur(r.dur_s) : ""));
+      row.append(head);
+      row.append(el("span", "line", line));
+      row.append(el("span", "exit " + (r.exit === 0 ? "ok" : "bad"),
+        r.exit === undefined || r.exit === null ? "no exit" : "exit " + r.exit));
+      row.title = "propose this launch again";
+      row.addEventListener("click", () => proposeRelaunch(r));
+      box.append(row);
+    }
+  } catch (e) {
+    box.replaceChildren(el("pre", "", String(e.message || e)));
+  }
+}
+
+function fmtDur(s) {
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  return m < 60 ? m + "m" + String(s % 60).padStart(2, "0") + "s" : Math.floor(m / 60) + "h" + String(m % 60).padStart(2, "0") + "m";
+}
+
+// A recorded argv back into its parts:
+// ["fdl", <globals...>, ("--env", e)?, cmd, ...args].
+// The globals are recovered too, so re-launching reproduces the run
+// rather than the run's command under today's form state.
+function splitRecorded(argv) {
+  const rest = (argv || []).slice(argv && argv[0] === "fdl" ? 1 : 0);
+  const g = {};
+  let env = "";
+  let i = 0;
+  for (; i < rest.length; i++) {
+    const a = rest[i];
+    if (["-q", "-v", "-vv", "-vvv"].includes(a)) g.verbosity = a;
+    else if (a === "--no-append") g.no_append = true;
+    else if (a === "--no-prebuild") g.no_prebuild = true;
+    else if (a === "--gpus" && rest[i + 1]) { g.gpus = rest[++i]; }
+    else if (a === "--env" && rest[i + 1]) { env = rest[++i]; }
+    else break;
+  }
+  return { env, globals: g, command: rest[i] || "", args: rest.slice(i + 1) };
+}
+
+// Proposing, not launching: the command line to be re-run is shown with
+// an explicit confirm, because a click in a history list must never be
+// the thing that starts a training run.
+function proposeRelaunch(record) {
+  const { env, globals, command, args } = splitRecorded(record.argv);
+  if (!command) return;
+  const bar = document.getElementById("ln-again");
+  bar.replaceChildren();
+  const go = el("button", "", "re-launch");
+  const cancel = el("button", "", "cancel");
+  const line = "fdl " + (env ? "--env " + env + " " : "") + command + (args.length ? " " + args.join(" ") : "");
+  bar.append(go, cancel, el("span", "slot-note", line));
+  bar.hidden = false;
+  // Point the selects at it too, so the form reflects what is proposed.
+  const envSel = document.getElementById("ln-env");
+  if ([...envSel.options].some(o => o.value === env)) envSel.value = env;
+  const cmdSel = document.getElementById("ln-cmd");
+  if ([...cmdSel.options].some(o => o.value === command)) {
+    cmdSel.value = command;
+    renderLaunchForm();
+  }
+  // Show the recorded globals in the form too, so what is proposed and
+  // what the controls say cannot disagree.
+  document.getElementById("ln-verbosity").value = globals.verbosity || "";
+  document.getElementById("ln-gpus").value = globals.gpus || "";
+  document.getElementById("ln-no-append").checked = !!globals.no_append;
+  document.getElementById("ln-no-prebuild").checked = !!globals.no_prebuild;
+  cancel.addEventListener("click", () => { bar.hidden = true; bar.replaceChildren(); });
+  go.addEventListener("click", () => {
+    bar.hidden = true;
+    bar.replaceChildren();
+    runLaunch({ command, args, ...globals, ...(env ? { env } : {}) });
+  });
+}
+
 document.getElementById("ln-cmd").addEventListener("change", renderLaunchForm);
 document.getElementById("ln-env").addEventListener("change", () => { loadCommands(); });
 
-document.getElementById("ln-run").addEventListener("click", async () => {
+// fdl's own options ride the body as structured fields; the server
+// turns them back into the pre-command flags.
+function withGlobals(body) {
+  const v = document.getElementById("ln-verbosity").value;
+  const gpus = document.getElementById("ln-gpus").value.trim();
+  if (v) body.verbosity = v;
+  if (gpus) body.gpus = gpus;
+  if (document.getElementById("ln-no-append").checked) body.no_append = true;
+  if (document.getElementById("ln-no-prebuild").checked) body.no_prebuild = true;
+  return body;
+}
+
+function launchBody(args) {
   const command = document.getElementById("ln-cmd").value;
-  if (!command) return;
+  if (!command) return null;
   const env = document.getElementById("ln-env").value;
-  const args = assembleLaunchArgs();
   const body = { command, args };
   if (env) body.env = env;
+  return withGlobals(body);
+}
+
+document.getElementById("ln-run").addEventListener("click", () => {
+  const body = launchBody(assembleLaunchArgs());
+  if (body) runLaunch(body);
+});
+
+// `--help` answers what a command takes — the only route to that for a
+// command with no schema. It runs like any launch (same stream, same
+// job slot) but the server keeps inspections out of the run ledger.
+document.getElementById("ln-help").addEventListener("click", () => {
+  const body = launchBody(["--help"]);
+  if (body) runLaunch(body);
+});
+
+async function runLaunch(body) {
+  const args = body.args || [];
   // A run asked to serve its dashboard points the run tab at it.
   const mi = args.indexOf("--monitor");
   if (mi >= 0 && args[mi + 1]) {
@@ -1085,8 +1281,10 @@ document.getElementById("ln-run").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     setBusy(out, false);
+    // The run just became history.
+    loadLaunchHistory();
   }
-});
+}
 
 // ── The run tab: one slot, its backing follows the run's lifecycle ──
 function iframeTo(src) {
@@ -1153,25 +1351,11 @@ function stopRunPoll() {
 document.getElementById("run-connect").addEventListener("click", () => { connectRun().catch(() => {}); });
 document.getElementById("run-refresh").addEventListener("click", () => { runConnected = false; refreshRunSlot(); });
 
-// ── History: the run ledger + persisted dashboards on disk ─────────
+// ── Training history: the persisted dashboards a run left on disk ──
+// (What was LAUNCHED lives beside the launch form instead — a command
+// history belongs next to the thing that runs commands.)
 async function loadHistory() {
-  const runsBox = document.getElementById("hist-runs");
   const archBox = document.getElementById("hist-archives");
-  try {
-    const { runs } = await api("/api/runs");
-    runsBox.replaceChildren();
-    if (!runs.length) {
-      runsBox.append(el("p", "empty", "No launches recorded yet — runs started from this page will be listed here."));
-    }
-    for (const r of runs.slice().reverse()) {
-      const row = el("div", "arch-row");
-      row.append(el("span", "when", r.ts ? new Date(r.ts * 1000).toLocaleString() : ""));
-      row.append(el("span", "p", (r.farm ? "@" + r.farm + " " : "") + (Array.isArray(r.argv) ? r.argv.join(" ") : "")));
-      row.append(el("span", "exit " + (r.exit === 0 ? "ok" : "bad"), r.exit === undefined ? "" : "exit " + r.exit));
-      if (r.archive_path) row.addEventListener("click", () => openArchive(r.archive_path));
-      runsBox.append(row);
-    }
-  } catch { runsBox.replaceChildren(); }
   try {
     const { archives } = await api("/api/archives");
     histRuns = groupArchives(archives);
@@ -1300,8 +1484,27 @@ document.getElementById("pub-follow").addEventListener("click", async () => {
   }
 });
 
-api("/api/farms").then(renderFarms).catch(e => {
-  document.getElementById("farms").replaceChildren(el("pre", "", String(e.message || e)));
+const TAB_LOADERS = {
+  "farms-panel": loadFarms,
+  "launch-panel": loadCommands,
+  "run-panel": refreshRunSlot,
+  "history-panel": loadHistory,
+};
+
+async function loadFarms() {
+  try {
+    renderFarms(await api("/api/farms"));
+  } catch (e) {
+    document.getElementById("farms").replaceChildren(el("pre", "", String(e.message || e)));
+  }
+}
+
+// Farms load unconditionally: they fill every env select, including the
+// ones the launch and run tabs read. Only then does the active tab load,
+// so a deep-linked tab sees the same selects a clicked one would.
+loadFarms().then(() => {
+  loadLaunchHistory();
+  if (INITIAL_TAB !== "farms-panel") enterTab(INITIAL_TAB);
 });
 </script>
 </body>

@@ -445,12 +445,17 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
         // and its completion appends the run ledger.
         "/api/launch" => match parse_body(&req.body).and_then(|b| launch_argv(&b, server)) {
             Ok((argv, farm)) => {
-                let ledger = LedgerCtx {
+                // Asking a command what it takes is an inspection, not a
+                // run: it must not land in the run ledger. Decided from
+                // the argv here rather than trusted from the body, so a
+                // real launch cannot opt itself out of history.
+                let inspecting = argv.iter().any(|a| a == "--help" || a == "-h");
+                let ledger = (!inspecting).then(|| LedgerCtx {
                     path: server.root.join(".fdl/ui/runs.jsonl"),
                     farm,
                     port: *server.run_target.lock().expect("run target lock"),
-                };
-                Reply::StartJob(argv, Some(ledger))
+                });
+                Reply::StartJob(argv, ledger)
             }
             Err(why) => error_json("400 Bad Request", &why).into(),
         },
@@ -715,9 +720,24 @@ fn run_fdl(fdl_bin: &Path, root: &Path, args: &[&str]) -> serde_json::Value {
 
 /// The `commands:` tree of the merged config (base, or base + the
 /// named overlay — a farm's run command usually lives in its overlay),
-/// each carrying its cached `--fdl-schema` when one exists. No schema
-/// means the options live in the command's own code: the form degrades
-/// to a freeform args field, never a blocker.
+/// each carrying the schema that command actually resolves to.
+///
+/// **A schema belongs to a command's own directory, not to the root.**
+/// A `path:` command (the convention `./<name>/fdl.yml`, which is how a
+/// training vehicle is declared) resolves its surface through
+/// `load_command_with_env` — cached `--fdl-schema` output when fresh,
+/// the inline `schema:` block otherwise — and that cache lives under
+/// `<name>/.fdl/schema-cache/`. Reading a root-level cache instead
+/// found nothing for anything, so every command claimed "no schema"
+/// while `ddp-bench/.fdl/schema-cache/ddp-bench.json` sat right there.
+///
+/// The load is deliberately the **cheap** one: a page load must never
+/// trigger a cargo compile. A `compile: true` command whose cache is
+/// stale therefore reports no schema rather than blocking the page —
+/// `fdl <cmd> --refresh-schema` is the (named) way to refill it.
+///
+/// `kind` rides along so the page can be honest about *why* a form is
+/// absent: a `run:` command is a shell line and never grows one.
 fn commands_route(env: Option<&str>, server: &UiServer) -> Vec<u8> {
     let Some(base) = crate::config::find_project_config(&server.root) else {
         return json_ok(&serde_json::json!({ "commands": [] }));
@@ -730,15 +750,32 @@ fn commands_route(env: Option<&str>, server: &UiServer) -> Vec<u8> {
         .commands
         .iter()
         .map(|(name, spec)| {
-            let schema = crate::schema_cache::read_cache(&crate::schema_cache::cache_path(
-                &server.root,
-                name,
-            ))
-            .and_then(|s| serde_json::to_value(s).ok());
+            let kind = match spec.kind() {
+                Ok(crate::config::CommandKind::Run) => "run",
+                Ok(crate::config::CommandKind::Path) => "path",
+                Ok(crate::config::CommandKind::Preset) => "preset",
+                Err(_) => "invalid",
+            };
+            // Only a path command owns a directory, and therefore a
+            // schema. Its own `description:` is better than the parent's
+            // stub, so prefer it when the child config carries one.
+            let (schema, description) = if kind == "path" {
+                let dir = spec.resolve_path(name, &server.root);
+                match crate::config::load_command_with_env(&dir, env) {
+                    Ok(child) => (
+                        child.schema.and_then(|s| serde_json::to_value(s).ok()),
+                        child.description.or_else(|| spec.description.clone()),
+                    ),
+                    Err(_) => (None, spec.description.clone()),
+                }
+            } else {
+                (None, spec.description.clone())
+            };
             serde_json::json!({
                 "name": name,
-                "description": spec.description,
+                "description": description,
                 "cluster": spec.cluster.unwrap_or(false),
+                "kind": kind,
                 "schema": schema,
             })
         })
@@ -746,11 +783,51 @@ fn commands_route(env: Option<&str>, server: &UiServer) -> Vec<u8> {
     json_ok(&serde_json::json!({ "commands": commands }))
 }
 
-/// The launch argv: `[--env <farm>] <command> <args...>`. The command
-/// must be declared in the merged config — the launch surface drives
-/// the project's own commands, never arbitrary fdl subcommands (those
-/// have their own routes and their own consent rules). Args are the
-/// command's own flags, so dashes are the point; they are still
+/// fdl's own options, which sit BEFORE the command and apply to every
+/// one of them (`fdl [options] <command> [command-options]`). They are
+/// not in any command's schema — they belong to fdl — so the form has
+/// to carry them separately or they are simply unreachable from the
+/// page.
+///
+/// Taken as STRUCTURED fields rather than raw flags, like every other
+/// driven form here: the allowlist is then implicit and a body cannot
+/// smuggle an arbitrary pre-command argument.
+///
+/// `--ansi` / `--no-ansi` are deliberately absent: colour already
+/// auto-disables off a tty, so a driven command's output is plain and
+/// the only thing `--ansi` could add is escape sequences in the log.
+fn global_argv(body: &serde_json::Value) -> Result<Vec<String>, String> {
+    let mut argv = Vec::new();
+    if let Some(v) = body_str(body, "verbosity", true)? {
+        if !matches!(v, "-q" | "-v" | "-vv" | "-vvv") {
+            return Err("verbosity: one of `-q`, `-v`, `-vv`, `-vvv`".to_string());
+        }
+        argv.push(v.to_string());
+    }
+    if let Some(spec) = body_str(body, "gpus", false)? {
+        // fdl's own parser is the authority on the spec; this only
+        // keeps a value from posing as a flag.
+        if spec != "all" && !spec.chars().all(|c| c.is_ascii_digit() || c == ',') {
+            return Err("gpus: a device list like `0,1`, or `all`".to_string());
+        }
+        argv.extend(["--gpus".to_string(), spec.to_string()]);
+    }
+    for (key, flag) in [
+        ("no_append", "--no-append"),
+        ("no_prebuild", "--no-prebuild"),
+    ] {
+        if body.get(key).and_then(|v| v.as_bool()) == Some(true) {
+            argv.push(flag.to_string());
+        }
+    }
+    Ok(argv)
+}
+
+/// The launch argv: `[globals] [--env <farm>] <command> <args...>`. The
+/// command must be declared in the merged config — the launch surface
+/// drives the project's own commands, never arbitrary fdl subcommands
+/// (those have their own routes and their own consent rules). Args are
+/// the command's own flags, so dashes are the point; they are still
 /// bounded and control-character-free.
 fn launch_argv(
     body: &serde_json::Value,
@@ -773,7 +850,9 @@ fn launch_argv(
             env.map(|e| format!(" (env `{e}`)")).unwrap_or_default(),
         ));
     }
-    let mut argv: Vec<String> = Vec::new();
+    // Everything fdl-level comes first, in the order its own usage
+    // line states: `fdl [options] <command> [command-options]`.
+    let mut argv: Vec<String> = global_argv(body)?;
     if let Some(e) = env {
         argv.extend(["--env".to_string(), e.to_string()]);
     }
@@ -1923,14 +2002,32 @@ mod tests {
     fn stage_launch_project(tmp: &Path) {
         std::fs::write(
             tmp.join("fdl.yml"),
-            "commands:\n  train:\n    description: the training run\n    run: echo train\n  bare:\n    run: echo bare\n",
+            "commands:\n  train:\n  inline:\n  bare:\n    run: echo bare\n",
         )
         .unwrap();
-        let cache = tmp.join(".fdl/schema-cache");
-        std::fs::create_dir_all(&cache).unwrap();
+        // Cached `--fdl-schema` output, in the command's OWN dir — the
+        // real layout. The first cut of this fixture put the cache at
+        // the project root, mirroring the bug it was meant to catch, so
+        // it passed while every real command reported "no schema".
+        let train = tmp.join("train");
+        std::fs::create_dir_all(train.join(".fdl/schema-cache")).unwrap();
         std::fs::write(
-            cache.join("train.json"),
+            train.join("fdl.yml"),
+            "description: the training run\nentry: cargo run --release\n",
+        )
+        .unwrap();
+        std::fs::write(
+            train.join(".fdl/schema-cache/train.json"),
             r#"{"args":[],"options":{"epochs":{"type":"int","default":10,"description":"how long"},"model":{"type":"string","choices":["lenet","resnet"]}}}"#,
+        )
+        .unwrap();
+        // The other road to a schema: an inline `schema:` block. No
+        // `entry:`, so nothing is probed or spawned by the load.
+        let inline = tmp.join("inline");
+        std::fs::create_dir_all(&inline).unwrap();
+        std::fs::write(
+            inline.join("fdl.yml"),
+            "schema:\n  options:\n    alpha:\n      type: float\n",
         )
         .unwrap();
     }
@@ -1946,14 +2043,22 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(out.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let cmds = body["commands"].as_array().unwrap();
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 3);
+        // A path command's schema comes from ITS OWN dir's cache, and
+        // its own `description:` beats the parent's silence.
         let train = cmds.iter().find(|c| c["name"] == "train").unwrap();
+        assert_eq!(train["kind"], "path");
         assert_eq!(train["description"], "the training run");
-        // The cached schema rides along, fields intact for the form.
         assert_eq!(train["schema"]["options"]["epochs"]["type"], "int");
         assert_eq!(train["schema"]["options"]["model"]["choices"][0], "lenet");
-        // No cache → null schema → the form degrades to freeform args.
+        // The inline-`schema:` road resolves too — the old root-cache
+        // lookup missed both.
+        let inline = cmds.iter().find(|c| c["name"] == "inline").unwrap();
+        assert_eq!(inline["schema"]["options"]["alpha"]["type"], "float");
+        // A shell command has no schema by nature; the page says so in
+        // its own words rather than pointing at --refresh-schema.
         let bare = cmds.iter().find(|c| c["name"] == "bare").unwrap();
+        assert_eq!(bare["kind"], "run");
         assert!(bare["schema"].is_null());
         // An unknown env is a loud 400, not an empty menu.
         assert!(
@@ -2011,6 +2116,74 @@ mod tests {
             .starts_with("HTTP/1.1 400"),
         );
         assert!(post(port, "/api/launch", Some(&token), "{}").starts_with("HTTP/1.1 400"),);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// fdl's own options precede the command, come from structured
+    /// fields (so no body can smuggle a pre-command argument), and are
+    /// validated by name.
+    #[test]
+    fn global_options_lead_the_argv_and_are_allowlisted() {
+        let tmp = tempdir();
+        stage_launch_project(&tmp);
+        let (port, token) = spawn_server(&tmp);
+
+        let out = post(
+            port,
+            "/api/launch",
+            Some(&token),
+            r#"{"command":"train","verbosity":"-vv","gpus":"0,1","no_prebuild":true,
+                "no_append":true,"args":["--epochs","2"]}"#,
+        );
+        assert!(
+            out.contains(
+                r#"["fdl","-vv","--gpus","0,1","--no-append","--no-prebuild","train","--epochs","2"]"#
+            ),
+            "{out}",
+        );
+        // Only the four real verbosity spellings, and a gpu spec that
+        // cannot pose as a flag.
+        for bad in [
+            r#"{"command":"train","verbosity":"-vvvv"}"#,
+            r#"{"command":"train","verbosity":"--wat"}"#,
+            r#"{"command":"train","gpus":"--no-build"}"#,
+            r#"{"command":"train","gpus":"0;rm"}"#,
+        ] {
+            let r = post(port, "/api/launch", Some(&token), bad);
+            assert!(r.starts_with("HTTP/1.1 400"), "{bad} → {r}");
+        }
+        // `all` is a legal spec.
+        assert!(
+            post(
+                port,
+                "/api/launch",
+                Some(&token),
+                r#"{"command":"train","gpus":"all"}"#
+            )
+            .contains(r#""--gpus","all""#),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Asking what a command takes is an inspection: it streams like a
+    /// launch but never enters the run ledger, and the rule is decided
+    /// from the argv rather than trusted from the body.
+    #[test]
+    fn a_help_invocation_streams_but_is_not_history() {
+        let tmp = tempdir();
+        stage_launch_project(&tmp);
+        let (port, token) = spawn_server(&tmp);
+        let out = post(
+            port,
+            "/api/launch",
+            Some(&token),
+            r#"{"command":"train","args":["--help"]}"#,
+        );
+        assert!(out.contains(r#"["fdl","train","--help"]"#), "{out}");
+        assert!(
+            !tmp.join(".fdl/ui/runs.jsonl").exists(),
+            "a --help inspection must not enter the run ledger",
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
