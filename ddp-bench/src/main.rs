@@ -18,11 +18,14 @@ use config::{DdpMode, RunConfig};
 /// DDP validation and benchmark suite for flodl.
 #[derive(FdlArgs, Debug)]
 struct Cli {
-    /// Run specific model (name or "all").
+    /// Run specific model (name or "all"). `--list` prints the registered
+    /// names with a line each; the names are not enumerated here because the
+    /// registry is the only place that cannot fall out of date.
     #[option]
     model: Option<String>,
 
-    /// Run specific DDP mode (name or "all").
+    /// Run specific DDP mode (name or "all"). `--list` prints the available
+    /// modes.
     #[option]
     mode: Option<String>,
 

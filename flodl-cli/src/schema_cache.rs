@@ -5,9 +5,12 @@
 //! `flodl-cli` caches the output under `<cmd_dir>/.fdl/schema-cache/<cmd>.json`
 //! and prefers it over any inline YAML schema declared in `fdl.yaml`.
 //!
-//! **Cargo entries** (`entry: cargo run ...`) are *not* auto-probed: invoking
-//! them forces a full compile, which is unacceptable latency for `fdl --help`.
-//! For those, users run `fdl <cmd> --refresh-schema` explicitly after a build.
+//! **Cargo entries** (`entry: cargo run ...`) are probed only when the command
+//! opts in with `compile: true` *and* the caller asked for an authoritative
+//! surface (see [`crate::config::ProbeCost`]) — invoking one forces a full
+//! compile, which is unacceptable latency for `fdl --help` or a tab-press.
+//! Without the opt-in, users run `fdl <cmd> --refresh-schema` explicitly after
+//! a build.
 //!
 //! Cache invalidation is mtime-based: the cache file's mtime is compared
 //! against every path that could change the schema — the command's config
@@ -152,6 +155,21 @@ pub fn write_cache(path: &Path, schema: &Schema) -> Result<(), String> {
 /// container instead of failing silently on the host. When unset, the
 /// entry runs directly on the host.
 ///
+/// The wrap must reproduce what the *exec* path does, not merely resemble
+/// it, and two pieces of that are easy to leave out:
+///
+/// - `docker:` is resolved through [`crate::run::resolve_docker_service`],
+///   because `gpu` is a LOGICAL service picked from the active libtorch
+///   variant. Handing compose the literal string yields `no such service:
+///   gpu` — and since probe errors are a documented fall-through, the only
+///   symptom is a `--help` that quietly stops listing options.
+/// - The libtorch env vars go on the child, because they are what
+///   `--features "$FDL_GPU_FEATURE"` and compose's own
+///   `${LIBTORCH_HOST_PATH}` / `${CUDA_TAG}` interpolations read. Without
+///   them the probe either builds the wrong feature set or mounts the
+///   wrong variant, both of which look like a broken binary rather than a
+///   missing export.
+///
 /// On failure returns a string error rather than panicking — callers
 /// almost always want to fall back to the inline schema (or none).
 pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Result<Schema, String> {
@@ -169,26 +187,7 @@ pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Resul
                     cmd_dir.display()
                 )
             })?;
-            // The container starts in its configured workdir (the
-            // compose root's mount), NOT the command dir — without a
-            // `cd`, a cargo entry builds and probes the WORKSPACE
-            // default binary instead of the command's (observed:
-            // `fdl ddp-bench --refresh-schema` probing `fdl` itself,
-            // which rejects `--fdl-schema`). The command dir's path
-            // relative to the compose root is the same on both sides
-            // of the mount, so prefix the entry with a relative cd.
-            let inner_in_container = match cmd_dir
-                .strip_prefix(&compose_root)
-                .ok()
-                .filter(|rel| !rel.as_os_str().is_empty())
-            {
-                Some(rel) => format!("cd {} && {inner}", posix_quote(&rel.to_string_lossy())),
-                None => inner,
-            };
-            let wrapped = format!(
-                "docker compose run --rm {svc} bash -c {}",
-                posix_quote(&inner_in_container)
-            );
+            let wrapped = docker_invocation(&inner, cmd_dir, svc, &compose_root);
             (wrapped, compose_root)
         }
         _ => (inner, cmd_dir.to_path_buf()),
@@ -199,11 +198,27 @@ pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Resul
     } else {
         ("sh", "-c")
     };
-    let output = Command::new(shell)
-        .args([flag, &invocation])
+    let mut cmd = Command::new(shell);
+    cmd.args([flag, &invocation])
         .current_dir(&run_cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // `run_cwd` is the compose root when wrapped and the command dir
+    // otherwise; the env is anchored at the project root either way, which
+    // for the wrapped case is the same directory. Errors are ignored on
+    // purpose: a project with no resolvable libtorch still probes fine (a
+    // CPU-only or script entry needs none of these), and the probe's own
+    // failure is the better diagnostic if it does need them.
+    let env_root = match crate::config::find_project_config(&run_cwd) {
+        Some(cfg) => cfg.parent().unwrap_or(&run_cwd).to_path_buf(),
+        None => run_cwd.clone(),
+    };
+    if let Ok(env_vars) = crate::run::libtorch_env(&env_root) {
+        for (key, val) in &env_vars {
+            cmd.env(key, val);
+        }
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("spawn `{invocation}`: {e}"))?;
 
@@ -228,8 +243,42 @@ pub fn probe(entry: &str, cmd_dir: &Path, docker_service: Option<&str>) -> Resul
     Ok(schema)
 }
 
-/// Heuristic: cargo entries compile-on-run, so they are never auto-probed.
-/// Probing must be explicit (`fdl <cmd> --refresh-schema`) for those.
+/// Wrap a probe command for `docker compose run`.
+///
+/// Split out of [`probe`] so the service-resolution step can be asserted
+/// without spawning a container — the regression it guards (a literal `gpu`
+/// reaching compose) is invisible from the outside, since a failed probe is a
+/// documented fall-through and the only symptom was a `--help` that stopped
+/// listing options.
+fn docker_invocation(inner: &str, cmd_dir: &Path, svc: &str, compose_root: &Path) -> String {
+    // `gpu` is logical, standing for whichever GPU container matches the
+    // active libtorch variant; compose knows only the concrete names.
+    let svc = crate::run::resolve_docker_service(svc, compose_root);
+    // The container starts in its configured workdir (the compose root's
+    // mount), NOT the command dir — without a `cd`, a cargo entry builds and
+    // probes the WORKSPACE default binary instead of the command's (observed:
+    // `fdl ddp-bench --refresh-schema` probing `fdl` itself, which rejects
+    // `--fdl-schema`). The command dir's path relative to the compose root is
+    // the same on both sides of the mount, so prefix the entry with a
+    // relative cd.
+    let inner_in_container = match cmd_dir
+        .strip_prefix(compose_root)
+        .ok()
+        .filter(|rel| !rel.as_os_str().is_empty())
+    {
+        Some(rel) => format!("cd {} && {inner}", posix_quote(&rel.to_string_lossy())),
+        None => inner.to_string(),
+    };
+    format!(
+        "docker compose run --rm {svc} bash -c {}",
+        posix_quote(&inner_in_container)
+    )
+}
+
+/// Heuristic: cargo entries compile-on-run, which is what makes them the
+/// expensive class. They are probed only under `compile: true` plus a
+/// [`ProbeCost::Compile`](crate::config::ProbeCost::Compile) load; otherwise
+/// probing is explicit (`fdl <cmd> --refresh-schema`).
 pub fn is_cargo_entry(entry: &str) -> bool {
     entry.trim_start().starts_with("cargo ")
 }
@@ -469,6 +518,46 @@ JSON
             err.contains("no JSON") || err.contains("valid JSON"),
             "err was: {err}"
         );
+    }
+
+    /// The logical `gpu` service must be resolved before compose sees it.
+    ///
+    /// Regression: `probe` wrapped the raw `docker:` value while the exec path
+    /// resolved it, so the day `ddp-bench` switched to `docker: gpu` every
+    /// probe died with `no such service: gpu`. Nothing said so — a probe
+    /// error is a documented fall-through — and `fdl ddp-bench --help` simply
+    /// stopped listing the binary's 59 options.
+    #[test]
+    fn docker_invocation_resolves_the_logical_gpu_service() {
+        let tmp = TestDir::new("sc");
+        let cmd_dir = tmp.path().join("bench");
+        fs::create_dir_all(&cmd_dir).unwrap();
+
+        let out = docker_invocation("run --fdl-schema", &cmd_dir, "gpu", tmp.path());
+        assert!(
+            !out.contains(" gpu "),
+            "the logical name must never reach compose; got: {out}"
+        );
+        // No libtorch variant resolves under a temp root, which is
+        // `resolve_docker_service`'s documented `cuda` fallback.
+        assert!(
+            out.contains("--rm cuda "),
+            "expected the resolved service; got: {out}"
+        );
+        assert!(
+            out.contains("cd bench &&"),
+            "the command dir's relative cd must survive the split; got: {out}"
+        );
+    }
+
+    /// An explicit service name is a pin and passes through untouched.
+    #[test]
+    fn docker_invocation_passes_explicit_services_through() {
+        let tmp = TestDir::new("sc");
+        for svc in ["dev", "rocm", "cuda"] {
+            let out = docker_invocation("run --fdl-schema", tmp.path(), svc, tmp.path());
+            assert!(out.contains(&format!("--rm {svc} ")), "{svc}: {out}");
+        }
     }
 
     #[test]

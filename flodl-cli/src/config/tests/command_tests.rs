@@ -1,6 +1,8 @@
-//! Tests for `load_command`: auto-probe vs cargo-skip behaviour.
+//! Tests for `load_command`: auto-probe vs cargo-skip behaviour, and which
+//! loads are allowed to pay for a probe.
 
 use super::*;
+use crate::config::command::probe_allowed;
 
 #[test]
 fn load_command_auto_probes_non_cargo_entry_and_writes_cache() {
@@ -128,6 +130,82 @@ fn load_command_auto_probe_failure_falls_through_silently() {
 
     let cfg = load_command(&cmd_dir).expect("load must succeed despite probe error");
     assert!(cfg.schema.is_none());
+}
+
+// ── Probe cost ──────────────────────────────────────────────────
+
+/// A cargo entry must never be probed by a load that only wants cheap data.
+///
+/// `fdl --help` loads every child config just to read its `description:`, and
+/// completion generation loads all of them for their flag lists. Both would
+/// otherwise spin a container and run a build — on a tab-press, in the
+/// completion case. `compile: true` buys the probe a right to exist, not a
+/// right to run from anywhere.
+#[test]
+fn a_cargo_entry_is_never_probed_under_cheap_cost() {
+    for compiles in [true, false] {
+        assert!(
+            !probe_allowed("cargo run --release --", compiles, ProbeCost::Cheap),
+            "compile: {compiles} must not make a cheap load pay for a build",
+        );
+    }
+    assert!(
+        probe_allowed("cargo run --release --", true, ProbeCost::Compile),
+        "the opted-in command is exactly what ProbeCost::Compile is for",
+    );
+    assert!(
+        !probe_allowed("cargo run --release --", false, ProbeCost::Compile),
+        "without the yml opt-in, a cargo entry stays unprobed at any cost",
+    );
+}
+
+/// Scripts and pre-built binaries answer in milliseconds, so no cost class
+/// has a reason to skip them.
+#[test]
+fn a_cheap_entry_is_probed_at_every_cost() {
+    for cost in [ProbeCost::Cheap, ProbeCost::Compile] {
+        assert!(probe_allowed("./target/release/bench", false, cost));
+        assert!(probe_allowed("python ./train.py", false, cost));
+    }
+}
+
+/// A stale cache is a better answer than no answer.
+///
+/// Dropping it took `strict` and every `choices:` contract down with the help
+/// text, so a `compile: true` command whose sources had been touched lost its
+/// whole declared surface until something paid for a probe.
+#[test]
+fn a_stale_cache_still_serves_a_cheap_load() {
+    let tmp = TempDir::new();
+    let cmd_dir = tmp.0.join("stalecache");
+    std::fs::create_dir_all(cmd_dir.join("src")).unwrap();
+    std::fs::write(
+        cmd_dir.join("fdl.yml"),
+        "entry: cargo run --\ncompile: true\n",
+    )
+    .unwrap();
+
+    let cache = crate::schema_cache::cache_path(&cmd_dir, "stalecache");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::write(
+        &cache,
+        r#"{"options":{"rounds":{"type":"int","description":"N"}}}"#,
+    )
+    .unwrap();
+
+    // A source edit after the cache was written: stale, and nothing here can
+    // afford to refresh it.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(cmd_dir.join("src").join("main.rs"), "fn main(){}\n").unwrap();
+
+    let cfg = load_command(&cmd_dir).expect("load ok");
+    let schema = cfg
+        .schema
+        .expect("a stale cache must still populate the schema");
+    assert!(
+        schema.options.contains_key("rounds"),
+        "the cached surface is what should have been served",
+    );
 }
 
 // ── Cluster topology (multi-host DDP overlay) ───────────────────

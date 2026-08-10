@@ -8,6 +8,11 @@ docker: gpu
 # result is then cached (.fdl/schema-cache/, gitignored) and subsequent `-h`
 # are fast. Adding a flag therefore shows up in `-h` on its own — no yml touch,
 # no manual cache delete.
+#
+# The compile is charged only to commands that consume the surface: `fdl
+# ddp-bench -h` and `fdl ddp-bench <args>`. `fdl --help` and tab-completion
+# read the cache and never build, stale cache included — a tab-press must not
+# start a container.
 compile: true
 entry: cargo run --release --features "$FDL_GPU_FEATURE" --
 
