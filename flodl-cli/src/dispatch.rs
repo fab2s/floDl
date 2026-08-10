@@ -49,6 +49,13 @@ pub enum PathOutcome {
 /// Classify a `Path`-kind step. Pure: loads the child config, inspects
 /// the tail, and returns the matching [`PathOutcome`]. The caller owns
 /// every side effect (printing, spawning).
+///
+/// Loads with [`config::ProbeCost::Compile`]: every outcome here either
+/// renders the command's surface (`ShowHelp`) or validates an argv tail
+/// against it before the entry runs (`Exec`), so this is the one place a
+/// `compile: true` probe earns its cost. Loaders that only want a
+/// `description:` or a flag list for completion go through
+/// [`config::load_command_with_env`] instead and never compile.
 pub fn classify_path_step(
     spec: &CommandSpec,
     name: &str,
@@ -57,7 +64,7 @@ pub fn classify_path_step(
     env: Option<&str>,
 ) -> PathOutcome {
     let child_dir = spec.resolve_path(name, current_dir);
-    let child_cfg = match config::load_command_with_env(&child_dir, env) {
+    let child_cfg = match config::load_command_probed(&child_dir, env) {
         Ok(c) => c,
         Err(e) => return PathOutcome::LoadFailed(e),
     };

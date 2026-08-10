@@ -255,7 +255,7 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
 ///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
 ///   FDL_GPU_FEATURE   = the cargo feature the active variant needs
-fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
     // CPU path is always the same.
@@ -1232,10 +1232,25 @@ fn print_entry_section(cmd_config: &CommandConfig) {
         eprintln!("     {}", style::dim(&format!("[docker: {service}]")));
     }
     eprintln!();
-    eprintln!(
-        "    Any extra {} are forwarded to the entry point.",
-        style::dim("[options]")
-    );
+    // Say where the option list came from when there is one. Without this the
+    // section reads as "fdl has no idea what this command takes" directly
+    // below a full list of what it takes, and it leaves the useful half
+    // unsaid: undeclared flags still reach the binary.
+    let declares_options = cmd_config
+        .schema
+        .as_ref()
+        .is_some_and(|s| !s.options.is_empty());
+    if declares_options {
+        eprintln!(
+            "    Options above come from the entry's own {}; anything else is forwarded as-is.",
+            style::dim("--fdl-schema")
+        );
+    } else {
+        eprintln!(
+            "    Any extra {} are forwarded to the entry point.",
+            style::dim("[options]")
+        );
+    }
 }
 
 fn print_defaults_section(cmd_config: &CommandConfig) {

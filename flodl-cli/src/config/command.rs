@@ -5,7 +5,32 @@ use std::path::{Path, PathBuf};
 use super::loading::{CONFIG_NAMES, EXAMPLE_SUFFIXES, try_copy_example};
 use super::schema::{CommandConfig, validate_schema};
 
-/// Load a command config from a sub-directory.
+/// How much a load may spend to obtain the command's schema.
+///
+/// A schema comes from one of three places: the cache, a `--fdl-schema`
+/// probe of the entry, or an inline `schema:` block. Probing is what costs,
+/// and its cost is not uniform — which is why the caller picks rather than
+/// the loader guessing.
+///
+/// The split exists because most loads do not want the schema at all. `fdl
+/// --help` loads every child config just to read its `description:`, and
+/// shell completion loads all of them to list flags. Neither can afford a
+/// container spinning up a cargo build, and a tab-press least of all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeCost {
+    /// Probe only entries that answer in milliseconds — a script or a
+    /// pre-built binary. A `compile: true` cargo entry is served from its
+    /// cache, stale included: an out-of-date surface beats no surface,
+    /// since dropping the schema also drops `strict` and every `choices:`
+    /// contract along with the help text.
+    Cheap,
+    /// Compile if that is what an authoritative surface costs. For the
+    /// paths that actually consume the schema: rendering `--help` and
+    /// validating an argv tail before handing it to the entry.
+    Compile,
+}
+
+/// Load a command config from a sub-directory, [cheaply](ProbeCost::Cheap).
 ///
 /// Applies the same `.example`/`.dist` fallback as [`super::loading::find_config`]. If a
 /// `schema:` block is present, validates it before returning.
@@ -13,7 +38,8 @@ pub fn load_command(dir: &Path) -> Result<CommandConfig, String> {
     load_command_with_env(dir, None)
 }
 
-/// Load a sub-command config with an optional environment overlay.
+/// Load a sub-command config with an optional environment overlay,
+/// [cheaply](ProbeCost::Cheap).
 ///
 /// Applies the same `.example`/`.dist` fallback as [`super::loading::find_config`] to locate
 /// the base file, then deep-merges a sibling `fdl.<env>.yml` overlay if one
@@ -21,6 +47,20 @@ pub fn load_command(dir: &Path) -> Result<CommandConfig, String> {
 /// [`super::loading::load_project_with_env`]) — envs declared at the project root don't
 /// have to exist for every sub-command.
 pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandConfig, String> {
+    load_command_full(dir, env, ProbeCost::Cheap)
+}
+
+/// [`load_command_with_env`], but willing to pay a `compile: true` probe to
+/// get the entry's current surface. See [`ProbeCost`].
+pub fn load_command_probed(dir: &Path, env: Option<&str>) -> Result<CommandConfig, String> {
+    load_command_full(dir, env, ProbeCost::Compile)
+}
+
+fn load_command_full(
+    dir: &Path,
+    env: Option<&str>,
+    cost: ProbeCost,
+) -> Result<CommandConfig, String> {
     // Resolve the base config path (with .example fallback, same as before).
     let mut base_path: Option<PathBuf> = None;
     for name in CONFIG_NAMES {
@@ -89,12 +129,34 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
         // when the broken preset is actually invoked.
     }
 
-    // Cache precedence: a valid, fresh cached schema (written by `fdl <cmd>
-    // --refresh-schema` or auto-probed below) wins over the inline YAML
-    // schema. This lets a binary become the source of truth for its own
-    // surface once it opts into the `--fdl-schema` contract. A cache that
-    // is older than the command's fdl.yml is treated as stale and skipped
-    // — the inline schema (if any) reasserts until a refresh happens.
+    apply_schema(&mut cfg, dir, cost);
+
+    Ok(cfg)
+}
+
+/// Whether a stale-or-missing schema may be re-probed under `cost`.
+///
+/// Split out of [`apply_schema`] because it is the whole latency contract in
+/// one expression, and the expression has to hold for callers that never see
+/// a container: a cargo entry compiles, so it is off-limits to a
+/// [`ProbeCost::Cheap`] load no matter what the yml says. Anything else
+/// answers `--fdl-schema` in milliseconds and is always fair game.
+pub(super) fn probe_allowed(entry: &str, compiles: bool, cost: ProbeCost) -> bool {
+    if crate::schema_cache::is_cargo_entry(entry) {
+        compiles && cost == ProbeCost::Compile
+    } else {
+        true
+    }
+}
+
+/// Resolve `cfg.schema` from the cache, a `--fdl-schema` probe, or the
+/// inline `schema:` block already parsed into `cfg`.
+///
+/// Cache precedence: a valid, fresh cached schema (written by `fdl <cmd>
+/// --refresh-schema` or probed below) wins over the inline YAML schema. This
+/// lets a binary become the source of truth for its own surface once it opts
+/// into the `--fdl-schema` contract.
+fn apply_schema(cfg: &mut CommandConfig, dir: &Path, cost: ProbeCost) {
     let cmd_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("_");
     let cache = crate::schema_cache::cache_path(dir, cmd_name);
     // Reference mtimes: everything whose edit could change the cached schema.
@@ -110,37 +172,64 @@ pub fn load_command_with_env(dir: &Path, env: Option<&str>) -> Result<CommandCon
         .map(|n| dir.join(n))
         .filter(|p| p.exists())
         .collect();
-    if cfg.compile.unwrap_or(false) {
+    let compiles = cfg.compile.unwrap_or(false);
+    if compiles {
         refs.extend(crate::schema_cache::schema_source_refs(dir));
     }
+
     if !crate::schema_cache::is_stale(&cache, &refs) {
         if let Some(cached) = crate::schema_cache::read_cache(&cache) {
             cfg.schema = Some(cached);
         }
-    } else if let Some(entry) = cfg.entry.as_deref() {
-        // Auto-probe non-cargo entries when the cache is stale or missing.
-        // Cargo entries are skipped by default — `cargo run --fdl-schema`
-        // triggers a full compile which is unacceptable latency for `-h`
-        // — unless the yml explicitly opts in via `compile: true`.
-        // Scripts and pre-built binaries are expected to handle the flag
-        // cheaply (emit JSON and exit), so probing them on demand is safe.
-        // Probe failures are swallowed: an entry that doesn't implement
-        // `--fdl-schema` simply falls through to the inline schema (or no
-        // schema) — help still renders.
-        let opts_into_compile = cfg.compile.unwrap_or(false);
-        let should_probe = !crate::schema_cache::is_cargo_entry(entry) || opts_into_compile;
-        if should_probe
-            && let Ok(probed) = crate::schema_cache::probe(entry, dir, cfg.docker.as_deref())
-        {
-            // Best-effort cache write: if the dir is read-only, the
-            // schema still applies to this invocation, we just re-probe
-            // next time. Non-fatal.
-            let _ = crate::schema_cache::write_cache(&cache, &probed);
-            cfg.schema = Some(probed);
+        return;
+    }
+
+    // Stale or missing. Probe when the entry can answer within the budget
+    // this load was given: a script or pre-built binary emits JSON and exits
+    // (cheap, always allowed), while a cargo entry compiles first — allowed
+    // only where the yml opted in AND the caller asked for an authoritative
+    // surface.
+    if let Some(entry) = cfg.entry.as_deref() {
+        let is_cargo = crate::schema_cache::is_cargo_entry(entry);
+        if probe_allowed(entry, compiles, cost) {
+            if is_cargo {
+                // A compile behind `-h` is a multi-second wall at best and a
+                // cold container build at worst. Say so before going quiet,
+                // or it reads as a hang.
+                eprintln!(
+                    "fdl: reading {cmd_name}'s options from the binary \
+                     (compiling once, then cached)"
+                );
+            }
+            match crate::schema_cache::probe(entry, dir, cfg.docker.as_deref()) {
+                Ok(probed) => {
+                    // Best-effort cache write: if the dir is read-only, the
+                    // schema still applies to this invocation, we just
+                    // re-probe next time. Non-fatal.
+                    let _ = crate::schema_cache::write_cache(&cache, &probed);
+                    cfg.schema = Some(probed);
+                    return;
+                }
+                // `compile: true` is an explicit claim that this entry
+                // answers `--fdl-schema`, so a failure is a broken contract
+                // and gets reported. Without it the fall-through is the
+                // documented behaviour for an entry that simply doesn't
+                // implement the flag, and saying so on every `-h` would be
+                // noise.
+                Err(e) if compiles => {
+                    crate::cli_error!("could not read {cmd_name}'s schema: {e}");
+                }
+                Err(_) => {}
+            }
         }
     }
 
-    Ok(cfg)
+    // Nothing fresh to be had. A stale cache still describes the entry far
+    // better than nothing does, so prefer it over falling back to the inline
+    // schema — help renders, and `strict`/`choices:` keep holding.
+    if let Some(cached) = crate::schema_cache::read_cache(&cache) {
+        cfg.schema = Some(cached);
+    }
 }
 
 // ── Strict-mode validation ──────────────────────────────────────────────
