@@ -30,15 +30,17 @@
 //!   route. A cross-site request can fire blind at loopback but cannot
 //!   read the page, so it never holds the token.
 //!
-//! ## Reserved: the run ledger (launch slice)
+//! ## The run ledger
 //!
-//! When the page learns to launch training, each launch appends one JSON
-//! line to `.fdl/ui/runs.jsonl` (project-local, inside the self-ignored
-//! `.fdl/`): `{v, ts, farm, argv, exit, dashboard_port, record_log_dir,
-//! archive_path}` — invocations plus artifact pointers, the durable
-//! index the run-history view reads. Nothing writes it in this slice;
-//! the name is reserved here so no other `.fdl/` consumer claims it
-//! (`is_farm_dir` already keeps `.fdl/ui/` out of the farm list).
+//! Each completed launch appends one JSON line to `.fdl/ui/runs.jsonl`
+//! (project-local, inside the self-ignored `.fdl/`; `is_farm_dir`
+//! keeps `.fdl/ui/` out of the farm list): `{v, ts, dur_s, farm, argv,
+//! exit, port}` — invocations that actually ran, the durable index the
+//! history tab reads. A failed *spawn* is not recorded (nothing ran;
+//! the stream reports it live), and ledger I/O failures warn without
+//! breaking the stream. Artifact pointers (record-log dir, archive
+//! path) ride the args themselves; the history tab's disk scan finds
+//! the artifacts regardless.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -70,10 +72,18 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// longer, and a bound keeps a hostile body from becoming a huge argv.
 const MAX_VALUE_LEN: usize = 512;
 
-/// Job line-buffer cap. A publish gate build is hundreds of lines;
-/// anything past this keeps running but stops being recorded (the final
-/// exit event always lands).
+/// Job line-buffer cap — a drop-OLDEST ring: when a run out-talks it,
+/// the head falls away and the tail survives, because the tail is what
+/// diagnoses a run (the same call `record_log` makes). The exit event
+/// is always the last line by construction.
 const JOB_MAX_LINES: usize = 20_000;
+
+/// How long a job stream may go byte-silent before a no-op line goes
+/// out. A cold coverage build sits minutes between output lines, and
+/// an idle stream is prey to every reaper between here and the
+/// browser — the coordinator's own beacon lesson: never go
+/// heartbeat-silent while alive.
+const STREAM_HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// Per-socket read/write budget. The page's fetches are small; anything
 /// slower is a wedged client, not a request. Driven subcommands are NOT
@@ -187,8 +197,8 @@ fn handle(mut stream: TcpStream, server: &UiServer) {
         Reply::Bytes(response) => {
             let _ = stream.write_all(&response);
         }
-        Reply::StartJob(argv) => stream_job(stream, server, argv),
-        Reply::FollowJob => follow_job(stream, server),
+        Reply::StartJob(argv, ledger) => stream_job(stream, server, argv, ledger),
+        Reply::FollowJob { from } => follow_job(stream, server, from),
         Reply::Proxy(target) => proxy_dashboard(stream, server, &target),
     }
 }
@@ -199,11 +209,27 @@ fn handle(mut stream: TcpStream, server: &UiServer) {
 /// the streaming legs inherit the same gates as everything else.
 enum Reply {
     Bytes(Vec<u8>),
-    StartJob(Vec<String>),
-    FollowJob,
+    /// Spawn this argv and stream its output; a launch also carries
+    /// the ledger context its completion appends.
+    StartJob(Vec<String>, Option<LedgerCtx>),
+    FollowJob {
+        /// Absolute line index to resume from (`?from=`).
+        from: usize,
+    },
     /// Forward this request target to the dashboard slot's loopback
     /// port and stream the response back.
     Proxy(String),
+}
+
+/// What a launch knows at spawn time; its exit completes the ledger
+/// record.
+struct LedgerCtx {
+    /// `<root>/.fdl/ui/runs.jsonl`.
+    path: PathBuf,
+    farm: Option<String>,
+    /// The dashboard slot's target at launch, best-effort — the run
+    /// tab's port if the operator set one.
+    port: Option<u16>,
 }
 
 impl From<Vec<u8>> for Reply {
@@ -373,7 +399,7 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
     // arriving as GET is refused even though the token already proved
     // the caller — links and prefetchers must never mutate.
     // (`/api/run-target` legitimately speaks both: GET reads, POST sets.)
-    let want_post = matches!(path, "/api/join-config" | "/api/publish")
+    let want_post = matches!(path, "/api/join-config" | "/api/publish" | "/api/launch")
         || (path == "/api/run-target" && req.method == "POST");
     let expected = if want_post { "POST" } else { "GET" };
     if req.method != expected {
@@ -409,12 +435,35 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
         // The publish gate build runs for minutes: the response is a
         // live NDJSON stream of the child's output.
         "/api/publish" => match parse_body(&req.body).and_then(|b| publish_argv(&b)) {
-            Ok(argv) => Reply::StartJob(argv),
+            Ok(argv) => Reply::StartJob(argv, None),
             Err(why) => error_json("400 Bad Request", &why).into(),
         },
-        // Reconnect road: replay the current/last job from its start
-        // and follow it live.
-        "/api/jobs/last" => Reply::FollowJob,
+        // The configured commands, with their cached `--fdl-schema`
+        // when one exists — the launch form's menu and its field source.
+        "/api/commands" => commands_route(env, server).into(),
+        // Launch a configured command; the stream is the run's output
+        // and its completion appends the run ledger.
+        "/api/launch" => match parse_body(&req.body).and_then(|b| launch_argv(&b, server)) {
+            Ok((argv, farm)) => {
+                let ledger = LedgerCtx {
+                    path: server.root.join(".fdl/ui/runs.jsonl"),
+                    farm,
+                    port: *server.run_target.lock().expect("run target lock"),
+                };
+                Reply::StartJob(argv, Some(ledger))
+            }
+            Err(why) => error_json("400 Bad Request", &why).into(),
+        },
+        // Reconnect road: replay the current/last job and follow it
+        // live — from its start, or from `?from=<index>` for a client
+        // resuming a lost transport.
+        "/api/jobs/last" => Reply::FollowJob {
+            from: req
+                .query
+                .get("from")
+                .and_then(|f| f.parse().ok())
+                .unwrap_or(0),
+        },
         // The dashboard slot's target: GET = current port + a
         // reachability probe, POST = set (or clear with null).
         "/api/run-target" => run_target_route(req, server).into(),
@@ -662,28 +711,152 @@ fn run_fdl(fdl_bin: &Path, root: &Path, args: &[&str]) -> serde_json::Value {
     }
 }
 
+// ── Launch: the configured commands, driven with their own schema ──────
+
+/// The `commands:` tree of the merged config (base, or base + the
+/// named overlay — a farm's run command usually lives in its overlay),
+/// each carrying its cached `--fdl-schema` when one exists. No schema
+/// means the options live in the command's own code: the form degrades
+/// to a freeform args field, never a blocker.
+fn commands_route(env: Option<&str>, server: &UiServer) -> Vec<u8> {
+    let Some(base) = crate::config::find_project_config(&server.root) else {
+        return json_ok(&serde_json::json!({ "commands": [] }));
+    };
+    let project = match crate::config::load_project_with_env(&base, env) {
+        Ok(p) => p,
+        Err(e) => return error_json("400 Bad Request", &format!("config: {e}")),
+    };
+    let commands: Vec<serde_json::Value> = project
+        .commands
+        .iter()
+        .map(|(name, spec)| {
+            let schema = crate::schema_cache::read_cache(&crate::schema_cache::cache_path(
+                &server.root,
+                name,
+            ))
+            .and_then(|s| serde_json::to_value(s).ok());
+            serde_json::json!({
+                "name": name,
+                "description": spec.description,
+                "cluster": spec.cluster.unwrap_or(false),
+                "schema": schema,
+            })
+        })
+        .collect();
+    json_ok(&serde_json::json!({ "commands": commands }))
+}
+
+/// The launch argv: `[--env <farm>] <command> <args...>`. The command
+/// must be declared in the merged config — the launch surface drives
+/// the project's own commands, never arbitrary fdl subcommands (those
+/// have their own routes and their own consent rules). Args are the
+/// command's own flags, so dashes are the point; they are still
+/// bounded and control-character-free.
+fn launch_argv(
+    body: &serde_json::Value,
+    server: &UiServer,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let Some(command) = body_str(body, "command", false)? else {
+        return Err("command: required".to_string());
+    };
+    let env = body_str(body, "env", false)?;
+    if let Some(e) = env {
+        validate_label(e)?;
+    }
+    let base = crate::config::find_project_config(&server.root)
+        .ok_or("no fdl.yml here — nothing to launch")?;
+    let project =
+        crate::config::load_project_with_env(&base, env).map_err(|e| format!("config: {e}"))?;
+    if !project.commands.contains_key(command) {
+        return Err(format!(
+            "command `{command}` is not declared in this project's `commands:`{}",
+            env.map(|e| format!(" (env `{e}`)")).unwrap_or_default(),
+        ));
+    }
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(e) = env {
+        argv.extend(["--env".to_string(), e.to_string()]);
+    }
+    argv.push(command.to_string());
+    if let Some(args) = body.get("args") {
+        let Some(args) = args.as_array() else {
+            return Err("args: expected an array of strings".to_string());
+        };
+        for a in args {
+            let Some(a) = a.as_str() else {
+                return Err("args: expected an array of strings".to_string());
+            };
+            safe_value("args", a, true)?;
+            argv.push(a.to_string());
+        }
+    }
+    Ok((argv, env.map(str::to_string)))
+}
+
+/// Append one launch record to the run ledger. Failures warn and never
+/// break anything (`record_log`'s philosophy: a full disk must not
+/// kill a run — nor, here, the stream reporting on it).
+fn append_ledger(path: &Path, record: &serde_json::Value) {
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{record}")
+    };
+    if let Err(e) = write() {
+        eprintln!(
+            "fdl ui: cannot append the run ledger at {}: {e}",
+            path.display(),
+        );
+    }
+}
+
 // ── The job slot: one long-running command, streamed and replayable ────
 
 /// The buffer one job accumulates: NDJSON lines, pushed by the reader
 /// threads, drained by however many sockets are following.
 #[derive(Debug)]
 struct JobState {
-    lines: Mutex<Vec<String>>,
+    buf: Mutex<JobBuf>,
     done: AtomicBool,
 }
 
+/// The drop-oldest ring plus how much of the stream's history it no
+/// longer holds — followers use `base` to say what they missed instead
+/// of silently starting late.
+#[derive(Debug, Default)]
+struct JobBuf {
+    lines: std::collections::VecDeque<String>,
+    /// Absolute stream index of `lines[0]` — the count dropped from
+    /// the front so far.
+    base: usize,
+}
+
 impl JobState {
-    fn push(&self, line: String) {
-        let mut lines = self.lines.lock().expect("job buffer lock");
-        // The cap bounds memory, never the run: past it the child keeps
-        // going unrecorded and the exit event still lands.
-        if lines.len() < JOB_MAX_LINES {
-            lines.push(line);
+    /// Buffer one event, stamped with its ABSOLUTE stream index `i` —
+    /// what lets a client that lost its transport reconnect with
+    /// `?from=` and resume exactly where it died, instead of replaying
+    /// or gapping. Synthetic lines a follower writes (heartbeats, gap
+    /// markers) are never buffered and carry no index.
+    fn push(&self, mut line: serde_json::Value) {
+        let mut buf = self.buf.lock().expect("job buffer lock");
+        let idx = buf.base + buf.lines.len();
+        if let Some(obj) = line.as_object_mut() {
+            obj.insert("i".to_string(), idx.into());
+        }
+        buf.lines.push_back(line.to_string());
+        while buf.lines.len() > JOB_MAX_LINES {
+            buf.lines.pop_front();
+            buf.base += 1;
         }
     }
 
-    fn push_final(&self, line: String) {
-        self.lines.lock().expect("job buffer lock").push(line);
+    fn push_final(&self, line: serde_json::Value) {
+        self.push(line);
         self.done.store(true, Ordering::Release);
     }
 }
@@ -706,7 +879,7 @@ impl JobSlot {
             return Err("a job is already running — follow it at /api/jobs/last".to_string());
         }
         let job = Arc::new(JobState {
-            lines: Mutex::new(Vec::new()),
+            buf: Mutex::new(JobBuf::default()),
             done: AtomicBool::new(false),
         });
         *current = Some(Arc::clone(&job));
@@ -723,7 +896,12 @@ impl JobSlot {
 /// cleanly fail before) its manifest commit point regardless of a
 /// closed tab, so the readers keep buffering and `/api/jobs/last`
 /// replays what the tab missed.
-fn stream_job(mut stream: TcpStream, server: &UiServer, argv: Vec<String>) {
+fn stream_job(
+    mut stream: TcpStream,
+    server: &UiServer,
+    argv: Vec<String>,
+    ledger: Option<LedgerCtx>,
+) {
     let job = match server.job.try_start() {
         Ok(j) => j,
         Err(why) => {
@@ -733,7 +911,7 @@ fn stream_job(mut stream: TcpStream, server: &UiServer, argv: Vec<String>) {
     };
     let mut cmd_line = vec!["fdl".to_string()];
     cmd_line.extend(argv.iter().cloned());
-    job.push(serde_json::json!({ "cmd": cmd_line }).to_string());
+    job.push(serde_json::json!({ "cmd": cmd_line }));
 
     let spawned = Command::new(&server.fdl_bin)
         .args(&argv)
@@ -761,12 +939,18 @@ fn stream_job(mut stream: TcpStream, server: &UiServer, argv: Vec<String>) {
                 std::thread::spawn(move || {
                     for line in reader.lines() {
                         let Ok(line) = line else { break };
-                        job.push(serde_json::json!({ "s": tag, "t": line }).to_string());
+                        job.push(serde_json::json!({ "s": tag, "t": line }));
                     }
                 })
             })
             .collect();
             let job_done = Arc::clone(&job);
+            let waiter_cmd = cmd_line.clone();
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let clock = std::time::Instant::now();
             std::thread::spawn(move || {
                 // Output first, exit last: join the readers before the
                 // exit event so nothing lands after it.
@@ -774,28 +958,42 @@ fn stream_job(mut stream: TcpStream, server: &UiServer, argv: Vec<String>) {
                     let _ = r.join();
                 }
                 let exit = child.wait().ok().and_then(|s| s.code());
-                job_done.push_final(serde_json::json!({ "exit": exit }).to_string());
+                // A launch's completion is what makes it history: the
+                // ledger records invocations that actually ran, with
+                // whatever artifact pointers are knowable here.
+                if let Some(ctx) = ledger {
+                    append_ledger(
+                        &ctx.path,
+                        &serde_json::json!({
+                            "v": 1,
+                            "ts": started,
+                            "dur_s": clock.elapsed().as_secs(),
+                            "farm": ctx.farm,
+                            "argv": waiter_cmd,
+                            "exit": exit,
+                            "port": ctx.port,
+                        }),
+                    );
+                }
+                job_done.push_final(serde_json::json!({ "exit": exit }));
             });
         }
         Err(e) => {
-            job.push(
-                serde_json::json!({
-                    "s": "err",
-                    "t": format!("cannot spawn {}: {e}", server.fdl_bin.display()),
-                })
-                .to_string(),
-            );
-            job.push_final(serde_json::json!({ "exit": serde_json::Value::Null }).to_string());
+            job.push(serde_json::json!({
+                "s": "err",
+                "t": format!("cannot spawn {}: {e}", server.fdl_bin.display()),
+            }));
+            job.push_final(serde_json::json!({ "exit": serde_json::Value::Null }));
         }
     }
-    follow(&mut stream, &job);
+    follow(&mut stream, &job, 0);
 }
 
 /// `/api/jobs/last`: replay the current or finished job from its first
 /// line and follow while it runs.
-fn follow_job(mut stream: TcpStream, server: &UiServer) {
+fn follow_job(mut stream: TcpStream, server: &UiServer, from: usize) {
     match server.job.last() {
-        Some(job) => follow(&mut stream, &job),
+        Some(job) => follow(&mut stream, &job, from),
         None => {
             let _ = stream.write_all(&error_json("404 Not Found", "no job has run yet"));
         }
@@ -805,7 +1003,14 @@ fn follow_job(mut stream: TcpStream, server: &UiServer) {
 /// Stream a job's buffer as NDJSON from the start, then poll for new
 /// lines until the job is done and drained. A dead socket ends the
 /// following, never the job.
-fn follow(stream: &mut TcpStream, job: &JobState) {
+fn follow(stream: &mut TcpStream, job: &JobState, from: usize) {
+    // Streaming legs drop the write timeout: a reader throttled by its
+    // own rendering cost (a coverage run floods tens of thousands of
+    // lines — found live, tab in the foreground) or by a backgrounded
+    // tab builds backpressure, and a 10s budget then cuts a perfectly
+    // healthy stream mid-run. A slow consumer is not a dead one; a
+    // dead one still errors the write when TCP gives up.
+    let _ = stream.set_write_timeout(None);
     let header = "HTTP/1.1 200 OK\r\n\
          Content-Type: application/x-ndjson\r\n\
          Cache-Control: no-store\r\n\
@@ -814,23 +1019,52 @@ fn follow(stream: &mut TcpStream, job: &JobState) {
     if stream.write_all(header.as_bytes()).is_err() {
         return;
     }
-    let mut sent = 0usize;
+    // `sent` is an ABSOLUTE stream position; the ring's `base` says
+    // how much history is gone, so a follower that fell behind (or a
+    // replay of a run that out-talked the ring) reports the gap
+    // instead of silently starting late.
+    let mut sent = from;
+    let mut last_write = std::time::Instant::now();
     loop {
         // Batch and done-ness read under one lock. The final line is
         // pushed before `done` is stored (release), so seeing `done`
         // here guarantees the exit event is in the batch just taken —
         // this iteration drains everything and can end the stream.
-        let (batch, done) = {
-            let lines = job.lines.lock().expect("job buffer lock");
-            (lines[sent..].to_vec(), job.done.load(Ordering::Acquire))
+        let (batch, dropped, done) = {
+            let buf = job.buf.lock().expect("job buffer lock");
+            let dropped = buf.base.saturating_sub(sent);
+            let from = sent.max(buf.base) - buf.base;
+            let batch: Vec<String> = buf.lines.iter().skip(from).cloned().collect();
+            sent = buf.base + buf.lines.len();
+            (batch, dropped, job.done.load(Ordering::Acquire))
         };
+        if dropped > 0 {
+            let gap = serde_json::json!({
+                "s": "err",
+                "t": format!(
+                    "({dropped} earlier lines fell out of the buffer — it keeps \
+                     the most recent {JOB_MAX_LINES})",
+                ),
+            });
+            if stream.write_all(format!("{gap}\n").as_bytes()).is_err() {
+                return;
+            }
+        }
         if !batch.is_empty() {
-            sent += batch.len();
             let mut chunk = batch.join("\n");
             chunk.push('\n');
             if stream.write_all(chunk.as_bytes()).is_err() {
                 return;
             }
+            last_write = std::time::Instant::now();
+        } else if !done && last_write.elapsed() >= STREAM_HEARTBEAT {
+            // A no-op object the page ignores: bytes on the wire are
+            // what keep an idle stream alive through whatever sits
+            // between here and the reader.
+            if stream.write_all(b"{}\n").is_err() {
+                return;
+            }
+            last_write = std::time::Instant::now();
         }
         if done {
             return;
@@ -848,6 +1082,9 @@ fn follow(stream: &mut TcpStream, job: &JobState) {
 /// gets NO timeout on purpose — `/events` and `/stream` are SSE legs
 /// that legitimately sit idle between window ticks.
 fn proxy_dashboard(mut stream: TcpStream, server: &UiServer, target: &str) {
+    // Same rule as `follow`: an SSE leg to a backgrounded tab may
+    // legitimately stall past any fixed budget.
+    let _ = stream.set_write_timeout(None);
     let Some(port) = *server.run_target.lock().expect("run target lock") else {
         let _ = stream.write_all(&error_json(
             "502 Bad Gateway",
@@ -1416,12 +1653,41 @@ mod tests {
             "{events:?}",
         );
         assert!(events.last().unwrap()["exit"].is_null(), "{events:?}");
-        // The finished job replays identically from /api/jobs/last.
+        // The finished job replays identically from /api/jobs/last...
         let local = format!("127.0.0.1:{port}");
         let replay = get(port, "/api/jobs/last", Some(&local), Some(&token));
         assert!(replay.contains("cannot spawn"), "{replay}");
         assert!(replay.contains("\"cmd\""), "{replay}");
+        // ...and `?from=` resumes mid-stream: a client that lost its
+        // transport at line 1 gets everything from there on, and
+        // nothing it already has.
+        let resumed = get(port, "/api/jobs/last?from=2", Some(&local), Some(&token));
+        assert!(!resumed.contains("\"cmd\""), "{resumed}");
+        assert!(resumed.contains("\"exit\""), "{resumed}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_job_buffer_is_a_drop_oldest_ring_and_the_exit_survives() {
+        let slot = JobSlot::default();
+        let job = slot.try_start().unwrap();
+        for i in 0..(JOB_MAX_LINES + 50) {
+            job.push(serde_json::json!({ "n": i }));
+        }
+        job.push_final(serde_json::json!({ "exit": 0 }));
+        let buf = job.buf.lock().unwrap();
+        // The tail survives, the head fell away, and the record of how
+        // much fell away is exact.
+        assert_eq!(buf.lines.len(), JOB_MAX_LINES);
+        assert_eq!(buf.base, 51);
+        assert!(buf.lines.back().unwrap().contains("\"exit\":0"));
+        // Every buffered line carries its absolute index — the resume
+        // cursor a reconnecting client hands back as ?from=.
+        let front: serde_json::Value = serde_json::from_str(buf.lines.front().unwrap()).unwrap();
+        assert_eq!(front["n"], 51);
+        assert_eq!(front["i"], 51);
+        let back: serde_json::Value = serde_json::from_str(buf.lines.back().unwrap()).unwrap();
+        assert_eq!(back["i"], JOB_MAX_LINES + 50);
     }
 
     #[test]
@@ -1433,7 +1699,7 @@ mod tests {
         let refused = slot.try_start().unwrap_err();
         assert!(refused.contains("/api/jobs/last"), "{refused}");
         // Finished → the slot frees, and the old buffer stays readable.
-        first.push_final("{\"exit\":0}".to_string());
+        first.push_final(serde_json::json!({ "exit": 0 }));
         assert!(slot.try_start().is_ok());
         let _ = first;
     }
@@ -1647,6 +1913,126 @@ mod tests {
         assert!(runs.contains("\"farm\":\"rig\""), "{runs}");
         assert!(runs.contains("\"farm\":\"b300\""), "{runs}");
         assert!(!runs.contains("torn tail"), "{runs}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── PR5: launch ─────────────────────────────────────────────────
+
+    /// A minimal project with one declared command and a cached schema
+    /// for it — the launch surface's whole world.
+    fn stage_launch_project(tmp: &Path) {
+        std::fs::write(
+            tmp.join("fdl.yml"),
+            "commands:\n  train:\n    description: the training run\n    run: echo train\n  bare:\n    run: echo bare\n",
+        )
+        .unwrap();
+        let cache = tmp.join(".fdl/schema-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(
+            cache.join("train.json"),
+            r#"{"args":[],"options":{"epochs":{"type":"int","default":10,"description":"how long"},"model":{"type":"string","choices":["lenet","resnet"]}}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_commands_route_serves_the_menu_with_cached_schemas() {
+        let tmp = tempdir();
+        stage_launch_project(&tmp);
+        let (port, token) = spawn_server(&tmp);
+        let local = format!("127.0.0.1:{port}");
+        let out = get(port, "/api/commands", Some(&local), Some(&token));
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        let body: serde_json::Value =
+            serde_json::from_str(out.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let cmds = body["commands"].as_array().unwrap();
+        assert_eq!(cmds.len(), 2);
+        let train = cmds.iter().find(|c| c["name"] == "train").unwrap();
+        assert_eq!(train["description"], "the training run");
+        // The cached schema rides along, fields intact for the form.
+        assert_eq!(train["schema"]["options"]["epochs"]["type"], "int");
+        assert_eq!(train["schema"]["options"]["model"]["choices"][0], "lenet");
+        // No cache → null schema → the form degrades to freeform args.
+        let bare = cmds.iter().find(|c| c["name"] == "bare").unwrap();
+        assert!(bare["schema"].is_null());
+        // An unknown env is a loud 400, not an empty menu.
+        assert!(
+            get(port, "/api/commands?env=ghost", Some(&local), Some(&token))
+                .starts_with("HTTP/1.1 400"),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_launch_drives_only_declared_commands() {
+        let tmp = tempdir();
+        stage_launch_project(&tmp);
+        let (port, token) = spawn_server(&tmp);
+
+        // A declared command flows to the runner with its args; the
+        // fake binary cannot spawn, and that is a streamed result
+        // carrying the exact argv (and NO ledger line — nothing ran).
+        let out = post(
+            port,
+            "/api/launch",
+            Some(&token),
+            r#"{"command":"train","args":["--epochs","2","--model","lenet"]}"#,
+        );
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(
+            out.contains(r#"["fdl","train","--epochs","2","--model","lenet"]"#),
+            "{out}",
+        );
+        assert!(out.contains("cannot spawn"), "{out}");
+        assert!(
+            !tmp.join(".fdl/ui/runs.jsonl").exists(),
+            "a failed spawn must not enter the ledger",
+        );
+
+        // Undeclared commands are refused by name — the launch surface
+        // drives the project's own commands, never arbitrary fdl
+        // subcommands.
+        let refused = post(
+            port,
+            "/api/launch",
+            Some(&token),
+            r#"{"command":"join-config"}"#,
+        );
+        assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+        assert!(refused.contains("not declared"), "{refused}");
+        // Bad env label and missing command: named refusals.
+        assert!(
+            post(
+                port,
+                "/api/launch",
+                Some(&token),
+                r#"{"command":"train","env":"a/b"}"#
+            )
+            .starts_with("HTTP/1.1 400"),
+        );
+        assert!(post(port, "/api/launch", Some(&token), "{}").starts_with("HTTP/1.1 400"),);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_ledger_appends_and_survives_its_own_dir_being_absent() {
+        let tmp = tempdir();
+        let path = tmp.join(".fdl/ui/runs.jsonl");
+        append_ledger(
+            &path,
+            &serde_json::json!({"v":1,"ts":1,"farm":"rig","argv":["fdl","train"],"exit":0}),
+        );
+        append_ledger(
+            &path,
+            &serde_json::json!({"v":1,"ts":2,"farm":null,"exit":1}),
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        // Exactly what /api/runs reads back.
+        let runs = read_runs_ledger(&tmp);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["farm"], "rig");
+        assert_eq!(runs[1]["exit"], 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

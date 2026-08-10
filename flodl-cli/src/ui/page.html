@@ -351,6 +351,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
   <button data-tab="farms-panel" class="active">farms<span class="dot"></span></button>
   <button data-tab="wizard-panel">provision<span class="dot"></span></button>
   <button data-tab="publish-panel">publish<span class="dot"></span></button>
+  <button data-tab="launch-panel">launch<span class="dot"></span></button>
   <button data-tab="run-panel">run<span class="dot"></span></button>
   <button data-tab="history-panel">history<span class="dot"></span></button>
   <button data-tab="status-panel">status<span class="dot"></span></button>
@@ -416,6 +417,20 @@ button:disabled { opacity: 0.5; cursor: wait; }
       <button id="pub-follow">Follow last job</button>
     </div>
     <div id="pub-out" class="result"></div>
+  </section>
+
+  <section id="launch-panel" hidden>
+    <h2>Launch training</h2>
+    <div class="controls">
+      <select id="ln-env" aria-label="Environment to launch under"></select>
+      <select id="ln-cmd" aria-label="Command to launch"></select>
+    </div>
+    <div id="ln-form" class="form"></div>
+    <div class="actions">
+      <button id="ln-run">Launch</button>
+      <span class="slot-note" id="ln-hint"></span>
+    </div>
+    <div id="ln-out" class="result"></div>
   </section>
 
   <section id="run-panel" hidden>
@@ -534,6 +549,7 @@ function showTab(id) {
 for (const b of tabs) b.addEventListener("click", () => {
   showTab(b.dataset.tab);
   if (b.dataset.tab === "run-panel") refreshRunSlot();
+  if (b.dataset.tab === "launch-panel") loadCommands();
   if (b.dataset.tab === "history-panel") loadHistory();
 });
 {
@@ -580,7 +596,7 @@ function renderFarms(data) {
 
 function fillEnvSelects(data) {
   const envs = [...data.farms.map(f => f.label), ...data.other_envs];
-  for (const id of ["status-env", "probe-env", "config-env", "run-env"]) {
+  for (const id of ["status-env", "probe-env", "config-env", "run-env", "ln-env"]) {
     const sel = document.getElementById(id);
     sel.replaceChildren(new Option(id === "config-env" ? "base config" : "no env (local)", ""));
     for (const e of envs) sel.append(new Option("@" + e, e));
@@ -806,32 +822,104 @@ async function streamJob(out, url, init) {
   out.replaceChildren();
   let exitBadge = null;
   const pre = el("pre", "log");
+  // Appends batch per network chunk and the DOM keeps only a recent
+  // window: per-line appends on a flooding run (coverage: tens of
+  // thousands of lines) throttle the reader with rendering cost, and
+  // the backpressure that builds is what kills the stream.
+  const LOG_DOM_MAX = 4000;
+  let pending = null;
+  let trimmed = false;
+  const flushPending = () => {
+    if (!pending) return;
+    pre.append(pending);
+    pending = null;
+    if (pre.childNodes.length > LOG_DOM_MAX) {
+      // Oldest lines leave the view; the marker holds index 0 once
+      // trimming starts, so victims are always the line after it.
+      if (!trimmed) {
+        trimmed = true;
+        pre.prepend(el("span", "err",
+          "(older output trimmed from the view — “Follow last job” replays what the server recorded)\n"));
+      }
+      while (pre.childNodes.length > LOG_DOM_MAX && pre.childNodes.length > 1) {
+        pre.removeChild(pre.childNodes[1]);
+      }
+    }
+    pre.scrollTop = pre.scrollHeight;
+  };
   const onEvent = ev => {
     if (ev.cmd) {
       exitBadge = streamPrompt(out, ev.cmd);
       out.append(pre);
     } else if ("exit" in ev) {
+      flushPending();
       if (exitBadge) {
         exitBadge.textContent = ev.exit === null ? "no exit" : "exit " + ev.exit;
         exitBadge.className = "exit " + (ev.exit === 0 ? "ok" : "bad");
       }
     } else if ("t" in ev) {
-      pre.append(el("span", ev.s === "err" ? "err" : "", ev.t + "\n"));
-      pre.scrollTop = pre.scrollHeight;
+      if (!pending) pending = document.createDocumentFragment();
+      pending.append(el("span", ev.s === "err" ? "err" : "", ev.t + "\n"));
     }
   };
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
+  // Every buffered line carries its absolute index `i`; tracking the
+  // highest one seen is what lets a lost transport resume exactly
+  // where it died (`/api/jobs/last?from=`). Synthetic lines
+  // (heartbeats, gap markers) carry none and cost nothing.
+  let sawExit = false;
+  let lastIdx = -1;
+  const seeEvent = ev => {
+    if (typeof ev.i === "number") lastIdx = ev.i;
+    if ("exit" in ev) sawExit = true;
+    onEvent(ev);
+  };
+  const readAll = async body => {
+    const reader = body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) { flushPending(); return; }
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (line) { try { seeEvent(JSON.parse(line)); } catch { /* partial noise */ } }
+      }
+      flushPending();
+    }
+  };
+  const note = t => {
+    pre.append(el("span", "err", t + "\n"));
+    pre.scrollTop = pre.scrollHeight;
+  };
+  // The transport is not trusted: anything between this page and the
+  // server (the WSL2 localhost relay notably) may cut a long stream.
+  // The connection dying is not the run dying — reconnect and resume.
+  let body = res.body;
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (line) { try { onEvent(JSON.parse(line)); } catch { /* partial noise */ } }
+    try {
+      await readAll(body);
+      break; // clean end of stream (exit event seen, or job replayed out)
+    } catch (e) {
+      if (sawExit) break;
+      note("(stream lost: " + (e.message || e) + " — the run continues; reconnecting)");
+      body = null;
+      for (let attempt = 0; attempt < 10 && !body; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const again = await fetch("/api/jobs/last?from=" + (lastIdx + 1),
+            { headers: { "x-fdl-token": TOKEN } });
+          if (again.ok) body = again.body;
+        } catch { /* server not back yet */ }
+      }
+      if (!body) {
+        note("(could not reconnect — “Follow last job” replays once the server answers)");
+        if (exitBadge) { exitBadge.textContent = "stream lost"; exitBadge.className = "exit bad"; }
+        break;
+      }
+      note("(reconnected — resuming from line " + (lastIdx + 1) + ")");
     }
   }
 }
@@ -848,6 +936,148 @@ document.getElementById("pub-run").addEventListener("click", async () => {
   setBusy(out, true);
   try {
     await streamJob(out, "/api/publish", {
+      method: "POST",
+      headers: { "x-fdl-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } finally {
+    btn.disabled = false;
+    setBusy(out, false);
+  }
+});
+
+// ── Launch: the configured commands, a form from their own schema ──
+let lnCommands = [];
+
+async function loadCommands() {
+  const env = document.getElementById("ln-env").value;
+  const sel = document.getElementById("ln-cmd");
+  try {
+    const { commands } = await api("/api/commands" + (env ? "?env=" + encodeURIComponent(env) : ""));
+    lnCommands = commands;
+    sel.replaceChildren();
+    if (!commands.length) sel.append(new Option("no commands: declared", ""));
+    for (const c of commands) {
+      sel.append(new Option(c.name + (c.cluster ? "  (cluster)" : ""), c.name));
+    }
+    renderLaunchForm();
+  } catch (e) {
+    document.getElementById("ln-form").replaceChildren(el("pre", "", String(e.message || e)));
+  }
+}
+
+function renderLaunchForm() {
+  const form = document.getElementById("ln-form");
+  const hint = document.getElementById("ln-hint");
+  form.replaceChildren();
+  hint.textContent = "";
+  const cmd = lnCommands.find(c => c.name === document.getElementById("ln-cmd").value);
+  if (!cmd) return;
+  if (cmd.description) {
+    const d = el("div", "row2");
+    d.append(el("span", "slot-note", cmd.description));
+    form.append(d);
+  }
+  if (!cmd.schema) {
+    // No --fdl-schema: the options live in the command's own code.
+    const label = el("label", "", "args");
+    label.htmlFor = "ln-freeform";
+    const input = el("input");
+    input.type = "text";
+    input.id = "ln-freeform";
+    input.placeholder = "space-separated, no quoting";
+    form.append(label, input);
+    hint.textContent = "no schema cached for this command — a cargo command grows a form after `fdl " + cmd.name + " --refresh-schema`";
+    return;
+  }
+  for (const arg of cmd.schema.args || []) {
+    form.append(schemaField("arg:" + arg.name, arg.name + (arg.required ? " *" : ""), arg));
+  }
+  for (const [name, spec] of Object.entries(cmd.schema.options || {})) {
+    form.append(schemaField("opt:" + name, "--" + name, spec));
+  }
+}
+
+// One schema entry → one labelled field; the dataset carries how to
+// turn its value back into argv.
+function schemaField(key, labelText, spec) {
+  const frag = document.createDocumentFragment();
+  const label = el("label", "", labelText);
+  if (spec.description) label.title = spec.description;
+  let input;
+  if (spec.type === "bool") {
+    input = el("input");
+    input.type = "checkbox";
+    if (spec.default === true) input.checked = true;
+  } else if (spec.choices && spec.choices.length) {
+    input = document.createElement("select");
+    input.append(new Option("(default" + (spec.default !== undefined && spec.default !== null ? ": " + spec.default : "") + ")", ""));
+    for (const c of spec.choices) input.append(new Option(String(c), String(c)));
+  } else {
+    input = el("input");
+    input.type = "text";
+    const bits = [];
+    if (spec.default !== undefined && spec.default !== null) bits.push("default " + spec.default);
+    if (spec.type) bits.push(spec.type);
+    input.placeholder = bits.join(" · ");
+  }
+  input.dataset.launchKey = key;
+  if (spec.description) input.title = spec.description;
+  frag.append(label, input);
+  return frag;
+}
+
+// The form back to argv: positionals in order, then only the options
+// the operator actually set — defaults stay the binary's own.
+function assembleLaunchArgs() {
+  const freeform = document.getElementById("ln-freeform");
+  if (freeform) return freeform.value.trim() ? freeform.value.trim().split(/\s+/) : [];
+  const positionals = [];
+  const flags = [];
+  for (const input of document.querySelectorAll("#ln-form [data-launch-key]")) {
+    const key = input.dataset.launchKey;
+    if (key.startsWith("arg:")) {
+      const v = input.value.trim();
+      if (v) positionals.push(v);
+    } else {
+      const name = "--" + key.slice(4);
+      if (input.type === "checkbox") {
+        if (input.checked) flags.push(name);
+      } else {
+        const v = input.value.trim();
+        if (v) flags.push(name, v);
+      }
+    }
+  }
+  return [...positionals, ...flags];
+}
+
+document.getElementById("ln-cmd").addEventListener("change", renderLaunchForm);
+document.getElementById("ln-env").addEventListener("change", () => { loadCommands(); });
+
+document.getElementById("ln-run").addEventListener("click", async () => {
+  const command = document.getElementById("ln-cmd").value;
+  if (!command) return;
+  const env = document.getElementById("ln-env").value;
+  const args = assembleLaunchArgs();
+  const body = { command, args };
+  if (env) body.env = env;
+  // A run asked to serve its dashboard points the run tab at it.
+  const mi = args.indexOf("--monitor");
+  if (mi >= 0 && args[mi + 1]) {
+    const p = parseInt(args[mi + 1], 10);
+    if (p) {
+      apiPost("/api/run-target", { port: p }).catch(() => {});
+      document.getElementById("run-port").value = String(p);
+      document.getElementById("ln-hint").textContent = "dashboard port " + p + " set — watch the run tab";
+    }
+  }
+  const btn = document.getElementById("ln-run");
+  const out = document.getElementById("ln-out");
+  btn.disabled = true;
+  setBusy(out, true);
+  try {
+    await streamJob(out, "/api/launch", {
       method: "POST",
       headers: { "x-fdl-token": TOKEN, "content-type": "application/json" },
       body: JSON.stringify(body),

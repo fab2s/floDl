@@ -617,6 +617,26 @@ same kind of slot, plus the run ledger once the launch slice writes
 it; archive serving is double-bounded (the path must resolve inside
 the project root AND look like a run artifact).
 
+The **launch tab** runs the project's own configured commands (the
+`fdl.yml` `commands:` tree, under a farm overlay when one is selected —
+which is where a farm's `cluster: true` run command lives). A command
+whose binary implements the `--fdl-schema` contract gets a **form
+generated from its cached schema** — checkboxes for bools, selects for
+choices, typed hints and defaults on everything else, and only the
+fields the operator actually sets become argv (defaults stay the
+binary's own). No cached schema degrades to a freeform args field: the
+options live in the command's code, and that is fine. Launching streams
+the run's output live through the same job machinery as publish (one
+job at a time; a closed tab never kills the run; "Follow last job"
+reconnects), a `--monitor <port>` in the args automatically points the
+run tab's dashboard slot at the run, and **each completed launch
+appends one line to the run ledger** (`.fdl/ui/runs.jsonl`: timestamp,
+duration, farm, exact argv, exit code) — the durable history the
+history tab lists. Deliberately absent: a stop button. A killed cluster
+run leaves ports held and remote ranks spinning (the rig-hygiene
+protocol exists for a reason), and a button that pretends otherwise
+would be a lie; stopping stays a deliberate act.
+
 **The page drives the CLI, it never reimplements it.** Every panel that
 runs something spawns `fdl` itself with `--json` and renders argv, exit
 code and output verbatim — the exact command line sits above each
