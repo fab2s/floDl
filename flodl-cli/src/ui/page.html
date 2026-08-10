@@ -4,10 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>fdl ui</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f9e0;</text></svg>">
 <style>
-/* Palette: the repo's own diagram roles — indigo marks an actor,
-   green a good state, amber a cost/warning. Dark-first: this page
-   lives next to terminals. */
+/* flodl design tokens -- begin */
+/* floDl design tokens: one palette across the site, the live dashboard
+   and fdl ui. Colour marks a ROLE, matching the mermaid convention in
+   CLAUDE.md: indigo = an actor, green = a good/cheap state, amber = a
+   cost/hazard. Dark-first, light via prefers-color-scheme.
+   Canonical home: site/assets/css/flodl-tokens.css. Consumers vendor
+   this file verbatim between the marker comments;
+   ci/release/13-design-tokens.sh fails on drift. */
 :root {
   --bg: #12161d;
   --panel: #1a2028;
@@ -21,19 +27,24 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f6f9;
-    --panel: #ffffff;
-    --line: #d9dfe7;
-    --ink: #26303b;
-    --muted: #5f6b79;
-    --actor: #5c6bc0;
-    --good: #2e7d32;
-    --cost: #8a5320;
-    --prompt-bg: #eceff3;
-  }
+/* Light rides data-theme, not a media query: the shared pre-paint
+   script resolves localStorage('flodl-theme') -> prefers-color-scheme
+   -> dark, and the toggle flips the attribute. Same key, same
+   attribute as the site and the live dashboard, so every surface
+   aligns (the proxied dashboard even shares the ui's origin, hence
+   the very same stored value). */
+:root[data-theme="light"] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --line: #d9dfe7;
+  --ink: #26303b;
+  --muted: #5f6b79;
+  --actor: #5c6bc0;
+  --good: #2e7d32;
+  --cost: #8a5320;
+  --prompt-bg: #eceff3;
 }
+/* flodl design tokens -- end */
 * { box-sizing: border-box; }
 body {
   margin: 0;
@@ -241,6 +252,50 @@ button:disabled { opacity: 0.5; cursor: wait; }
   overflow-wrap: anywhere;
 }
 .log .err { color: var(--cost); }
+.slot-frame {
+  width: 100%;
+  height: 78vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.slot-note { color: var(--muted); font: 12px var(--mono); margin: 0 0 8px; }
+.arch-row {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  cursor: pointer;
+  font: 12px var(--mono);
+  padding: 3px 8px;
+  border-radius: 4px;
+  max-width: 900px;
+}
+.arch-row:hover { background: var(--bg); }
+.arch-row .when { color: var(--muted); white-space: nowrap; }
+.arch-row .p { overflow-wrap: anywhere; }
+.run-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font: 12px var(--mono);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.run-row:hover { background: var(--bg); }
+.run-row .when { color: var(--muted); white-space: nowrap; }
+.run-row .dir { overflow-wrap: anywhere; }
+.chip {
+  font: 11px var(--mono);
+  color: var(--actor);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--actor); }
+.chip.more { color: var(--muted); }
 .report pre {
   margin: 2px 0 6px;
   background: var(--prompt-bg);
@@ -250,17 +305,54 @@ button:disabled { opacity: 0.5; cursor: wait; }
   font: 12px/1.45 var(--mono);
   overflow-x: auto;
 }
+.theme-toggle {
+  margin-left: auto;
+  align-self: center;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+}
+.theme-toggle:hover { color: var(--ink); background: var(--bg); }
+.theme-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; display: block; }
+.theme-toggle .sun { display: block; }
+.theme-toggle .moon { display: none; }
+:root[data-theme="light"] .theme-toggle .sun { display: none; }
+:root[data-theme="light"] .theme-toggle .moon { display: block; }
 </style>
+<script>
+// Resolve the theme BEFORE the body paints, or the page flashes the
+// wrong one. Same precedence as the site and the live dashboard:
+// the reader's own toggle (localStorage 'flodl-theme') -> the OS
+// preference -> dark.
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("flodl-theme"); } catch (e) {}
+  if (t !== "light" && t !== "dark") {
+    t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)
+      ? "light" : "dark";
+  }
+  if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+})();
+</script>
 </head>
 <body>
 <header>
   <h1>fdl ui</h1>
   <span class="root">__FDL_ROOT__</span>
+  <button class="theme-toggle" id="theme-toggle" aria-label="Toggle light/dark theme" title="Toggle light/dark theme">
+    <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    <svg class="moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  </button>
 </header>
 <nav id="tabs" aria-label="Sections">
   <button data-tab="farms-panel" class="active">farms<span class="dot"></span></button>
   <button data-tab="wizard-panel">provision<span class="dot"></span></button>
   <button data-tab="publish-panel">publish<span class="dot"></span></button>
+  <button data-tab="run-panel">run<span class="dot"></span></button>
+  <button data-tab="history-panel">history<span class="dot"></span></button>
   <button data-tab="status-panel">status<span class="dot"></span></button>
   <button data-tab="probe-panel">probe<span class="dot"></span></button>
   <button data-tab="config-panel">config<span class="dot"></span></button>
@@ -326,6 +418,33 @@ button:disabled { opacity: 0.5; cursor: wait; }
     <div id="pub-out" class="result"></div>
   </section>
 
+  <section id="run-panel" hidden>
+    <h2>Run</h2>
+    <div class="controls">
+      <label for="run-port">dashboard port</label>
+      <input type="text" id="run-port" size="6" style="font:13px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;">
+      <button id="run-connect">Connect</button>
+      <select id="run-env" aria-label="Environment for the admission watch"></select>
+      <button id="run-refresh">Refresh</button>
+    </div>
+    <div id="run-slot"><p class="slot-note">The run's live dashboard renders here once something answers on the port; until then this shows the admission view.</p></div>
+  </section>
+
+  <section id="history-panel" hidden>
+    <h2>History</h2>
+    <div id="hist-viewing" hidden class="controls"></div>
+    <div id="hist-browser">
+      <div id="hist-runs"></div>
+      <h2 style="margin-top:14px">Persisted dashboards on disk</h2>
+      <div class="controls">
+        <input type="text" id="hist-filter" placeholder="filter runs — space-separated terms, all must match"
+               style="font:13px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;flex:1;max-width:560px;">
+      </div>
+      <div id="hist-archives"><span class="spin">loading</span></div>
+    </div>
+    <div id="hist-slot" style="margin-top:10px"></div>
+  </section>
+
   <section id="status-panel" hidden>
     <h2>Cluster status</h2>
     <div class="controls">
@@ -357,6 +476,37 @@ button:disabled { opacity: 0.5; cursor: wait; }
 "use strict";
 const TOKEN = "__FDL_TOKEN__";
 
+// Same flip as the site and the dashboard: the stored choice always
+// wins, on every flodl surface. An embedded dashboard (live proxy or
+// archive) resolves its theme once, at load — so after the shared key
+// changes it is re-loaded to pick the new value up, the same move the
+// website makes for its reference dashboard. The store happens FIRST:
+// a reloading iframe must never race the old value.
+function syncEmbeddedFrames() {
+  for (const f of document.querySelectorAll("iframe.slot-frame")) f.src = f.src;
+}
+function applyTheme(light, store) {
+  if (store) { try { localStorage.setItem("flodl-theme", light ? "light" : "dark"); } catch (e) {} }
+  if (light) document.documentElement.setAttribute("data-theme", "light");
+  else document.documentElement.removeAttribute("data-theme");
+  syncEmbeddedFrames();
+}
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  applyTheme(document.documentElement.getAttribute("data-theme") !== "light", true);
+});
+// Follow the OS live, but only while no explicit choice is stored —
+// a toggle outranks the system setting.
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: light)");
+  const onChange = e => {
+    let stored = null;
+    try { stored = localStorage.getItem("flodl-theme"); } catch (err) {}
+    if (stored === "light" || stored === "dark") return;
+    applyTheme(e.matches, false);
+  };
+  if (mq.addEventListener) mq.addEventListener("change", onChange);
+}
+
 async function api(path) {
   const res = await fetch(path, { headers: { "x-fdl-token": TOKEN } });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -381,7 +531,11 @@ function showTab(id) {
   for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== id;
   if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
 }
-for (const b of tabs) b.addEventListener("click", () => showTab(b.dataset.tab));
+for (const b of tabs) b.addEventListener("click", () => {
+  showTab(b.dataset.tab);
+  if (b.dataset.tab === "run-panel") refreshRunSlot();
+  if (b.dataset.tab === "history-panel") loadHistory();
+});
 {
   const initial = location.hash.slice(1);
   showTab(tabs.some(b => b.dataset.tab === initial) ? initial : "farms-panel");
@@ -426,7 +580,7 @@ function renderFarms(data) {
 
 function fillEnvSelects(data) {
   const envs = [...data.farms.map(f => f.label), ...data.other_envs];
-  for (const id of ["status-env", "probe-env", "config-env"]) {
+  for (const id of ["status-env", "probe-env", "config-env", "run-env"]) {
     const sel = document.getElementById(id);
     sel.replaceChildren(new Option(id === "config-env" ? "base config" : "no env (local)", ""));
     for (const e of envs) sel.append(new Option("@" + e, e));
@@ -703,6 +857,203 @@ document.getElementById("pub-run").addEventListener("click", async () => {
     setBusy(out, false);
   }
 });
+
+// ── The run tab: one slot, its backing follows the run's lifecycle ──
+function iframeTo(src) {
+  const f = el("iframe", "slot-frame");
+  f.src = src;
+  return f;
+}
+
+let runConnected = false;
+let runPoll = null;
+
+document.getElementById("run-port").value = localStorage.getItem("fdl-ui-run-port") || "8099";
+
+async function connectRun() {
+  const port = parseInt(document.getElementById("run-port").value, 10);
+  if (!port) return;
+  localStorage.setItem("fdl-ui-run-port", String(port));
+  await apiPost("/api/run-target", { port });
+  await refreshRunSlot();
+}
+
+// While the tab is open and no dashboard answers, the slot shows the
+// admission view (fdl status) and quietly re-probes; the moment the
+// run's dashboard comes up, the same slot becomes the dashboard.
+async function refreshRunSlot() {
+  const slot = document.getElementById("run-slot");
+  let target = null;
+  try { target = await api("/api/run-target"); } catch { return; }
+  if (target.port && target.reachable) {
+    if (!runConnected) {
+      runConnected = true;
+      slot.replaceChildren(iframeTo("/run"));
+    }
+    stopRunPoll();
+    return;
+  }
+  runConnected = false;
+  const note = el("p", "slot-note",
+    target.port
+      ? "nothing answering on 127.0.0.1:" + target.port + " yet — admission view below, re-probing"
+      : "no dashboard port set — admission view below (Connect points the slot at a live run)");
+  const out = el("div", "result");
+  slot.replaceChildren(note, out);
+  const env = document.getElementById("run-env").value;
+  try {
+    renderRun(out, await api("/api/status" + (env ? "?env=" + encodeURIComponent(env) : "")));
+  } catch (e) {
+    out.replaceChildren(el("pre", "", String(e.message || e)));
+  }
+  startRunPoll();
+}
+
+function startRunPoll() {
+  if (runPoll) return;
+  runPoll = setInterval(() => {
+    if (document.getElementById("run-panel").hidden) { stopRunPoll(); return; }
+    refreshRunSlot();
+  }, 10000);
+}
+function stopRunPoll() {
+  if (runPoll) { clearInterval(runPoll); runPoll = null; }
+}
+
+document.getElementById("run-connect").addEventListener("click", () => { connectRun().catch(() => {}); });
+document.getElementById("run-refresh").addEventListener("click", () => { runConnected = false; refreshRunSlot(); });
+
+// ── History: the run ledger + persisted dashboards on disk ─────────
+async function loadHistory() {
+  const runsBox = document.getElementById("hist-runs");
+  const archBox = document.getElementById("hist-archives");
+  try {
+    const { runs } = await api("/api/runs");
+    runsBox.replaceChildren();
+    if (!runs.length) {
+      runsBox.append(el("p", "empty", "No launches recorded yet — runs started from this page will be listed here."));
+    }
+    for (const r of runs.slice().reverse()) {
+      const row = el("div", "arch-row");
+      row.append(el("span", "when", r.ts ? new Date(r.ts * 1000).toLocaleString() : ""));
+      row.append(el("span", "p", (r.farm ? "@" + r.farm + " " : "") + (Array.isArray(r.argv) ? r.argv.join(" ") : "")));
+      row.append(el("span", "exit " + (r.exit === 0 ? "ok" : "bad"), r.exit === undefined ? "" : "exit " + r.exit));
+      if (r.archive_path) row.addEventListener("click", () => openArchive(r.archive_path));
+      runsBox.append(row);
+    }
+  } catch { runsBox.replaceChildren(); }
+  try {
+    const { archives } = await api("/api/archives");
+    histRuns = groupArchives(archives);
+    renderArchiveBrowser();
+  } catch (e) {
+    archBox.replaceChildren(el("pre", "", String(e.message || e)));
+  }
+}
+
+// Artifacts sharing a directory are one run — the harness writes
+// dashboard.html and timeline*.html into one run dir together. That
+// grouping comes from the artifact set itself, so it holds for any
+// layout, not just ddp-bench's.
+let histRuns = [];
+let histShowAll = false;
+
+function groupArchives(archives) {
+  const byDir = new Map();
+  for (const a of archives) {
+    const i = a.path.lastIndexOf("/");
+    const dir = i >= 0 ? a.path.slice(0, i) : "";
+    const name = i >= 0 ? a.path.slice(i + 1) : a.path;
+    if (!byDir.has(dir)) byDir.set(dir, { dir, mtime: 0, files: [] });
+    const run = byDir.get(dir);
+    run.files.push({ name, path: a.path, mtime: a.mtime });
+    run.mtime = Math.max(run.mtime, a.mtime);
+  }
+  const runs = [...byDir.values()];
+  runs.sort((a, b) => b.mtime - a.mtime);
+  // Primary artifacts lead; older timestamped variants trail.
+  for (const r of runs) {
+    r.files.sort((a, b) =>
+      (a.name.includes("_") ? 1 : 0) - (b.name.includes("_") ? 1 : 0)
+      || b.mtime - a.mtime || a.name.localeCompare(b.name));
+  }
+  return runs;
+}
+
+const SHOW_RECENT = 15;
+
+function renderArchiveBrowser() {
+  const box = document.getElementById("hist-archives");
+  box.replaceChildren();
+  if (!histRuns.length) {
+    const p = el("p", "empty");
+    p.append("No persisted dashboards found. A run saves one with ");
+    p.append(el("code", "", "--save-dashboard"));
+    p.append(".");
+    box.append(p);
+    return;
+  }
+  const terms = document.getElementById("hist-filter").value
+    .toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = histRuns.filter(r => terms.every(t => r.dir.toLowerCase().includes(t)));
+  // The filter searches everything; only the unfiltered view is capped.
+  const shown = (terms.length || histShowAll) ? matches : matches.slice(0, SHOW_RECENT);
+  for (const run of shown) box.append(runRow(run));
+  if (!terms.length && !histShowAll && matches.length > SHOW_RECENT) {
+    const more = el("button", "chip more",
+      "show all " + matches.length + " runs (" + (matches.length - SHOW_RECENT) + " more)");
+    more.addEventListener("click", () => { histShowAll = true; renderArchiveBrowser(); });
+    more.style.margin = "6px 8px";
+    box.append(more);
+  }
+  if (terms.length && !matches.length) {
+    box.append(el("p", "empty", "nothing matches — terms AND-match against the run directory path"));
+  }
+}
+
+function runRow(run) {
+  const row = el("div", "run-row");
+  row.append(el("span", "when", new Date(run.mtime * 1000).toLocaleString()));
+  row.append(el("span", "dir", run.dir));
+  const primary = run.files.filter(f => !f.name.includes("_"));
+  const older = run.files.filter(f => f.name.includes("_"));
+  for (const f of primary) row.append(fileChip(f));
+  if (older.length) {
+    const more = el("button", "chip more", "+" + older.length + " older");
+    more.addEventListener("click", e => {
+      e.stopPropagation();
+      more.replaceWith(...older.map(fileChip));
+    });
+    row.append(more);
+  }
+  return row;
+}
+
+function fileChip(f) {
+  const chip = el("button", "chip", f.name.replace(/\.html$/, ""));
+  chip.addEventListener("click", e => { e.stopPropagation(); openArchive(f.path); });
+  return chip;
+}
+
+document.getElementById("hist-filter").addEventListener("input", renderArchiveBrowser);
+
+// Opening an archive gives the viewport to the viewer: the browser
+// collapses to a one-line "viewing" bar until asked back.
+function openArchive(relPath) {
+  document.getElementById("hist-slot").replaceChildren(
+    iframeTo("/archive?path=" + encodeURIComponent(relPath)));
+  const bar = document.getElementById("hist-viewing");
+  bar.replaceChildren();
+  const back = el("button", "", "browse");
+  back.addEventListener("click", () => {
+    document.getElementById("hist-browser").hidden = false;
+    bar.hidden = true;
+    document.getElementById("hist-slot").replaceChildren();
+  });
+  bar.append(back, el("span", "slot-note", "viewing " + relPath));
+  bar.hidden = false;
+  document.getElementById("hist-browser").hidden = true;
+}
 
 document.getElementById("pub-follow").addEventListener("click", async () => {
   const btn = document.getElementById("pub-follow");
