@@ -704,7 +704,8 @@ fn prebuild_one_worker(
             )
         };
         let docker_cmd = format!(
-            "docker compose run --rm {svc} bash -c {inner}",
+            "docker compose{progress} run --rm {svc} bash -c {inner}",
+            progress = crate::run::compose_quiet_arg(),
             svc = docker_svc,
             inner = posix_quote(&build_cmd),
         );

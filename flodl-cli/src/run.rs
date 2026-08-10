@@ -663,6 +663,27 @@ fn testing_cluster_env_arg() -> String {
     out
 }
 
+/// ` --progress quiet` for `docker compose` under `-q`, else empty.
+///
+/// Compose narrates every container it brings up (`Container rdl-dev-run-…
+/// Creating` / `Created`), which is two lines in front of every containerized
+/// command — and nearly every command here is containerized. It stays ON by
+/// default on purpose: seeing it is the confirmation that a container really
+/// is being spun up, i.e. that the command did NOT run natively. `-q` is the
+/// user saying they already know.
+///
+/// Scoped to the progress narration only. The container's own stdout/stderr
+/// (cargo's output, the training binary's) is untouched, because that is the
+/// work rather than chatter about the work — a `-q` that hid it would be
+/// hiding the answer.
+pub(crate) fn compose_quiet_arg() -> &'static str {
+    if style::quiet() {
+        " --progress quiet"
+    } else {
+        ""
+    }
+}
+
 /// Testing env vars forwarded into a docker-compose run when present.
 ///
 /// `FLODL_TESTING_CLUSTER_JSON` injects a cluster topology;
@@ -766,9 +787,10 @@ pub fn exec_script(
             // don't escape the inner shell.
             let overlay = crate::cluster::cluster_compose_overlay_arg(cwd);
             let testing_env_arg = testing_cluster_env_arg();
+            let progress = compose_quiet_arg();
             let service = resolve_docker_service(service, cwd);
             let docker_cmd = format!(
-                "docker compose{overlay} run --rm{testing_env_arg} {service} bash -c {}",
+                "docker compose{overlay}{progress} run --rm{testing_env_arg} {service} bash -c {}",
                 posix_quote(&inner_cmd)
             );
             spawn_docker_shell(&docker_cmd, cwd)
@@ -928,6 +950,7 @@ pub fn exec_command(
         // root resolves against the wrong cwd inside the container.
         let overlay = crate::cluster::cluster_compose_overlay_arg(project_root);
         let testing_env_arg = testing_cluster_env_arg();
+        let progress = compose_quiet_arg();
         // Quote the whole composed command for the outer `sh -c`,
         // exactly like `exec_script`. A double-quoted wrapper would
         // let the outer shell expand `$`/backticks inside it (host-side,
@@ -937,7 +960,7 @@ pub fn exec_command(
         // `sh -c`, and a container root with a space would otherwise
         // splice the env value across arguments.
         let docker_cmd = format!(
-            "docker compose{overlay} run --rm -e {}{testing_env_arg} {service} bash -c {}",
+            "docker compose{overlay}{progress} run --rm -e {}{testing_env_arg} {service} bash -c {}",
             posix_quote(&format!("FDL_PROJECT_ROOT={container_root}")),
             posix_quote(&inner),
         );
@@ -1515,7 +1538,7 @@ pub fn print_project_help(
         style::green(&format!("{:<18}", "-vvv"))
     );
     eprintln!(
-        "    {}  Suppress non-error output",
+        "    {}  Lowest log level; hides docker's container-lifecycle lines",
         style::green(&format!("{:<18}", "-q, --quiet"))
     );
     eprintln!(
@@ -2102,6 +2125,30 @@ mod tests {
             resolve_libtorch_at(&bogus).is_none(),
             "dir without lib/, .active, or pointer-shape filename → None"
         );
+    }
+
+    /// The compose progress flag is opt-IN, because the lifecycle lines it
+    /// hides are the confirmation that a container was really spun up (i.e.
+    /// that the command did not run natively). Only `-q` says "I know".
+    #[test]
+    fn compose_progress_is_quiet_only_under_quiet() {
+        let _g = style::TEST_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("FLODL_VERBOSITY").ok();
+
+        style::set_quiet(false);
+        assert_eq!(compose_quiet_arg(), "", "default keeps compose narrating");
+        style::set_quiet(true);
+        assert_eq!(compose_quiet_arg(), " --progress quiet");
+        // Leading space: it splices straight after `docker compose`, so the
+        // arg must carry its own separator like the overlay fragment does.
+        assert!(compose_quiet_arg().starts_with(' '));
+
+        style::set_quiet(false);
+        match prev {
+            // SAFETY: guarded by the process-wide env lock.
+            Some(v) => unsafe { std::env::set_var("FLODL_VERBOSITY", v) },
+            None => unsafe { std::env::remove_var("FLODL_VERBOSITY") },
+        }
     }
 
     #[test]

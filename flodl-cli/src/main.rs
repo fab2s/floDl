@@ -78,6 +78,9 @@ fn main() -> ExitCode {
         unsafe {
             env::set_var("FLODL_VERBOSITY", v.to_string());
         }
+        // The env var carries the level to children (it is flodl's own log
+        // level); this records the one bit fdl itself acts on.
+        flodl_cli::style::set_quiet(v == 0);
     }
 
     // Export HOSTNAME so docker-compose's `hostname: ${HOSTNAME}` resolves to
@@ -635,7 +638,10 @@ pub(crate) fn print_usage() {
     println!("    -v                 Verbose output (DDP sync, data loading detail)");
     println!("    -vv                Debug output (per-batch timing, loop internals)");
     println!("    -vvv               Trace output (maximum detail)");
-    println!("    -q, --quiet        Suppress all non-error output");
+    // Not "suppress all non-error output", which it never did and -- since a
+    // wizard's prose is its prompt's context -- should not. It is the bottom of
+    // the -v scale, plus the container chatter.
+    println!("    -q, --quiet        Lowest log level; hides docker's container-lifecycle lines");
     println!(
         "    --no-append        Drop a run command's `append:` suffix (cargo / runner defaults)"
     );

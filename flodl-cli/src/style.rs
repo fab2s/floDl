@@ -38,6 +38,38 @@ pub fn set_color_choice(choice: ColorChoice) {
     CHOICE.store(v, Ordering::Relaxed);
 }
 
+/// `-q` / `--quiet` was given.
+///
+/// Set by `main` from the same flag scan that fills `FLODL_VERBOSITY`. Falls
+/// back to reading that variable so a NESTED `fdl` inherits the answer —
+/// including the one a run line invokes inside a container, which never sees
+/// the parent's argv.
+///
+/// Deliberately narrow in what it governs: today, the container-lifecycle
+/// chatter `docker compose` prints in front of every containerized command
+/// (`run::compose_quiet_arg`). Errors, warnings, prompts, a command's actual
+/// report, and a child process's own output all still print — a `-q` that hid
+/// a wizard's prose would strand its prompts, and one that hid cargo's output
+/// would be hiding the answer.
+pub fn quiet() -> bool {
+    match QUIET.load(Ordering::Relaxed) {
+        QUIET_YES => true,
+        QUIET_NO => false,
+        _ => std::env::var("FLODL_VERBOSITY").is_ok_and(|v| v.trim() == "0"),
+    }
+}
+
+/// Record the `-q` decision for this process. Called by `main` before dispatch.
+pub fn set_quiet(on: bool) {
+    QUIET.store(if on { QUIET_YES } else { QUIET_NO }, Ordering::Relaxed);
+}
+
+// 0 = not yet decided (consult the env), 1 = quiet, 2 = not quiet.
+const QUIET_UNSET: u8 = 0;
+const QUIET_YES: u8 = 1;
+const QUIET_NO: u8 = 2;
+static QUIET: AtomicU8 = AtomicU8::new(QUIET_UNSET);
+
 /// Current explicit choice, or `Auto` when none is set.
 pub fn color_choice() -> ColorChoice {
     match CHOICE.load(Ordering::Relaxed) {
@@ -202,6 +234,38 @@ mod tests {
         set_color_choice(ColorChoice::Never);
         assert_eq!(amber("x"), "x", "colour off must leave the text bare");
         reset();
+    }
+
+    /// `-q` must survive the process boundary: a run line invokes `fdl` again
+    /// INSIDE the container, where the parent's argv is long gone and only the
+    /// environment crosses. Without the fallback that nested call would narrate
+    /// container chatter the user had already silenced.
+    #[test]
+    fn quiet_falls_back_to_the_inherited_verbosity() {
+        let _g = LOCK.lock().unwrap();
+        let prev = std::env::var("FLODL_VERBOSITY").ok();
+        QUIET.store(QUIET_UNSET, Ordering::Relaxed);
+
+        // SAFETY: guarded by the process-wide env lock.
+        unsafe { std::env::set_var("FLODL_VERBOSITY", "0") };
+        assert!(quiet(), "an inherited quiet level must be honoured");
+        unsafe { std::env::set_var("FLODL_VERBOSITY", "2") };
+        assert!(!quiet(), "a verbose level is not quiet");
+        unsafe { std::env::remove_var("FLODL_VERBOSITY") };
+        assert!(!quiet(), "unset means normal, not quiet");
+
+        // An explicit decision wins over whatever the environment says.
+        unsafe { std::env::set_var("FLODL_VERBOSITY", "0") };
+        set_quiet(false);
+        assert!(!quiet(), "this process's own flag scan is authoritative");
+        set_quiet(true);
+        assert!(quiet());
+
+        QUIET.store(QUIET_UNSET, Ordering::Relaxed);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("FLODL_VERBOSITY", v) },
+            None => unsafe { std::env::remove_var("FLODL_VERBOSITY") },
+        }
     }
 
     #[test]
