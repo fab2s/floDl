@@ -58,10 +58,38 @@ header .root {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+nav {
+  display: flex;
+  gap: 2px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+nav button {
+  font: 13px var(--mono);
+  color: var(--muted);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 9px 12px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+nav button:hover { color: var(--ink); border-bottom-color: var(--line); }
+nav button.active { color: var(--actor); border-bottom-color: var(--actor); }
+nav button .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cost);
+  margin-left: 6px;
+  vertical-align: 1px;
+  visibility: hidden;
+}
+nav button.busy .dot { visibility: visible; }
 main {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-  gap: 16px;
   padding: 16px 20px 40px;
   max-width: 1500px;
   margin: 0 auto;
@@ -70,9 +98,10 @@ section {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 14px 16px;
+  padding: 14px 18px;
   min-width: 0;
 }
+section[hidden] { display: none; }
 section h2 {
   margin: 0 0 10px;
   font: 600 13px var(--sans);
@@ -80,6 +109,7 @@ section h2 {
   letter-spacing: 0.06em;
   color: var(--muted);
 }
+.form { max-width: 760px; }
 .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
 select, button {
   font: 13px var(--mono);
@@ -94,12 +124,13 @@ button:hover { border-color: var(--actor); }
 button:disabled { opacity: 0.5; cursor: wait; }
 :is(button, select, .copy):focus-visible { outline: 2px solid var(--actor); outline-offset: 1px; }
 
-/* Farm cards */
+/* Farm cards: readable width even when the panel owns the viewport. */
 .farm {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 10px 12px;
   margin-bottom: 10px;
+  max-width: 760px;
 }
 .farm .name { font: 600 14px var(--mono); color: var(--actor); }
 .farm .shape { color: var(--muted); font-size: 13px; margin: 2px 0 6px; overflow-wrap: anywhere; }
@@ -153,7 +184,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
   padding: 10px;
   font: 12px/1.45 var(--mono);
   overflow-x: auto;
-  max-height: 420px;
+  max-height: 65vh;
   overflow-y: auto;
 }
 .result .stderr { color: var(--cost); }
@@ -162,6 +193,63 @@ button:disabled { opacity: 0.5; cursor: wait; }
   .spin::after { content: ""; animation: dots 1.2s steps(4) infinite; }
   @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 }
+
+/* Forms (wizard + publish) */
+.form { display: grid; grid-template-columns: max-content 1fr; gap: 7px 10px; align-items: center; margin-bottom: 10px; }
+.form label { font-size: 12px; color: var(--muted); }
+.form input[type="text"] {
+  font: 13px var(--mono);
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  min-width: 0;
+}
+.form input[type="text"]:focus-visible { outline: 2px solid var(--actor); outline-offset: 1px; }
+.form .row2 { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.form .consent { color: var(--cost); font-size: 12px; }
+.actions { display: flex; gap: 8px; margin-bottom: 10px; }
+
+/* Wizard report */
+.report { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin-top: 4px; }
+.report .banner { font: 600 12px var(--mono); margin-bottom: 8px; }
+.report .banner.dry { color: var(--cost); }
+.report .banner.applied { color: var(--good); }
+.report .kv { font: 12px var(--mono); color: var(--muted); }
+.report .kv b { color: var(--ink); font-weight: 500; }
+.report h3 { margin: 10px 0 4px; font: 600 11px var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.change { font: 12px var(--mono); }
+.change .k { display: inline-block; width: 7ch; }
+.change .k.create, .change .k.update { color: var(--cost); }
+.report.applied-report .change .k.create, .report.applied-report .change .k.update { color: var(--good); }
+.change .k.unchanged { color: var(--muted); }
+.warn { color: var(--cost); font-size: 12px; margin-top: 6px; }
+
+/* Streamed log */
+.log {
+  margin: 0;
+  background: var(--prompt-bg);
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  padding: 10px;
+  font: 12px/1.45 var(--mono);
+  overflow: auto;
+  max-height: 65vh;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.log .err { color: var(--cost); }
+.report pre {
+  margin: 2px 0 6px;
+  background: var(--prompt-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  font: 12px/1.45 var(--mono);
+  overflow-x: auto;
+}
 </style>
 </head>
 <body>
@@ -169,13 +257,76 @@ button:disabled { opacity: 0.5; cursor: wait; }
   <h1>fdl ui</h1>
   <span class="root">__FDL_ROOT__</span>
 </header>
+<nav id="tabs" aria-label="Sections">
+  <button data-tab="farms-panel" class="active">farms<span class="dot"></span></button>
+  <button data-tab="wizard-panel">provision<span class="dot"></span></button>
+  <button data-tab="publish-panel">publish<span class="dot"></span></button>
+  <button data-tab="status-panel">status<span class="dot"></span></button>
+  <button data-tab="probe-panel">probe<span class="dot"></span></button>
+  <button data-tab="config-panel">config<span class="dot"></span></button>
+</nav>
 <main>
   <section id="farms-panel">
     <h2>Farms</h2>
     <div id="farms"><span class="spin">loading</span></div>
   </section>
 
-  <section>
+  <section id="wizard-panel" hidden>
+    <h2>Provision a farm</h2>
+    <div class="form">
+      <label for="wz-label">label</label>
+      <input type="text" id="wz-label" placeholder="b300">
+      <label for="wz-controller">controller</label>
+      <input type="text" id="wz-controller" placeholder="user@host:port (default: this box)">
+      <label for="wz-door">door</label>
+      <select id="wz-door">
+        <option value="">b — rrsync source pull (default)</option>
+        <option value="a">a — read-only sftp data mount</option>
+        <option value="nologin">nologin — tunnel only</option>
+      </select>
+      <label for="wz-data">data path</label>
+      <input type="text" id="wz-data" placeholder="dataset source root (optional)">
+      <div class="row2">
+        <input type="checkbox" id="wz-cloud-init">
+        <label for="wz-cloud-init">cloud-init user-data</label>
+        <input type="text" id="wz-cloud-user" placeholder="instance user (default ubuntu)" style="flex:1">
+      </div>
+      <div class="row2">
+        <input type="checkbox" id="wz-regen">
+        <label for="wz-regen">regenerate credentials</label>
+        <span class="consent">workers holding the old key and token stop being admitted</span>
+      </div>
+      <div class="row2">
+        <input type="checkbox" id="wz-install">
+        <label for="wz-install">install the authorized_keys line</label>
+        <span class="consent">writes the wizard's own line into ~/.ssh/authorized_keys</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="wz-preview">Preview (dry run)</button>
+      <button id="wz-apply" disabled>Apply</button>
+    </div>
+    <div id="wz-out" class="result"></div>
+  </section>
+
+  <section id="publish-panel" hidden>
+    <h2>Publish</h2>
+    <div class="form">
+      <label for="pub-source">source</label>
+      <input type="text" id="pub-source" placeholder="empty = the fdl.yml publish: block">
+      <label for="pub-bin">bin</label>
+      <input type="text" id="pub-bin" placeholder="target/release/train (optional)">
+      <label for="pub-args">run args</label>
+      <input type="text" id="pub-args" placeholder="--model lenet --epochs 2 (space-separated, no quoting)">
+    </div>
+    <div class="actions">
+      <button id="pub-run">Publish</button>
+      <button id="pub-follow">Follow last job</button>
+    </div>
+    <div id="pub-out" class="result"></div>
+  </section>
+
+  <section id="status-panel" hidden>
     <h2>Cluster status</h2>
     <div class="controls">
       <select id="status-env" aria-label="Environment for status"></select>
@@ -184,7 +335,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
     <div id="status-out" class="result"></div>
   </section>
 
-  <section>
+  <section id="probe-panel" hidden>
     <h2>Hardware probe</h2>
     <div class="controls">
       <select id="probe-env" aria-label="Environment for probe"></select>
@@ -193,7 +344,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
     <div id="probe-out" class="result"></div>
   </section>
 
-  <section>
+  <section id="config-panel" hidden>
     <h2>Resolved config</h2>
     <div class="controls">
       <select id="config-env" aria-label="Environment for config"></select>
@@ -221,6 +372,26 @@ function el(tag, cls, text) {
 
 function badge(label, on) {
   return el("span", "badge " + (on ? "on" : "off"), label + (on ? "" : " missing"));
+}
+
+// ── Tabs: each panel owns the full width; a dot marks hidden work ───
+const tabs = [...document.querySelectorAll("#tabs button")];
+function showTab(id) {
+  for (const b of tabs) b.classList.toggle("active", b.dataset.tab === id);
+  for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== id;
+  if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
+}
+for (const b of tabs) b.addEventListener("click", () => showTab(b.dataset.tab));
+{
+  const initial = location.hash.slice(1);
+  showTab(tabs.some(b => b.dataset.tab === initial) ? initial : "farms-panel");
+}
+
+// Work running in a non-active tab stays visible as a dot on its tab.
+function setBusy(node, on) {
+  const sec = node.closest("section");
+  const tab = sec && document.querySelector(`#tabs button[data-tab="${sec.id}"]`);
+  if (tab) tab.classList.toggle("busy", on);
 }
 
 // ── Farms ───────────────────────────────────────────────────────────
@@ -303,12 +474,14 @@ function wire(btnId, envId, outId, path) {
     const out = document.getElementById(outId);
     out.replaceChildren(el("span", "spin", "running"));
     btn.disabled = true;
+    setBusy(out, true);
     try {
       renderRun(out, await api(path + (env ? "?env=" + encodeURIComponent(env) : "")));
     } catch (e) {
       out.replaceChildren(el("pre", "", String(e.message || e)));
     } finally {
       btn.disabled = false;
+      setBusy(out, false);
     }
   });
 }
@@ -316,6 +489,235 @@ function wire(btnId, envId, outId, path) {
 wire("status-run", "status-env", "status-out", "/api/status");
 wire("probe-run", "probe-env", "probe-out", "/api/probe");
 wire("config-run", "config-env", "config-out", "/api/config");
+
+// ── Wizard: preview (dry run) → apply ───────────────────────────────
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "x-fdl-token": TOKEN, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  return res.json();
+}
+
+function copyPre(text) {
+  const wrap = el("div");
+  const btn = el("button", "copy", "copy");
+  btn.addEventListener("click", () => {
+    navigator.clipboard.writeText(text).then(() => { btn.textContent = "copied"; setTimeout(() => btn.textContent = "copy", 1200); });
+  });
+  wrap.append(btn, el("pre", "", text));
+  return wrap;
+}
+
+function wizardBody(dry) {
+  const v = id => document.getElementById(id).value.trim();
+  const c = id => document.getElementById(id).checked;
+  const body = { label: v("wz-label"), dry_run: dry };
+  if (v("wz-controller")) body.controller = v("wz-controller");
+  const door = document.getElementById("wz-door").value;
+  if (door) body.door = door;
+  if (v("wz-data")) body.data_path = v("wz-data");
+  if (c("wz-cloud-init")) {
+    body.cloud_init = true;
+    if (v("wz-cloud-user")) body.cloud_init_user = v("wz-cloud-user");
+  }
+  if (c("wz-regen")) body.regen = true;
+  if (c("wz-install")) body.install_key = true;
+  return body;
+}
+
+// Apply unlocks only after a preview of exactly this form state: the
+// dry run IS the confirmation step.
+let previewed = null;
+function shapeKey(body) { const b = { ...body }; delete b.dry_run; return JSON.stringify(b); }
+function updateApply() {
+  document.getElementById("wz-apply").disabled =
+    previewed === null || previewed !== shapeKey(wizardBody(false));
+}
+for (const node of document.querySelectorAll(
+  "#wz-label, #wz-controller, #wz-door, #wz-data, #wz-cloud-init, #wz-cloud-user, #wz-regen, #wz-install")) {
+  node.addEventListener("input", updateApply);
+  node.addEventListener("change", updateApply);
+}
+
+async function runWizard(dry) {
+  const out = document.getElementById("wz-out");
+  const body = wizardBody(dry);
+  if (!body.label) { out.replaceChildren(el("pre", "", "label: required")); return; }
+  out.replaceChildren(el("span", "spin", dry ? "previewing" : "applying"));
+  const preview = document.getElementById("wz-preview");
+  preview.disabled = true;
+  document.getElementById("wz-apply").disabled = true;
+  setBusy(out, true);
+  try {
+    const r = await apiPost("/api/join-config", body);
+    renderWizard(out, r, dry);
+    previewed = dry && r.exit === 0 ? shapeKey(body) : null;
+    if (!dry) api("/api/farms").then(renderFarms).catch(() => {});
+  } catch (e) {
+    out.replaceChildren(el("pre", "", String(e.message || e)));
+  } finally {
+    preview.disabled = false;
+    setBusy(out, false);
+    updateApply();
+  }
+}
+document.getElementById("wz-preview").addEventListener("click", () => runWizard(true));
+document.getElementById("wz-apply").addEventListener("click", () => runWizard(false));
+
+function renderWizard(box, r, dry) {
+  box.replaceChildren();
+  let report = null;
+  if (r.exit === 0) { try { report = JSON.parse(r.stdout); } catch { /* fall through */ } }
+  if (!report) { renderRun(box, r); return; }
+
+  const div = el("div", "report" + (dry ? "" : " applied-report"));
+  div.append(el("div", "banner " + (dry ? "dry" : "applied"),
+    dry ? "dry run — nothing written; an apply would do this" : "applied"));
+  const kv = (k, val) => {
+    const p = el("div", "kv");
+    p.append(k + ": ");
+    p.append(el("b", "", val));
+    return p;
+  };
+  div.append(kv("farm dir", report.farm_dir));
+  div.append(kv("overlay", report.overlay.action.replaceAll("_", " ")));
+  div.append(kv("join key", report.key.action));
+  div.append(kv("sshd install", report.install.action + (report.install.why ? " — " + report.install.why : "")));
+  if (report.cloud_init_path) div.append(kv("cloud-init (SECRET, key inside)", report.cloud_init_path));
+
+  div.append(el("h3", "", dry ? "changes an apply would make" : "changes made"));
+  const changed = report.changes.filter(ch => ch.action !== "unchanged");
+  if (!changed.length) div.append(el("div", "change", "nothing — the farm is already in this shape"));
+  for (const ch of changed) {
+    const line = el("div", "change");
+    line.append(el("span", "k " + ch.action, ch.action));
+    line.append(" " + ch.path + "  (" + ch.what + ")");
+    div.append(line);
+  }
+
+  const gaps = report.preflight.filter(p => !p.ok);
+  if (gaps.length) {
+    div.append(el("h3", "", "this box is still missing"));
+    for (const g of gaps) {
+      div.append(el("div", "warn", g.what));
+      if (g.fix) div.append(el("pre", "", g.fix));
+    }
+  }
+  for (const w of [report.reuse_warning, report.bin_caveat, report.freshness]) {
+    if (w) div.append(el("div", "warn", w));
+  }
+
+  div.append(el("h3", "", "authorized_keys line (controller sshd, one line)"));
+  div.append(copyPre(report.authorized_keys_line));
+  box.append(div);
+
+  if (!dry) {
+    api("/api/farm?label=" + encodeURIComponent(report.label)).then(f => {
+      if (f.worker_yml) {
+        div.append(el("h3", "", "worker fdl.yml (token inside — hand it to the worker)"));
+        div.append(copyPre(f.worker_yml));
+      }
+    }).catch(() => {});
+  }
+}
+
+// ── Publish: a live stream of the gate build ───────────────────────
+function streamPrompt(out, cmd) {
+  const prompt = el("div", "prompt");
+  prompt.append(el("span", "dollar", "$"));
+  const line = cmd.join(" ");
+  prompt.append(el("span", "line", line));
+  const exit = el("span", "exit", "running…");
+  prompt.append(exit);
+  const copy = el("button", "copy", "copy");
+  copy.addEventListener("click", () => {
+    navigator.clipboard.writeText(line).then(() => { copy.textContent = "copied"; setTimeout(() => copy.textContent = "copy", 1200); });
+  });
+  prompt.append(copy);
+  out.append(prompt);
+  return exit;
+}
+
+async function streamJob(out, url, init) {
+  out.replaceChildren(el("span", "spin", "starting"));
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    const why = (await res.json().catch(() => ({}))).error || res.statusText;
+    out.replaceChildren(el("pre", "", why));
+    return;
+  }
+  out.replaceChildren();
+  let exitBadge = null;
+  const pre = el("pre", "log");
+  const onEvent = ev => {
+    if (ev.cmd) {
+      exitBadge = streamPrompt(out, ev.cmd);
+      out.append(pre);
+    } else if ("exit" in ev) {
+      if (exitBadge) {
+        exitBadge.textContent = ev.exit === null ? "no exit" : "exit " + ev.exit;
+        exitBadge.className = "exit " + (ev.exit === 0 ? "ok" : "bad");
+      }
+    } else if ("t" in ev) {
+      pre.append(el("span", ev.s === "err" ? "err" : "", ev.t + "\n"));
+      pre.scrollTop = pre.scrollHeight;
+    }
+  };
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line) { try { onEvent(JSON.parse(line)); } catch { /* partial noise */ } }
+    }
+  }
+}
+
+document.getElementById("pub-run").addEventListener("click", async () => {
+  const v = id => document.getElementById(id).value.trim();
+  const body = {};
+  if (v("pub-source")) body.source = v("pub-source");
+  if (v("pub-bin")) body.bin = v("pub-bin");
+  if (v("pub-args")) body.args = v("pub-args").split(/\s+/);
+  const btn = document.getElementById("pub-run");
+  const out = document.getElementById("pub-out");
+  btn.disabled = true;
+  setBusy(out, true);
+  try {
+    await streamJob(out, "/api/publish", {
+      method: "POST",
+      headers: { "x-fdl-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } finally {
+    btn.disabled = false;
+    setBusy(out, false);
+  }
+});
+
+document.getElementById("pub-follow").addEventListener("click", async () => {
+  const btn = document.getElementById("pub-follow");
+  const out = document.getElementById("pub-out");
+  btn.disabled = true;
+  setBusy(out, true);
+  try {
+    await streamJob(out, "/api/jobs/last", {
+      headers: { "x-fdl-token": TOKEN },
+    });
+  } finally {
+    btn.disabled = false;
+    setBusy(out, false);
+  }
+});
 
 api("/api/farms").then(renderFarms).catch(e => {
   document.getElementById("farms").replaceChildren(el("pre", "", String(e.message || e)));
