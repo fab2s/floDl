@@ -327,12 +327,12 @@ pub struct JoinConfigArgs {
     pub json: bool,
 }
 
-/// Serve the local operations page: one loopback web page showing this
+/// Serve the local operations page: one loopback web page for this
 /// project's farms, hardware probe, cluster run status and resolved
-/// config — the browser counterpart of the walk-in CLI surface. Read-only
-/// today; actions (the wizard form, publish) arrive on top of the same
-/// server. Every panel that runs a command shows the exact `fdl` argv it
-/// ran: the page drives the CLI, it never reimplements it.
+/// config, plus the first actions — the join-config wizard as a
+/// preview-then-apply form and publish with its gate build streamed
+/// live. Every panel shows the exact `fdl` argv it ran: the page drives
+/// the CLI, it never reimplements it.
 ///
 /// Binds 127.0.0.1 only. Reaching it from another box is an ssh forward
 /// (`ssh -L 1338:127.0.0.1:1338 <controller>`), the same trust story as

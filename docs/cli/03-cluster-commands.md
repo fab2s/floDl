@@ -578,11 +578,24 @@ actually lives, which is not the container's `~/.ssh`.
 
 ## `fdl ui`
 
-The local operations page: one loopback web page showing the project's
+The local operations page: one loopback web page for the project's
 farms, hardware probe, cluster run status and resolved config — the
-browser counterpart of the walk-in CLI surface. Read-only today;
-actions (the wizard form as a form, publish with a streamed gate build)
-arrive on the same server.
+browser counterpart of the walk-in CLI surface — plus the first
+actions:
+
+- **the join-config wizard as a form**: fill label/door/controller,
+  Preview runs `--dry-run` and shows exactly what an apply would
+  create or update, and Apply unlocks only after a preview of exactly
+  that form state — the dry run IS the confirmation step. The applied
+  report carries the authorized_keys line and the worker yml with copy
+  buttons (cloud-init stays a file path: it embeds the private key and
+  a secret artifact is never served over HTTP);
+- **publish with the gate build streamed live**: the child's output
+  arrives line by line with the exit code at the end. One job runs at
+  a time (two concurrent publishes would race the manifest commit
+  point), a closed tab never kills the build (a publish must reach or
+  cleanly fail before its commit point), and "Follow last job" replays
+  the stream from its first line and follows live.
 
 ```bash
 fdl ui                # serve http://127.0.0.1:1338/
