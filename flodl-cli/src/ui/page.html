@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fdl ui</title>
+<style>
+/* Palette: the repo's own diagram roles — indigo marks an actor,
+   green a good state, amber a cost/warning. Dark-first: this page
+   lives next to terminals. */
+:root {
+  --bg: #12161d;
+  --panel: #1a2028;
+  --line: #2a323d;
+  --ink: #d7dee8;
+  --muted: #8b96a5;
+  --actor: #7986cb;
+  --good: #66bb6a;
+  --cost: #d9a05b;
+  --prompt-bg: #0d1117;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --line: #d9dfe7;
+    --ink: #26303b;
+    --muted: #5f6b79;
+    --actor: #5c6bc0;
+    --good: #2e7d32;
+    --cost: #8a5320;
+    --prompt-bg: #eceff3;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 var(--sans);
+}
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+}
+header h1 {
+  margin: 0;
+  font: 600 16px var(--mono);
+  color: var(--actor);
+}
+header .root {
+  font: 12px var(--mono);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+main {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px;
+  padding: 16px 20px 40px;
+  max-width: 1500px;
+  margin: 0 auto;
+}
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  min-width: 0;
+}
+section h2 {
+  margin: 0 0 10px;
+  font: 600 13px var(--sans);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+select, button {
+  font: 13px var(--mono);
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--actor); }
+button:disabled { opacity: 0.5; cursor: wait; }
+:is(button, select, .copy):focus-visible { outline: 2px solid var(--actor); outline-offset: 1px; }
+
+/* Farm cards */
+.farm {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.farm .name { font: 600 14px var(--mono); color: var(--actor); }
+.farm .shape { color: var(--muted); font-size: 13px; margin: 2px 0 6px; overflow-wrap: anywhere; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.badge {
+  font: 11px var(--mono);
+  border-radius: 4px;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.badge.on  { color: var(--good); border-color: var(--good); }
+.badge.off { color: var(--cost); border-color: var(--cost); }
+.aside { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.empty { color: var(--muted); }
+.empty code { font-family: var(--mono); color: var(--ink); }
+
+/* The signature: every driven result opens with the exact command line. */
+.prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--prompt-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px 6px 0 0;
+  padding: 6px 10px;
+  font: 12px var(--mono);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.prompt .dollar { color: var(--good); user-select: none; }
+.prompt .line { flex: 1; }
+.prompt .exit { font-size: 11px; }
+.prompt .exit.ok { color: var(--good); }
+.prompt .exit.bad { color: var(--cost); }
+.copy {
+  font: 11px var(--mono);
+  color: var(--muted);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.result pre {
+  margin: 0;
+  background: var(--prompt-bg);
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  padding: 10px;
+  font: 12px/1.45 var(--mono);
+  overflow-x: auto;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.result .stderr { color: var(--cost); }
+.spin { color: var(--muted); font: 12px var(--mono); }
+@media (prefers-reduced-motion: no-preference) {
+  .spin::after { content: ""; animation: dots 1.2s steps(4) infinite; }
+  @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>fdl ui</h1>
+  <span class="root">__FDL_ROOT__</span>
+</header>
+<main>
+  <section id="farms-panel">
+    <h2>Farms</h2>
+    <div id="farms"><span class="spin">loading</span></div>
+  </section>
+
+  <section>
+    <h2>Cluster status</h2>
+    <div class="controls">
+      <select id="status-env" aria-label="Environment for status"></select>
+      <button id="status-run">Check status</button>
+    </div>
+    <div id="status-out" class="result"></div>
+  </section>
+
+  <section>
+    <h2>Hardware probe</h2>
+    <div class="controls">
+      <select id="probe-env" aria-label="Environment for probe"></select>
+      <button id="probe-run">Run probe</button>
+    </div>
+    <div id="probe-out" class="result"></div>
+  </section>
+
+  <section>
+    <h2>Resolved config</h2>
+    <div class="controls">
+      <select id="config-env" aria-label="Environment for config"></select>
+      <button id="config-run">Show config</button>
+    </div>
+    <div id="config-out" class="result"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const TOKEN = "__FDL_TOKEN__";
+
+async function api(path) {
+  const res = await fetch(path, { headers: { "x-fdl-token": TOKEN } });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  return res.json();
+}
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+function badge(label, on) {
+  return el("span", "badge " + (on ? "on" : "off"), label + (on ? "" : " missing"));
+}
+
+// ── Farms ───────────────────────────────────────────────────────────
+const DOORS = { b: "door b (rrsync source pull)", a: "door a (sftp data mount)", nologin: "door nologin (tunnel only)" };
+
+function renderFarms(data) {
+  const box = document.getElementById("farms");
+  box.replaceChildren();
+  if (!data.farms.length) {
+    const p = el("p", "empty");
+    p.append("No farms here yet. Create one on the controller: ");
+    p.append(el("code", "", "fdl join-config <label>"));
+    box.append(p);
+  }
+  for (const f of data.farms) {
+    const card = el("div", "farm");
+    card.append(el("div", "name", f.label));
+    const shape = f.door ? DOORS[f.door] || f.door : "door unknown (no wizard worker.yml)";
+    card.append(el("div", "shape", shape + (f.controller ? " · " + f.controller : "")));
+    const badges = el("div", "badges");
+    badges.append(badge("overlay", f.overlay.exists), badge("token", f.overlay.token), badge("key", f.key_present));
+    if (f.worker_yml) badges.append(badge("worker.yml", true));
+    if (f.cloud_init) badges.append(badge("cloud-init", true));
+    card.append(badges);
+    box.append(card);
+  }
+  if (data.other_envs.length) {
+    box.append(el("div", "aside", "env overlays that are not farms: " + data.other_envs.join(", ")));
+  }
+  fillEnvSelects(data);
+}
+
+function fillEnvSelects(data) {
+  const envs = [...data.farms.map(f => f.label), ...data.other_envs];
+  for (const id of ["status-env", "probe-env", "config-env"]) {
+    const sel = document.getElementById(id);
+    sel.replaceChildren(new Option(id === "config-env" ? "base config" : "no env (local)", ""));
+    for (const e of envs) sel.append(new Option("@" + e, e));
+  }
+  // A farm is the likely status/config target when there is exactly one.
+  if (data.farms.length === 1) {
+    document.getElementById("status-env").value = data.farms[0].label;
+    document.getElementById("config-env").value = data.farms[0].label;
+  }
+}
+
+// ── Driven panels: the result always opens with its command line ───
+function renderRun(box, r) {
+  box.replaceChildren();
+  const prompt = el("div", "prompt");
+  prompt.append(el("span", "dollar", "$"));
+  const line = r.cmd.join(" ");
+  prompt.append(el("span", "line", line));
+  const exitOk = r.exit === 0;
+  prompt.append(el("span", "exit " + (exitOk ? "ok" : "bad"),
+    r.exit === null ? "no exit" : "exit " + r.exit));
+  const copy = el("button", "copy", "copy");
+  copy.addEventListener("click", () => {
+    navigator.clipboard.writeText(line).then(() => { copy.textContent = "copied"; setTimeout(() => copy.textContent = "copy", 1200); });
+  });
+  prompt.append(copy);
+  box.append(prompt);
+
+  const pre = el("pre");
+  let body = r.stdout;
+  try { body = JSON.stringify(JSON.parse(r.stdout), null, 2); } catch { /* not JSON: show as-is */ }
+  pre.append(el("span", "", body));
+  if (r.stderr.trim()) {
+    if (body.trim()) pre.append("\n");
+    pre.append(el("span", "stderr", r.stderr.trimEnd()));
+  }
+  if (!body.trim() && !r.stderr.trim()) pre.append(el("span", "", "(no output)"));
+  box.append(pre);
+}
+
+function wire(btnId, envId, outId, path) {
+  const btn = document.getElementById(btnId);
+  btn.addEventListener("click", async () => {
+    const env = document.getElementById(envId).value;
+    const out = document.getElementById(outId);
+    out.replaceChildren(el("span", "spin", "running"));
+    btn.disabled = true;
+    try {
+      renderRun(out, await api(path + (env ? "?env=" + encodeURIComponent(env) : "")));
+    } catch (e) {
+      out.replaceChildren(el("pre", "", String(e.message || e)));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+wire("status-run", "status-env", "status-out", "/api/status");
+wire("probe-run", "probe-env", "probe-out", "/api/probe");
+wire("config-run", "config-env", "config-out", "/api/config");
+
+api("/api/farms").then(renderFarms).catch(e => {
+  document.getElementById("farms").replaceChildren(el("pre", "", String(e.message || e)));
+});
+</script>
+</body>
+</html>

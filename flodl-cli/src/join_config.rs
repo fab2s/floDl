@@ -372,16 +372,15 @@ fn wizard_at(cli: &JoinConfigArgs, cwd: &Path) -> Result<Report, String> {
     let key_action = ensure_key(cli, &mut changes, &key_path, &label)?;
     // A dry run mints nothing, so wherever the (re)generated key would
     // appear, a placeholder appears instead.
-    let pub_line = if cli.dry_run
-        && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated)
-    {
-        PLACEHOLDER_PUB.to_string()
-    } else {
-        fs::read_to_string(key_path.with_extension("pub"))
-            .map_err(|e| format!("cannot read the generated public key: {e}"))?
-            .trim()
-            .to_string()
-    };
+    let pub_line =
+        if cli.dry_run && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated) {
+            PLACEHOLDER_PUB.to_string()
+        } else {
+            fs::read_to_string(key_path.with_extension("pub"))
+                .map_err(|e| format!("cannot read the generated public key: {e}"))?
+                .trim()
+                .to_string()
+        };
 
     // ── Token + overlay ─────────────────────────────────────────────────
     let overlay_path = root.join(format!("fdl.{label}.yml"));
@@ -461,14 +460,13 @@ fn wizard_at(cli: &JoinConfigArgs, cwd: &Path) -> Result<Report, String> {
     // ── cloud-init (opt-in) ─────────────────────────────────────────────
     let cloud_init_path = if cli.cloud_init {
         let user = cli.cloud_init_user.as_deref().unwrap_or("ubuntu");
-        let private_key = if cli.dry_run
-            && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated)
-        {
-            PLACEHOLDER_PRIVATE.to_string()
-        } else {
-            fs::read_to_string(&key_path)
-                .map_err(|e| format!("cannot read the private key for cloud-init: {e}"))?
-        };
+        let private_key =
+            if cli.dry_run && matches!(key_action, KeyAction::Generated | KeyAction::Regenerated) {
+                PLACEHOLDER_PRIVATE.to_string()
+            } else {
+                fs::read_to_string(&key_path)
+                    .map_err(|e| format!("cannot read the private key for cloud-init: {e}"))?
+            };
         let content = render_cloud_init(&label, user, door, &worker_yml, &private_key);
         let path = farm_dir.join("cloud-init.yml");
         let kind = changes.write(&path, &content, "cloud-init user-data (SECRET)")?;
@@ -940,7 +938,11 @@ fn install_authorized_line(
 
     let (new_content, outcome) = upsert_authorized_line(&content, line)?;
     if outcome == UpsertOutcome::Identical {
-        changes.note(&ak_path, ChangeKind::Unchanged, "authorized_keys (wizard's line)");
+        changes.note(
+            &ak_path,
+            ChangeKind::Unchanged,
+            "authorized_keys (wizard's line)",
+        );
         return Ok(InstallAction::AlreadyPresent);
     }
     if outcome == UpsertOutcome::Replaced {
@@ -1010,7 +1012,9 @@ fn dry_install_verdict(
     line: &str,
 ) -> Result<InstallAction, String> {
     if cli.no_install_key {
-        return Ok(InstallAction::Skipped("declined (--no-install-key)".to_string()));
+        return Ok(InstallAction::Skipped(
+            "declined (--no-install-key)".to_string(),
+        ));
     }
     if !cli.install_key {
         return Ok(InstallAction::Skipped(
@@ -1056,11 +1060,19 @@ fn dry_install_verdict(
     let (_, outcome) = upsert_authorized_line(&content, line)?;
     Ok(match outcome {
         UpsertOutcome::Identical => {
-            changes.note(&ak_path, ChangeKind::Unchanged, "authorized_keys (wizard's line)");
+            changes.note(
+                &ak_path,
+                ChangeKind::Unchanged,
+                "authorized_keys (wizard's line)",
+            );
             InstallAction::AlreadyPresent
         }
         UpsertOutcome::Replaced => {
-            changes.note(&ak_path, ChangeKind::Update, "authorized_keys (wizard's line)");
+            changes.note(
+                &ak_path,
+                ChangeKind::Update,
+                "authorized_keys (wizard's line)",
+            );
             InstallAction::Replaced
         }
         UpsertOutcome::Appended => {
@@ -1217,8 +1229,9 @@ fn resolve_label(cli: &JoinConfigArgs) -> Result<String, String> {
 }
 
 /// Labels become filenames (`fdl.<label>.yml`, `.fdl/<label>/`), so the
-/// charset is the portable-filename one.
-fn validate_label(label: &str) -> Result<(), String> {
+/// charset is the portable-filename one. Also the validation `fdl ui`
+/// applies to env names arriving in a query string.
+pub(crate) fn validate_label(label: &str) -> Result<(), String> {
     let ok = !label.is_empty()
         && label
             .chars()
@@ -1369,7 +1382,11 @@ fn ensure_overlay(
                 return Ok((old, OverlayAction::TokenReused));
             }
             if cli.dry_run {
-                changes.note(overlay_path, ChangeKind::Update, "farm overlay (token regenerated)");
+                changes.note(
+                    overlay_path,
+                    ChangeKind::Update,
+                    "farm overlay (token regenerated)",
+                );
                 return Ok((PLACEHOLDER_TOKEN.to_string(), OverlayAction::TokenReplaced));
             }
             let token = fresh_token()?;
@@ -1402,8 +1419,8 @@ fn ensure_overlay(
 /// nonce, but this one IS secret (it is the admission token), so there
 /// is no fallback: a credential mint with no entropy has nothing honest
 /// to fall back to, and the syscall failing is a refusal, not a
-/// degradation.
-fn fresh_token() -> Result<String, String> {
+/// degradation. Also mints `fdl ui`'s per-session token.
+pub(crate) fn fresh_token() -> Result<String, String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|e| format!("cannot draw OS entropy for the token: {e}"))?;
@@ -2220,7 +2237,12 @@ impl Report {
                 any = true;
                 push(
                     &mut out,
-                    &format!("  {:<7} {}  ({})", c.kind.as_str(), c.path.display(), c.what),
+                    &format!(
+                        "  {:<7} {}  ({})",
+                        c.kind.as_str(),
+                        c.path.display(),
+                        c.what
+                    ),
                 );
             }
             if !any {
@@ -2521,21 +2543,27 @@ fn run_list(cli: &JoinConfigArgs) -> i32 {
     let root = crate::config::find_project_config(&cwd)
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or(cwd);
-    let (farms, other_envs) = enumerate_farms(&root);
     if cli.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "root": root.display().to_string(),
-                "farms": farms.iter().map(FarmInfo::to_json).collect::<Vec<_>>(),
-                "other_envs": other_envs,
-            }))
-            .expect("a farm list serializes"),
+            serde_json::to_string_pretty(&farms_json(&root)).expect("a farm list serializes"),
         );
     } else {
+        let (farms, other_envs) = enumerate_farms(&root);
         print!("{}", render_farm_list(&root, &farms, &other_envs));
     }
     0
+}
+
+/// The `--list --json` payload for a project root — also what `fdl ui`'s
+/// farms endpoint serves, so the page and the CLI cannot disagree.
+pub(crate) fn farms_json(root: &Path) -> serde_json::Value {
+    let (farms, other_envs) = enumerate_farms(root);
+    serde_json::json!({
+        "root": root.display().to_string(),
+        "farms": farms.iter().map(FarmInfo::to_json).collect::<Vec<_>>(),
+        "other_envs": other_envs,
+    })
 }
 
 /// One farm's on-disk state, as `--list` reports it.
@@ -2565,10 +2593,7 @@ fn enumerate_farms(root: &Path) -> (Vec<FarmInfo>, Vec<String>) {
     // Overlay names come from the resolver's own discovery, so `--list`
     // cannot disagree with what `fdl @<env>` accepts (.yaml/.json too).
     let base = crate::config::find_project_config(root);
-    let envs = base
-        .as_deref()
-        .map(overlay::list_envs)
-        .unwrap_or_default();
+    let envs = base.as_deref().map(overlay::list_envs).unwrap_or_default();
 
     let mut labels: Vec<String> = Vec::new();
     let mut other_envs: Vec<String> = Vec::new();

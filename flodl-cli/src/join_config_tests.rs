@@ -560,14 +560,12 @@ fn an_authorized_keys_path_under_etc_ssh_is_refused() {
     cli.install_key = true;
     cli.authorized_keys = Some("/etc/ssh/authorized_keys.d/op".to_string());
     let mut changes = Changes::new(false);
-    let err =
-        install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
+    let err = install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
     assert!(err.contains("system sshd configuration"), "got: {err}");
     assert!(err.contains("by hand"), "names the way out: {err}");
     // The dry half keeps the same promise.
     cli.dry_run = true;
-    let err =
-        install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
+    let err = install_authorized_line(&cli, &mut changes, "ssh-ed25519 AAAA test", 22).unwrap_err();
     assert!(err.contains("system sshd configuration"), "got: {err}");
 }
 
@@ -680,19 +678,34 @@ fn the_recorder_classifies_and_a_dry_one_withholds_the_write() {
     let path = tmp.join("artifact.txt");
 
     let mut real = Changes::new(false);
-    assert_eq!(real.write(&path, "v1\n", "artifact").unwrap(), ChangeKind::Create);
+    assert_eq!(
+        real.write(&path, "v1\n", "artifact").unwrap(),
+        ChangeKind::Create
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), "v1\n");
     // Identical content is never rewritten.
-    assert_eq!(real.write(&path, "v1\n", "artifact").unwrap(), ChangeKind::Unchanged);
-    assert_eq!(real.write(&path, "v2\n", "artifact").unwrap(), ChangeKind::Update);
+    assert_eq!(
+        real.write(&path, "v1\n", "artifact").unwrap(),
+        ChangeKind::Unchanged
+    );
+    assert_eq!(
+        real.write(&path, "v2\n", "artifact").unwrap(),
+        ChangeKind::Update
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
 
     let missing = tmp.join("never-written.txt");
     let mut dry = Changes::new(true);
-    assert_eq!(dry.write(&missing, "x\n", "artifact").unwrap(), ChangeKind::Create);
+    assert_eq!(
+        dry.write(&missing, "x\n", "artifact").unwrap(),
+        ChangeKind::Create
+    );
     assert!(!missing.exists(), "a dry run must not write");
     // ... but it still classifies against what IS on disk.
-    assert_eq!(dry.write(&path, "v3\n", "artifact").unwrap(), ChangeKind::Update);
+    assert_eq!(
+        dry.write(&path, "v3\n", "artifact").unwrap(),
+        ChangeKind::Update
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), "v2\n");
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -811,7 +824,10 @@ fn a_dry_regen_promises_new_credentials_without_minting_them() {
     fs::create_dir_all(farm.join("keys")).unwrap();
     fs::write(farm.join("keys/flodl-join"), "PRIVATE\n").unwrap();
     fs::write(farm.join("keys/flodl-join.pub"), "ssh-ed25519 AAAAold c\n").unwrap();
-    let overlay = format!("cluster:\n  controller:\n    join:\n      token: {}\n", "a".repeat(32));
+    let overlay = format!(
+        "cluster:\n  controller:\n    join:\n      token: {}\n",
+        "a".repeat(32)
+    );
     fs::write(tmp.join(format!("fdl.{label}.yml")), &overlay).unwrap();
 
     let mut cli = no_flags();
@@ -821,7 +837,10 @@ fn a_dry_regen_promises_new_credentials_without_minting_them() {
     let report = wizard_at(&cli, &tmp).unwrap();
 
     assert!(matches!(report.key_action, KeyAction::Regenerated));
-    assert!(matches!(report.overlay_action, OverlayAction::TokenReplaced));
+    assert!(matches!(
+        report.overlay_action,
+        OverlayAction::TokenReplaced
+    ));
     assert!(report.authorized_line.contains(PLACEHOLDER_PUB));
     assert!(report.worker_yml.contains(PLACEHOLDER_TOKEN));
     // The old credentials are still exactly in place.
@@ -901,7 +920,10 @@ fn farm_enumeration_unions_overlays_and_dirs_and_skips_non_farms() {
     .unwrap();
     fs::write(
         tmp.join("fdl.full.yml"),
-        format!("cluster:\n  controller:\n    join:\n      token: {}\n", "b".repeat(32)),
+        format!(
+            "cluster:\n  controller:\n    join:\n      token: {}\n",
+            "b".repeat(32)
+        ),
     )
     .unwrap();
 
@@ -924,7 +946,10 @@ fn farm_enumeration_unions_overlays_and_dirs_and_skips_non_farms() {
     assert!(full_info.overlay_exists && full_info.has_token && full_info.key_present);
     assert!(full_info.worker_yml && !full_info.cloud_init);
     assert_eq!(full_info.door, Some(Door::A));
-    assert_eq!(full_info.controller.as_deref(), Some("op@ctrl.example:2222"));
+    assert_eq!(
+        full_info.controller.as_deref(),
+        Some("op@ctrl.example:2222")
+    );
 
     let half_info = &farms[1];
     assert!(!half_info.overlay_exists && !half_info.has_token && !half_info.key_present);
