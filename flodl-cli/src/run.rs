@@ -654,7 +654,7 @@ pub(crate) fn compose_run_command(run: &str, user_args: &[String], append: Optio
 /// library crate by policy (it must build without libtorch).
 fn testing_cluster_env_arg() -> String {
     let mut out = String::new();
-    for name in TESTING_ENV_VARS {
+    for name in TESTING_ENV_VARS.iter().chain(COLOR_ENV_VARS) {
         if std::env::var(name).is_ok() {
             out.push_str(" -e ");
             out.push_str(name);
@@ -696,6 +696,21 @@ pub(crate) fn compose_quiet_arg() -> &'static str {
 /// flodl library crate by policy; `flodl-hw` is a dependency, so the GPU
 /// one is asserted against its constant in the tests below.
 const TESTING_ENV_VARS: &[&str] = &["FLODL_TESTING_CLUSTER_JSON", "FLODL_TESTING_GPU_JSON"];
+
+/// Colour-forcing vars, forwarded into a containerized run when the
+/// caller set them — and only then, so ordinary use is untouched.
+///
+/// A tool inside the container decides on colour from ITS OWN stdout,
+/// which is a pipe whenever the invocation is not attached to a
+/// terminal. In a shell that is fine (compose gets a tty and hands one
+/// down, which is why `fdl test` is colourful); but anything capturing
+/// the output — CI logs, and `fdl ui`'s consoles — loses every colour
+/// at the docker boundary, because the env that would have forced it
+/// dies there. These names are the ecosystem's conventions
+/// (<https://no-color.org/>, cargo's own), so forwarding them costs
+/// nothing and makes `FORCE_COLOR=1 fdl test` behave the way its author
+/// obviously meant.
+const COLOR_ENV_VARS: &[&str] = &["FORCE_COLOR", "CLICOLOR_FORCE", "CARGO_TERM_COLOR"];
 
 /// The logical `docker:` value meaning "whichever GPU container matches
 /// the active libtorch variant".
@@ -2171,6 +2186,36 @@ mod tests {
             resolve_docker_service(LOGICAL_GPU_SERVICE, Path::new("/nonexistent")),
             "cuda",
         );
+    }
+
+    /// Colour-forcing vars cross the docker boundary when set, and
+    /// nothing is forwarded when they are not. Without the forward, a
+    /// captured run (CI logs, `fdl ui`'s consoles) loses every colour
+    /// the tools inside the container would have emitted.
+    /// Deliberately exercises `CARGO_TERM_COLOR` and touches neither
+    /// `FORCE_COLOR` nor `CLICOLOR_FORCE`: those belong to `style.rs`'s
+    /// tests, which serialize on `style::TEST_ENV_LOCK` — a DIFFERENT
+    /// process-global mutex from this module's `env_lock()`. Two
+    /// mutexes do not exclude each other, so a test here that removed
+    /// `FORCE_COLOR` raced a style test that had just set it (observed,
+    /// not theorised). Forwarding is per-name identical, so one name
+    /// proves the mechanism without reaching into another lock's
+    /// territory.
+    #[test]
+    fn color_env_is_forwarded_into_containers_only_when_set() {
+        let _guard = env_lock();
+        unsafe { std::env::remove_var("CARGO_TERM_COLOR") };
+        assert!(
+            !testing_cluster_env_arg().contains("CARGO_TERM_COLOR"),
+            "nothing to forward when the caller set nothing",
+        );
+        unsafe { std::env::set_var("CARGO_TERM_COLOR", "always") };
+        let arg = testing_cluster_env_arg();
+        assert!(arg.contains(" -e CARGO_TERM_COLOR"), "got: {arg:?}");
+        // By NAME only: the value rides the inherited environment, so it
+        // never lands on a command line.
+        assert!(!arg.contains("always"), "got: {arg:?}");
+        unsafe { std::env::remove_var("CARGO_TERM_COLOR") };
     }
 
     #[test]
