@@ -180,7 +180,7 @@ const KIND_META = [
   ['throttle',       'throttle',       '#f87171',true],
   ['meta_nudge',     'meta nudge',     '#67e8f9',true],
   ['lost_broadcast', 'lost broadcast', '#f87171',true],
-  ['div',            'divergence',     'muted',  false],
+  ['div',            'divergence',     'muted',  true],
   ['guard_telemetry','guard',          'muted',  false],
   ['div_epoch',      'div/epoch',      'muted',  true],
 ];
@@ -568,8 +568,8 @@ function buildGroups(){
         stat: G.vt ? `total ${fmtBytes(G.vt)}` : '',
         draw(ctx,w,h){
           drawSpans(ctx,w,h,G.idle,SHADE.idle);
-          drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
-          drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
+          if (kindEnabled['sync']) drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
+          if (kindEnabled['cpu_avg']) drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
           drawSeries(ctx,w,h,G.t,G.u,100,'util',true);
           drawSeries(ctx,w,h,G.t,G.vaPct,100,'va',false);
           drawSeries(ctx,w,h,G.t,G.vuPct,100,'vu',false);
@@ -585,10 +585,14 @@ function buildGroups(){
   }
 
   // Engine: what ElChe was doing. Anchor level and the round-trip costs it
-  // was reacting to, each on its own axis.
-  if (M.anchor.length || M.syncMs.length || M.avgMs.length){
+  // was reacting to, each on its own axis. Each strip answers to its
+  // kind's toggle.
+  const showAnchor = M.anchor.length && kindEnabled['anchor'];
+  const showSync = M.syncMs.length && kindEnabled['sync'];
+  const showAvg = M.avgMs.length && kindEnabled['cpu_avg'];
+  if (showAnchor || showSync || showAvg){
     const g = group('Engine');
-    if (M.anchor.length){
+    if (showAnchor){
       const vals = M.anchor.map(p=>p.v);
       const lo = Math.min(...vals), hi = Math.max(...vals);
       addStrip(g, 'anchor (batches)', {
@@ -601,16 +605,16 @@ function buildGroups(){
         },
       });
     }
-    const dur = M.syncMs.concat(M.avgMs);
+    const dur = (showSync?M.syncMs:[]).concat(showAvg?M.avgMs:[]);
     if (dur.length){
       const hi = Math.max(...dur.map(p=>p.v));
       const scale = linScale(0, hi*1.1||1);
       addStrip(g, 'sync duration (ms)', {
         legend: [['allreduce', seriesColor('syncMs')], ['cpu avg', seriesColor('avgMs')]],
-        stat: `${M.syncMs.length} syncs` + (M.avgMs.length?` · ${M.avgMs.length} cpu avgs`:''),
+        stat: (showSync?`${M.syncMs.length} syncs`:'') + (showAvg?` · ${M.avgMs.length} cpu avgs`:''),
         draw(ctx,w,h){
-          drawDots(ctx,w,h,M.syncMs,scale,'syncMs');
-          drawDots(ctx,w,h,M.avgMs,scale,'avgMs');
+          if (showSync) drawDots(ctx,w,h,M.syncMs,scale,'syncMs');
+          if (showAvg) drawDots(ctx,w,h,M.avgMs,scale,'avgMs');
         },
         tip(t){
           const p = nearestPoint(dur,t);
@@ -620,9 +624,14 @@ function buildGroups(){
     }
   }
 
-  // Convergence: divergence level (log) and its growth rate.
-  if (M.d.length){
+  // Convergence: divergence level (log) and its growth rate. The d and
+  // lambda strips answer to the divergence toggle, the per-key strips to
+  // the guard toggle.
+  const showDiv = M.d.length && kindEnabled['div'];
+  const showGuard = M.guardKeys.length && kindEnabled['guard_telemetry'];
+  if (showDiv || showGuard){
     const g = group('Convergence');
+    if (showDiv){
     const dv = M.d.map(p=>p.v).filter(v=>v>0);
     const scale = logScale(Math.min(...dv), Math.max(...dv));
     addStrip(g, 'divergence d (log)', {
@@ -651,8 +660,8 @@ function buildGroups(){
         tip(t){ const p = nearestPoint(M.lambda,t); return p?`λ_ema = ${fmtVal(p.v)}`:null; },
       });
     }
-    for (const key of M.guardKeys){
-      if (!kindEnabled['guard_telemetry']) break;
+    }
+    if (showGuard) for (const key of M.guardKeys){
       const pts = M.guard(key);
       if (!pts.length) continue;
       const vs = pts.map(p=>p.v);
@@ -667,7 +676,7 @@ function buildGroups(){
   }
 
   // Training: the run's outcome curves, from epoch events.
-  if (M.loss.length){
+  if (M.loss.length && kindEnabled['epoch']){
     const g = group('Training');
     const lv = M.loss.map(p=>p.v);
     const lo = Math.min(...lv), hi = Math.max(...lv);
@@ -697,7 +706,7 @@ function buildGroups(){
       legend: [['cpu', seriesColor('cpu')], ['ram', seriesColor('ram')]],
       stat: M.ramTotal?`ram total ${fmtBytes(M.ramTotal)}`:'',
       draw(ctx,w,h){
-        drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
+        if (kindEnabled['cpu_avg']) drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
         drawSeries(ctx,w,h,M.t,M.cpu,100,'cpu',true);
         drawSeries(ctx,w,h,M.t,M.ramPct,100,'ram',false);
       },
@@ -721,7 +730,7 @@ function buildGroups(){
         legend: [['gpu util', seriesColor('util')], ['vram', seriesColor('va')], ['cpu', seriesColor('cpu')]],
         stat: gpuList.length&&gpuList[0][1].vt?`gpu${gpuList[0][0]} · ${fmtBytes(gpuList[0][1].vt)}`:'',
         draw(ctx,w,h){
-          drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
+          if (kindEnabled['sync']) drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
           for (const [,gg] of gpuList){
             drawSeries(ctx,w,h,e.t,gg.u,100,'util',false);
             drawSeries(ctx,w,h,e.t,gg.vaPct,100,'va',false);
@@ -805,16 +814,23 @@ function fmtEvent(e){
 function buildKindToggles(){
   const present = new Set(E.map(e=>kindFamily(e.k)).filter(Boolean));
   const bar = document.getElementById('kinds');
+  const lead = document.createElement('span');
+  lead.textContent = 'show:';
+  bar.appendChild(lead);
   for (const [key,label,colorSpec,def] of KIND_META){
     kindEnabled[key] = def;
     if (!present.has(key)) continue;
     const l = document.createElement('label');
     const n = E.filter(e=>kindFamily(e.k)===key).length;
     l.innerHTML = `<input type="checkbox" ${def?'checked':''}> <span class="sw" data-kc="${key}"></span>${label} <span style="opacity:.6">${n}</span>`;
+    if (!def) l.style.opacity = '0.45';
+    // A kind's toggle governs EVERYTHING derived from that kind — its
+    // strips, its span shading, and its event-strip ticks — so every
+    // click has a visible effect (ticks alone can be sub-pixel subtle).
     l.querySelector('input').addEventListener('change', ev=>{
       kindEnabled[key] = ev.target.checked;
-      if (key==='guard_telemetry') rebuild();
-      else render();
+      l.style.opacity = ev.target.checked ? '' : '0.45';
+      rebuild();
     });
     bar.appendChild(l);
   }

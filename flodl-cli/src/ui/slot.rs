@@ -159,6 +159,14 @@ pub(super) fn serve_archive(req: &Request, server: &UiServer) -> Vec<u8> {
     let Some(rel) = req.query.get("path") else {
         return error_json("400 Bad Request", "missing ?path=");
     };
+    serve_archive_rel(rel, server)
+}
+
+/// The path-preserving form (`/archive/<rel>`): relative links INSIDE a
+/// served archive — the telemetry index card's per-host pages — resolve
+/// against the same prefix, so sibling artifacts are reachable without
+/// rewriting the page. Same validation as the query form.
+pub(super) fn serve_archive_rel(rel: &str, server: &UiServer) -> Vec<u8> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute()
         || rel_path
