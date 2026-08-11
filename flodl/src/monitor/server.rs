@@ -45,6 +45,11 @@ const MAX_HISTORY: usize = crate::monitor::record_store::MAX_RECORDS;
 /// Dashboard HTML — embedded at compile time.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
+/// Timeline page — embedded at compile time, served at `/timeline` for the
+/// dashboard's Timeline tab. The page fetches `/timeline/data?host=…`
+/// itself (its JSONL mode), so it is served verbatim, no injection.
+const TIMELINE_HTML: &str = include_str!("timeline.html");
+
 /// Messages from the Monitor to the server.
 pub(crate) enum ServerMsg {
     /// New epoch data as JSON string.
@@ -63,6 +68,9 @@ pub(crate) enum ServerMsg {
     /// Path-keyed monitor records (`node` / `event` / `meta`) for the portal's
     /// record plane. Fanned out to `/stream` subscribers by path scope.
     Records(Vec<Value>),
+    /// Where the run's shipped telemetry lives (`<run dir>/telemetry`) and
+    /// the controller's host name — the Timeline tab's data source.
+    SetTelemetry(std::path::PathBuf, String),
     /// Clean shutdown.
     Shutdown,
 }
@@ -109,6 +117,11 @@ struct SharedState {
     metadata: Mutex<Option<String>>,
     /// GPU init data for immediate tab creation.
     gpu_init: Mutex<Option<String>>,
+    /// Telemetry root (`<run dir>/telemetry`) + controller host, when the
+    /// run publishes telemetry. `/timeline/hosts` and `/timeline/data`
+    /// serve from here — the UNIFORM data path: every host, the
+    /// controller's included, reads from its shipped stream.
+    telemetry: Mutex<Option<(std::path::PathBuf, String)>>,
     /// Set (before the SSE sender list is cleared) once shutdown begins,
     /// so a connection racing shutdown never registers into the cleared
     /// list and blocks forever. Checked under the `sse_senders` lock.
@@ -191,6 +204,7 @@ impl DashboardServer {
             metadata: Mutex::new(None),
             gpu_init: Mutex::new(None),
             records,
+            telemetry: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
         });
 
@@ -240,6 +254,11 @@ impl DashboardServer {
     /// Install the baked timing heat maps (replaces the whole set).
     pub fn set_heatmaps(&self, maps: Vec<(String, String)>) {
         let _ = self.tx.send(ServerMsg::SetHeatmaps(maps));
+    }
+
+    /// Point the Timeline tab at the run's shipped telemetry.
+    pub fn set_telemetry(&self, root: std::path::PathBuf, controller: String) {
+        let _ = self.tx.send(ServerMsg::SetTelemetry(root, controller));
     }
 
     /// Set graph label and structural hash for the dashboard header.
@@ -369,6 +388,9 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
             ServerMsg::SetGpuInit(json) => {
                 *state.gpu_init.lock().unwrap() = Some(json);
             }
+            ServerMsg::SetTelemetry(root, controller) => {
+                *state.telemetry.lock().unwrap() = Some((root, controller));
+            }
             ServerMsg::Shutdown => {
                 let event = "event: complete\ndata: {}\n\n".to_string();
                 let mut senders = state.sse_senders.lock().unwrap();
@@ -402,6 +424,12 @@ fn handle_connection(mut stream: TcpStream, state: &SharedState) {
         "/graph.svg" => serve_svg(&mut stream, state),
         "/api/heatmaps" => serve_heatmap_index(&mut stream, state),
         "/heatmap.svg" => serve_heatmap(&mut stream, state, query),
+        // The Timeline tab: the page itself, the host/run discovery, and
+        // the shipped JSONL stream — every host uniformly from the run
+        // dir's telemetry tree, the controller's included.
+        "/timeline" => serve_timeline_page(&mut stream),
+        "/timeline/hosts" => serve_timeline_hosts(&mut stream, state),
+        "/timeline/data" => serve_timeline_data(&mut stream, state, query),
         "/api/history" => serve_history(&mut stream, state),
         // Portal record plane — all three keyed by `?path=`.
         "/node" => serve_node(&mut stream, state, query),
@@ -688,6 +716,149 @@ fn serve_svg(stream: &mut TcpStream, state: &SharedState) {
 /// Serve the heat-map index as JSON: `[{"model":..,"url":..}]`. The
 /// page shows the switcher only when this is non-empty (frames arrive
 /// at teardown, so it usually fills right as the run completes).
+/// Serve the timeline page verbatim; it reads `?host=` itself and fetches
+/// `/timeline/data` (its JSONL mode).
+fn serve_timeline_page(stream: &mut TcpStream) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+        TIMELINE_HTML.len(),
+        TIMELINE_HTML,
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// Hosts with a live telemetry stream: newest run dir per host holding a
+/// `timeline.log` or its in-flight `.partial`. Unlike the archive bake's
+/// discovery (which wants finished `timeline.html` pages), the live tab
+/// reads streams, so an in-flight `.partial` counts.
+fn live_telemetry_hosts(root: &std::path::Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String, std::time::SystemTime)> = Vec::new();
+    let Ok(hosts) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    for host in hosts.flatten() {
+        if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let host_name = host.file_name().to_string_lossy().into_owned();
+        let Ok(runs) = std::fs::read_dir(host.path()) else {
+            continue;
+        };
+        let mut best: Option<(String, std::time::SystemTime)> = None;
+        for run in runs.flatten() {
+            let dir = run.path();
+            let has_stream =
+                dir.join("timeline.log.partial").is_file() || dir.join("timeline.log").is_file();
+            if !has_stream {
+                continue;
+            }
+            let mtime = run
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let name = run.file_name().to_string_lossy().into_owned();
+            if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                best = Some((name, mtime));
+            }
+        }
+        if let Some((run, mtime)) = best {
+            out.push((host_name, run, mtime));
+        }
+    }
+    out.sort();
+    out.into_iter().map(|(h, r, _)| (h, r)).collect()
+}
+
+/// `GET /timeline/hosts` — `{controller, hosts:[{host, run}]}`. Empty when
+/// the run ships no telemetry (the tab says so instead of erroring).
+fn serve_timeline_hosts(stream: &mut TcpStream, state: &SharedState) {
+    let (controller, entries) = match state.telemetry.lock().unwrap().clone() {
+        Some((root, controller)) => (Some(controller), live_telemetry_hosts(&root)),
+        None => (None, Vec::new()),
+    };
+    let mut b = String::from("{\"controller\":");
+    match controller {
+        Some(c) => {
+            let _ = write!(b, "\"{}\"", c.replace('\\', "\\\\").replace('"', "\\\""));
+        }
+        None => b.push_str("null"),
+    }
+    b.push_str(",\"hosts\":[");
+    for (i, (host, run)) in entries.iter().enumerate() {
+        if i > 0 {
+            b.push(',');
+        }
+        let _ = write!(
+            b,
+            "{{\"host\":\"{}\",\"run\":\"{}\"}}",
+            host.replace('\\', "\\\\").replace('"', "\\\""),
+            run.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+    }
+    b.push_str("]}");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        b.len(),
+        b,
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// `GET /timeline/data?host=<h>[&run=<r>]` — the shipped JSONL stream,
+/// `.partial` preferred (it is the live one). `run` defaults to the host's
+/// newest. Params must be single path components: anything else is data
+/// trying to walk the filesystem, refused before any path is joined.
+fn serve_timeline_data(stream: &mut TcpStream, state: &SharedState, query: &str) {
+    let telemetry = state.telemetry.lock().unwrap().clone();
+    let Some((root, _)) = telemetry else {
+        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        return;
+    };
+    let single_component = |s: &str| {
+        !s.is_empty()
+            && std::path::Path::new(s).components().count() == 1
+            && matches!(
+                std::path::Path::new(s).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+    };
+    let Some(host) = query_param(query, "host").filter(|h| single_component(h)) else {
+        let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        return;
+    };
+    let run = match query_param(query, "run") {
+        Some(r) if single_component(&r) => Some(r),
+        Some(_) => {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            return;
+        }
+        None => live_telemetry_hosts(&root)
+            .into_iter()
+            .find(|(h, _)| *h == host)
+            .map(|(_, r)| r),
+    };
+    let Some(run) = run else {
+        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        return;
+    };
+    let dir = root.join(&host).join(&run);
+    let bytes = std::fs::read(dir.join("timeline.log.partial"))
+        .or_else(|_| std::fs::read(dir.join("timeline.log")));
+    match bytes {
+        Ok(b) => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n",
+                b.len(),
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&b);
+        }
+        Err(_) => {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
+    }
+}
+
 fn serve_heatmap_index(stream: &mut TcpStream, state: &SharedState) {
     let body = {
         let maps = state.heatmaps.lock().unwrap();
@@ -759,6 +930,97 @@ fn serve_history(stream: &mut TcpStream, state: &SharedState) {
 mod tests {
     use super::*;
 
+    /// The three Timeline-tab routes over a real socketpair: `/timeline`
+    /// serves the page, `/timeline/hosts` discovers the newest streaming
+    /// run per host (an in-flight `.partial` counts — the live tab reads
+    /// streams, not finished pages), and `/timeline/data` serves the
+    /// shipped JSONL with `.partial` preferred. Path-shaped params are
+    /// refused before any filesystem join.
+    #[test]
+    fn timeline_routes_serve_hosts_and_streams() {
+        let dir = std::env::temp_dir().join(format!("flodl-tlroutes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("exa/run-a")).unwrap();
+        std::fs::write(dir.join("exa/run-a/timeline.log.partial"), "{\"t\":1}\n").unwrap();
+        std::fs::create_dir_all(dir.join("pascal/run-b")).unwrap();
+        std::fs::write(dir.join("pascal/run-b/timeline.log"), "{\"t\":2}\n").unwrap();
+        std::fs::create_dir_all(dir.join("pascal/empty-run")).unwrap();
+
+        let state = Arc::new(SharedState {
+            epochs: Mutex::new(Vec::new()),
+            svg: Mutex::new(None),
+            heatmaps: Mutex::new(Vec::new()),
+            sse_senders: Mutex::new(Vec::new()),
+            label: Mutex::new(None),
+            hash: Mutex::new(None),
+            hardware: Mutex::new(None),
+            metadata: Mutex::new(None),
+            gpu_init: Mutex::new(None),
+            records: Arc::new(Mutex::new(RecordStore::new())),
+            telemetry: Mutex::new(Some((dir.clone(), "exa".to_string()))),
+            shutting_down: AtomicBool::new(false),
+        });
+
+        let respond = |path: &str, query: &str| -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).unwrap();
+            let (mut server_side, _) = listener.accept().unwrap();
+            match path {
+                "/timeline" => serve_timeline_page(&mut server_side),
+                "/timeline/hosts" => serve_timeline_hosts(&mut server_side, &state),
+                "/timeline/data" => serve_timeline_data(&mut server_side, &state, query),
+                _ => unreachable!(),
+            }
+            drop(server_side);
+            let mut out = String::new();
+            let mut c = client;
+            let _ = c.read_to_string(&mut out);
+            out
+        };
+
+        let page = respond("/timeline", "");
+        assert!(
+            page.contains("200 OK") && page.contains("floDl Timeline"),
+            "{}",
+            &page[..200]
+        );
+
+        let hosts = respond("/timeline/hosts", "");
+        assert!(hosts.contains("\"controller\":\"exa\""), "{hosts}");
+        assert!(
+            hosts.contains("{\"host\":\"exa\",\"run\":\"run-a\"}"),
+            "{hosts}"
+        );
+        assert!(
+            hosts.contains("{\"host\":\"pascal\",\"run\":\"run-b\"}"),
+            "{hosts}"
+        );
+        assert!(
+            !hosts.contains("empty-run"),
+            "streamless dir listed: {hosts}"
+        );
+
+        // `.partial` preferred, run defaulting to the host's newest.
+        let data = respond("/timeline/data", "host=exa");
+        assert!(
+            data.contains("200 OK") && data.ends_with("{\"t\":1}\n"),
+            "{data}"
+        );
+        let data = respond("/timeline/data", "host=pascal&run=run-b");
+        assert!(data.ends_with("{\"t\":2}\n"), "{data}");
+
+        assert!(respond("/timeline/data", "host=nosuch").contains("404"));
+        for bad in ["host=../exa", "host=exa&run=../run-a", "host=%2Fetc"] {
+            let out = respond("/timeline/data", bad);
+            assert!(
+                out.contains("400") || out.contains("404"),
+                "{bad} must be refused: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The two heat-map routes, over a real socketpair: the index lists
     /// installed maps with stable urls, the svg route serves the exact
     /// bytes with a save-as filename, and a bad index is a plain 404.
@@ -778,6 +1040,7 @@ mod tests {
             metadata: Mutex::new(None),
             gpu_init: Mutex::new(None),
             records: Arc::new(Mutex::new(RecordStore::new())),
+            telemetry: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
         });
 

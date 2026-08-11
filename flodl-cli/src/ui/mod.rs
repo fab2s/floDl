@@ -262,7 +262,16 @@ fn respond(req: &Request, server: &UiServer) -> Reply {
         // dashboard's legacy `/api/history` route is deliberately NOT
         // forwarded — dashboard.html never fetches it, and `/api/` is
         // this server's own namespace.
-        "/run" | "/events" | "/graph.svg" | "/node" | "/history" | "/paths" | "/stream" => {
+        // `/timeline*` deliberately avoids the dashboard's `/api/` prefix:
+        // `/api/` is THIS server's namespace (token-gated), so a dashboard
+        // route under it could never be forwarded.
+        // `/api/heatmaps` is the one dashboard route living under `/api/`
+        // (this server's token-gated namespace): dashboard.html fetches it
+        // for the heat-map views, and ui has no route of that name, so
+        // forwarding it is unambiguous — without it the proxied live
+        // dashboard's heat maps 404.
+        "/run" | "/events" | "/graph.svg" | "/node" | "/history" | "/paths" | "/stream"
+        | "/timeline" | "/timeline/hosts" | "/timeline/data" | "/api/heatmaps" | "/heatmap.svg" => {
             if req.method != "GET" {
                 return error_json("405 Method Not Allowed", "GET only").into();
             }

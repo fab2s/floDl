@@ -317,6 +317,18 @@ impl ClusterDashboardSink {
     /// Write a self-contained dashboard archive to `path` at teardown, or
     /// `None` for live-only.
     pub fn with_dashboard_html(mut self, path: Option<String>) -> Self {
+        // The shipped telemetry lands beside the archive (`<run dir>/
+        // telemetry`); point the Timeline tab there, with the world-map
+        // controller name so the root view resolves to the right host dir.
+        if let Some(parent) = path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).parent())
+        {
+            self.monitor
+                .lock()
+                .unwrap()
+                .set_telemetry_root(parent.join("telemetry"), self.controller_host.clone());
+        }
         self.dashboard_html = path;
         self
     }
