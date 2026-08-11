@@ -411,6 +411,13 @@ services:
 
   docs-rs:
     image: rust:latest
+    # Same host-identity mapping as every other build service. Without
+    # it this one ran as root and left root-owned artifacts in the three
+    # bind-mounted dirs below, which the owning user then cannot delete
+    # (`fdl cargo target --clear` skips them) and `actions/cache` cannot
+    # read. Stock `rust:latest` makes `/usr/local/{cargo,rustup}`
+    # world-writable, so `rustup install nightly` still works here.
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
       - ./.cargo-cache-docsrs:/usr/local/cargo/registry

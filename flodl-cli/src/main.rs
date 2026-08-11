@@ -176,6 +176,7 @@ fn main() -> ExitCode {
         }
         "libtorch" => dispatch_libtorch(&args),
         "nccl" => dispatch_nccl(&args),
+        "cargo" => dispatch_cargo(&args),
         "diagnose" => {
             let cli: DiagnoseArgs = parse_sub("fdl diagnose", &args[1..]);
             diagnose::run(cli.json);
@@ -611,6 +612,7 @@ fn dispatch_skill(args: &[String]) -> ExitCode {
 }
 
 mod cli;
+use cli::cargo::dispatch_cargo;
 use cli::config::{cmd_config_show, dispatch_config, load_project_config};
 use cli::install::cmd_install;
 use cli::libtorch::dispatch_libtorch;
@@ -652,6 +654,9 @@ pub(crate) fn print_usage() {
     println!("COMMANDS:");
     println!("    setup              Interactive guided setup");
     println!("    libtorch           Manage libtorch installations");
+    println!("    cargo              Report / reclaim cargo's on-disk footprint");
+    println!("        target         Compiled artifacts (--clear = recompute, offline)");
+    println!("        cache          Registry caches (--clear = re-download, online)");
     println!("    init <name>        Scaffold a new floDl project");
     println!("        --docker       Generate Docker-based scaffold (libtorch baked in)");
     println!("    add <target>       Add a flodl ecosystem crate (currently: flodl-hf)");

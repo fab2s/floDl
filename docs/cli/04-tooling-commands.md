@@ -82,6 +82,47 @@ in the `fdl` binary, so this works anywhere, even without a flodl
 checkout. Inside the repo, it uses the latest `ai/skills/` files from
 the source tree.
 
+## `fdl cargo`
+
+Report and reclaim cargo's on-disk footprint. A long-lived checkout
+accumulates tens of GB of compiled artifacts across `target/`,
+per-container target dirs, and the docker-mounted registry caches; this
+command answers "where did my disk go" and gives it back.
+
+```bash
+fdl cargo                  # both tiers, per-path sizes (always safe)
+fdl cargo target           # compiled-artifact tier only
+fdl cargo target --clear   # reclaim it (cost: recompute, no network)
+fdl cargo cache --clear    # reclaim registry caches (cost: re-download)
+fdl cargo --json           # machine-readable report
+```
+
+Two tiers, split by what getting the bytes back costs:
+
+| Tier     | Covers                                                      | Reclaim cost              |
+|----------|-------------------------------------------------------------|---------------------------|
+| `target` | `target/`, `.target*`, workspace-excluded crates' `target/` | recompute, offline-safe   |
+| `cache`  | `.cargo-cache*`, `.cargo-git*`                              | re-download, needs network |
+
+`--clear` deletes a tier's *contents* and always keeps the directories
+themselves: several are docker bind-mount sources, and a removed source
+would be recreated root-owned by the next compose run, breaking container
+builds. Entries the current user cannot delete are skipped, reported with
+the bytes they still hold, and paired with a command that works, never
+fatal. Those entries come from a container that ran as root, so the
+durable fix is a `user:` host-identity mapping on the compose service
+that wrote them rather than a habit of reaching for `sudo` (and note that
+`fdl` installs per user, so `sudo fdl` does not resolve). Bare
+`fdl cargo --clear` is refused: clearing names a tier, because the two
+reclaim costs differ.
+
+Clearing the `target` tier takes its binaries with it, so a symlink
+pointing into that tree resolves to nothing until something rebuilds (the
+clear says so). `fdl install --dev` is unaffected: it links to
+`~/.cargo/bin/fdl`, which is outside the tree. A hand-made link, such as
+a cluster host pointing `fdl` at a shared checkout's
+`target/release/fdl`, does need the rebuild.
+
 ## `fdl completions` / `fdl autocomplete`
 
 Generate shell completion scripts. Completions are project-aware: they

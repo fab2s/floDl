@@ -151,6 +151,10 @@ pub mod libtorch;
 /// pattern used by cross-host heterogeneous-arch clusters.
 pub mod nccl;
 
+/// `fdl cargo` engine: discover, size, and clear cargo's on-disk
+/// footprint (compiled artifacts vs registry caches).
+pub mod cargo;
+
 /// Environment overlay loader (`@env`, `--env`, `FDL_ENV`) with
 /// per-field origin annotations for `fdl config show`.
 pub mod overlay;

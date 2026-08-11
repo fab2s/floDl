@@ -583,6 +583,42 @@ pub struct NcclBuildArgs {
     pub dry_run: bool,
 }
 
+/// Report cargo's on-disk footprint: compiled artifacts + registry
+/// caches, with per-path sizes and tier subtotals. Always safe (sizes
+/// only); reclaiming goes through the tier sub-commands.
+#[derive(crate::FdlArgs, Debug)]
+pub struct CargoArgs {
+    /// Emit machine-readable JSON.
+    #[option]
+    pub json: bool,
+}
+
+/// Compiled-artifact tier: `target/`, `.target*`, workspace-excluded
+/// crates' `target/`. Reclaim = recompute, no network needed.
+#[derive(crate::FdlArgs, Debug)]
+pub struct CargoTargetArgs {
+    /// Delete the tier's contents (directories themselves are kept:
+    /// several are docker bind-mount sources).
+    #[option]
+    pub clear: bool,
+    /// Emit machine-readable JSON.
+    #[option]
+    pub json: bool,
+}
+
+/// Registry-cache tier: `.cargo-cache*`, `.cargo-git*`. Reclaim =
+/// re-download, needs network.
+#[derive(crate::FdlArgs, Debug)]
+pub struct CargoCacheArgs {
+    /// Delete the tier's contents (directories themselves are kept:
+    /// they are docker bind-mount sources).
+    #[option]
+    pub clear: bool,
+    /// Emit machine-readable JSON.
+    #[option]
+    pub json: bool,
+}
+
 /// Install AI coding assistant skills.
 #[derive(crate::FdlArgs, Debug)]
 pub struct SkillInstallArgs {
@@ -691,6 +727,21 @@ pub fn registry() -> &'static [BuiltinSpec] {
             path: &["nccl", "build"],
             description: Some("Compile libnccl for the local GPU arch"),
             schema_fn: Some(NcclBuildArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["cargo"],
+            description: Some("Report / reclaim cargo's on-disk footprint"),
+            schema_fn: Some(CargoArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["cargo", "target"],
+            description: Some("Compiled-artifact tier (reclaim = recompute)"),
+            schema_fn: Some(CargoTargetArgs::schema),
+        },
+        BuiltinSpec {
+            path: &["cargo", "cache"],
+            description: Some("Registry-cache tier (reclaim = re-download)"),
+            schema_fn: Some(CargoCacheArgs::schema),
         },
         BuiltinSpec {
             path: &["init"],
@@ -894,6 +945,7 @@ mod tests {
             "setup",
             "libtorch",
             "nccl",
+            "cargo",
             "diagnose",
             "probe",
             "status",
@@ -932,6 +984,7 @@ mod tests {
                 "setup",
                 "libtorch",
                 "nccl",
+                "cargo",
                 "init",
                 "add",
                 "diagnose",
