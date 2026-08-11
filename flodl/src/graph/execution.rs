@@ -246,13 +246,12 @@ impl Graph {
 
         // Store profile
         if host_profiling {
-            *self.last_profile.borrow_mut() = Some(profile::Profile {
+            self.store_profile(profile::Profile {
                 total: forward_start.unwrap().elapsed(),
                 levels: prof_levels,
                 nodes: prof_nodes,
                 source: profile::ProfileSource::HostWallClock,
             });
-            self.profile_collected.set(false);
         }
 
         // Extract graph output

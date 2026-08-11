@@ -120,6 +120,130 @@ impl fmt::Display for Profile {
     }
 }
 
+// --- Accumulated per-node statistics (across profiled passes) ---
+
+/// Profiled passes dropped before accumulation starts: the first few
+/// passes carry cudnn algorithm selection and allocator growth, not
+/// steady-state cost (the calibration probe needed 3 to settle).
+const PROFILE_WARMUP_PASSES: usize = 3;
+
+/// Per-node timing accumulated across profiled passes.
+#[derive(Clone, Debug)]
+pub struct NodeStat {
+    pub id: String,
+    pub tag: String,
+    pub level: usize,
+    /// Minimum across passes: the standard estimator of the node's
+    /// intrinsic cost, the sample least polluted by interference.
+    pub min: Duration,
+    /// Mean across passes: what the node costs in practice.
+    pub mean: Duration,
+}
+
+/// Running min/mean over profiled passes, keyed by node index.
+///
+/// Node order matches execution order (identical on every rank of a
+/// cohort, which is what makes cross-rank aggregation keyed by index
+/// legitimate); `structural_hash` is the guard for that claim.
+#[derive(Clone, Debug)]
+pub struct ProfileStats {
+    pub source: ProfileSource,
+    pub structural_hash: String,
+    /// Passes accumulated (warmup passes excluded).
+    pub samples: usize,
+    pub total_min: Duration,
+    pub total_mean: Duration,
+    pub nodes: Vec<NodeStat>,
+}
+
+struct NodeStatAcc {
+    id: String,
+    tag: String,
+    level: usize,
+    min_secs: f64,
+    sum_secs: f64,
+}
+
+/// Internal accumulator behind [`Graph::profile_stats`]. Fed at every
+/// profile store; a source change (the graph moved devices) resets it,
+/// since host-clock and device-event samples must not average together.
+pub(crate) struct ProfileStatsAcc {
+    source: ProfileSource,
+    to_skip: usize,
+    samples: usize,
+    total_min_secs: f64,
+    total_sum_secs: f64,
+    nodes: Vec<NodeStatAcc>,
+}
+
+impl ProfileStatsAcc {
+    fn new(source: ProfileSource) -> Self {
+        ProfileStatsAcc {
+            source,
+            to_skip: PROFILE_WARMUP_PASSES,
+            samples: 0,
+            total_min_secs: f64::INFINITY,
+            total_sum_secs: 0.0,
+            nodes: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, p: &Profile) {
+        if self.to_skip > 0 {
+            self.to_skip -= 1;
+            return;
+        }
+        if self.nodes.is_empty() {
+            self.nodes = p
+                .nodes
+                .iter()
+                .map(|n| NodeStatAcc {
+                    id: n.id.clone(),
+                    tag: n.tag.clone(),
+                    level: n.level,
+                    min_secs: f64::INFINITY,
+                    sum_secs: 0.0,
+                })
+                .collect();
+        }
+        let total = p.total.as_secs_f64();
+        self.total_min_secs = self.total_min_secs.min(total);
+        self.total_sum_secs += total;
+        for (acc, n) in self.nodes.iter_mut().zip(&p.nodes) {
+            let secs = n.duration.as_secs_f64();
+            acc.min_secs = acc.min_secs.min(secs);
+            acc.sum_secs += secs;
+        }
+        self.samples += 1;
+    }
+
+    fn snapshot(&self, structural_hash: &str) -> ProfileStats {
+        let n = self.samples.max(1) as f64;
+        ProfileStats {
+            source: self.source,
+            structural_hash: structural_hash.to_string(),
+            samples: self.samples,
+            total_min: Duration::from_secs_f64(if self.samples > 0 {
+                self.total_min_secs
+            } else {
+                0.0
+            }),
+            total_mean: Duration::from_secs_f64(self.total_sum_secs / n),
+            nodes: self
+                .nodes
+                .iter()
+                .map(|a| NodeStat {
+                    id: a.id.clone(),
+                    tag: a.tag.clone(),
+                    level: a.level,
+                    min: Duration::from_secs_f64(if self.samples > 0 { a.min_secs } else { 0.0 }),
+                    mean: Duration::from_secs_f64(a.sum_secs / n),
+                })
+                .collect(),
+        }
+    }
+}
+
 // --- GPU-event profiling (device-side timing) ---
 
 /// GPU profiling state, created lazily on the first profiled CUDA forward
@@ -252,6 +376,49 @@ impl Graph {
         self.profiling.set(false);
         *self.last_profile.borrow_mut() = None;
         *self.gpu_prof.borrow_mut() = GpuProfState::Unused;
+        *self.profile_stats_acc.borrow_mut() = None;
+    }
+
+    /// Single store point for a completed pass's profile: feeds the
+    /// min/mean accumulator, publishes `last_profile`, and re-arms the
+    /// end_step collection flag. A source change resets the accumulator,
+    /// since host-clock and device-event samples must not average together.
+    pub(crate) fn store_profile(&self, p: Profile) {
+        {
+            let mut acc = self.profile_stats_acc.borrow_mut();
+            match acc.as_mut() {
+                Some(a) if a.source == p.source => a.feed(&p),
+                _ => {
+                    let mut fresh = ProfileStatsAcc::new(p.source);
+                    fresh.feed(&p);
+                    *acc = Some(fresh);
+                }
+            }
+        }
+        *self.last_profile.borrow_mut() = Some(p);
+        self.profile_collected.set(false);
+    }
+
+    /// Accumulated per-node min/mean across profiled passes, or None
+    /// when nothing has been accumulated yet (profiling off, or fewer
+    /// passes than the warmup skip).
+    ///
+    /// Same pull semantics as [`profile`](Self::profile): a pending GPU
+    /// pass is folded in if the device has drained it, and the read
+    /// waits only when there is no accumulated sample to serve yet.
+    pub fn profile_stats(&self) -> Option<ProfileStats> {
+        let nothing_to_serve = self
+            .profile_stats_acc
+            .borrow()
+            .as_ref()
+            .is_none_or(|a| a.samples == 0);
+        self.resolve_gpu_profile(nothing_to_serve);
+        let acc = self.profile_stats_acc.borrow();
+        let a = acc.as_ref()?;
+        if a.samples == 0 {
+            return None;
+        }
+        Some(a.snapshot(self.structural_hash()))
     }
 
     /// Reverse tag lookup: node_idx → first tag name.
@@ -302,8 +469,11 @@ impl Graph {
             }
             match pool.resolve() {
                 Ok(p) => {
-                    *self.last_profile.borrow_mut() = Some(p);
-                    self.profile_collected.set(false);
+                    // Drop the pool borrow before the store: store_profile
+                    // touches other cells only, but keeping the scopes
+                    // disjoint keeps the borrow graph obvious.
+                    drop(state);
+                    self.store_profile(p);
                 }
                 Err(e) => {
                     eprintln!(

@@ -147,6 +147,64 @@ fn test_profiling_gpu_event_telescoping() {
 }
 
 #[test]
+fn test_profile_stats_min_mean_warmup() {
+    let graph = FlowBuilder::from(Linear::on_device(8, 8, crate::tensor::test_device()).unwrap())
+        .tag("enc")
+        .through(ReLU::new())
+        .through(Linear::on_device(8, 2, crate::tensor::test_device()).unwrap())
+        .build()
+        .unwrap();
+    let x = Variable::new(from_f32(&[0.5; 8], &[1, 8]), false);
+
+    // No profiling: no stats.
+    graph.forward(&x).unwrap();
+    assert!(graph.profile_stats().is_none());
+
+    graph.enable_profiling();
+
+    // The first 3 profiled passes are warmup: skipped, no stats yet.
+    // (On CUDA, profiles lag one pass, so run one extra and read
+    // through the pull path, which folds a drained pending pass in.)
+    for _ in 0..3 {
+        graph.forward(&x).unwrap();
+    }
+    let after_warmup = graph.profile_stats();
+    if crate::tensor::test_device().is_cuda() {
+        // At most the warmup has resolved; nothing accumulated.
+        assert!(after_warmup.is_none());
+    } else {
+        assert!(after_warmup.is_none(), "3 passes are all warmup");
+    }
+
+    for _ in 0..5 {
+        graph.forward(&x).unwrap();
+    }
+    let stats = graph.profile_stats().unwrap();
+    assert!(stats.samples >= 4, "8 passes minus 3 warmup minus lag");
+    assert_eq!(stats.nodes.len(), 3);
+    assert_eq!(stats.structural_hash, graph.structural_hash());
+    assert_eq!(stats.nodes[0].tag, "enc");
+    for n in &stats.nodes {
+        assert!(
+            n.min <= n.mean,
+            "{}: min {:?} > mean {:?}",
+            n.id,
+            n.min,
+            n.mean
+        );
+    }
+    assert!(stats.total_min <= stats.total_mean);
+    // The node means telescope into the total mean on the event path
+    // and nearly so on the host path (per-node Instant reads add up).
+    let node_mean_sum: f64 = stats.nodes.iter().map(|n| n.mean.as_secs_f64()).sum();
+    assert!(node_mean_sum <= stats.total_mean.as_secs_f64() * 1.5 + 1e-4);
+
+    // Disable wipes the accumulator with the rest of profiling state.
+    graph.disable_profiling();
+    assert!(graph.profile_stats().is_none());
+}
+
+#[test]
 fn test_profiling_timing_trend() {
     let graph = FlowBuilder::from(ScalarSum).tag("loss").build().unwrap();
 
