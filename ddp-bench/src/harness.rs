@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use flodl::autograd::Variable;
 use flodl::distributed::{ApplyPolicy, AverageBackend, Trainer};
 use flodl::graph::GraphExt;
-use flodl::monitor::{Monitor, Timeline};
+use flodl::monitor::{DEFAULT_SPILL_MAX_BYTES, Monitor, Timeline, TimelineSpill, telemetry_dir};
 use flodl::nn::{Module, Optimizer, Parameter};
 use flodl::tensor::{Device, Result, Tensor, TensorError};
 
@@ -362,6 +362,14 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     // Start timeline AFTER data loading so measurements reflect training only.
     let timeline = Timeline::new(100);
     timeline.start();
+    // Node-local crash-forensics spill: the RAM archive above dies with the
+    // process, the spill survives it. Per process on purpose (pid in the dir
+    // name), so fan-out rank children each keep their own.
+    let spill = TimelineSpill::start(
+        &timeline,
+        telemetry_dir(&format!("{}-{mode_str}", model_def.name)),
+        DEFAULT_SPILL_MAX_BYTES,
+    );
 
     // Create monitor. Suppress its "training complete in …" terminal
     // line: the harness owns a richer `done: loss=…, syncs=…,
@@ -432,6 +440,10 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     timeline.stop();
+    // After stop: the poller's exit flush is the final broadcast, and
+    // finish() drains it to disk before returning.
+    let spill_dir = spill.dir().to_path_buf();
+    spill.finish();
 
     // Rotate + save artifacts. Suppressed on cooperative non-narrator ranks
     // (they'd race the narrator's writes to the shared run_dir — the launcher
@@ -530,6 +542,7 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+        eprintln!("  spill: {}", spill_dir.display());
     }
 
     Ok(RunResult {
@@ -1611,8 +1624,8 @@ fn run_cooperative(
     Ok((final_loss, epoch_times, log_lines))
 }
 
-/// Rotate an existing artifact file by appending a timestamp before the extension.
-/// e.g. `training.log` -> `training_YYYY-MM-DD_HH-MM-SS.log`
+/// Rotate an existing artifact file by appending a UTC timestamp before the
+/// extension, e.g. `training.log` -> `training_YYYYMMDD-HHMMSS.log`.
 fn rotate_artifact(dir: &str, filename: &str) {
     let path = format!("{dir}/{filename}");
     if !std::path::Path::new(&path).exists() {
@@ -1622,28 +1635,7 @@ fn rotate_artifact(dir: &str, filename: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // Format as YYYY-MM-DD-HH-MM-SS (UTC) without chrono.
-    let s = secs;
-    let days = s / 86400;
-    let time = s % 86400;
-    let hh = time / 3600;
-    let mm = (time % 3600) / 60;
-    let ss = time % 60;
-    // Days since 1970-01-01 to (y, m, d) -- civil calendar algorithm.
-    let (y, m, d) = {
-        let z = days as i64 + 719468;
-        let era = z.div_euclid(146097);
-        let doe = z.rem_euclid(146097) as u64;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        (y, m, d)
-    };
-    let ts = format!("{y:04}-{m:02}-{d:02}-{hh:02}-{mm:02}-{ss:02}");
+    let ts = flodl::monitor::format_utc_stamp(secs);
     let (stem, ext) = filename.rsplit_once('.').unwrap_or((filename, ""));
     let rotated = if ext.is_empty() {
         format!("{dir}/{stem}_{ts}")

@@ -258,6 +258,11 @@ pub struct TimelineBroadcast {
     pub samples: Vec<TimelineSample>,
     /// Events injected since the last broadcast.
     pub events: Vec<TimelineEvent>,
+    /// Rank-reported samples deposited since the last broadcast (cluster
+    /// runs; empty otherwise). Without these a subscriber on the controller
+    /// would only ever see the controller host's own poller — remote hosts'
+    /// GPU activity would be invisible to any live sink, the spill included.
+    pub rank_samples: Vec<RankTimelineSample>,
 }
 
 /// Full-resolution sample archive cap (~14 h at the default 100 ms poll).
@@ -321,6 +326,8 @@ pub struct Timeline {
     pending_samples: Mutex<Vec<TimelineSample>>,
     /// Pending events accumulated since last broadcast.
     pending_events: Mutex<Vec<TimelineEvent>>,
+    /// Pending rank-reported samples accumulated since last broadcast.
+    pending_rank_samples: Mutex<Vec<RankTimelineSample>>,
 }
 
 impl Timeline {
@@ -345,6 +352,7 @@ impl Timeline {
             subscribers: Mutex::new(Vec::new()),
             pending_samples: Mutex::new(Vec::new()),
             pending_events: Mutex::new(Vec::new()),
+            pending_rank_samples: Mutex::new(Vec::new()),
         })
     }
 
@@ -370,6 +378,7 @@ impl Timeline {
             subscribers: Mutex::new(Vec::new()),
             pending_samples: Mutex::new(Vec::new()),
             pending_events: Mutex::new(Vec::new()),
+            pending_rank_samples: Mutex::new(Vec::new()),
         })
     }
 
@@ -456,12 +465,15 @@ impl Timeline {
                 })
                 .collect(),
         };
-        let mut rank_samples = self.rank_samples.lock().unwrap();
-        rank_samples.push(sample);
-        // Same cap as the poller archive: rank samples ride the
-        // metrics-report cadence (per chunk / per epoch), far sparser
-        // than the 100ms poll, so the cap is a runaway backstop only.
-        trim_archive(&mut rank_samples, MAX_TIMELINE_SAMPLES, "rank sample");
+        {
+            let mut rank_samples = self.rank_samples.lock().unwrap();
+            rank_samples.push(sample.clone());
+            // Same cap as the poller archive: rank samples ride the
+            // metrics-report cadence (per chunk / per epoch), far sparser
+            // than the 100ms poll, so the cap is a runaway backstop only.
+            trim_archive(&mut rank_samples, MAX_TIMELINE_SAMPLES, "rank sample");
+        }
+        self.pending_rank_samples.lock().unwrap().push(sample);
     }
 
     /// Detect idle gaps for a device: consecutive samples where `compute_util < threshold_pct`
@@ -874,12 +886,17 @@ impl Timeline {
     fn flush_broadcast(&self) {
         let samples = std::mem::take(&mut *self.pending_samples.lock().unwrap());
         let events = std::mem::take(&mut *self.pending_events.lock().unwrap());
+        let rank_samples = std::mem::take(&mut *self.pending_rank_samples.lock().unwrap());
 
-        if samples.is_empty() && events.is_empty() {
+        if samples.is_empty() && events.is_empty() && rank_samples.is_empty() {
             return;
         }
 
-        let batch = TimelineBroadcast { samples, events };
+        let batch = TimelineBroadcast {
+            samples,
+            events,
+            rank_samples,
+        };
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|tx| tx.send(batch.clone()).is_ok());
     }
@@ -915,27 +932,31 @@ fn write_samples_json(out: &mut String, samples: &[TimelineSample]) {
         if i > 0 {
             out.push_str(",\n");
         }
+        write_sample_json(out, s);
+    }
+}
+
+/// One poller sample as a single JSON object (no trailing newline). The
+/// spill's line shape: identical to a `samples` array element in
+/// [`Timeline::save_json`], distinguishable in an interleaved stream by
+/// carrying neither `"k"` (events) nor `"rank"` (rank samples).
+pub(super) fn write_sample_json(out: &mut String, s: &TimelineSample) {
+    let _ = write!(
+        out,
+        "{{\"t\":{},\"cpu\":{:.1},\"ram\":[{},{}],\"gpus\":[",
+        s.elapsed_ms, s.cpu_util, s.ram_used_bytes, s.ram_total_bytes,
+    );
+    for (gi, g) in s.gpus.iter().enumerate() {
+        if gi > 0 {
+            out.push(',');
+        }
         let _ = write!(
             out,
-            "{{\"t\":{},\"cpu\":{:.1},\"ram\":[{},{}],\"gpus\":[",
-            s.elapsed_ms, s.cpu_util, s.ram_used_bytes, s.ram_total_bytes,
+            "{{\"d\":{},\"u\":{},\"vu\":{},\"va\":{},\"vt\":{}}}",
+            g.device, g.compute_util, g.vram_used_bytes, g.vram_allocated_bytes, g.vram_total_bytes,
         );
-        for (gi, g) in s.gpus.iter().enumerate() {
-            if gi > 0 {
-                out.push(',');
-            }
-            let _ = write!(
-                out,
-                "{{\"d\":{},\"u\":{},\"vu\":{},\"va\":{},\"vt\":{}}}",
-                g.device,
-                g.compute_util,
-                g.vram_used_bytes,
-                g.vram_allocated_bytes,
-                g.vram_total_bytes,
-            );
-        }
-        out.push_str("]}");
     }
+    out.push_str("]}");
 }
 
 /// Emit `rank_samples` entries: `{"t":..,"rank":..,"host":"..",` then
@@ -947,40 +968,48 @@ fn write_rank_samples_json(out: &mut String, samples: &[RankTimelineSample]) {
         if i > 0 {
             out.push_str(",\n");
         }
-        let host = s.host.replace('\\', "\\\\").replace('"', "\\\"");
-        let _ = write!(
-            out,
-            "{{\"t\":{},\"rank\":{},\"host\":\"{host}\"",
-            s.elapsed_ms, s.rank
-        );
-        if let Some(cpu) = s.cpu_util {
-            let _ = write!(out, ",\"cpu\":{cpu:.1}");
-        }
-        if let Some(used) = s.ram_used_bytes {
-            let _ = write!(out, ",\"ram_used\":{used}");
-        }
-        if let Some(total) = s.ram_total_bytes {
-            let _ = write!(out, ",\"ram_total\":{total}");
-        }
-        out.push_str(",\"gpus\":[");
-        for (gi, g) in s.gpus.iter().enumerate() {
-            if gi > 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{{\"d\":{}", g.device);
-            if let Some(u) = g.compute_util {
-                let _ = write!(out, ",\"u\":{u:.1}");
-            }
-            if let Some(va) = g.vram_allocated_bytes {
-                let _ = write!(out, ",\"va\":{va}");
-            }
-            if let Some(vt) = g.vram_total_bytes {
-                let _ = write!(out, ",\"vt\":{vt}");
-            }
-            out.push('}');
-        }
-        out.push_str("]}");
+        write_rank_sample_json(out, s);
     }
+}
+
+/// One rank-reported sample as a single JSON object (no trailing newline).
+/// The spill's line shape: identical to a `rank_samples` array element in
+/// [`Timeline::save_json`], distinguishable in an interleaved stream by its
+/// `"rank"` key.
+pub(super) fn write_rank_sample_json(out: &mut String, s: &RankTimelineSample) {
+    let host = s.host.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = write!(
+        out,
+        "{{\"t\":{},\"rank\":{},\"host\":\"{host}\"",
+        s.elapsed_ms, s.rank
+    );
+    if let Some(cpu) = s.cpu_util {
+        let _ = write!(out, ",\"cpu\":{cpu:.1}");
+    }
+    if let Some(used) = s.ram_used_bytes {
+        let _ = write!(out, ",\"ram_used\":{used}");
+    }
+    if let Some(total) = s.ram_total_bytes {
+        let _ = write!(out, ",\"ram_total\":{total}");
+    }
+    out.push_str(",\"gpus\":[");
+    for (gi, g) in s.gpus.iter().enumerate() {
+        if gi > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{{\"d\":{}", g.device);
+        if let Some(u) = g.compute_util {
+            let _ = write!(out, ",\"u\":{u:.1}");
+        }
+        if let Some(va) = g.vram_allocated_bytes {
+            let _ = write!(out, ",\"va\":{va}");
+        }
+        if let Some(vt) = g.vram_total_bytes {
+            let _ = write!(out, ",\"vt\":{vt}");
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
 }
 
 fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
@@ -988,157 +1017,165 @@ fn write_events_json(out: &mut String, events: &[TimelineEvent]) {
         if i > 0 {
             out.push_str(",\n");
         }
-        let _ = write!(out, "{{\"t\":{},", e.elapsed_ms);
-        match &e.kind {
-            EventKind::EpochStart { epoch } => {
-                let _ = write!(out, "\"k\":\"epoch_start\",\"epoch\":{epoch}");
+        write_event_json(out, e);
+    }
+}
+
+/// One event as a single JSON object (no trailing newline). The spill's
+/// line shape: identical to an `events` array element in
+/// [`Timeline::save_json`], distinguishable in an interleaved stream by its
+/// `"k"` key.
+pub(super) fn write_event_json(out: &mut String, e: &TimelineEvent) {
+    let _ = write!(out, "{{\"t\":{},", e.elapsed_ms);
+    match &e.kind {
+        EventKind::EpochStart { epoch } => {
+            let _ = write!(out, "\"k\":\"epoch_start\",\"epoch\":{epoch}");
+        }
+        EventKind::EpochEnd { epoch, loss, lr } => {
+            let _ = write!(
+                out,
+                "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6},\"lr\":{lr:.6e}"
+            );
+        }
+        EventKind::SyncStart => {
+            out.push_str("\"k\":\"sync_start\"");
+        }
+        EventKind::SyncEnd { duration_ms } => {
+            let _ = write!(out, "\"k\":\"sync_end\",\"ms\":{duration_ms:.3}");
+        }
+        EventKind::CpuAvgStart => {
+            out.push_str("\"k\":\"cpu_avg_start\"");
+        }
+        EventKind::CpuAvgEnd { duration_ms } => {
+            let _ = write!(out, "\"k\":\"cpu_avg_end\",\"ms\":{duration_ms:.3}");
+        }
+        EventKind::AnchorChanged { from, to } => {
+            let _ = write!(out, "\"k\":\"anchor\",\"from\":{from},\"to\":{to}");
+        }
+        EventKind::Throttle { rank } => {
+            let _ = write!(out, "\"k\":\"throttle\",\"rank\":{rank}");
+        }
+        EventKind::LostBroadcast { control, failures } => {
+            let escaped = control.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = write!(
+                out,
+                "\"k\":\"lost_broadcast\",\"control\":\"{escaped}\",\"failures\":{failures}"
+            );
+        }
+        EventKind::Idle {
+            device,
+            duration_ms,
+        } => {
+            let _ = write!(
+                out,
+                "\"k\":\"idle\",\"dev\":{device},\"ms\":{duration_ms:.1}"
+            );
+        }
+        EventKind::MetaNudge { factor, from, to } => {
+            let _ = write!(
+                out,
+                "\"k\":\"meta_nudge\",\"factor\":{factor:.6},\"from\":{from},\"to\":{to}"
+            );
+        }
+        EventKind::Divergence {
+            d_raw,
+            lambda_raw,
+            lambda_ema,
+            k_used,
+            k_max,
+            step,
+            deltas,
+            post_norm,
+            pre_norms,
+            epoch,
+        } => {
+            let _ = write!(
+                out,
+                "\"k\":\"div\",\"d\":{d_raw:.6e},\"k_used\":{k_used},\"k_max\":{k_max},\"step\":{step}"
+            );
+            if let Some(ep) = epoch {
+                let _ = write!(out, ",\"epoch\":{ep}");
             }
-            EventKind::EpochEnd { epoch, loss, lr } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"epoch_end\",\"epoch\":{epoch},\"loss\":{loss:.6},\"lr\":{lr:.6e}"
-                );
+            if let Some(l) = lambda_raw {
+                let _ = write!(out, ",\"lambda\":{l:.6e}");
             }
-            EventKind::SyncStart => {
-                out.push_str("\"k\":\"sync_start\"");
+            if let Some(l) = lambda_ema {
+                let _ = write!(out, ",\"lambda_ema\":{l:.6e}");
             }
-            EventKind::SyncEnd { duration_ms } => {
-                let _ = write!(out, "\"k\":\"sync_end\",\"ms\":{duration_ms:.3}");
+            if let Some(p) = post_norm {
+                let _ = write!(out, ",\"post_norm\":{p:.6e}");
             }
-            EventKind::CpuAvgStart => {
-                out.push_str("\"k\":\"cpu_avg_start\"");
-            }
-            EventKind::CpuAvgEnd { duration_ms } => {
-                let _ = write!(out, "\"k\":\"cpu_avg_end\",\"ms\":{duration_ms:.3}");
-            }
-            EventKind::AnchorChanged { from, to } => {
-                let _ = write!(out, "\"k\":\"anchor\",\"from\":{from},\"to\":{to}");
-            }
-            EventKind::Throttle { rank } => {
-                let _ = write!(out, "\"k\":\"throttle\",\"rank\":{rank}");
-            }
-            EventKind::LostBroadcast { control, failures } => {
-                let escaped = control.replace('\\', "\\\\").replace('"', "\\\"");
-                let _ = write!(
-                    out,
-                    "\"k\":\"lost_broadcast\",\"control\":\"{escaped}\",\"failures\":{failures}"
-                );
-            }
-            EventKind::Idle {
-                device,
-                duration_ms,
-            } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"idle\",\"dev\":{device},\"ms\":{duration_ms:.1}"
-                );
-            }
-            EventKind::MetaNudge { factor, from, to } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"meta_nudge\",\"factor\":{factor:.6},\"from\":{from},\"to\":{to}"
-                );
-            }
-            EventKind::Divergence {
-                d_raw,
-                lambda_raw,
-                lambda_ema,
-                k_used,
-                k_max,
-                step,
-                deltas,
-                post_norm,
-                pre_norms,
-                epoch,
-            } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"div\",\"d\":{d_raw:.6e},\"k_used\":{k_used},\"k_max\":{k_max},\"step\":{step}"
-                );
-                if let Some(ep) = epoch {
-                    let _ = write!(out, ",\"epoch\":{ep}");
-                }
-                if let Some(l) = lambda_raw {
-                    let _ = write!(out, ",\"lambda\":{l:.6e}");
-                }
-                if let Some(l) = lambda_ema {
-                    let _ = write!(out, ",\"lambda_ema\":{l:.6e}");
-                }
-                if let Some(p) = post_norm {
-                    let _ = write!(out, ",\"post_norm\":{p:.6e}");
-                }
-                if let Some(prs) = pre_norms {
-                    out.push_str(",\"pre_norms\":[");
-                    for (i, p) in prs.iter().enumerate() {
-                        if i > 0 {
-                            out.push(',');
-                        }
-                        let _ = write!(out, "{p:.6e}");
-                    }
-                    out.push(']');
-                }
-                out.push_str(",\"deltas\":[");
-                for (i, d) in deltas.iter().enumerate() {
+            if let Some(prs) = pre_norms {
+                out.push_str(",\"pre_norms\":[");
+                for (i, p) in prs.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    let _ = write!(out, "{d:.6e}");
+                    let _ = write!(out, "{p:.6e}");
                 }
                 out.push(']');
             }
-            EventKind::GuardTelemetry {
-                epoch,
-                step,
-                values,
-            } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"guard_telemetry\",\"epoch\":{epoch},\"step\":{step},\"values\":{{",
-                );
-                for (i, (k, v)) in values.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    let escaped = k.replace('\\', "\\\\").replace('"', "\\\"");
-                    let _ = write!(out, "\"{escaped}\":{v:.6e}");
+            out.push_str(",\"deltas\":[");
+            for (i, d) in deltas.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
                 }
-                out.push('}');
+                let _ = write!(out, "{d:.6e}");
             }
-            EventKind::DivergenceEpoch {
-                epoch,
-                sync_count,
-                d_min,
-                d_max,
-                d_mean,
-                lambda_min,
-                lambda_max,
-                lambda_mean,
-                lambda_ema_at_epoch_end,
-                d_at_epoch_end,
-                k_at_epoch_end,
-            } => {
-                let _ = write!(
-                    out,
-                    "\"k\":\"div_epoch\",\"epoch\":{epoch},\"syncs\":{sync_count},\
+            out.push(']');
+        }
+        EventKind::GuardTelemetry {
+            epoch,
+            step,
+            values,
+        } => {
+            let _ = write!(
+                out,
+                "\"k\":\"guard_telemetry\",\"epoch\":{epoch},\"step\":{step},\"values\":{{",
+            );
+            for (i, (k, v)) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let escaped = k.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(out, "\"{escaped}\":{v:.6e}");
+            }
+            out.push('}');
+        }
+        EventKind::DivergenceEpoch {
+            epoch,
+            sync_count,
+            d_min,
+            d_max,
+            d_mean,
+            lambda_min,
+            lambda_max,
+            lambda_mean,
+            lambda_ema_at_epoch_end,
+            d_at_epoch_end,
+            k_at_epoch_end,
+        } => {
+            let _ = write!(
+                out,
+                "\"k\":\"div_epoch\",\"epoch\":{epoch},\"syncs\":{sync_count},\
                      \"d_min\":{d_min:.6e},\"d_max\":{d_max:.6e},\"d_mean\":{d_mean:.6e},\
                      \"d_end\":{d_at_epoch_end:.6e},\"k_end\":{k_at_epoch_end}"
-                );
-                if let Some(l) = lambda_min {
-                    let _ = write!(out, ",\"lambda_min\":{l:.6e}");
-                }
-                if let Some(l) = lambda_max {
-                    let _ = write!(out, ",\"lambda_max\":{l:.6e}");
-                }
-                if let Some(l) = lambda_mean {
-                    let _ = write!(out, ",\"lambda_mean\":{l:.6e}");
-                }
-                if let Some(l) = lambda_ema_at_epoch_end {
-                    let _ = write!(out, ",\"lambda_ema_end\":{l:.6e}");
-                }
+            );
+            if let Some(l) = lambda_min {
+                let _ = write!(out, ",\"lambda_min\":{l:.6e}");
+            }
+            if let Some(l) = lambda_max {
+                let _ = write!(out, ",\"lambda_max\":{l:.6e}");
+            }
+            if let Some(l) = lambda_mean {
+                let _ = write!(out, ",\"lambda_mean\":{l:.6e}");
+            }
+            if let Some(l) = lambda_ema_at_epoch_end {
+                let _ = write!(out, ",\"lambda_ema_end\":{l:.6e}");
             }
         }
-        out.push('}');
     }
+    out.push('}');
 }
 
 #[cfg(test)]
@@ -1429,6 +1466,32 @@ mod tests {
         assert!(total_samples >= 1, "expected samples, got {total_samples}");
         // The epoch event should have been broadcast
         assert!(total_events >= 1, "expected events, got {total_events}");
+    }
+
+    /// Rank-reported samples ride the broadcast alongside samples and
+    /// events — without this a controller-side subscriber (the spill
+    /// included) would never see remote hosts' GPU activity.
+    #[test]
+    fn test_subscribe_receives_rank_samples() {
+        let tl = Timeline::with_intervals(50, 100);
+        let rx = tl.subscribe();
+        tl.rank_sample(
+            3,
+            "pascal",
+            &crate::monitor::ResourceSample {
+                cpu_percent: Some(21.0),
+                ..Default::default()
+            },
+        );
+        tl.start();
+        std::thread::sleep(Duration::from_millis(250));
+        tl.stop();
+
+        let mut got = 0;
+        while let Ok(batch) = rx.try_recv() {
+            got += batch.rank_samples.len();
+        }
+        assert!(got >= 1, "expected a rank sample in the broadcast");
     }
 
     #[test]
