@@ -92,6 +92,26 @@ fn the_page_carries_the_token_and_only_behind_the_host_check() {
 }
 
 #[test]
+fn the_run_tab_carries_the_dashboard_discovery_wiring() {
+    // The discovery itself is page JS, which no Rust test can execute, so
+    // this guards the wiring that makes it possible: the port comes from
+    // the run's own status document, and a discovered-but-unreachable
+    // port must name the tunnel rather than leave the operator guessing.
+    // A refactor that drops either fails here instead of on the rig.
+    let tmp = tempdir();
+    let (port, token) = spawn_server(&tmp);
+    let local = format!("127.0.0.1:{port}");
+    let page = get(port, "/", Some(&local), None);
+    assert!(page.contains("dashboardPortFrom"), "discovery helper gone");
+    assert!(page.contains("dashboard_port"), "status field not read");
+    assert!(page.contains("ssh -L "), "tunnel hint gone");
+    // Discovery only ever proposes; the reachability probe decides.
+    assert!(page.contains("/api/run-target"), "probe route gone");
+    let _ = token;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn api_routes_need_the_token_and_serve_the_farm_list() {
     let tmp = tempdir();
     std::fs::write(tmp.join("fdl.yml"), "# base\n").unwrap();

@@ -62,6 +62,41 @@ struct StartSwitch {
     token_hex: String,
 }
 
+/// Everything the board publishes, behind one lock. The rendered JSON
+/// and its typed source live together so they cannot disagree (the
+/// `POST /start` handler needs the typed form for phase/quorum gating,
+/// and parsing the JSON back would be silly), and so recording the
+/// dashboard port can re-render atomically against the same snapshot.
+#[derive(Default)]
+struct Published {
+    /// Pre-serialized document served by the HTTP responder.
+    json: Option<String>,
+    /// The membership snapshot `json` was rendered from.
+    latest: Option<MembershipSnapshot>,
+    /// Where this run's training dashboard is listening, once a rank has
+    /// asked for one and the launcher's sink has bound it. Not part of
+    /// [`MembershipSnapshot`] on purpose: the ledger answers who joined,
+    /// and has no business knowing about dashboards. The status
+    /// *document* is a superset of it.
+    dashboard_port: Option<u16>,
+}
+
+/// Render the status document: the membership snapshot plus the fields
+/// the board owns. `dashboard_port` is always present so a consumer can
+/// tell "no dashboard" (null) from "old flodl" (absent).
+fn render(snapshot: &MembershipSnapshot, dashboard_port: Option<u16>) -> Option<String> {
+    let mut value = serde_json::to_value(snapshot).ok()?;
+    let obj = value.as_object_mut()?;
+    obj.insert(
+        "dashboard_port".to_string(),
+        match dashboard_port {
+            Some(port) => serde_json::json!(port),
+            None => serde_json::Value::Null,
+        },
+    );
+    serde_json::to_string(&value).ok()
+}
+
 /// Shared, cloneable slot holding the latest membership state as
 /// pre-serialized JSON. The controller publishes transitions; the HTTP
 /// responder (and the debug log) serve the SAME string, so the log and
@@ -69,10 +104,7 @@ struct StartSwitch {
 /// start switch: the HTTP responder arms it, the join window polls it.
 #[derive(Clone, Default)]
 pub(crate) struct StatusBoard {
-    state_json: Arc<Mutex<Option<String>>>,
-    /// Typed twin of `state_json`, for the `POST /start` handler's
-    /// phase/quorum gating (parsing the JSON back would be silly).
-    latest: Arc<Mutex<Option<MembershipSnapshot>>>,
+    published: Arc<Mutex<Published>>,
     start: Arc<Mutex<Option<StartSwitch>>>,
     start_requested: Arc<AtomicBool>,
 }
@@ -85,7 +117,8 @@ impl StatusBoard {
     /// Publish a snapshot: serialize once, store for the HTTP endpoint,
     /// and mirror to the debug stream.
     pub fn publish(&self, snapshot: &MembershipSnapshot) {
-        let Ok(js) = serde_json::to_string(snapshot) else {
+        let mut published = self.published.lock().unwrap();
+        let Some(js) = render(snapshot, published.dashboard_port) else {
             // Serialize on plain data types cannot realistically fail;
             // if it somehow does, keep serving the previous state.
             return;
@@ -93,13 +126,33 @@ impl StatusBoard {
         if crate::log::enabled(crate::log::Verbosity::Debug) {
             crate::debug!("cluster membership: state {js}");
         }
-        *self.state_json.lock().unwrap() = Some(js);
-        *self.latest.lock().unwrap() = Some(snapshot.clone());
+        published.json = Some(js);
+        published.latest = Some(snapshot.clone());
+    }
+
+    /// Record where the training dashboard bound, and re-render the
+    /// current document so the endpoint carries it immediately.
+    ///
+    /// The re-render is the point: the sink binds on the first rank's
+    /// register frame, which happens AFTER the last membership
+    /// transition, so waiting for the next `publish` would mean waiting
+    /// for one that may never come. This is what lets anything holding
+    /// the controller address (`fdl status`, `fdl ui`'s run tab) find
+    /// the dashboard without being told the port.
+    pub fn set_dashboard_port(&self, port: u16) {
+        let mut published = self.published.lock().unwrap();
+        published.dashboard_port = Some(port);
+        if let Some(snapshot) = published.latest.take() {
+            if let Some(js) = render(&snapshot, Some(port)) {
+                published.json = Some(js);
+            }
+            published.latest = Some(snapshot);
+        }
     }
 
     /// Latest published state, if any.
     pub fn state_json(&self) -> Option<String> {
-        self.state_json.lock().unwrap().clone()
+        self.published.lock().unwrap().json.clone()
     }
 
     /// Wire the operator start switch (launcher, before the window
@@ -226,8 +279,8 @@ fn handle_start(
             );
         }
     }
-    let latest = board.latest.lock().unwrap();
-    let Some(snap) = latest.as_ref() else {
+    let published = board.published.lock().unwrap();
+    let Some(snap) = published.latest.as_ref() else {
         return (
             "503 Service Unavailable",
             r#"{"error":"no membership state published yet"}"#.to_string(),
@@ -313,6 +366,45 @@ mod tests {
                 joined_at_secs: 2,
             }],
         }
+    }
+
+    #[test]
+    fn the_dashboard_port_reaches_the_document_after_the_last_publish() {
+        let board = StatusBoard::new();
+        board.publish(&snapshot(ClusterPhase::Training));
+        // No dashboard yet: the key is present and null, so a consumer
+        // can tell "this run serves none" from "this flodl is older".
+        assert!(
+            board
+                .state_json()
+                .unwrap()
+                .contains(r#""dashboard_port":null"#),
+            "{}",
+            board.state_json().unwrap()
+        );
+
+        // The sink binds after formation, which is after the last
+        // membership transition — so recording the port must re-render
+        // the current document rather than wait for a publish that may
+        // never come. This is the whole point of the field.
+        board.set_dashboard_port(8099);
+        let js = board.state_json().unwrap();
+        assert!(js.contains(r#""dashboard_port":8099"#), "{js}");
+        // Re-rendered against the same snapshot, nothing else lost.
+        assert!(js.contains(r#""phase":"training""#), "{js}");
+        assert!(js.contains(r#""host":"node-a""#), "{js}");
+
+        // And it survives later membership transitions (elastic
+        // scale-down keeps publishing while the dashboard stays put).
+        board.publish(&snapshot(ClusterPhase::Waiting));
+        assert!(
+            board
+                .state_json()
+                .unwrap()
+                .contains(r#""dashboard_port":8099"#),
+            "{}",
+            board.state_json().unwrap()
+        );
     }
 
     #[test]
