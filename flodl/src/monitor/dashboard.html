@@ -149,10 +149,8 @@ stroke-linecap:round;stroke-linejoin:round}
 :root[data-theme="light"] .theme-toggle .moon{display:inline-block}
 
 /* SVG toggle */
-.svg-toggle{cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px}
-.svg-toggle .arrow{transition:transform 0.2s;font-size:10px}
-.svg-toggle.open .arrow{transform:rotate(90deg)}
-.svg-container{max-height:0;overflow:hidden;transition:max-height 0.3s ease;background:var(--paper);border-radius:6px;margin-top:8px}
+.svg-toggle{display:flex;align-items:center;gap:6px}
+.svg-container{overflow-y:auto;background:var(--paper);border-radius:6px;margin-top:8px}
 /* A deep model's graph is a tall, narrow ribbon (ResNet-56 renders ~272pt
    wide by ~7500pt high). `width:100%` upscaled that thinness to the card
    width and multiplied the height by the same factor, so the card grew to
@@ -317,8 +315,7 @@ animation:pulse 2s ease-in-out infinite}
   </div>
 
   <div class="card full-width" id="svgCard" style="display:none">
-    <div class="svg-toggle" id="svgToggle" onclick="toggleSvg()">
-      <span class="arrow">&#9654;</span>
+    <div class="svg-toggle" id="svgToggle">
       <h2 style="margin:0">Graph Architecture</h2>
       <span id="svgViews" style="display:none;gap:6px;margin-left:12px"></span>
       <a id="svgDownload" title="Download the displayed SVG" style="display:none;margin-left:auto;font-size:12px;color:var(--muted);text-decoration:none">SVG &#8681;</a>
@@ -769,50 +766,77 @@ function timelineHost(){
   }
   return TL_INFO?TL_INFO.controller:null;
 }
-function updateTimelinePanel(){
+function setTimelineFrame(src,scopeText){
   const holder=document.getElementById('timelineFrameHolder');
-  const hint=document.getElementById('timelineHint');
-  const scope=document.getElementById('timelineScope');
-  if(typeof ARCHIVE_DATA!=='undefined'){
-    // Archive mode: the telemetry card below the panel carries the
-    // shipped per-host pages (they are self-contained files, no server).
-    const has=typeof ARCHIVE_TELEMETRY!=='undefined'&&Array.isArray(ARCHIVE_TELEMETRY)&&ARCHIVE_TELEMETRY.length;
-    hint.textContent=has
-      ?'Open a host below — each link is the full-resolution forensic timeline shipped with this run.'
-      :'This archive shipped no per-host telemetry.';
-    hint.style.display='block';
-    return;
-  }
-  if(!TL_INFO){
-    fetch('/timeline/hosts').then(r=>r.json()).then(j=>{TL_INFO=j;updateTimelinePanel()})
-      .catch(()=>{hint.textContent='Timeline source unavailable.';hint.style.display='block'});
-    return;
-  }
-  const host=timelineHost();
-  if(!host){
-    hint.textContent='This run ships no telemetry.';
-    hint.style.display='block';
-    return;
-  }
-  hint.style.display='none';
-  scope.textContent=host+' · auto-refreshes every 10s';
+  document.getElementById('timelineHint').style.display='none';
+  document.getElementById('timelineScope').textContent=scopeText;
   let f=holder.querySelector('iframe');
   if(!f){
     f=document.createElement('iframe');
     f.style.cssText='width:100%;height:78vh;border:0;border-radius:8px;background:var(--bg)';
     holder.appendChild(f);
   }
-  const src='/timeline?host='+encodeURIComponent(host);
   if(f.dataset.src!==src){f.src=src;f.dataset.src=src}
+}
+function timelineHintOnly(text){
+  const holder=document.getElementById('timelineFrameHolder');
+  const f=holder.querySelector('iframe');
+  if(f)f.remove();
+  document.getElementById('timelineScope').textContent='';
+  const hint=document.getElementById('timelineHint');
+  hint.textContent=text;
+  hint.style.display='block';
+}
+/// A host without a shipped stream stays without one for the run's whole
+/// life in practice (an unwritable shared run dir keeps its shipper
+/// node-local), so say where its data still lives instead of implying it
+/// is on the way.
+function timelineUnpublished(host){
+  return host+' has not published telemetry (unwritable shared run dir keeps its '
+    +'shipper node-local). Its GPU activity still shows in the controller timeline at root.';
+}
+function updateTimelinePanel(){
+  if(typeof ARCHIVE_DATA!=='undefined'){
+    // Archive mode drives the same crumb-following iframe as live: the
+    // entries' hrefs are relative, so they resolve from a file:// open
+    // and through fdl ui's path-preserving /archive/ route alike. The
+    // link card below stays as the all-hosts index.
+    const entries=typeof ARCHIVE_TELEMETRY!=='undefined'&&Array.isArray(ARCHIVE_TELEMETRY)
+      ?ARCHIVE_TELEMETRY:[];
+    if(!entries.length){timelineHintOnly('This archive shipped no per-host telemetry.');return}
+    const controller=typeof ARCHIVE_TELEMETRY_CONTROLLER!=='undefined'?ARCHIVE_TELEMETRY_CONTROLLER:null;
+    const segs=current.split('/');
+    const host=current!==ROOT&&segs.length>1?segs[1]:controller;
+    // Several runs can share the dir; run ids embed the UTC stamp, so
+    // the lexicographic last is the newest for that host.
+    const mine=entries.filter(e=>e.host===host);
+    const entry=mine.length?mine[mine.length-1]:null;
+    if(!entry){
+      timelineHintOnly(host
+        ?timelineUnpublished(host)
+        :'No entry for the controller in this archive — open a host from the list below.');
+      return;
+    }
+    setTimelineFrame(entry.href,entry.host+' · '+entry.run);
+    return;
+  }
+  const hint=document.getElementById('timelineHint');
+  if(!TL_INFO){
+    fetch('/timeline/hosts').then(r=>r.json()).then(j=>{TL_INFO=j;updateTimelinePanel()})
+      .catch(()=>{hint.textContent='Timeline source unavailable.';hint.style.display='block'});
+    return;
+  }
+  const host=timelineHost();
+  if(!host){timelineHintOnly('This run ships no telemetry.');return}
+  if(!TL_INFO.hosts.some(h=>h.host===host)){
+    timelineHintOnly(timelineUnpublished(host));
+    return;
+  }
+  setTimelineFrame('/timeline?host='+encodeURIComponent(host),host+' · auto-refreshes every 10s');
 }
 function applyTab(){
   document.body.dataset.tab=currentTab;
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('active',b.dataset.tab===currentTab));
-  if(currentTab==='architecture'){
-    // The fold-in unclutters Overview; inside its own tab the SVG opens.
-    const t=document.getElementById('svgToggle');
-    if(t&&!t.classList.contains('open'))toggleSvg();
-  }
   if(currentTab==='timeline')updateTimelinePanel();
 }
 
@@ -1590,22 +1614,14 @@ function renderHardware(){
 // every other card thousands of pixels down the page.
 function svgOpenHeight(c){return Math.min(c.scrollHeight,Math.round(window.innerHeight*0.7))}
 function showSvg(svg){
+  // Always expanded: the card lives in its own Architecture tab now, so
+  // the old collapse affordance is gone. Height stays viewport-capped —
+  // a deep model scrolls internally instead of pushing the page down.
   const card=document.getElementById('svgCard'),c=document.getElementById('svgContainer');
   card.dataset.have='1';
   card.style.display=current===ROOT?'block':'none';
   c.innerHTML=svg;
-  if(document.getElementById('svgToggle').classList.contains('open')){
-    c.style.overflowY='auto';
-    c.style.maxHeight=svgOpenHeight(c)+'px';
-  }
-}
-function toggleSvg(){
-  const t=document.getElementById('svgToggle'),c=document.getElementById('svgContainer');
-  const opening=!t.classList.contains('open');
-  t.classList.toggle('open');
-  // Hidden while collapsing so the scrollbar doesn't flicker on the way out.
-  c.style.overflowY=opening?'auto':'hidden';
-  c.style.maxHeight=opening?svgOpenHeight(c)+'px':'0';
+  c.style.maxHeight=svgOpenHeight(c)+'px';
 }
 // --- graph views: the structural SVG plus one baked timing heat map per
 // GPU model. Heat maps arrive at teardown (the SSE `complete` refetch);

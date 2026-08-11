@@ -1198,6 +1198,14 @@ impl Monitor {
             b
         };
 
+        // The controller's host name, so an archived page can resolve the
+        // ROOT crumb's timeline entry the same way the live tab does.
+        let telemetry_controller_js = match &self.telemetry_root {
+            Some((_, controller)) if !controller.is_empty() => {
+                serde_json::Value::String(controller.clone()).to_string()
+            }
+            _ => "null".to_string(),
+        };
         let telemetry_js = serde_json::Value::Array(
             telemetry
                 .iter()
@@ -1213,7 +1221,7 @@ impl Monitor {
         .to_string();
 
         let archive_consts = format!(
-            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_HEATMAPS={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\nconst ARCHIVE_TELEMETRY={};\n",
+            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_HEATMAPS={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\nconst ARCHIVE_TELEMETRY={};\nconst ARCHIVE_TELEMETRY_CONTROLLER={};\n",
             match &self.archive_theme {
                 Some(t) => format!("\"{t}\""),
                 None => "null".to_string(),
@@ -1229,6 +1237,7 @@ impl Monitor {
             hw_js,
             gpu_init_js,
             telemetry_js,
+            telemetry_controller_js,
         );
         let archive_block = format!(
             "<script>{}</script>",
@@ -1515,10 +1524,16 @@ mod tests {
         }
         let archive = dir.join("dashboard.html");
 
-        let monitor = Monitor::new(1);
+        let mut monitor = Monitor::new(1);
+        monitor.set_telemetry_root(dir.join("telemetry"), "exa".to_string());
         monitor.write_archive_now(archive.to_str().unwrap());
         let html = std::fs::read_to_string(&archive).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            html.contains("const ARCHIVE_TELEMETRY_CONTROLLER=\"exa\";"),
+            "controller stamp missing"
+        );
 
         let idx = html
             .split_once("const ARCHIVE_TELEMETRY=")
