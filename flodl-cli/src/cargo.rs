@@ -517,11 +517,39 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Whether this process can unlink inside a write-protected
+    /// directory, i.e. whether it holds root's DAC override.
+    ///
+    /// Probed, not derived from a uid: the capability is exactly what the
+    /// assertion below depends on, and `geteuid` would need libc in a
+    /// zero-dep crate while `/proc/self/status` does not exist on macOS.
+    /// Cleans up after itself so the caller's fixture starts empty.
+    #[cfg(unix)]
+    fn can_override_dir_perms(root: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = root.join("dac-probe");
+        fs::create_dir_all(&probe).expect("probe dir");
+        fs::write(probe.join("f"), "x").expect("probe file");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o555)).expect("probe chmod");
+        let overridden = fs::remove_file(probe.join("f")).is_ok();
+        let _ = fs::set_permissions(&probe, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&probe);
+        overridden
+    }
+
+    #[cfg(unix)]
     #[test]
     fn clear_contents_reports_undeletable_and_continues() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new();
         let root = tmp.path();
+        // Root bypasses a directory's write bit, so the fixture below is
+        // only undeletable for an ordinary user. Assert the branch that
+        // actually applies rather than skipping: os.yml's rocky legs run
+        // their container AS ROOT, and a silent early return would report
+        // ok on the one platform whose condition differs.
+        let privileged = can_override_dir_perms(root);
+
         touch(root, "locked/pinned.bin", "can't touch this");
         touch(root, "free.bin", "gone");
         // Read+exec but no write: children can be listed, not unlinked.
@@ -531,8 +559,23 @@ mod tests {
 
         let out = clear_contents(root);
 
-        // Restore before asserting so Drop can clean up either way.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        // Restore so Drop can clean up. Not `unwrap`: when privileged the
+        // directory is already gone, and its absence is the expected
+        // outcome there rather than a failure worth panicking on.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        if privileged {
+            // Nothing on a normal filesystem is undeletable for root, so
+            // the whole tree goes. What matters is that the report says so
+            // instead of inventing a skip or losing the freed bytes.
+            assert!(out.skipped.is_empty(), "root skipped: {:?}", out.skipped);
+            assert_eq!(out.removed_files, 2, "both files removed as root");
+            assert_eq!(out.skipped_bytes, 0);
+            assert!(out.freed > 0);
+            assert!(root.is_dir(), "root must survive a clear");
+            assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+            return;
+        }
 
         assert_eq!(out.removed_files, 1, "free.bin still removed");
         assert!(!out.skipped.is_empty());
