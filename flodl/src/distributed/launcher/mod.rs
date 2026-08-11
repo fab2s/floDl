@@ -1413,6 +1413,7 @@ pub fn run_launcher_with_config(
                 config.num_epochs,
             )
             .with_record_log(record_log)
+            .with_status_board(status_board.clone())
             .with_scalar_reductions(config.scalar_reductions.clone())
             .with_dashboard_html(config.dashboard_html.clone())
             .with_dashboard_theme(config.dashboard_theme.clone()),

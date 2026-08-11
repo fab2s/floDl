@@ -152,6 +152,11 @@ pub struct ClusterDashboardSink {
     controller_host: String,
     /// Bound port (0 = not yet bound).
     bound_port: Mutex<u16>,
+    /// The run's status board, so the port this sink binds becomes
+    /// discoverable on the controller's status endpoint. Without it the
+    /// dashboard's location is known only to rank user-code and to
+    /// whoever reads the launcher's stderr.
+    status_board: Option<crate::distributed::status::StatusBoard>,
     /// `true` once an SVG has been installed; subsequent set_svg calls
     /// are dropped (every rank ships the same SVG).
     svg_installed: Mutex<bool>,
@@ -238,6 +243,7 @@ impl ClusterDashboardSink {
             cluster,
             controller_host,
             bound_port: Mutex::new(0),
+            status_board: None,
             svg_installed: Mutex::new(false),
             svg_copy: Mutex::new(None),
             per_rank_hardware: Mutex::new(vec![None; world_size]),
@@ -266,6 +272,18 @@ impl ClusterDashboardSink {
         log: Option<Arc<crate::monitor::record_log::RecordLog>>,
     ) -> Self {
         self.record_log = log;
+        self
+    }
+
+    /// Report the bound dashboard port to the run's status board, making
+    /// it discoverable by anything holding the controller address.
+    /// `pub(crate)` because [`crate::distributed::status::StatusBoard`]
+    /// is internal; the launcher is the only caller.
+    pub(crate) fn with_status_board(
+        mut self,
+        board: crate::distributed::status::StatusBoard,
+    ) -> Self {
+        self.status_board = Some(board);
         self
     }
 
@@ -556,6 +574,11 @@ impl DashboardSink for ClusterDashboardSink {
         match mon.serve_local_unconditional(port) {
             Ok(()) => {
                 *bound = port;
+                // Announce it on the status endpoint too, so finding the
+                // dashboard does not require reading this stderr line.
+                if let Some(board) = &self.status_board {
+                    board.set_dashboard_port(port);
+                }
                 if crate::monitor::dashboard_bind_is_loopback() {
                     // Loopback default: the URL below only works ON the
                     // controller. Point remote viewers at an SSH tunnel rather
@@ -1226,6 +1249,54 @@ mod tests {
         let r = &log.tail("root", 10)[0];
         assert!(r.get("res").is_none(), "no resource fields anywhere: {r}");
         assert!(log.tail("root/exa/rank0", 10)[0].get("label").is_none());
+    }
+
+    /// Binding the dashboard makes its port discoverable on the status
+    /// endpoint. This is the wiring `fdl ui`'s run tab depends on: the
+    /// port is known only here, and only at bind time, so if the sink
+    /// stops telling the board nobody downstream can find the dashboard
+    /// without reading the launcher's stderr.
+    #[test]
+    fn binding_the_dashboard_publishes_its_port_to_the_status_board() {
+        let board = crate::distributed::status::StatusBoard::new();
+        // A published snapshot is the document the port re-renders into.
+        board.publish(&crate::distributed::membership::MembershipSnapshot {
+            phase: crate::distributed::membership::ClusterPhase::Training,
+            joined_ranks: 1,
+            joined_hosts: 1,
+            min_rank_start: 1,
+            target_ranks: None,
+            window_remaining_secs: None,
+            cap_remaining_secs: None,
+            start_mode: crate::distributed::membership::StartMode::Auto,
+            start_armed: false,
+            members: vec![],
+        });
+        assert!(
+            board
+                .state_json()
+                .unwrap()
+                .contains(r#""dashboard_port":null"#)
+        );
+
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_status_board(board.clone());
+        // Port 0 lets the OS pick, but the sink publishes what it was
+        // asked for, so use a real free port to keep the assertion exact.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        sink.register_port(0, port);
+
+        assert!(
+            board
+                .state_json()
+                .unwrap()
+                .contains(&format!(r#""dashboard_port":{port}"#)),
+            "{}",
+            board.state_json().unwrap()
+        );
+        sink.shutdown();
     }
 
     #[test]

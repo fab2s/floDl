@@ -288,6 +288,16 @@ fn print_status(addr: &str, body: &str) {
         }
     }
 
+    // Where the run's live dashboard is, once a rank has asked for one
+    // and the launcher bound it. Absent on older flodl, null when the
+    // run serves no dashboard; either way there is nothing to point at.
+    // The URL is written against the controller's own host because the
+    // bind is loopback by default, so it resolves only there.
+    if let Some(port) = state["dashboard_port"].as_u64() {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        println!("  dashboard: {}", style::bold(&format!("{host}:{port}")));
+    }
+
     let Some(members) = state["members"].as_array() else {
         return;
     };
@@ -363,6 +373,51 @@ mod tests {
         let gpus = serde_json::json!(["GP106", "RTX 5060 Ti"]);
         assert_eq!(summarize_gpus(&gpus), "GP106, RTX 5060 Ti");
         assert_eq!(summarize_gpus(&serde_json::json!([])), "no GPUs listed");
+    }
+
+    /// A one-shot status endpoint answering 200 with `body`, as the
+    /// controller's mux leg would. Returns its address.
+    fn fake_endpoint(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Connection: close\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                )
+                .as_bytes(),
+            );
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn a_run_that_reports_its_dashboard_port_is_fetched_verbatim() {
+        // The field the launcher's status board adds once its sink binds.
+        // This is the discovery channel `fdl ui`'s run tab reads, so what
+        // matters is that it survives the fetch intact.
+        let (addr, server) = fake_endpoint(
+            r#"{"phase":"training","joined_ranks":3,"members":[],"dashboard_port":8099}"#,
+        );
+        let body = fetch_state(&addr).expect("fetch");
+        server.join().unwrap();
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(state["dashboard_port"].as_u64(), Some(8099));
+        // A run serving no dashboard says so with null, which must not
+        // read as a port.
+        let (addr, server) =
+            fake_endpoint(r#"{"phase":"training","joined_ranks":3,"dashboard_port":null}"#);
+        let body = fetch_state(&addr).expect("fetch");
+        server.join().unwrap();
+        let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(state["dashboard_port"].as_u64().is_none());
     }
 
     #[test]

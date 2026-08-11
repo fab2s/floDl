@@ -1452,19 +1452,56 @@ async function refreshRunSlot() {
     return;
   }
   runConnected = false;
-  const note = el("p", "slot-note",
-    target.port
-      ? "nothing answering on 127.0.0.1:" + target.port + " yet — admission view below, re-probing"
-      : "no dashboard port set — admission view below (Connect points the slot at a live run)");
   const out = el("div", "result");
+  const note = el("p", "slot-note", "");
   slot.replaceChildren(note, out);
   const env = document.getElementById("run-env").value;
+  let status = null;
   try {
-    renderRun(out, await api("/api/status" + (env ? "?env=" + encodeURIComponent(env) : "")));
+    status = await api("/api/status" + (env ? "?env=" + encodeURIComponent(env) : ""));
+    renderRun(out, status);
   } catch (e) {
     out.replaceChildren(el("pre", "", String(e.message || e)));
   }
+  // A running cluster reports where its dashboard bound, so the slot can
+  // find it without anyone typing a port. Discovery only proposes the
+  // number: the reachability probe still decides, because this server
+  // proxies 127.0.0.1 only and the run may be on another box.
+  const found = dashboardPortFrom(status);
+  if (found && found !== target.port) {
+    document.getElementById("run-port").value = String(found);
+    localStorage.setItem("fdl-ui-run-port", String(found));
+    try {
+      const re = await apiPost("/api/run-target", { port: found });
+      if (re && re.reachable) {
+        runConnected = true;
+        slot.replaceChildren(iframeTo("/run"));
+        stopRunPoll();
+        return;
+      }
+    } catch { /* fall through to the note below */ }
+  }
+  const port = found || target.port;
+  note.textContent = !port
+    ? "no dashboard port set — admission view below (Connect points the slot at a live run)"
+    : found
+      ? "the run reports its dashboard on port " + found + ", but nothing answers on "
+        + "127.0.0.1:" + found + " — if the controller is another box, forward it first: "
+        + "ssh -L " + found + ":localhost:" + found + " <controller>"
+      : "nothing answering on 127.0.0.1:" + port + " yet — admission view below, re-probing";
   startRunPoll();
+}
+
+// The dashboard port out of an `/api/status` result: the run's own
+// answer, parsed from the state document `fdl status --json` printed.
+// Absent on older flodl and null when the run serves no dashboard, and
+// both mean the same thing here (nothing to point at).
+function dashboardPortFrom(status) {
+  if (!status || status.exit !== 0) return null;
+  try {
+    const port = JSON.parse(status.stdout).dashboard_port;
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+  } catch { return null; }
 }
 
 function startRunPoll() {

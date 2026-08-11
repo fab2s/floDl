@@ -610,7 +610,19 @@ proxied through the ui's own port — so a headless controller needs
 exactly **one** `ssh -L` forward for the whole experience, ops page
 and live dashboard together. The proxy forwards the dashboard's own
 routes verbatim to a loopback port only (the host is not configurable,
-so it cannot be aimed off-box). The **history tab** is training
+so it cannot be aimed off-box).
+
+**The port is discovered, not typed.** A run reports where its dashboard
+bound in its own status document (`dashboard_port` in `state.json`, which
+`fdl status` also prints), so connecting to a cluster that was already
+running embeds its dashboard without anyone knowing the number. Discovery
+only ever *proposes* the port: the loopback reachability probe still
+decides, because the proxy is 127.0.0.1-only and the run may be on
+another box. When a run reports a port that nothing answers locally, the
+slot says so and gives the exact forward to run
+(`ssh -L <port>:localhost:<port> <controller>`) rather than leaving the
+operator to guess. Runs launched from the ui with `--monitor <port>` keep
+pointing the slot immediately, before any status document exists. The **history tab** is training
 history alone: the dashboards runs persisted on disk (`dashboard*.html`
 / `timeline*.html` under the project, rustdoc lookalikes and templates
 excluded), grouped one row per run directory since artifacts sharing a
