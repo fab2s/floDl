@@ -76,7 +76,7 @@ pub use loop_node::LoopBuilder;
 pub use map::MapBuilder;
 pub use observe::Reduce;
 pub use plot::format_duration;
-pub use profile::{LevelTiming, NodeTiming, Profile, ProfileSource};
+pub use profile::{LevelTiming, NodeStat, NodeTiming, Profile, ProfileSource, ProfileStats};
 pub use reshape::Reshape;
 pub use router::{ArgmaxSelector, FixedSelector, SigmoidRouter, SoftmaxRouter};
 pub use snapshot::ModelSnapshot;

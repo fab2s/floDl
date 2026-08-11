@@ -121,6 +121,10 @@ CPU), and the SVG legend repeats it. Device timings resolve one pass behind the
 forward calls so the training loop never waits on the GPU; a `profile()` read
 serves the freshest completed pass.
 
+For a steady-state picture across many passes, `g.profile_stats()` accumulates
+per-node **min** (intrinsic cost, least polluted by interference) and **mean**
+(cost in practice), skipping the first 3 passes as warmup.
+
 Profiled SVG output colors nodes green->yellow->red by relative execution
 time:
 

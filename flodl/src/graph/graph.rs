@@ -89,6 +89,8 @@ pub struct Graph {
     // On the GPU path a profile resolves once per pass but a user pull
     // can resolve it mid-step; the flag keeps each pass counted once.
     pub(crate) profile_collected: Cell<bool>,
+    // Running per-node min/mean across profiled passes (heat-map feed).
+    pub(crate) profile_stats_acc: RefCell<Option<profile::ProfileStatsAcc>>,
     pub(crate) timing_buffer: RefCell<HashMap<String, Vec<f64>>>,
     pub(crate) timing_history: RefCell<HashMap<String, Vec<f64>>>,
     // Flush timestamps (seconds since first forward — for ETA in write_log)
@@ -429,6 +431,7 @@ impl Graph {
             last_profile: RefCell::new(None),
             gpu_prof: RefCell::new(profile::GpuProfState::Unused),
             profile_collected: Cell::new(false),
+            profile_stats_acc: RefCell::new(None),
             timing_buffer: RefCell::new(HashMap::new()),
             timing_history: RefCell::new(HashMap::new()),
             flush_times: RefCell::new(Vec::new()),
