@@ -86,6 +86,12 @@ user-select:none;padding:2px 6px;border-radius:4px;transition:opacity 0.2s,backg
 .legend-item.solo{background:rgba(108,140,255,0.15)}
 .legend-dot{width:8px;height:8px;border-radius:50%}
 .empty{color:var(--dim);font-size:12px;padding:24px 0;text-align:center}
+.telemetry-links{display:flex;flex-wrap:wrap;gap:8px}
+.telemetry-links a{display:flex;flex-direction:column;gap:2px;border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;text-decoration:none;background:var(--bg)}
+.telemetry-links a:hover{border-color:var(--accent)}
+.telemetry-links a b{color:var(--accent);font-size:13px;font-weight:600}
+.telemetry-links a span{color:var(--dim);font-size:11px;font-family:monospace}
 
 /* Resource bars */
 .res-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
@@ -279,6 +285,11 @@ animation:pulse 2s ease-in-out infinite}
       <summary style="cursor:pointer;color:var(--dim);font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Training Configuration</summary>
       <pre id="metaPre" style="margin-top:12px;color:var(--text);font-size:12px;white-space:pre-wrap;word-break:break-word"></pre>
     </details>
+  </div>
+
+  <div class="card full-width" id="telemetryCard" style="display:none">
+    <h2>Per-host telemetry <span class="sub">full-resolution forensic timelines shipped beside this archive</span></h2>
+    <div class="telemetry-links" id="telemetryLinks"></div>
   </div>
 
   <div class="card full-width" id="svgCard" style="display:none">
@@ -1658,6 +1669,23 @@ if(typeof ARCHIVE_DATA!=='undefined'){
         for(const m of ARCHIVE_HEATMAPS)views.push({label:m.model,svg:m.svg});
       setSvgViews(views);
     }catch(e){console.error('showSvg:',e)}
+  }
+  // Per-host telemetry index: relative links to the forensic timeline pages
+  // the shippers published beside this archive. Discovered at bake time —
+  // a host still shipping when the archive was written is simply absent.
+  if(typeof ARCHIVE_TELEMETRY!=='undefined'&&Array.isArray(ARCHIVE_TELEMETRY)&&ARCHIVE_TELEMETRY.length){
+    try{
+      const box=document.getElementById('telemetryLinks');
+      for(const t of ARCHIVE_TELEMETRY){
+        const a=document.createElement('a');
+        a.href=t.href;a.target='_blank';a.rel='noopener';
+        const b=document.createElement('b');b.textContent=t.host;
+        const s=document.createElement('span');s.textContent=t.run;
+        a.appendChild(b);a.appendChild(s);
+        box.appendChild(a);
+      }
+      document.getElementById('telemetryCard').style.display='';
+    }catch(e){console.error('telemetry index:',e)}
   }
   requestAnimationFrame(()=>{try{render()}catch(e){console.error('rAF render:',e)}});
   if(archiveErr){
