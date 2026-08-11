@@ -1621,8 +1621,10 @@ document.getElementById("hist-filter").addEventListener("input", renderArchiveBr
 // Opening an archive gives the viewport to the viewer: the browser
 // collapses to a one-line "viewing" bar until asked back.
 function openArchive(relPath) {
+  // Path-preserving form so the archive's own relative links (the
+  // per-host telemetry card) resolve to their sibling files.
   document.getElementById("hist-slot").replaceChildren(
-    iframeTo("/archive?path=" + encodeURIComponent(relPath)));
+    iframeTo("/archive/" + relPath.split("/").map(encodeURIComponent).join("/")));
   const bar = document.getElementById("hist-viewing");
   bar.replaceChildren();
   const back = el("button", "", "browse");

@@ -290,6 +290,18 @@ fn respond(req: &Request, server: &UiServer) -> Reply {
             }
             serve_archive(req, server).into()
         }
+        // Path-preserving twin of `/archive`: an archive's own relative
+        // links (the per-host telemetry card) resolve under this prefix,
+        // so they reach their sibling files instead of 404ing against the
+        // ui origin — a query-shaped URL gives the browser no base to
+        // resolve them from.
+        path if path.starts_with("/archive/") => {
+            if req.method != "GET" {
+                return error_json("405 Method Not Allowed", "GET only").into();
+            }
+            let rel = percent_decode(&path["/archive/".len()..]);
+            serve_archive_rel(&rel, server).into()
+        }
         path if path.starts_with("/api/") => {
             // Every API route needs the session token: the page holds
             // it, a cross-site request cannot.
@@ -403,9 +415,11 @@ use drive::{
     commands_route, farm_artifacts, launch_argv, parse_body, publish_argv, route_argv, run_fdl,
 };
 use drive::{join_config_argv, run_target_route};
-use http::{Request, error_json, host_is_local, http, json_ok, percent_encode, read_request};
+use http::{
+    Request, error_json, host_is_local, http, json_ok, percent_decode, percent_encode, read_request,
+};
 use job::{JobSlot, follow_job, stream_job};
-use slot::{proxy_dashboard, read_runs_ledger, scan_archives, serve_archive};
+use slot::{proxy_dashboard, read_runs_ledger, scan_archives, serve_archive, serve_archive_rel};
 
 #[cfg(test)]
 #[path = "tests.rs"]

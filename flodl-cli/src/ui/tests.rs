@@ -569,6 +569,35 @@ fn archives_are_scanned_and_served_inside_the_root_only() {
     let served = get(port, &format!("/archive?path={path}"), Some(&local), None);
     assert!(served.ends_with("<html>ARCHIVE</html>"), "{served}");
 
+    // The path-preserving form serves the same file, and — the reason it
+    // exists — a RELATIVE link inside the served page resolves under the
+    // same prefix to a sibling artifact (the telemetry index card's
+    // per-host pages). A query-shaped URL gave the browser no base.
+    let served = get(
+        port,
+        "/archive/ddp-bench/runs/mlp/nccl-sync/dashboard.html",
+        Some(&local),
+        None,
+    );
+    assert!(served.ends_with("<html>ARCHIVE</html>"), "{served}");
+    let telem = run_dir.join("telemetry/exa/run-1");
+    std::fs::create_dir_all(&telem).unwrap();
+    std::fs::write(telem.join("timeline.html"), "<html>HOSTPAGE</html>").unwrap();
+    let sibling = get(
+        port,
+        "/archive/ddp-bench/runs/mlp/nccl-sync/telemetry/exa/run-1/timeline.html",
+        Some(&local),
+        None,
+    );
+    assert!(sibling.ends_with("<html>HOSTPAGE</html>"), "{sibling}");
+    for escape in [
+        "/archive/../flodl/src/monitor/dashboard.html",
+        "/archive/ddp-bench/runs/mlp/nccl-sync/notes.html",
+    ] {
+        let out = get(port, escape, Some(&local), None);
+        assert!(out.starts_with("HTTP/1.1 400"), "{escape}: {out}");
+    }
+
     // The two refusal classes: not-an-artifact, and escape attempts.
     let bad_name = get(
         port,
