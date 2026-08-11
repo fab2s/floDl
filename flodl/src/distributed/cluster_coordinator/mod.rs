@@ -729,6 +729,14 @@ pub struct ClusterCoordinator {
     /// finalizes. `Some` between `trigger_averaging` and the matching
     /// `finish_averaging_*`; `None` outside a cycle.
     sync_start: Option<std::time::Instant>,
+    /// Last engine observations, stamped where their timeline events are
+    /// emitted and read by the window report as curated root metrics
+    /// (`window_records::insert_engine_metrics`). Last-known on purpose:
+    /// the report snapshots the engine's state at record cadence.
+    last_sync_ms: Option<f64>,
+    last_cpu_avg_ms: Option<f64>,
+    last_divergence_d: Option<f64>,
+    last_lambda_ema: Option<f64>,
     /// Optional controller-side dashboard sink. When the launcher
     /// hosts a live dashboard, it constructs a concrete
     /// [`crate::distributed::DashboardSink`] and threads it through
