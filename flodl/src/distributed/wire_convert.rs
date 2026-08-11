@@ -99,6 +99,10 @@ pub(crate) fn timing_msg_to_wire(msg: TimingMsg) -> TimingMsgWire {
             epoch: epoch as u64,
             elapsed_ms,
         },
+        TimingMsg::GraphProfile { rank, profile } => TimingMsgWire::DashboardGraphTimings {
+            rank: rank as u64,
+            profile,
+        },
     }
 }
 

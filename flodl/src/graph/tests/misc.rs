@@ -205,6 +205,45 @@ fn test_profile_stats_min_mean_warmup() {
 }
 
 #[test]
+fn test_profiling_pause_keeps_the_accumulator() {
+    let graph = FlowBuilder::from(Linear::on_device(4, 4, crate::tensor::test_device()).unwrap())
+        .build()
+        .unwrap();
+    let x = Variable::new(from_f32(&[0.5; 4], &[1, 4]), false);
+
+    // Pause when profiling was never enabled must not enable it.
+    assert!(!graph.pause_profiling());
+    graph.forward(&x).unwrap();
+    assert!(graph.profile().is_none());
+
+    graph.enable_profiling();
+    for _ in 0..6 {
+        graph.forward(&x).unwrap();
+    }
+    let before = graph.profile_stats().unwrap().samples;
+    assert!(before >= 1);
+
+    // Paused forwards (the eval/epoch-callback wrap) record nothing
+    // and leave the accumulated samples intact.
+    assert!(graph.pause_profiling());
+    for _ in 0..4 {
+        graph.forward(&x).unwrap();
+    }
+    let paused = graph.profile_stats().unwrap().samples;
+    assert!(
+        paused <= before + 1,
+        "paused forwards must not accumulate (before {before}, after {paused})"
+    );
+
+    // Resume continues on the same accumulator.
+    graph.resume_profiling();
+    for _ in 0..3 {
+        graph.forward(&x).unwrap();
+    }
+    assert!(graph.profile_stats().unwrap().samples > paused);
+}
+
+#[test]
 fn test_profiling_timing_trend() {
     let graph = FlowBuilder::from(ScalarSum).tag("loss").build().unwrap();
 

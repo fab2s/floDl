@@ -252,6 +252,7 @@ fn shutdown_with_save_writes_model_and_optim_to_save_path() {
         policy: ApplyPolicy::Sync,
         save_path: Some(stem_str.clone()),
         model_sig: [0u8; 32],
+        profile_graph: false,
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };

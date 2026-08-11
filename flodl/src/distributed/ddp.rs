@@ -510,6 +510,7 @@ impl Trainer {
             .num_epochs(cfg.num_epochs)
             .elche(cfg.elche)
             .vram_pool(cfg.vram_pool)
+            .profile_graph(cfg.profile_graph)
             .vram_max_usage(cfg.vram_max_usage)
             .ram_max_usage(cfg.ram_max_usage)
             .sample_cache(cfg.sample_cache)

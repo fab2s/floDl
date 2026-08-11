@@ -497,6 +497,14 @@ pub struct TrainerConfig<M: Module> {
     /// Sizing is automatic; `FLODL_VRAM_POOL=off` in a worker's `env:`
     /// block is the runtime kill-switch.
     pub vram_pool: bool,
+    /// Profile each rank's training graph with device-side events and
+    /// ship the accumulated per-node min/mean timings to the
+    /// controller's dashboard at clean teardown (the timing heat map's
+    /// data source). Symmetric across ranks by construction, which is
+    /// what keeps ElChe's delivered-cost scheduling undisturbed;
+    /// overhead is one event record per node per pass. No-op when the
+    /// model is not a [`crate::graph::Graph`]. Default: `false`.
+    pub profile_graph: bool,
     /// Augmentation multiplicity: each sample appears `k` times per
     /// epoch in the shared shuffle (pick space `dataset.len() * k`).
     /// Pure scheduling — data variation comes exclusively from
@@ -691,6 +699,7 @@ impl<M: Module> TrainerConfig<M> {
             elche: ElCheConfig::default(),
             max_grad_norm: None,
             vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
+            profile_graph: false,
             augment: 1,
             epoch_splits: 1,
             transform: None,
@@ -751,6 +760,13 @@ impl<M: Module> TrainerConfig<M> {
     /// (see [`Self::vram_pool`]).
     pub fn with_vram_pool(mut self, enabled: bool) -> Self {
         self.vram_pool = enabled;
+        self
+    }
+
+    /// Profile each rank's training graph and ship accumulated
+    /// per-node timings to the dashboard (see [`Self::profile_graph`]).
+    pub fn with_profile_graph(mut self, on: bool) -> Self {
+        self.profile_graph = on;
         self
     }
 

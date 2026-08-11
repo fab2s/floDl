@@ -125,7 +125,8 @@ fn timing_wire_rank(msg: &TimingMsgWire) -> u32 {
         | TimingMsgWire::DashboardRegister { rank, .. }
         | TimingMsgWire::DashboardSetSvg { rank, .. }
         | TimingMsgWire::DashboardSetMetadata { rank, .. }
-        | TimingMsgWire::DashboardSetHardware { rank, .. } => *rank,
+        | TimingMsgWire::DashboardSetHardware { rank, .. }
+        | TimingMsgWire::DashboardGraphTimings { rank, .. } => *rank,
     };
     r as u32
 }

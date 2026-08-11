@@ -54,6 +54,14 @@ pub trait DashboardSink: Send + Sync {
     /// world map).
     fn set_hardware(&self, rank: usize, summary: String);
 
+    /// Rank shipped its accumulated graph timings (one frame per rank,
+    /// at clean teardown). Per-rank storage; aggregation groups by
+    /// `gpu_model` at render time. Default = no-op so sinks that only
+    /// render epochs (and test stubs) need not care.
+    fn set_graph_timings(&self, rank: usize, profile: crate::distributed::wire::GraphProfileWire) {
+        let _ = (rank, profile);
+    }
+
     /// Per-epoch resource sample for `rank`. Carried as the
     /// `resources` field on `MetricsMsgWire`
     /// alongside the existing metric report.
@@ -149,6 +157,14 @@ pub struct ClusterDashboardSink {
     svg_installed: Mutex<bool>,
     /// Per-rank hardware summary strings, indexed by global rank.
     per_rank_hardware: Mutex<Vec<Option<String>>>,
+    /// Per-rank accumulated graph timings, indexed by global rank.
+    /// One frame per rank at clean teardown; the render pass groups
+    /// them by `gpu_model`.
+    graph_timings: Mutex<Vec<Option<crate::distributed::wire::GraphProfileWire>>>,
+    /// Structural hash of the first graph-timings arrival. Every later
+    /// frame must match: averaging incomparable graphs would produce a
+    /// plausible-looking picture of no graph that exists.
+    graph_timings_hash: Mutex<Option<String>>,
     /// Per-rank latest resource sample, indexed by global rank.
     ///
     /// Latest-wins on purpose here: this feeds the `/events` gauges and the
@@ -220,6 +236,8 @@ impl ClusterDashboardSink {
             bound_port: Mutex::new(0),
             svg_installed: Mutex::new(false),
             per_rank_hardware: Mutex::new(vec![None; world_size]),
+            graph_timings: Mutex::new(vec![None; world_size]),
+            graph_timings_hash: Mutex::new(None),
             per_rank_resources: Mutex::new(vec![None; world_size]),
             per_rank_res_acc: Mutex::new(vec![
                 crate::monitor::record::ResAcc::default();
@@ -484,6 +502,40 @@ impl DashboardSink for ClusterDashboardSink {
         mon.set_svg(&svg);
         mon.set_identity(label.as_deref(), hash.as_deref());
         *installed = true;
+    }
+
+    fn set_graph_timings(&self, rank: usize, profile: crate::distributed::wire::GraphProfileWire) {
+        // Every frame must describe the same graph: the hash of the
+        // first arrival is the reference, a mismatch is refused loudly
+        // (averaging incomparable graphs would render a plausible
+        // picture of no graph that exists).
+        {
+            let mut reference = self.graph_timings_hash.lock().unwrap();
+            match reference.as_deref() {
+                None => *reference = Some(profile.hash.clone()),
+                Some(h) if h == profile.hash => {}
+                Some(h) => {
+                    eprintln!(
+                        "cluster dashboard: rank {rank} graph timings refused: \
+                         structural hash {} does not match the cohort's {}; \
+                         timings from a different graph cannot be aggregated",
+                        profile.hash, h
+                    );
+                    return;
+                }
+            }
+        }
+        let mut slots = self.graph_timings.lock().unwrap();
+        if rank < slots.len() {
+            crate::verbose!(
+                "cluster dashboard: rank {rank} graph timings ({} nodes, {} samples, {} on {})",
+                profile.nodes.len(),
+                profile.samples,
+                profile.source,
+                profile.gpu_model
+            );
+            slots[rank] = Some(profile);
+        }
     }
 
     fn set_metadata(&self, _rank: usize, json: String) {

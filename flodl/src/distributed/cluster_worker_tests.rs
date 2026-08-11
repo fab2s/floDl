@@ -309,6 +309,7 @@ fn end_to_end_sync_nccl_via_coord_smoke() {
                 policy: ApplyPolicy::Sync,
                 save_path: None,
                 model_sig: [0u8; 32],
+                profile_graph: false,
                 coord_liveness_timeout_secs:
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
             };
@@ -506,6 +507,7 @@ fn end_to_end_cadence_nccl_via_coord_smoke() {
                 // when save_path is set on DdpRunConfig.
                 save_path: None,
                 model_sig: [0u8; 32],
+                profile_graph: false,
                 coord_liveness_timeout_secs:
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
             };
@@ -712,6 +714,7 @@ fn end_to_end_cadence_cpu_via_coord_smoke() {
                 policy: ApplyPolicy::Cadence,
                 save_path: None,
                 model_sig: [0u8; 32],
+                profile_graph: false,
                 coord_liveness_timeout_secs:
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
             };
@@ -1038,6 +1041,7 @@ fn end_to_end_sync_cpu_smoke() {
                 policy: ApplyPolicy::Sync,
                 save_path: None,
                 model_sig: [0u8; 32],
+                profile_graph: false,
                 coord_liveness_timeout_secs:
                     crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
             };

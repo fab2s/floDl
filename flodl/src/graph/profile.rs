@@ -421,6 +421,26 @@ impl Graph {
         Some(a.snapshot(self.structural_hash()))
     }
 
+    // Consumed by the cluster worker (eval / epoch-callback wrap).
+    /// Suspend profiling without wiping the accumulator, returning
+    /// whether it was active. For framework code running non-training
+    /// forwards on ONE rank (eval, epoch callbacks): those passes must
+    /// not pollute the per-node means, and they fire asymmetrically so
+    /// they would tilt exactly one rank's stats. Pair with
+    /// [`resume_profiling`](Self::resume_profiling) when this returns
+    /// true; a pending GPU pass survives the pause and resolves on the
+    /// next profiled forward.
+    pub(crate) fn pause_profiling(&self) -> bool {
+        let was_active = self.profiling.get();
+        self.profiling.set(false);
+        was_active
+    }
+
+    /// Re-activate profiling after [`pause_profiling`](Self::pause_profiling).
+    pub(crate) fn resume_profiling(&self) {
+        self.profiling.set(true);
+    }
+
     /// Reverse tag lookup: node_idx → first tag name.
     pub(crate) fn tags_by_node(&self) -> HashMap<usize, String> {
         let mut m = HashMap::new();

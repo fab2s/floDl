@@ -98,7 +98,10 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 // letting the first collective hang on mismatched shapes. The join
 // hello gained the same signature as an `Option` (probed by `fdl join`
 // before the dial), moving the refusal to admission for walk-ins.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+// v5: `TimingMsgWire` gained `DashboardGraphTimings` (per-rank
+// accumulated graph timings at clean teardown, for the dashboard's
+// timing heat map).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Channel-select magics (single-port mux)
@@ -1444,6 +1447,48 @@ pub enum TimingMsgWire {
         rank: u64,
         sample: ResourceSampleWire,
     },
+    /// Rank → controller accumulated graph timings, one frame per rank
+    /// at clean teardown (teardown rather than "last epoch" so every
+    /// early-exit path (convergence shutdown, save-and-stop, elastic
+    /// scale-down) still yields the picture. The launcher's dashboard
+    /// sink groups these by GPU model; a `hash` that does not match the
+    /// installed graph is refused loudly rather than averaged.
+    DashboardGraphTimings {
+        rank: u64,
+        profile: GraphProfileWire,
+    },
+}
+
+/// One node's accumulated timing on the wire (milliseconds; the id is
+/// the graph node id, which is also its `<title>` in the structural SVG
+/// the dashboard already holds).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNodeTimingWire {
+    pub id: String,
+    pub level: u32,
+    pub min_ms: f64,
+    pub mean_ms: f64,
+}
+
+/// A rank's accumulated graph profile, wire mirror of
+/// [`crate::graph::ProfileStats`]. `nodes` is keyed by node index in
+/// execution order, identical across ranks of a cohort, which is what
+/// `hash` (the graph's structural hash) guards.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphProfileWire {
+    /// `Graph::structural_hash()` of the profiled graph.
+    pub hash: String,
+    /// GPU model name of the rank's assigned device (aggregation key:
+    /// averaging within a model is legitimate, a cross-model mean
+    /// describes no device that exists).
+    pub gpu_model: String,
+    /// Which clock produced the timings (`ProfileSource::label()`).
+    pub source: String,
+    /// Passes accumulated (warmup excluded).
+    pub samples: u64,
+    pub total_min_ms: f64,
+    pub total_mean_ms: f64,
+    pub nodes: Vec<GraphNodeTimingWire>,
 }
 
 /// Per-GPU snapshot wire mirror of [`crate::monitor::resources::GpuSnapshot`].

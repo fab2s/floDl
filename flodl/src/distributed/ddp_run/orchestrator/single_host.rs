@@ -138,6 +138,11 @@ impl DdpHandle {
             // Thread-based path: no control handshake reads it, and a
             // single process has nothing to disagree with itself about.
             model_sig: [0u8; 32],
+            // No consumer on the thread-based path: there is no
+            // dashboard sink to ship timings to, and the factory-built
+            // model never leaves the worker. Solo profiling is the
+            // public Graph API (enable_profiling + profile_stats).
+            profile_graph: false,
         };
 
         // Keep the worker channels: `run_epoch_plan` calls `worker.report_epoch`
@@ -369,6 +374,11 @@ impl DdpHandle {
             // Thread-based path: no control handshake reads it, and a
             // single process has nothing to disagree with itself about.
             model_sig: [0u8; 32],
+            // No consumer on the thread-based path: there is no
+            // dashboard sink to ship timings to, and the factory-built
+            // model never leaves the worker. Solo profiling is the
+            // public Graph API (enable_profiling + profile_stats).
+            profile_graph: false,
         };
 
         // The worker holds the sender ends; the cooperative Worker never drains
