@@ -83,6 +83,12 @@ pub struct Graph {
     // Profiling
     pub(crate) profiling: Cell<bool>,
     pub(crate) last_profile: RefCell<Option<profile::Profile>>,
+    // Pooled boundary events for device-side timing (CUDA path).
+    pub(crate) gpu_prof: RefCell<profile::GpuProfState>,
+    // Whether end_step already accumulated the current last_profile.
+    // On the GPU path a profile resolves once per pass but a user pull
+    // can resolve it mid-step; the flag keeps each pass counted once.
+    pub(crate) profile_collected: Cell<bool>,
     pub(crate) timing_buffer: RefCell<HashMap<String, Vec<f64>>>,
     pub(crate) timing_history: RefCell<HashMap<String, Vec<f64>>>,
     // Flush timestamps (seconds since first forward — for ETA in write_log)
@@ -421,6 +427,8 @@ impl Graph {
             flush_count: Cell::new(0),
             profiling: Cell::new(false),
             last_profile: RefCell::new(None),
+            gpu_prof: RefCell::new(profile::GpuProfState::Unused),
+            profile_collected: Cell::new(false),
             timing_buffer: RefCell::new(HashMap::new()),
             timing_history: RefCell::new(HashMap::new()),
             flush_times: RefCell::new(Vec::new()),
@@ -518,8 +526,9 @@ impl Graph {
     /// ```
     pub fn end_step(&self) {
         self.detach_state();
-        if self.profiling.get() {
+        if self.profiling.get() && !self.profile_collected.get() {
             self.collect_timings(&[]);
+            self.profile_collected.set(true);
         }
         self.step_count.set(self.step_count.get() + 1);
     }

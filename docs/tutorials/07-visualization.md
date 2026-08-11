@@ -114,6 +114,13 @@ for node in &profile.nodes {
 }
 ```
 
+On CUDA, timings come from device-side events bracketing each node, so they
+measure actual kernel execution rather than the (async) launch. `profile.source`
+says which clock produced the numbers (`GpuEvents` on GPU, `HostWallClock` on
+CPU), and the SVG legend repeats it. Device timings resolve one pass behind the
+forward calls so the training loop never waits on the GPU; a `profile()` read
+serves the freshest completed pass.
+
 Profiled SVG output colors nodes green->yellow->red by relative execution
 time:
 

@@ -30,7 +30,21 @@ impl Graph {
         }
 
         let is_profiling = self.profiling.get();
-        let forward_start = if is_profiling {
+        if is_profiling {
+            // Read the previous pass's GPU events (if any) before the pool
+            // is re-recorded below; by now that pass has long drained, so
+            // the blocking read is a formality, not a stall.
+            self.resolve_gpu_profile(true);
+        }
+        // On CUDA, host clocks time the kernel launch, not the execution
+        // (launches are async), so bracket nodes with device events instead.
+        let use_gpu_events = is_profiling
+            && !graph_inputs.is_empty()
+            && graph_inputs[0].device().is_cuda()
+            && self.ensure_gpu_profile_pool(graph_inputs[0].device());
+        let host_profiling = is_profiling && !use_gpu_events;
+
+        let forward_start = if host_profiling {
             Some(Instant::now())
         } else {
             None
@@ -39,12 +53,9 @@ impl Graph {
         let mut prof_levels: Vec<profile::LevelTiming> = Vec::new();
 
         // Build reverse tag lookup for profiling: node_idx → first tag name
-        let tags_by_node: HashMap<usize, String> = if is_profiling {
-            let mut m = HashMap::new();
-            for (name, &(ni, _)) in &self.tag_names {
-                m.entry(ni).or_insert_with(|| name.clone());
-            }
-            m
+        // (the GPU pool captures its own copy once, at creation).
+        let tags_by_node: HashMap<usize, String> = if host_profiling {
+            self.tags_by_node()
         } else {
             HashMap::new()
         };
@@ -74,9 +85,45 @@ impl Graph {
         // Will hold the output node's results until we can extract the final value
         let mut final_output: Option<Vec<Variable>> = None;
 
+        // GPU-event profiling: N+1 boundary markers on the current stream
+        // (one before the first node, one after each node). A record
+        // failure degrades this pass to unprofiled rather than failing
+        // the forward; the pool is retired after the loop.
+        fn record_boundary(
+            pool: &mut Option<&mut profile::GpuProfilePool>,
+            seq: &mut usize,
+            failed: &mut bool,
+        ) {
+            if let Some(p) = pool.as_deref_mut() {
+                if let Err(e) = p.record(*seq) {
+                    eprintln!(
+                        "  warning: graph profiling GPU event record failed \
+                         ({e}); timings fall back to the host wall clock"
+                    );
+                    *failed = true;
+                    *pool = None;
+                } else {
+                    *seq += 1;
+                }
+            }
+        }
+        let mut gpu_state = if use_gpu_events {
+            Some(self.gpu_prof.borrow_mut())
+        } else {
+            None
+        };
+        let mut gpu_pool: Option<&mut profile::GpuProfilePool> =
+            gpu_state.as_mut().and_then(|s| match &mut **s {
+                profile::GpuProfState::Active(p) => Some(p),
+                _ => None,
+            });
+        let mut gpu_seq = 0usize;
+        let mut gpu_failed = false;
+        record_boundary(&mut gpu_pool, &mut gpu_seq, &mut gpu_failed);
+
         // Execute levels sequentially
         for (level_idx, level) in self.levels.iter().enumerate() {
-            let level_start = if is_profiling {
+            let level_start = if host_profiling {
                 Some(Instant::now())
             } else {
                 None
@@ -118,13 +165,14 @@ impl Graph {
                 }
 
                 // Execute node (with optional per-node timing)
-                let node_start = if is_profiling {
+                let node_start = if host_profiling {
                     Some(Instant::now())
                 } else {
                     None
                 };
                 let node_outputs = (node.run)(&inputs)?;
-                if is_profiling {
+                record_boundary(&mut gpu_pool, &mut gpu_seq, &mut gpu_failed);
+                if host_profiling {
                     let elapsed = node_start.unwrap().elapsed();
                     level_sum_ns += elapsed.as_nanos() as u64;
                     prof_nodes.push(profile::NodeTiming {
@@ -172,7 +220,7 @@ impl Graph {
             }
 
             // Record level timing
-            if is_profiling {
+            if host_profiling {
                 prof_levels.push(profile::LevelTiming {
                     index: level_idx,
                     wall_clock: level_start.unwrap().elapsed(),
@@ -182,16 +230,29 @@ impl Graph {
             }
         }
 
+        // A fully recorded GPU pass awaits resolution: the deltas are read
+        // one pass later (or on an explicit profile()/timing() pull), so
+        // the training loop never waits on the device for its timings.
+        if let Some(pool) = gpu_pool {
+            pool.mark_pending();
+        }
+        drop(gpu_state);
+        if gpu_failed {
+            *self.gpu_prof.borrow_mut() = profile::GpuProfState::Failed;
+        }
+
         // Drop the borrow before storing profile (which also borrows RefCells)
         drop(slots);
 
         // Store profile
-        if is_profiling {
+        if host_profiling {
             *self.last_profile.borrow_mut() = Some(profile::Profile {
                 total: forward_start.unwrap().elapsed(),
                 levels: prof_levels,
                 nodes: prof_nodes,
+                source: profile::ProfileSource::HostWallClock,
             });
+            self.profile_collected.set(false);
         }
 
         // Extract graph output

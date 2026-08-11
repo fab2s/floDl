@@ -89,8 +89,8 @@ pub use distributed::{
 pub use graph::{
     ActiveGraphEpochIterator, ArgmaxSelector, FixedSelector, FlowBuilder, Graph,
     GraphEpochIterator, GraphExt, LearnedHalt, LevelTiming, MapBuilder, MergeOp, ModelSnapshot,
-    NodeTiming, PathKind, Profile, Reduce, Reshape, SigmoidRouter, SoftmaxRouter, StateAdd,
-    ThresholdHalt, Trend, TrendGroup, format_duration,
+    NodeTiming, PathKind, Profile, ProfileSource, Reduce, Reshape, SigmoidRouter, SoftmaxRouter,
+    StateAdd, ThresholdHalt, Trend, TrendGroup, format_duration,
 };
 pub use monitor::Monitor;
 pub use nn::{
