@@ -340,6 +340,16 @@ You can also update the SVG mid-training with `watch_profiled(&model)`.
 Both methods require Graphviz (`dot`) to be installed. If `dot` is not
 available, they silently fall back or do nothing.
 
+On cluster runs the heat map needs no `dot` anywhere and no monitor calls:
+set `TrainerConfig::profile_graph` and every rank profiles its training
+graph with device-side events, shipping accumulated per-node min/mean to
+the controller at teardown. The dashboard's Graph Architecture card gains
+one heat map per GPU model (averaging across different models would
+describe no device that exists), with mean/min in each node's hover
+tooltip and a legend carrying the clock provenance. The SVG download
+button saves exactly the bytes on screen, publication-ready; the saved
+HTML archive embeds the same finished artifacts.
+
 ## Resource Tracking
 
 The monitor samples system resources on every `log` call:

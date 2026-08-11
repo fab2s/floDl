@@ -155,6 +155,10 @@ pub struct ClusterDashboardSink {
     /// `true` once an SVG has been installed; subsequent set_svg calls
     /// are dropped (every rank ships the same SVG).
     svg_installed: Mutex<bool>,
+    /// Sink-side copy of the structural SVG, the substrate the timing
+    /// heat maps are baked onto (the Monitor's own copy is private to
+    /// its archive machinery).
+    svg_copy: Mutex<Option<String>>,
     /// Per-rank hardware summary strings, indexed by global rank.
     per_rank_hardware: Mutex<Vec<Option<String>>>,
     /// Per-rank accumulated graph timings, indexed by global rank.
@@ -235,6 +239,7 @@ impl ClusterDashboardSink {
             controller_host,
             bound_port: Mutex::new(0),
             svg_installed: Mutex::new(false),
+            svg_copy: Mutex::new(None),
             per_rank_hardware: Mutex::new(vec![None; world_size]),
             graph_timings: Mutex::new(vec![None; world_size]),
             graph_timings_hash: Mutex::new(None),
@@ -443,6 +448,88 @@ impl ClusterDashboardSink {
         }
         host_blocks.join(" | ")
     }
+
+    /// Re-aggregate every stored rank frame into per-GPU-model heat
+    /// maps and install them on the launcher's Monitor. Runs on every
+    /// frame arrival: ranks trickle in at teardown, so partial sets
+    /// converge to the full picture with the last rank. One map per
+    /// distinct GPU model, since averaging within a model is legitimate
+    /// while a cross-model mean describes no device that exists.
+    fn rebake_heatmaps(&self) {
+        use crate::graph::heatmap::{HeatLegend, HeatNode, bake_heatmap};
+
+        let Some(svg) = self.svg_copy.lock().unwrap().clone() else {
+            crate::verbose!(
+                "cluster dashboard: graph timings arrived before the \
+                 structural SVG; heat map deferred"
+            );
+            return;
+        };
+        let maps = {
+            let slots = self.graph_timings.lock().unwrap();
+            let mut groups: std::collections::BTreeMap<
+                String,
+                Vec<&crate::distributed::wire::GraphProfileWire>,
+            > = std::collections::BTreeMap::new();
+            for p in slots.iter().flatten() {
+                groups.entry(p.gpu_model.clone()).or_default().push(p);
+            }
+            let mut maps = Vec::new();
+            for (model, frames) in &groups {
+                // Sample-weighted mean of means, min of mins, per node
+                // index (the hash gate on arrival guarantees the frames
+                // describe one graph).
+                let first = frames[0];
+                let mut nodes: Vec<HeatNode> = first
+                    .nodes
+                    .iter()
+                    .map(|n| HeatNode {
+                        id: n.id.clone(),
+                        min_ms: f64::INFINITY,
+                        mean_ms: 0.0,
+                    })
+                    .collect();
+                let mut weight_total = 0.0;
+                let mut total_mean = 0.0;
+                let mut samples: u64 = 0;
+                for f in frames {
+                    let w = f.samples.max(1) as f64;
+                    weight_total += w;
+                    total_mean += f.total_mean_ms * w;
+                    samples += f.samples;
+                    for (acc, n) in nodes.iter_mut().zip(&f.nodes) {
+                        acc.min_ms = acc.min_ms.min(n.min_ms);
+                        acc.mean_ms += n.mean_ms * w;
+                    }
+                }
+                for acc in &mut nodes {
+                    acc.mean_ms /= weight_total;
+                    if !acc.min_ms.is_finite() {
+                        acc.min_ms = 0.0;
+                    }
+                }
+                let label = short_gpu_name(model);
+                let legend = HeatLegend {
+                    gpu_model: label.clone(),
+                    source: first.source.clone(),
+                    samples,
+                    ranks: frames.len(),
+                    total_mean_ms: total_mean / weight_total,
+                };
+                match bake_heatmap(&svg, &nodes, &legend) {
+                    Some(baked) => maps.push((label, baked)),
+                    None => eprintln!(
+                        "cluster dashboard: could not bake the {model} heat \
+                         map (unrecognized SVG shape); the plain graph stays"
+                    ),
+                }
+            }
+            maps
+        };
+        if !maps.is_empty() {
+            self.monitor.lock().unwrap().set_heatmaps(maps);
+        }
+    }
 }
 
 impl DashboardSink for ClusterDashboardSink {
@@ -498,6 +585,7 @@ impl DashboardSink for ClusterDashboardSink {
         if *installed {
             return; // first-arrival wins; SVG is identical across ranks
         }
+        *self.svg_copy.lock().unwrap() = Some(svg.clone());
         let mut mon = self.monitor.lock().unwrap();
         mon.set_svg(&svg);
         mon.set_identity(label.as_deref(), hash.as_deref());
@@ -536,6 +624,8 @@ impl DashboardSink for ClusterDashboardSink {
             );
             slots[rank] = Some(profile);
         }
+        drop(slots);
+        self.rebake_heatmaps();
     }
 
     fn set_metadata(&self, _rank: usize, json: String) {
@@ -1155,5 +1245,90 @@ mod tests {
         assert!(!d.0.join("root.log").exists());
         // The latest window is still held in memory for the portal.
         assert_eq!(sink.latest_window_records.lock().unwrap().len(), 2);
+    }
+
+    /// Two ranks on different GPU models: one baked heat map per model,
+    /// legend-labelled with the short GPU name, installed on the
+    /// launcher's Monitor as finished artifacts. A third frame with a
+    /// different structural hash is refused and changes nothing.
+    #[test]
+    fn graph_timings_bake_one_heatmap_per_gpu_model() {
+        use crate::distributed::wire::{GraphNodeTimingWire, GraphProfileWire};
+
+        let cluster = Arc::new(
+            ClusterBuilder::new()
+                .controller("127.0.0.1")
+                .port(29501)
+                .done()
+                .host("exa")
+                .ranks([0, 1])
+                .devices([0, 1])
+                .nccl_socket_ifname("lo")
+                .path("/opt/flodl")
+                .done()
+                .build()
+                .expect("test cluster builds"),
+        );
+        let sink = ClusterDashboardSink::new(cluster, "exa".to_string(), 1);
+        sink.set_svg(
+            0,
+            crate::graph::heatmap::GRAPHVIZ_FIXTURE.to_string(),
+            Some("g".to_string()),
+            Some("h1".to_string()),
+        );
+
+        let frame = |model: &str, mean: f64| GraphProfileWire {
+            hash: "h1".to_string(),
+            gpu_model: model.to_string(),
+            source: "gpu events".to_string(),
+            samples: 10,
+            total_min_ms: mean * 2.0,
+            total_mean_ms: mean * 2.2,
+            nodes: vec![
+                GraphNodeTimingWire {
+                    id: "linear_1".to_string(),
+                    level: 0,
+                    min_ms: mean * 0.9,
+                    mean_ms: mean,
+                },
+                GraphNodeTimingWire {
+                    id: "relu_2".to_string(),
+                    level: 1,
+                    min_ms: mean * 0.09,
+                    mean_ms: mean * 0.1,
+                },
+            ],
+        };
+        sink.set_graph_timings(0, frame("NVIDIA GeForce RTX 5060 Ti", 2.0));
+        sink.set_graph_timings(1, frame("NVIDIA GeForce GTX 1060 6GB", 9.0));
+
+        {
+            let mon = sink.monitor.lock().unwrap();
+            let maps = mon.heatmaps();
+            assert_eq!(maps.len(), 2, "one heat map per GPU model");
+            // BTreeMap order + short_gpu_name labels.
+            assert_eq!(maps[0].0, "GTX 1060 6GB");
+            assert_eq!(maps[1].0, "RTX 5060 Ti");
+            for (label, svg) in maps {
+                assert!(svg.contains("Timing heat map"), "{label}: legend missing");
+                assert!(svg.contains("1 rank(s)"));
+                assert!(svg.contains("10 passes"));
+                assert!(
+                    svg.contains("linear_1&#10;mean"),
+                    "{label}: tooltip missing"
+                );
+            }
+        }
+
+        // Mismatched hash: refused, stored set unchanged.
+        let mut bad = frame("NVIDIA GeForce GTX 1060 6GB", 1.0);
+        bad.hash = "OTHER".to_string();
+        sink.set_graph_timings(1, bad);
+        let mon = sink.monitor.lock().unwrap();
+        assert_eq!(mon.heatmaps().len(), 2);
+        assert!(
+            mon.heatmaps()[0].1.contains("10 passes"),
+            "refused frame must not replace the stored aggregation",
+        );
     }
 }

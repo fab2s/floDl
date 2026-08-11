@@ -285,6 +285,8 @@ animation:pulse 2s ease-in-out infinite}
     <div class="svg-toggle" id="svgToggle" onclick="toggleSvg()">
       <span class="arrow">&#9654;</span>
       <h2 style="margin:0">Graph Architecture</h2>
+      <span id="svgViews" style="display:none;gap:6px;margin-left:12px"></span>
+      <a id="svgDownload" title="Download the displayed SVG" style="display:none;margin-left:auto;font-size:12px;color:var(--muted);text-decoration:none">SVG &#8681;</a>
     </div>
     <div class="svg-container" id="svgContainer"></div>
   </div>
@@ -1490,6 +1492,56 @@ function toggleSvg(){
   c.style.overflowY=opening?'auto':'hidden';
   c.style.maxHeight=opening?svgOpenHeight(c)+'px':'0';
 }
+// --- graph views: the structural SVG plus one baked timing heat map per
+// GPU model. Heat maps arrive at teardown (the SSE `complete` refetch);
+// the download link serves exactly the bytes on screen, so the saved
+// artifact and the displayed one cannot diverge.
+let svgViews=[],svgViewIdx=0;
+function setSvgViews(views){
+  if(!views.length)return;
+  svgViews=views;
+  const bar=document.getElementById('svgViews');
+  bar.innerHTML='';
+  bar.style.display=views.length>1?'inline-flex':'none';
+  views.forEach((v,i)=>{
+    const b=document.createElement('button');
+    b.textContent=v.label;
+    b.style.cssText='font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid var(--grid);background:none;color:var(--muted);cursor:pointer';
+    b.onclick=e=>{e.stopPropagation();selectSvgView(i)};
+    bar.appendChild(b);
+  });
+  selectSvgView(svgViewIdx<views.length?svgViewIdx:0);
+}
+function selectSvgView(i){
+  const v=svgViews[i];if(!v)return;
+  svgViewIdx=i;
+  const bar=document.getElementById('svgViews');
+  [...bar.children].forEach((b,j)=>{
+    b.style.color=j===i?'var(--text)':'var(--muted)';
+    b.style.borderColor=j===i?'var(--accent, var(--text))':'var(--grid)';
+  });
+  const apply=t=>{showSvg(t);updateSvgDownload(v,t)};
+  if(v.svg!=null){apply(v.svg)}
+  else{fetch(v.url).then(r=>{if(r.ok)return r.text();throw 0}).then(t=>{v.svg=t;apply(t)}).catch(()=>{})}
+}
+function updateSvgDownload(v,text){
+  const a=document.getElementById('svgDownload');
+  a.onclick=e=>e.stopPropagation(); // inside the collapse-toggle row
+  a.style.display='inline';
+  if(a._url)URL.revokeObjectURL(a._url);
+  a._url=URL.createObjectURL(new Blob([text],{type:'image/svg+xml'}));
+  a.href=a._url;
+  const slug=v.label.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'');
+  a.download=(v.label==='Architecture'?'graph':'heatmap-'+slug)+'.svg';
+}
+function loadHeatmaps(){
+  fetch('/api/heatmaps').then(r=>{if(r.ok)return r.json();throw 0}).then(list=>{
+    if(!Array.isArray(list)||!list.length)return;
+    const views=[svgViews[0]||{label:'Architecture',url:'/graph.svg'}];
+    for(const m of list)views.push({label:m.model,url:m.url});
+    setSvgViews(views);
+  }).catch(()=>{});
+}
 function seedGpuInit(list){
   for(const g of list||[]){
     if(g.dev==null)continue;
@@ -1599,7 +1651,14 @@ if(typeof ARCHIVE_DATA!=='undefined'){
     fmtDur(ARCHIVE_DATA.reduce((s,d)=>s+(d.duration||0),0));
   markComplete(archiveErr?'Archive error - see console':
     (typeof ARCHIVE_COMPLETE!=='undefined'?ARCHIVE_COMPLETE:'Complete'));
-  if(typeof ARCHIVE_SVG==='string'){try{showSvg(ARCHIVE_SVG)}catch(e){console.error('showSvg:',e)}}
+  if(typeof ARCHIVE_SVG==='string'){
+    try{
+      const views=[{label:'Architecture',svg:ARCHIVE_SVG}];
+      if(typeof ARCHIVE_HEATMAPS!=='undefined'&&Array.isArray(ARCHIVE_HEATMAPS))
+        for(const m of ARCHIVE_HEATMAPS)views.push({label:m.model,svg:m.svg});
+      setSvgViews(views);
+    }catch(e){console.error('showSvg:',e)}
+  }
   requestAnimationFrame(()=>{try{render()}catch(e){console.error('rAF render:',e)}});
   if(archiveErr){
     const d=document.createElement('div');
@@ -1611,11 +1670,14 @@ if(typeof ARCHIVE_DATA!=='undefined'){
 }else{
   const es=new EventSource('/events');
   es.addEventListener('epoch',e=>{try{ingestEpoch(JSON.parse(e.data))}catch(err){}});
-  es.addEventListener('complete',()=>markComplete());
+  es.addEventListener('complete',()=>{markComplete();loadHeatmaps()});
   subscribeRoot();
   setLevel(current);
   if(!elapsedTimer)elapsedTimer=setInterval(updateElapsed,1000);
-  fetch('/graph.svg').then(r=>{if(r.ok)return r.text();throw 0}).then(showSvg).catch(()=>{});
+  fetch('/graph.svg').then(r=>{if(r.ok)return r.text();throw 0}).then(t=>{
+    setSvgViews([{label:'Architecture',svg:t}]);
+    loadHeatmaps(); // late viewer: the run may already be complete
+  }).catch(()=>{});
 }
 
 window.addEventListener('resize',()=>scheduleRender());

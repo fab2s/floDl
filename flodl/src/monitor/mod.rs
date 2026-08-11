@@ -221,6 +221,10 @@ pub struct Monitor {
     records: std::sync::Arc<std::sync::Mutex<record_store::RecordStore>>,
     save_html: Option<String>,
     svg_snapshot: Option<String>,
+    /// Baked per-GPU-model timing heat maps `(model label, finished
+    /// SVG)`, from the cluster sink. Served live and embedded in the
+    /// archive; the display IS the downloadable artifact.
+    heatmaps: Vec<(String, String)>,
     /// Published blob: [`Self::param_info`] merged under
     /// [`Self::user_metadata`]. Kept as the single read source for the
     /// archive + injected constants.
@@ -293,6 +297,7 @@ impl Monitor {
             records: std::sync::Arc::new(std::sync::Mutex::new(record_store::RecordStore::new())),
             save_html: None,
             svg_snapshot: None,
+            heatmaps: Vec::new(),
             metadata: None,
             archive_theme: None,
             user_metadata: None,
@@ -605,6 +610,23 @@ impl Monitor {
         if let Some(ref srv) = self.server {
             srv.set_svg(svg.to_string());
         }
+    }
+
+    /// Install the baked per-GPU-model timing heat maps (cluster sink
+    /// path). Replaces the whole set: the sink re-bakes on every
+    /// arriving rank frame, so partial sets converge to the full one.
+    pub fn set_heatmaps(&mut self, maps: Vec<(String, String)>) {
+        if let Some(ref srv) = self.server {
+            srv.set_heatmaps(maps.clone());
+        }
+        self.heatmaps = maps;
+    }
+
+    /// The installed timing heat maps as `(model label, finished SVG)`
+    /// pairs, the same artifacts the dashboard serves and the archive
+    /// embeds.
+    pub fn heatmaps(&self) -> &[(String, String)] {
+        &self.heatmaps
     }
 
     /// Replace the hardware-summary string displayed in the dashboard
@@ -1101,8 +1123,29 @@ impl Monitor {
         // </script> once across the whole assembled body (a value in any
         // constant — data, svg, label, hash, metadata, hardware — could
         // otherwise close the tag early; the HTML parser ignores JS quoting).
+        // Heat maps as a JS array of {model, svg} (same template-literal
+        // escaping as ARCHIVE_SVG).
+        let heatmaps_js = if self.heatmaps.is_empty() {
+            "[]".to_string()
+        } else {
+            let mut b = String::from("[");
+            for (i, (model, svg)) in self.heatmaps.iter().enumerate() {
+                if i > 0 {
+                    b.push(',');
+                }
+                let svg = svg
+                    .replace('\\', "\\\\")
+                    .replace('`', "\\`")
+                    .replace("${", "\\${");
+                let model = model.replace('\\', "\\\\").replace('"', "\\\"");
+                let _ = write!(b, "{{model:\"{}\",svg:`{}`}}", model, svg);
+            }
+            b.push(']');
+            b
+        };
+
         let archive_consts = format!(
-            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
+            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_HEATMAPS={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
             match &self.archive_theme {
                 Some(t) => format!("\"{t}\""),
                 None => "null".to_string(),
@@ -1110,6 +1153,7 @@ impl Monitor {
             data_json,
             records_json,
             svg_js,
+            heatmaps_js,
             format_eta(total_time),
             label_js,
             hash_js,
