@@ -339,6 +339,10 @@ pub struct RunConfig {
     /// Theme pinned into the saved dashboard (`--dashboard-theme`). `None`
     /// leaves it to the reader's `prefers-color-scheme`.
     pub dashboard_theme: Option<String>,
+    /// Suppress the heat-map graph profiling `--save-dashboard` implies
+    /// (`--no-profile-graph`): the A/B lever for measuring the profiling
+    /// overhead with otherwise identical runs.
+    pub no_profile_graph: bool,
     /// Execution tier (`--tier managed|cooperative`). `Managed` (default)
     /// runs `builder.run()`; `Cooperative` runs `builder.into_worker()` and
     /// hand-drives the loop. Both share the identical builder config, so a

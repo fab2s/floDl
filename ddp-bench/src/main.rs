@@ -325,6 +325,13 @@ struct Cli {
     #[option(choices = &["light", "dark", "auto"])]
     dashboard_theme: Option<String>,
 
+    /// Keep graph profiling OFF under --save-dashboard (the dashboard
+    /// otherwise profiles the training graph for its timing heat map).
+    /// The measurement lever: two --save-dashboard runs differing only
+    /// in this flag isolate the profiling overhead. Default off.
+    #[option]
+    no_profile_graph: bool,
+
     /// Run `eval_fn` at the end of every epoch and emit per-epoch
     /// `eval=X.XXXX` into `training.log`. Required to correlate the
     /// divergence growth rate `λ̂` against held-out accuracy. Default off.
@@ -1131,6 +1138,7 @@ fn run() -> flodl::tensor::Result<()> {
                 record_log_dir: cli.record_log.clone(),
                 save_dashboard: cli.save_dashboard,
                 dashboard_theme: cli.dashboard_theme.clone(),
+                no_profile_graph: cli.no_profile_graph,
                 tier,
             };
 
