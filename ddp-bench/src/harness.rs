@@ -452,10 +452,18 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
 
     timeline.stop();
     // Teardown order is the data's path: the poller's exit flush is the
-    // final broadcast, spill.finish() drains it to local disk, and only
-    // then does the shipper's final pass see those bytes and publish.
+    // final broadcast, spill.finish() drains it to local disk, the
+    // process's own timeline page is baked beside it, and only then does
+    // the shipper's final pass see all of it and publish. Every process
+    // bakes a page (its spill dir is unique), so the run dir ends up with
+    // one self-contained timeline per rank process, host-qualified — the
+    // dashboard archive indexes them.
     let spill_dir = spill.dir().to_path_buf();
     spill.finish();
+    let spill_page = spill_dir.join("timeline.html");
+    if let Some(p) = spill_page.to_str() {
+        let _ = timeline.save_html(p);
+    }
     shipper.finish();
 
     // Rotate + save artifacts. Suppressed on cooperative non-narrator ranks

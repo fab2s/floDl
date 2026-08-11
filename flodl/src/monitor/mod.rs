@@ -907,7 +907,7 @@ impl Monitor {
 
         // Save HTML archive
         if let Some(ref path) = self.save_html {
-            match self.build_archive() {
+            match self.build_archive_with_index(&discover_telemetry(path)) {
                 Ok(html) => {
                     if let Err(e) = std::fs::write(path, html) {
                         eprintln!("  warning: failed to save dashboard archive: {}", e);
@@ -933,7 +933,7 @@ impl Monitor {
     /// drains that channel and joins the handler, so snapshotting first would
     /// silently lose whatever tail was still in flight.
     pub(crate) fn write_archive_now(&self, path: &str) {
-        match self.build_archive() {
+        match self.build_archive_with_index(&discover_telemetry(path)) {
             Ok(html) => {
                 if let Err(e) = std::fs::write(path, html) {
                     eprintln!("  warning: failed to save dashboard archive: {e}");
@@ -1049,7 +1049,22 @@ impl Monitor {
     ///
     /// The dashboard template checks for `ARCHIVE_DATA` on load — if present
     /// it replays from the baked data instead of connecting to SSE.
+    /// Test-only convenience: the production bake sites go through
+    /// [`Self::build_archive_with_index`] with a discovered telemetry list.
+    #[cfg(test)]
     fn build_archive(&self) -> std::result::Result<String, std::fmt::Error> {
+        self.build_archive_with_index(&[])
+    }
+
+    /// [`Self::build_archive`] plus the per-host telemetry index: `(host,
+    /// run)` pairs become relative links (`telemetry/<host>/<run>/
+    /// timeline.html`) the archived page renders as a card. The production
+    /// bake sites discover the pairs beside the archive path at write time
+    /// ([`discover_telemetry`]); an empty slice keeps the card hidden.
+    fn build_archive_with_index(
+        &self,
+        telemetry: &[(String, String)],
+    ) -> std::result::Result<String, std::fmt::Error> {
         // Serialize all epochs to JSON array
         let mut data_json = String::from("[");
         for (i, record) in self.epochs.iter().enumerate() {
@@ -1148,8 +1163,22 @@ impl Monitor {
             b
         };
 
+        let telemetry_js = serde_json::Value::Array(
+            telemetry
+                .iter()
+                .map(|(host, run)| {
+                    serde_json::json!({
+                        "host": host,
+                        "run": run,
+                        "href": format!("telemetry/{host}/{run}/timeline.html"),
+                    })
+                })
+                .collect(),
+        )
+        .to_string();
+
         let archive_consts = format!(
-            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_HEATMAPS={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\n",
+            "\nconst ARCHIVE_THEME={};\nconst ARCHIVE_DATA={};\nconst ARCHIVE_RECORDS={};\nconst ARCHIVE_SVG={};\nconst ARCHIVE_HEATMAPS={};\nconst ARCHIVE_COMPLETE=\"Complete ({})\";\nconst ARCHIVE_LABEL={};\nconst ARCHIVE_HASH={};\nconst ARCHIVE_META={};\nconst ARCHIVE_HARDWARE={};\nconst ARCHIVE_GPU_INIT={};\nconst ARCHIVE_TELEMETRY={};\n",
             match &self.archive_theme {
                 Some(t) => format!("\"{t}\""),
                 None => "null".to_string(),
@@ -1164,6 +1193,7 @@ impl Monitor {
             meta_js,
             hw_js,
             gpu_init_js,
+            telemetry_js,
         );
         let archive_block = format!(
             "<script>{}</script>",
@@ -1354,6 +1384,45 @@ impl Monitor {
 }
 
 /// Number of digits needed to display a number.
+/// Discover the per-host telemetry pages published beside a dashboard
+/// archive: `(host, run)` for every `<archive dir>/telemetry/<host>/<run>/
+/// timeline.html` that exists at bake time, sorted. The storage fabric is
+/// the index — the shippers created these dirs, no control-plane plumbing
+/// names them. A host whose shipper had not yet published its page when
+/// the archive baked is simply absent, never a broken link.
+fn discover_telemetry(archive_path: &str) -> Vec<(String, String)> {
+    let root = match std::path::Path::new(archive_path).parent() {
+        Some(p) => p.join("telemetry"),
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let Ok(hosts) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for host in hosts.flatten() {
+        if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let host_name = host.file_name().to_string_lossy().into_owned();
+        let Ok(runs) = std::fs::read_dir(host.path()) else {
+            continue;
+        };
+        for run in runs.flatten() {
+            if !run.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if run.path().join("timeline.html").is_file() {
+                out.push((
+                    host_name.clone(),
+                    run.file_name().to_string_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn digit_count(n: usize) -> usize {
     if n == 0 {
         return 1;
@@ -1388,6 +1457,45 @@ mod tests {
         monitor.log(1, Duration::from_millis(90), &[("loss", 1.2)]);
         assert_eq!(monitor.history().len(), 2);
         assert_eq!(monitor.history()[1].epoch, 1);
+    }
+
+    /// The archive bake discovers the telemetry pages the shippers
+    /// published beside it and injects them as relative links: only dirs
+    /// that actually hold a `timeline.html` are listed (a still-shipping
+    /// host is absent, never a broken link), sorted host-then-run.
+    #[test]
+    fn test_archive_indexes_shipped_telemetry_pages() {
+        let dir = std::env::temp_dir().join(format!("flodl-arch-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (host, run, page) in [
+            ("pascal", "lenet-x-2", true),
+            ("exa", "lenet-x-1", true),
+            ("exa", "still-shipping", false),
+        ] {
+            let d = dir.join("telemetry").join(host).join(run);
+            std::fs::create_dir_all(&d).unwrap();
+            if page {
+                std::fs::write(d.join("timeline.html"), "<!doctype html>").unwrap();
+            }
+        }
+        let archive = dir.join("dashboard.html");
+
+        let monitor = Monitor::new(1);
+        monitor.write_archive_now(archive.to_str().unwrap());
+        let html = std::fs::read_to_string(&archive).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let idx = html
+            .split_once("const ARCHIVE_TELEMETRY=")
+            .and_then(|(_, rest)| rest.split_once(";\n"))
+            .map(|(json, _)| json)
+            .expect("ARCHIVE_TELEMETRY absent");
+        let v: serde_json::Value = serde_json::from_str(idx).expect("index not JSON");
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "pageless dir must be skipped: {idx}");
+        assert_eq!(arr[0]["host"], "exa", "sorted host-first: {idx}");
+        assert_eq!(arr[0]["href"], "telemetry/exa/lenet-x-1/timeline.html");
+        assert_eq!(arr[1]["host"], "pascal");
     }
 
     #[test]
