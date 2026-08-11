@@ -1383,6 +1383,7 @@ pub fn run_launcher_with_config(
         // Persisted record stream: opt-in via `record_log_dir`. The sink
         // writes each emitted record to its node's bounded log, so the
         // live stream and the on-disk history share one producer.
+        let mut record_shipper = None;
         let record_log = config.record_log_dir.as_ref().map(|dir| {
             // Echo where the stream actually lands. A relative `--record-log`
             // resolves against the LAUNCHER's cwd, not the directory the user
@@ -1399,8 +1400,24 @@ pub fn run_launcher_with_config(
                     .unwrap_or_else(|_| resolved.to_path_buf())
             };
             eprintln!("cluster launcher: record log -> {}", resolved.display());
+            // The writer targets node-local disk; the shipper carries the
+            // records to the configured destination on its own clock. With
+            // `record_log_dir` on a shared mount (NFS/sshfs) a direct
+            // writer would put every record append on the training-adjacent
+            // path, where a hung mount strands the sink — the destination
+            // must only ever stall the sacrificial shipper thread.
+            let staged = crate::monitor::telemetry_dir("records");
+            crate::verbose!(
+                "cluster launcher: record log staged at {}",
+                staged.display(),
+            );
+            record_shipper = Some(crate::monitor::TelemetryShipper::start(
+                &staged,
+                &resolved,
+                crate::monitor::DEFAULT_SHIP_INTERVAL_MS,
+            ));
             Arc::new(crate::monitor::record_log::RecordLog::new(
-                dir,
+                staged,
                 config
                     .max_log_size
                     .unwrap_or(crate::monitor::record_log::DEFAULT_MAX_LOG_BYTES),
@@ -1413,6 +1430,7 @@ pub fn run_launcher_with_config(
                 config.num_epochs,
             )
             .with_record_log(record_log)
+            .with_record_shipper(record_shipper)
             .with_status_board(status_board.clone())
             .with_scalar_reductions(config.scalar_reductions.clone())
             .with_dashboard_html(config.dashboard_html.clone())

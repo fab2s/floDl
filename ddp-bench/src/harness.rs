@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 use flodl::autograd::Variable;
 use flodl::distributed::{ApplyPolicy, AverageBackend, Trainer};
 use flodl::graph::GraphExt;
-use flodl::monitor::{DEFAULT_SPILL_MAX_BYTES, Monitor, Timeline, TimelineSpill, telemetry_dir};
+use flodl::monitor::{
+    DEFAULT_SHIP_INTERVAL_MS, DEFAULT_SPILL_MAX_BYTES, Monitor, TelemetryShipper, Timeline,
+    TimelineSpill, shipping_dest, telemetry_dir,
+};
 use flodl::nn::{Module, Optimizer, Parameter};
 use flodl::tensor::{Device, Result, Tensor, TensorError};
 
@@ -370,6 +373,14 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
         telemetry_dir(&format!("{}-{mode_str}", model_def.name)),
         DEFAULT_SPILL_MAX_BYTES,
     );
+    // Mirror the spill into the run dir continuously (host-qualified, so
+    // multi-host runs land side by side on shared storage) rather than as
+    // a teardown burst; a host that dies mid-run has already delivered.
+    let shipper = TelemetryShipper::start(
+        spill.dir(),
+        shipping_dest(format!("{run_dir}/telemetry"), spill.dir()),
+        DEFAULT_SHIP_INTERVAL_MS,
+    );
 
     // Create monitor. Suppress its "training complete in …" terminal
     // line: the harness owns a richer `done: loss=…, syncs=…,
@@ -440,10 +451,12 @@ pub fn run_combo(model_def: &ModelDef, mode: &DdpMode, config: &RunConfig) -> Re
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     timeline.stop();
-    // After stop: the poller's exit flush is the final broadcast, and
-    // finish() drains it to disk before returning.
+    // Teardown order is the data's path: the poller's exit flush is the
+    // final broadcast, spill.finish() drains it to local disk, and only
+    // then does the shipper's final pass see those bytes and publish.
     let spill_dir = spill.dir().to_path_buf();
     spill.finish();
+    shipper.finish();
 
     // Rotate + save artifacts. Suppressed on cooperative non-narrator ranks
     // (they'd race the narrator's writes to the shared run_dir — the launcher
