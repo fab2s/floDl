@@ -238,6 +238,12 @@ pub struct Monitor {
     /// as the live dashboard does. Only an explicit knob — or a hand edit of the
     /// one constant in the saved file — pins it, which is the publication case.
     archive_theme: Option<String>,
+    /// The run's shipped-telemetry root (`<run dir>/telemetry`) plus the
+    /// controller host name, feeding the dashboard's Timeline tab. Set
+    /// explicitly by the cluster sink (world-map controller name) or
+    /// derived from [`Self::save_html`]'s path on the solo path; pushed
+    /// to the server at bind, or immediately when one is live.
+    telemetry_root: Option<(std::path::PathBuf, String)>,
     /// Exactly what the user handed to [`Self::set_metadata`].
     user_metadata: Option<serde_json::Value>,
     /// Parameter counts derived from the watched graph.
@@ -304,6 +310,7 @@ impl Monitor {
             heatmaps: Vec::new(),
             metadata: None,
             archive_theme: None,
+            telemetry_root: None,
             user_metadata: None,
             param_info: None,
             graph_label: None,
@@ -483,6 +490,9 @@ impl Monitor {
             std::sync::Arc::clone(&self.records),
         )?;
         srv.set_hardware(self.hardware.clone());
+        if let Some((root, controller)) = &self.telemetry_root {
+            srv.set_telemetry(root.clone(), controller.clone());
+        }
 
         // Sample GPU hardware for immediate tab init (before epoch 1).
         // Skip in the launcher process: the launcher host doesn't
@@ -513,6 +523,30 @@ impl Monitor {
     /// ```
     pub fn save_html(&mut self, path: &str) {
         self.save_html = Some(path.to_string());
+        // Solo-path Timeline tab: the shipped telemetry lands beside the
+        // archive by convention. The cluster sink sets this explicitly
+        // (with the world-map controller name) and its call wins.
+        if self.telemetry_root.is_none()
+            && let Some(parent) = std::path::Path::new(path).parent()
+        {
+            let controller = crate::distributed::cluster::resolve_hostname().unwrap_or_default();
+            self.set_telemetry_root(parent.join("telemetry"), controller);
+        }
+    }
+
+    /// Point the dashboard's Timeline tab at the run's shipped telemetry.
+    /// Idempotent per value; effective immediately on a live server and
+    /// re-pushed at any later bind.
+    pub(crate) fn set_telemetry_root(
+        &mut self,
+        root: impl Into<std::path::PathBuf>,
+        controller: String,
+    ) {
+        let root = root.into();
+        if let Some(ref srv) = self.server {
+            srv.set_telemetry(root.clone(), controller.clone());
+        }
+        self.telemetry_root = Some((root, controller));
     }
 
     /// Theme the saved archive opens with: `"dark"` (default), `"light"`, or

@@ -139,13 +139,46 @@ canvas.strip-c{display:block;width:100%;background:var(--panel);border:1px solid
 'use strict';
 
 // ===========================================================================
-// Data source. Injected consts (save_html) win; a served copy may fetch a
-// sibling timeline.json instead (the dual-mode contract).
+// Data source, two modes. Injected consts (save_html) make the static
+// artifact. Served at /timeline?host=<h>, the page instead fetches the
+// shipped JSONL stream from /timeline/data and auto-refreshes every 10s
+// while visible — the shipper's clock, so "live" honestly means "within
+// one shipping tick".
 // ===========================================================================
-const S  = typeof TIMELINE_SAMPLES      !== 'undefined' ? TIMELINE_SAMPLES      : [];
-const E  = typeof TIMELINE_EVENTS       !== 'undefined' ? TIMELINE_EVENTS       : [];
-const R  = typeof TIMELINE_RANK_SAMPLES !== 'undefined' ? TIMELINE_RANK_SAMPLES : [];
-const HOST = typeof TIMELINE_HOST       !== 'undefined' ? TIMELINE_HOST         : null;
+let S = [], E = [], R = [], HOST = null;
+let totalMs = 1;
+let M = null;
+
+/// Spill/shipped stream lines are byte-identical to timeline.json's array
+/// elements; the discriminant is the stream contract ("k" = event, "rank"
+/// = rank sample, neither = poller sample).
+function parseJsonl(text){
+  const s = [], e = [], r = [];
+  for (const line of text.split('\n')){
+    if (!line) continue;
+    let o;
+    try { o = JSON.parse(line); } catch(err) { continue; } // torn tail line
+    if ('k' in o) e.push(o);
+    else if ('rank' in o) r.push(o);
+    else s.push(o);
+  }
+  return {s, e, r};
+}
+
+function setData(s, e, r, host){
+  const oldTotal = totalMs;
+  const wasFullView = view.t0 <= 1 && view.t1 >= oldTotal - 1;
+  S = s; E = e; R = r; HOST = host;
+  totalMs = Math.max(
+    S.length ? S[S.length-1].t : 0,
+    E.length ? E[E.length-1].t : 0,
+    R.length ? R[R.length-1].t : 0,
+  ) || 1;
+  // A zoomed view survives a refresh; a full view follows the new end.
+  if (wasFullView) view = {t0:0, t1:totalMs};
+  else view = {t0:Math.min(view.t0, totalMs), t1:Math.min(view.t1, totalMs)};
+  M = computeModel();
+}
 
 // ===========================================================================
 // Series colors. Fixed assignment per entity (never cycled), two theme
@@ -299,15 +332,9 @@ function rankSeries(rankSamples){
 }
 
 // ===========================================================================
-// Prepared model.
+// Prepared model, recomputed from (S, E, R) on every setData.
 // ===========================================================================
-const totalMs = Math.max(
-  S.length ? S[S.length-1].t : 0,
-  E.length ? E[E.length-1].t : 0,
-  R.length ? R[R.length-1].t : 0,
-) || 1;
-
-const M = (() => {
+function computeModel(){
   const t = S.map(s=>s.t);
   const gpuIds = [...new Set(S.flatMap(s=>(s.gpus||[]).map(g=>g.d)))].sort((a,b)=>a-b);
   const gpu = {};
@@ -343,7 +370,7 @@ const M = (() => {
                     .map(e=>({t:e.t, v:e.values[key]})),
     ranks: rankSeries(R),
   };
-})();
+}
 
 // ===========================================================================
 // Formatting.
@@ -531,9 +558,14 @@ function sampleAt(ts, t){
 const groupsDiv = document.getElementById('groups');
 
 function buildPage(){
+  // Idempotent: a live refresh rebuilds the whole page from the new data.
+  strips.length = 0;
+  groupsDiv.innerHTML = '';
+  document.getElementById('kinds').innerHTML = '';
   if (!S.length && !E.length && !R.length){
     document.getElementById('empty').style.display = 'block';
   } else {
+    document.getElementById('empty').style.display = 'none';
     buildKindToggles();
     buildGroups();
     buildSummary();
@@ -818,12 +850,14 @@ function buildKindToggles(){
   lead.textContent = 'show:';
   bar.appendChild(lead);
   for (const [key,label,colorSpec,def] of KIND_META){
-    kindEnabled[key] = def;
+    // A live refresh keeps the user's toggle choices.
+    if (!(key in kindEnabled)) kindEnabled[key] = def;
+    const on = kindEnabled[key];
     if (!present.has(key)) continue;
     const l = document.createElement('label');
     const n = E.filter(e=>kindFamily(e.k)===key).length;
-    l.innerHTML = `<input type="checkbox" ${def?'checked':''}> <span class="sw" data-kc="${key}"></span>${label} <span style="opacity:.6">${n}</span>`;
-    if (!def) l.style.opacity = '0.45';
+    l.innerHTML = `<input type="checkbox" ${on?'checked':''}> <span class="sw" data-kc="${key}"></span>${label} <span style="opacity:.6">${n}</span>`;
+    if (!on) l.style.opacity = '0.45';
     // A kind's toggle governs EVERYTHING derived from that kind — its
     // strips, its span shading, and its event-strip ticks — so every
     // click has a visible effect (ticks alone can be sub-pixel subtle).
@@ -1037,8 +1071,55 @@ document.getElementById('themeBtn').addEventListener('click', ()=>{
 });
 
 window.addEventListener('resize', render);
-buildPage();
-render();
+
+// Boot: injected consts make the static artifact; served with ?host= the
+// page fetches the shipped stream and auto-refreshes on the shipper's
+// clock while its tab is visible.
+const FETCH_HOST = new URLSearchParams(location.search).get('host');
+if (FETCH_HOST && typeof TIMELINE_SAMPLES === 'undefined'){
+  liveRefresh();
+} else {
+  setData(
+    typeof TIMELINE_SAMPLES      !== 'undefined' ? TIMELINE_SAMPLES      : [],
+    typeof TIMELINE_EVENTS       !== 'undefined' ? TIMELINE_EVENTS       : [],
+    typeof TIMELINE_RANK_SAMPLES !== 'undefined' ? TIMELINE_RANK_SAMPLES : [],
+    typeof TIMELINE_HOST         !== 'undefined' ? TIMELINE_HOST         : null,
+  );
+  buildPage();
+  render();
+}
+
+async function liveRefresh(){
+  // The catch owns NETWORK failures only (keep the last good view, retry
+  // next tick); a rendering bug must surface, not silently retry.
+  let text = null;
+  try {
+    const run = new URLSearchParams(location.search).get('run');
+    const url = '/timeline/data?host=' + encodeURIComponent(FETCH_HOST) +
+      (run ? '&run=' + encodeURIComponent(run) : '');
+    const resp = await fetch(url);
+    if (resp.ok) text = await resp.text();
+    else if (!S.length){
+      const el = document.getElementById('empty');
+      el.textContent = 'No shipped telemetry for "' + FETCH_HOST +
+        '" yet — the shipper publishes within a few seconds of the first samples.';
+      el.style.display = 'block';
+    }
+  } catch (e) { /* transient fetch error */ }
+  if (text !== null){
+    const {s, e, r} = parseJsonl(text);
+    setData(s, e, r, FETCH_HOST);
+    buildPage();
+    render();
+  }
+  setTimeout(() => {
+    if (document.visibilityState === 'visible') liveRefresh();
+    else document.addEventListener('visibilitychange', function once(){
+      document.removeEventListener('visibilitychange', once);
+      liveRefresh();
+    }, {once:true});
+  }, 10000);
+}
 </script>
 </body>
 </html>
