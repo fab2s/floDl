@@ -101,6 +101,23 @@ impl RecordLog {
         }
     }
 
+    /// Append one pre-serialized line to `path`'s log, same ring discipline
+    /// as [`Self::append`] without the serde round trip. The raw entry point
+    /// for producers that already hold their line as a string (the timeline
+    /// spill writes its manual-JSON objects through here). `line` must be a
+    /// single line; embedded newlines would corrupt the JSONL framing, so
+    /// they are rejected (skipped) rather than written.
+    pub fn append_line(&self, path: &str, line: &str) {
+        if line.contains('\n') {
+            return;
+        }
+        let Some(rel) = safe_relative_path(path) else {
+            return;
+        };
+        let mut nodes = self.nodes.lock().unwrap();
+        self.append_one(&mut nodes, path, &rel, line);
+    }
+
     /// Append one serialized record to `path`'s log, opening and rotating
     /// as needed.
     fn append_one(
@@ -325,6 +342,37 @@ mod tests {
 
     fn rec(path: &str, tick: u64) -> Value {
         json!({ "v": 1, "kind": "node", "path": path, "tick": tick })
+    }
+
+    /// `append_line` is the raw entry point: pre-serialized lines land
+    /// verbatim under the same ring, embedded newlines are rejected (they
+    /// would corrupt the JSONL framing), and the path-escape guard applies
+    /// exactly as it does for `append`.
+    #[test]
+    fn append_line_is_the_raw_entry() {
+        let d = TempDir::new("rawline");
+        let log = RecordLog::new(&d.0, DEFAULT_MAX_LOG_BYTES);
+        log.append_line("timeline", "{\"t\":1}");
+        log.append_line("timeline", "two\nlines");
+        log.append_line("../escape", "{}");
+        log.flush();
+        let content = std::fs::read_to_string(d.0.join("timeline.log")).unwrap();
+        assert_eq!(content, "{\"t\":1}\n");
+        assert!(!d.0.join("..").join("escape.log").exists());
+    }
+
+    /// Raw lines drive the same rotation as record appends: a tiny cap
+    /// produces the single retained rotated segment.
+    #[test]
+    fn append_line_rotates_at_cap() {
+        let d = TempDir::new("rawrot");
+        let log = RecordLog::new(&d.0, 64);
+        for i in 0..20 {
+            log.append_line("timeline", &format!("{{\"t\":{i}}}"));
+        }
+        log.flush();
+        assert!(d.0.join("timeline.log").is_file());
+        assert!(d.0.join("timeline.log.1").is_file());
     }
 
     #[test]

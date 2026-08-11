@@ -32,6 +32,7 @@ pub mod record_log;
 pub mod record_store;
 pub mod resources;
 mod server;
+pub mod spill;
 pub mod timeline;
 pub(crate) use server::dashboard_bind_is_loopback;
 
@@ -40,8 +41,9 @@ use std::time::{Duration, Instant};
 
 use crate::graph::Graph;
 
-pub use format::{format_bytes, format_eta, format_metric};
+pub use format::{format_bytes, format_eta, format_metric, format_utc_stamp};
 pub use resources::{GpuSnapshot, ResourceSample, ResourceSampler};
+pub use spill::{DEFAULT_SPILL_MAX_BYTES, TimelineSpill, telemetry_dir, telemetry_root};
 pub use timeline::{
     EventKind, GpuTimelineSample, RankGpuSample, RankTimelineSample, Timeline, TimelineBroadcast,
     TimelineEvent, TimelineSample, TimelineSummary,
