@@ -82,10 +82,10 @@ pub fn telemetry_dir(label: &str) -> PathBuf {
     telemetry_root().join(run_id(label, secs, std::process::id()))
 }
 
-/// `<label>-<UTC stamp>-<pid>`, label reduced to `[A-Za-z0-9._-]` so a
-/// caller-supplied string can never change the directory shape.
-fn run_id(label: &str, unix_secs: u64, pid: u32) -> String {
-    let mut clean: String = label
+/// Reduce a caller-supplied string to `[A-Za-z0-9._-]` for use as a single
+/// path component; empty input becomes `fallback`.
+pub(super) fn sanitize_component(s: &str, fallback: &str) -> String {
+    let clean: String = s
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -96,10 +96,18 @@ fn run_id(label: &str, unix_secs: u64, pid: u32) -> String {
         })
         .collect();
     if clean.is_empty() {
-        clean.push_str("run");
+        fallback.to_string()
+    } else {
+        clean
     }
+}
+
+/// `<label>-<UTC stamp>-<pid>`, label sanitized so a caller-supplied string
+/// can never change the directory shape.
+fn run_id(label: &str, unix_secs: u64, pid: u32) -> String {
     format!(
-        "{clean}-{}-{pid}",
+        "{}-{}-{pid}",
+        sanitize_component(label, "run"),
         super::format::format_utc_stamp(unix_secs)
     )
 }

@@ -204,6 +204,11 @@ pub struct ClusterDashboardSink {
     /// same records that go live also land on disk when the user opted in
     /// (`record_log_dir`); `None` keeps the stream live-only.
     record_log: Option<Arc<crate::monitor::record_log::RecordLog>>,
+    /// The shipper mirroring the record log's node-local staging dir to the
+    /// user's `record_log_dir`. Finished (residual shipped, `.partial`
+    /// published) in [`Self::shutdown`], strictly after the log's final
+    /// flush so the last window's records make the mirror.
+    record_shipper: Mutex<Option<crate::monitor::TelemetryShipper>>,
     /// Where to write the self-contained dashboard archive at teardown, or
     /// `None` for live-only. Sink-driven because on a cluster run this is the
     /// only `Monitor` holding the epochs and the record plane.
@@ -257,6 +262,7 @@ impl ClusterDashboardSink {
             latest_window_records: Mutex::new(Vec::new()),
             recent_events: Mutex::new(Vec::new()),
             record_log: None,
+            record_shipper: Mutex::new(None),
             dashboard_html: None,
             scalar_reductions: crate::monitor::record::Reductions::new(),
             meta_published: Mutex::new(false),
@@ -272,6 +278,13 @@ impl ClusterDashboardSink {
         log: Option<Arc<crate::monitor::record_log::RecordLog>>,
     ) -> Self {
         self.record_log = log;
+        self
+    }
+
+    /// Attach the shipper that mirrors the record log's node-local staging
+    /// dir to the user's destination; finished at [`Self::shutdown`].
+    pub fn with_record_shipper(self, shipper: Option<crate::monitor::TelemetryShipper>) -> Self {
+        *self.record_shipper.lock().unwrap() = shipper;
         self
     }
 
@@ -703,6 +716,12 @@ impl DashboardSink for ClusterDashboardSink {
         if let Some(log) = &self.record_log {
             log.flush();
         }
+        // Then let the shipper's final pass carry those bytes to the
+        // user's record_log_dir and publish the mirror. Bounded: a stalled
+        // destination detaches rather than hanging teardown.
+        if let Some(shipper) = self.record_shipper.lock().unwrap().take() {
+            shipper.finish();
+        }
         let mut mon = self.monitor.lock().unwrap();
         // Server down FIRST: it drains the record-push channel, so the archive
         // below sees the whole run including the final window rather than
@@ -981,6 +1000,42 @@ mod tests {
         let tail = log.tail("root", 10);
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[1]["tick"], 2);
+    }
+
+    /// The staged plane end to end: records append to a node-local staging
+    /// dir, the shipper mirrors them, and shutdown's flush-then-finish
+    /// ordering guarantees the LAST window makes the published destination
+    /// tree — no `.partial` left behind.
+    #[test]
+    fn staged_record_log_ships_to_the_destination_at_shutdown() {
+        let staged = TempDir::new("stage-src");
+        let dest = TempDir::new("stage-dst");
+        let log = Arc::new(RecordLog::new(&staged.0, DEFAULT_MAX_LOG_BYTES));
+        // A long tick: the destination content must not depend on a mirror
+        // pass happening to run mid-test — the shutdown pass alone must
+        // deliver everything.
+        let shipper = crate::monitor::TelemetryShipper::start(&staged.0, &dest.0, 60_000);
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_record_log(Some(Arc::clone(&log)))
+            .with_record_shipper(Some(shipper));
+
+        sink.push_window_records(window(1));
+        sink.push_window_records(window(2));
+        sink.shutdown(); // flush, then the shipper's final pass + publish
+
+        for node in ["root.log", "root/rank0.log"] {
+            let published = dest.0.join(node);
+            assert!(published.is_file(), "missing shipped {node}");
+            let content = std::fs::read_to_string(&published).unwrap();
+            assert!(
+                content.contains("\"tick\":2"),
+                "last window missing: {content}"
+            );
+        }
+        assert!(
+            !dest.0.join("root.log.partial").exists(),
+            "shutdown must publish the mirror"
+        );
     }
 
     /// A declared roll-up must actually change the cross-rank answer, and the

@@ -297,8 +297,11 @@ struct Cli {
     /// Persist the monitor record stream as append-only JSONL under this
     /// directory (flodl `.record_log`): one bounded, drop-oldest file per
     /// node, mirroring each record's path (`root.log`,
-    /// `root/<host>/rank0.log`). Pair with `--reports-per-epoch`.
-    /// Default: library default (live-only, nothing written).
+    /// `root/<host>/rank0.log`). Staged on node-local disk and mirrored
+    /// here (`.partial` while live, final names at teardown), so a shared
+    /// destination can never stall the run. Pair with
+    /// `--reports-per-epoch`. Default: library default (live-only,
+    /// nothing written).
     #[option]
     record_log: Option<String>,
 
