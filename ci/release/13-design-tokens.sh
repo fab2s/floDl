@@ -12,7 +12,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 canon="site/assets/css/flodl-tokens.css"
-consumers="flodl-cli/src/ui/page.html"
+consumers="flodl-cli/src/ui/page.html flodl/src/monitor/timeline.html"
 
 if [ ! -f "$canon" ]; then
     echo "FAIL: canonical token file $canon is missing"

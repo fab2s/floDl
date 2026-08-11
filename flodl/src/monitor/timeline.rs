@@ -726,10 +726,14 @@ impl Timeline {
         f.write_all(out.as_bytes())
     }
 
-    /// Save timeline as a self-contained HTML visualization.
+    /// Save timeline as a self-contained HTML visualization. Injects the
+    /// local poller samples, the event stream, the host-qualified rank
+    /// samples (cluster runs), and the controller host stamp.
     pub fn save_html(&self, path: &str) -> io::Result<()> {
         let samples = self.samples.lock().unwrap();
         let events = self.events.lock().unwrap();
+        let rank_samples = self.rank_samples.lock().unwrap();
+        let host = self.host.lock().unwrap();
 
         let template = include_str!("timeline.html");
 
@@ -740,9 +744,17 @@ impl Timeline {
         let mut events_json = String::with_capacity(events.len() * 80);
         write_events_json(&mut events_json, &events);
 
+        let mut rank_json = String::with_capacity(rank_samples.len() * 120);
+        write_rank_samples_json(&mut rank_json, &rank_samples);
+
+        let host_json = if host.is_empty() {
+            "null".to_string()
+        } else {
+            format!("\"{}\"", host.replace('\\', "\\\\").replace('"', "\\\""))
+        };
+
         let inject = format!(
-            "<script>\nconst TIMELINE_SAMPLES=[{}];\nconst TIMELINE_EVENTS=[{}];\n</script>\n",
-            samples_json, events_json,
+            "<script>\nconst TIMELINE_SAMPLES=[{samples_json}];\nconst TIMELINE_EVENTS=[{events_json}];\nconst TIMELINE_RANK_SAMPLES=[{rank_json}];\nconst TIMELINE_HOST={host_json};\n</script>\n",
         );
 
         let html = template.replacen("<!-- TIMELINE_DATA -->", &inject, 1);
@@ -1380,6 +1392,41 @@ mod tests {
             "host stamp missing: {doc}",
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The HTML artifact injects all four data consts: samples, events,
+    /// rank samples (so a controller page renders remote hosts), and the
+    /// host stamp (`null` when unset).
+    #[test]
+    fn test_save_html_injects_rank_samples_and_host() {
+        let dir = std::env::temp_dir();
+        let tl = Timeline::new(100);
+        tl.set_host("exa");
+        tl.event(EventKind::SyncStart);
+        tl.rank_sample(
+            1,
+            "pascal",
+            &crate::monitor::ResourceSample {
+                cpu_percent: Some(33.0),
+                ..Default::default()
+            },
+        );
+
+        let path = dir.join(format!("flodl_tl_html_{}.html", std::process::id()));
+        tl.save_html(path.to_str().unwrap()).unwrap();
+        let doc = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            doc.contains("const TIMELINE_RANK_SAMPLES=[{"),
+            "rank samples not injected"
+        );
+        assert!(doc.contains("\"host\":\"pascal\""), "rank host missing");
+        assert!(
+            doc.contains("const TIMELINE_HOST=\"exa\";"),
+            "host stamp missing"
+        );
+        assert!(doc.contains("\"k\":\"sync_start\""), "event missing");
     }
 
     /// `set_gpu_poll(false)` clears GPU slices from already-collected

@@ -3,465 +3,1026 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Timeline</title>
+<title>floDl Timeline</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f9e0;</text></svg>">
+<script>
+/* Pre-paint theme resolution, same key and attribute as the site, the live
+   dashboard and fdl ui: localStorage('flodl-theme') -> prefers-color-scheme
+   -> dark. */
+(function(){
+  let t = null;
+  try { t = localStorage.getItem('flodl-theme'); } catch(e) {}
+  if (t !== 'light' && t !== 'dark') {
+    t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <!-- TIMELINE_DATA -->
 <style>
+/* flodl design tokens -- begin */
+/* floDl design tokens: one palette across the site, the live dashboard
+   and fdl ui. Colour marks a ROLE, matching the mermaid convention in
+   CLAUDE.md: indigo = an actor, green = a good/cheap state, amber = a
+   cost/hazard. Dark-first, light via prefers-color-scheme.
+   Canonical home: site/assets/css/flodl-tokens.css. Consumers vendor
+   this file verbatim between the marker comments;
+   ci/release/13-design-tokens.sh fails on drift. */
+:root {
+  --bg: #12161d;
+  --panel: #1a2028;
+  --line: #2a323d;
+  --ink: #d7dee8;
+  --muted: #8b96a5;
+  --actor: #7986cb;
+  --good: #66bb6a;
+  --cost: #d9a05b;
+  --prompt-bg: #0d1117;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+/* Light rides data-theme, not a media query: the shared pre-paint
+   script resolves localStorage('flodl-theme') -> prefers-color-scheme
+   -> dark, and the toggle flips the attribute. Same key, same
+   attribute as the site and the live dashboard, so every surface
+   aligns (the proxied dashboard even shares the ui's origin, hence
+   the very same stored value). */
+:root[data-theme="light"] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --line: #d9dfe7;
+  --ink: #26303b;
+  --muted: #5f6b79;
+  --actor: #5c6bc0;
+  --good: #2e7d32;
+  --cost: #8a5320;
+  --prompt-bg: #eceff3;
+}
+/* flodl design tokens -- end */
+
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;overflow-x:hidden}
-h1{padding:12px 16px;font-size:16px;color:#8be9fd;background:#16213e}
-.controls{padding:8px 16px;background:#16213e;border-bottom:1px solid #333;display:flex;gap:16px;align-items:center;font-size:12px}
-.controls label{color:#999}
-.controls input[type=range]{width:120px}
-.container{padding:16px}
-.lane{margin-bottom:12px}
-.lane-label{font-size:11px;color:#999;margin-bottom:2px;display:flex;justify-content:space-between}
-.lane-label .stat{color:#6272a4}
-canvas{display:block;width:100%;border:1px solid #333;border-radius:3px;cursor:crosshair}
-.legend{padding:8px 16px;display:flex;gap:16px;flex-wrap:wrap;font-size:11px;background:#16213e;border-top:1px solid #333}
-.legend-item{display:flex;align-items:center;gap:4px}
-.legend-swatch{width:12px;height:12px;border-radius:2px}
-#tooltip{position:fixed;background:#0d1117;border:1px solid #555;padding:6px 10px;font-size:11px;pointer-events:none;display:none;z-index:100;border-radius:4px;max-width:300px;white-space:pre-line}
-.summary{padding:12px 16px;font-size:12px;background:#16213e;border-top:1px solid #333}
-.summary table{border-collapse:collapse;width:auto}
-.summary td,.summary th{padding:2px 12px 2px 0;text-align:left}
-.summary th{color:#999}
+body{font-family:var(--sans);background:var(--bg);color:var(--ink);min-height:100vh}
+.header{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);
+  padding:10px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.header h1{font-size:16px;font-weight:600;color:var(--actor);letter-spacing:-0.3px}
+.header h1 span{color:var(--muted);font-weight:400}
+.hostbadge{font-family:var(--mono);font-size:11px;color:var(--muted);border:1px solid var(--line);
+  border-radius:4px;padding:2px 8px}
+.chip{font-size:11px;color:var(--muted)}
+.chip b{color:var(--ink);font-weight:600}
+.spacer{flex:1}
+button{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:5px;
+  padding:4px 10px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+button:hover{border-color:var(--muted)}
+.hint{font-size:11px;color:var(--muted)}
+.axis-wrap{position:sticky;top:47px;z-index:15;background:var(--bg);padding:0 18px;border-bottom:1px solid var(--line)}
+#axis{display:block;width:100%;height:26px;cursor:crosshair}
+.groups{padding:8px 18px 4px}
+.group{margin:10px 0 16px}
+.group-title{font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:var(--muted);
+  margin-bottom:6px;display:flex;align-items:center;gap:10px}
+.group-title .toggles{display:flex;gap:10px;flex-wrap:wrap;text-transform:none;letter-spacing:0}
+.strip{margin-bottom:8px}
+.strip-label{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;
+  color:var(--muted);margin-bottom:2px;gap:8px}
+.strip-label .name{color:var(--ink)}
+.strip-label .stat{font-family:var(--mono);font-size:10px}
+.legend-inline{display:inline-flex;gap:10px;margin-left:8px}
+.legend-inline .li{display:inline-flex;align-items:center;gap:4px}
+.sw{width:9px;height:9px;border-radius:2px;display:inline-block}
+canvas.strip-c{display:block;width:100%;background:var(--panel);border:1px solid var(--line);
+  border-radius:4px;cursor:crosshair}
+.kinds{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);padding:6px 18px}
+.kinds label{display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
+.kinds input{accent-color:var(--actor)}
+#tooltip{position:fixed;background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  padding:7px 10px;font-size:11px;font-family:var(--mono);pointer-events:none;display:none;
+  z-index:100;border-radius:5px;max-width:340px;white-space:pre-line;line-height:1.5;
+  box-shadow:0 4px 14px rgba(0,0,0,0.25)}
+.summary{margin:8px 18px 24px;background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  padding:12px 16px}
+.summary h2{font-size:12px;text-transform:uppercase;letter-spacing:0.5px;color:var(--muted);margin-bottom:8px}
+.summary table{border-collapse:collapse;font-size:12px}
+.summary td,.summary th{padding:3px 16px 3px 0;text-align:left}
+.summary th{color:var(--muted);font-weight:500}
+.summary td{font-family:var(--mono)}
+.empty{color:var(--muted);font-size:13px;padding:32px 18px}
+.theme-toggle{width:30px;height:26px;display:flex;align-items:center;justify-content:center;padding:0}
+.theme-toggle svg{width:14px;height:14px;stroke:var(--muted);fill:none;stroke-width:2}
+:root[data-theme="light"] .theme-toggle .moon{display:none}
+:root:not([data-theme="light"]) .theme-toggle .sun{display:none}
 </style>
 </head>
 <body>
-<h1>System Timeline</h1>
-<div class="controls">
-  <label>Zoom: <input type="range" id="zoom" min="1" max="20" value="1" step="0.5"></label>
-  <label>Offset: <input type="range" id="offset" min="0" max="1" value="0" step="0.001"></label>
-  <span id="cursor-info" style="color:#6272a4"></span>
+<div class="header">
+  <h1>floDl <span>Timeline</span></h1>
+  <span class="hostbadge" id="hostBadge" style="display:none"></span>
+  <span class="chip">duration <b id="chipDur">&mdash;</b></span>
+  <span class="chip">samples <b id="chipSamples">&mdash;</b></span>
+  <span class="chip" id="chipView"></span>
+  <div class="spacer"></div>
+  <span class="hint">drag: zoom &middot; wheel: zoom &middot; double-click: reset</span>
+  <button id="resetBtn">Reset zoom</button>
+  <button class="theme-toggle" id="themeBtn" aria-label="Toggle light/dark theme" title="Toggle theme">
+    <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    <svg class="moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  </button>
 </div>
-<div class="container" id="lanes"></div>
-<div class="legend" id="legend"></div>
-<div class="summary" id="summary"></div>
+<div class="axis-wrap"><canvas id="axis"></canvas></div>
+<div class="kinds" id="kinds"></div>
+<div class="groups" id="groups"></div>
+<div class="summary" id="summary" style="display:none"><h2>Run summary</h2><div id="summaryBody"></div></div>
+<div class="empty" id="empty" style="display:none">No timeline data available.</div>
 <div id="tooltip"></div>
 
 <script>
-const S = typeof TIMELINE_SAMPLES !== 'undefined' ? TIMELINE_SAMPLES : [];
-const E = typeof TIMELINE_EVENTS !== 'undefined' ? TIMELINE_EVENTS : [];
-if (!S.length) {
-  document.getElementById('lanes').innerHTML = '<p style="padding:20px;color:#999">No timeline data available.</p>';
-}
+'use strict';
 
-const COLORS = {
-  gpu_heat: (v) => {
-    if (v < 30) return `rgb(${Math.round(v*2.5)},${Math.round(60+v*2)},${Math.round(80+v)})`;
-    if (v < 70) return `rgb(${Math.round(50+(v-30)*5)},${Math.round(180-(v-30)*2)},${Math.round(50-(v-30)*0.5)})`;
-    return `rgb(${Math.round(200+(v-70)*1.8)},${Math.round(100-(v-70)*2.5)},30)`;
-  },
-  cpu: '#8be9fd',
-  ram: '#bd93f9',
-  vram_alloc: '#ffb86c',
-  vram_used: '#ff79c6',
-  epoch_start: '#50fa7b',
-  epoch_end: '#50fa7b',
-  sync_start: '#ff5555',
-  sync_end: '#ff5555',
-  cpu_avg_start: '#f1fa8c',
-  cpu_avg_end: '#f1fa8c',
-  anchor: '#ff79c6',
-  throttle: '#ffb86c',
-  idle: 'rgba(255,85,85,0.15)',
-  custom: '#6272a4',
+// ===========================================================================
+// Data source. Injected consts (save_html) win; a served copy may fetch a
+// sibling timeline.json instead (the dual-mode contract).
+// ===========================================================================
+const S  = typeof TIMELINE_SAMPLES      !== 'undefined' ? TIMELINE_SAMPLES      : [];
+const E  = typeof TIMELINE_EVENTS       !== 'undefined' ? TIMELINE_EVENTS       : [];
+const R  = typeof TIMELINE_RANK_SAMPLES !== 'undefined' ? TIMELINE_RANK_SAMPLES : [];
+const HOST = typeof TIMELINE_HOST       !== 'undefined' ? TIMELINE_HOST         : null;
+
+// ===========================================================================
+// Series colors. Fixed assignment per entity (never cycled), two theme
+// variants like the dashboard's COLORS_DARK/COLORS_LIGHT. Roles follow the
+// house palette where one applies: sync/idle shading are cost/hazard tints.
+// ===========================================================================
+// Co-strip pairs are CVD-checked (dataviz validator): cpu/ram and
+// sync/cpu-avg were indigo/purple (protan dE 2.0) and light va/vu two
+// near-identical browns (dE 0.9) before the re-step below. Purple moved
+// to vram-used, pink to ram and cpu-avg; hues that never share a strip
+// may repeat (each strip is its own identity space, legend-named).
+const SERIES_DARK = {util:'#34d399', va:'#fbbf24', vu:'#a78bfa', cpu:'#6c8cff', ram:'#f472b6',
+  anchor:'#fb923c', syncMs:'#6c8cff', avgMs:'#f472b6', d:'#f87171', lambda:'#67e8f9',
+  loss:'#6c8cff', lr:'#34d399'};
+const SERIES_LIGHT = {util:'#0e9968', va:'#8f5b10', vu:'#6e4ad0', cpu:'#3656c7', ram:'#b83280',
+  anchor:'#b4530c', syncMs:'#3656c7', avgMs:'#b83280', d:'#c93c3c', lambda:'#0b7b95',
+  loss:'#3656c7', lr:'#0e9968'};
+function seriesColor(k){
+  return (document.documentElement.getAttribute('data-theme')==='light'?SERIES_LIGHT:SERIES_DARK)[k];
+}
+const SHADE = {
+  sync:    'rgba(217,160,91,0.12)',
+  cpu_avg: 'rgba(167,139,250,0.10)',
+  idle:    'rgba(248,113,113,0.12)',
 };
-
-const nGpus = S.length > 0 ? S[0].gpus.length : 0;
-const totalMs = S.length > 0 ? S[S.length-1].t : 1;
-const laneH = 48;
-const DPR = window.devicePixelRatio || 1;
-
-// Build lanes
-const lanesDiv = document.getElementById('lanes');
-const canvases = [];
-
-function makeLane(label, statFn) {
-  const div = document.createElement('div');
-  div.className = 'lane';
-  const lbl = document.createElement('div');
-  lbl.className = 'lane-label';
-  lbl.innerHTML = `<span>${label}</span><span class="stat" id="stat-${canvases.length}"></span>`;
-  const c = document.createElement('canvas');
-  c.height = laneH * DPR;
-  c.style.height = laneH + 'px';
-  div.appendChild(lbl);
-  div.appendChild(c);
-  lanesDiv.appendChild(div);
-  canvases.push({canvas: c, label, statFn, ctx: c.getContext('2d')});
-  return canvases.length - 1;
-}
-
-// GPU lanes
-for (let i = 0; i < nGpus; i++) {
-  const name = `GPU ${i}`;
-  makeLane(name, () => {
-    const last = S[S.length-1];
-    if (!last) return '';
-    const g = last.gpus[i];
-    return g ? `${g.u}% | VRAM: ${fmtBytes(g.va)} alloc / ${fmtBytes(g.vu)} used / ${fmtBytes(g.vt)} total` : '';
-  });
-}
-
-// CPU lane
-makeLane('CPU', () => {
-  const last = S[S.length-1];
-  return last ? `${last.cpu.toFixed(1)}%` : '';
-});
-
-// RAM lane
-makeLane('RAM', () => {
-  const last = S[S.length-1];
-  return last ? `${fmtBytes(last.ram[0])} / ${fmtBytes(last.ram[1])}` : '';
-});
-
-function fmtBytes(b) {
-  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
-  if (b >= 1e6) return (b/1e6).toFixed(0) + ' MB';
-  if (b >= 1e3) return (b/1e3).toFixed(0) + ' KB';
-  return b + ' B';
-}
-
-function fmtMs(ms) {
-  if (ms >= 60000) return (ms/60000).toFixed(1) + 'm';
-  if (ms >= 1000) return (ms/1000).toFixed(1) + 's';
-  return ms.toFixed(0) + 'ms';
-}
-
-// Legend
-const legendDiv = document.getElementById('legend');
-const legendItems = [
-  ['Epoch', COLORS.epoch_start],
-  ['Sync', COLORS.sync_start],
-  ['CPU Avg', COLORS.cpu_avg_start],
-  ['Anchor', COLORS.anchor],
-  ['Throttle', COLORS.throttle],
-  ['Idle gap', '#ff5555'],
+const KIND_META = [
+  // [key, label, color key or literal, default-enabled]
+  ['epoch',          'epoch',          'good',   true],
+  ['sync',           'sync',           'cost',   true],
+  ['cpu_avg',        'cpu avg',        '#a78bfa',true],
+  ['anchor',         'anchor',         '#fb923c',true],
+  ['throttle',       'throttle',       '#f87171',true],
+  ['meta_nudge',     'meta nudge',     '#67e8f9',true],
+  ['lost_broadcast', 'lost broadcast', '#f87171',true],
+  ['div',            'divergence',     'muted',  false],
+  ['guard_telemetry','guard',          'muted',  false],
+  ['div_epoch',      'div/epoch',      'muted',  true],
 ];
-legendItems.forEach(([name, color]) => {
-  const d = document.createElement('div');
-  d.className = 'legend-item';
-  d.innerHTML = `<div class="legend-swatch" style="background:${color}"></div>${name}`;
-  legendDiv.appendChild(d);
-});
-
-// Zoom/pan state
-let zoomLevel = 1;
-let panOffset = 0;
-const zoomInput = document.getElementById('zoom');
-const offsetInput = document.getElementById('offset');
-
-zoomInput.addEventListener('input', () => { zoomLevel = parseFloat(zoomInput.value); render(); });
-offsetInput.addEventListener('input', () => { panOffset = parseFloat(offsetInput.value); render(); });
-
-function getVisibleRange(w) {
-  const visMs = totalMs / zoomLevel;
-  const maxOff = totalMs - visMs;
-  const startMs = panOffset * maxOff;
-  return [startMs, startMs + visMs];
+function kindColor(spec){
+  if (spec==='good'||spec==='cost'||spec==='muted'||spec==='actor')
+    return getComputedStyle(document.documentElement).getPropertyValue('--'+spec).trim();
+  return spec;
 }
 
-function render() {
-  canvases.forEach((lane, li) => {
-    const c = lane.canvas;
-    const ctx = lane.ctx;
-    const w = c.parentElement.clientWidth;
-    c.width = w * DPR;
-    c.style.width = w + 'px';
-    ctx.scale(DPR, DPR);
+// ===========================================================================
+// Pure data preparation (DOM-free).
+// ===========================================================================
 
-    const h = laneH;
-    ctx.fillStyle = '#1a1a2e';
-    ctx.fillRect(0, 0, w, h);
-
-    if (!S.length) return;
-
-    const [startMs, endMs] = getVisibleRange(w);
-    const msPerPx = (endMs - startMs) / w;
-
-    // Draw data
-    if (li < nGpus) {
-      // GPU heatmap
-      drawGpuLane(ctx, w, h, li, startMs, endMs, msPerPx);
-    } else if (li === nGpus) {
-      // CPU line
-      drawLineLane(ctx, w, h, startMs, endMs, s => s.cpu, 100, COLORS.cpu);
-    } else {
-      // RAM fill
-      drawRamLane(ctx, w, h, startMs, endMs);
-    }
-
-    // Draw idle gaps (GPU lanes only)
-    if (li < nGpus) {
-      drawIdleGaps(ctx, w, h, li, startMs, endMs);
-    }
-
-    // Draw events
-    drawEvents(ctx, w, h, startMs, endMs);
-
-    // Update stat
-    const statEl = document.getElementById('stat-' + li);
-    if (statEl && lane.statFn) statEl.textContent = lane.statFn();
-
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-  });
+/// Map an event's `k` onto its toggle family.
+function kindFamily(k){
+  if (k==='epoch_start'||k==='epoch_end') return 'epoch';
+  if (k==='sync_start'||k==='sync_end') return 'sync';
+  if (k==='cpu_avg_start'||k==='cpu_avg_end') return 'cpu_avg';
+  if (k==='idle') return null; // rendered as shading, not a tick
+  return k;
 }
 
-function drawGpuLane(ctx, w, h, gpuIdx, startMs, endMs, msPerPx) {
-  // Draw heatmap bars
-  const barW = Math.max(1, Math.ceil(1 / msPerPx * (S.length > 1 ? S[1].t - S[0].t : 100)));
-  for (let si = 0; si < S.length; si++) {
-    const s = S[si];
-    if (s.t < startMs - msPerPx * barW || s.t > endMs) continue;
-    const g = s.gpus[gpuIdx];
+/// Pair `X_start`/`X_end` events in arrival order into [t0, t1, endEvent].
+function pairSpans(events, startK, endK){
+  const spans = []; let open = null;
+  for (const e of events){
+    if (e.k===startK) open = e.t;
+    else if (e.k===endK && open!==null){ spans.push([open, e.t, e]); open = null; }
+  }
+  if (open!==null) spans.push([open, open, null]); // unterminated: zero-width
+  return spans;
+}
+
+/// A piecewise-constant series from anchor events: value holds until the
+/// next change. Seeded with the first event's `from` so the pre-change
+/// level is drawn too.
+function anchorSteps(events){
+  const pts = [];
+  for (const e of events){
+    if (e.k!=='anchor') continue;
+    if (!pts.length) pts.push({t:0, v:e.from});
+    pts.push({t:e.t, v:e.to});
+  }
+  return pts;
+}
+
+/// Per-pixel-column min/max/mean envelope of a (t, v) series over [t0, t1]
+/// across `w` columns. Never loses a spike: every sample lands in exactly
+/// one column, and a column reports the extremes of what fell in it.
+function envelope(ts, vs, t0, t1, w){
+  const lo = new Float64Array(w).fill(Infinity);
+  const hi = new Float64Array(w).fill(-Infinity);
+  const sum = new Float64Array(w);
+  const cnt = new Uint32Array(w);
+  const span = t1 - t0 || 1;
+  // Binary search the window start; samples are time-ordered.
+  let i = lowerBound(ts, t0);
+  if (i > 0) i--; // one sample of margin so lines enter from the edge
+  for (; i < ts.length && ts[i] <= t1 + span/w; i++){
+    const v = vs[i];
+    if (v===null || v===undefined || Number.isNaN(v)) continue;
+    let c = Math.floor((ts[i]-t0)/span * w);
+    if (c < 0) c = 0; if (c >= w) c = w-1;
+    if (v < lo[c]) lo[c] = v;
+    if (v > hi[c]) hi[c] = v;
+    sum[c] += v; cnt[c]++;
+  }
+  return {lo, hi, sum, cnt};
+}
+
+function lowerBound(arr, x){
+  let a = 0, b = arr.length;
+  while (a < b){ const m = (a+b)>>1; if (arr[m] < x) a = m+1; else b = m; }
+  return a;
+}
+
+/// GPU idle gaps from the local poller samples: consecutive util < 5%
+/// lasting >= 200 ms, per device.
+function idleGaps(samples, device){
+  const gaps = []; let start = null; let lastT = 0;
+  for (const s of samples){
+    const g = s.gpus && s.gpus.find(g => g.d===device);
     if (!g) continue;
-    const x = (s.t - startMs) / (endMs - startMs) * w;
-    ctx.fillStyle = COLORS.gpu_heat(g.u);
-    ctx.fillRect(x, 0, barW + 1, h);
+    lastT = s.t;
+    if (g.u < 5){ if (start===null) start = s.t; }
+    else if (start!==null){ if (s.t-start >= 200) gaps.push([start, s.t]); start = null; }
   }
-
-  // VRAM overlay line (allocated)
-  ctx.beginPath();
-  ctx.strokeStyle = COLORS.vram_alloc;
-  ctx.lineWidth = 1.5;
-  let first = true;
-  for (const s of S) {
-    if (s.t < startMs || s.t > endMs) continue;
-    const g = s.gpus[gpuIdx];
-    if (!g || !g.vt) continue;
-    const x = (s.t - startMs) / (endMs - startMs) * w;
-    const y = h - (g.va / g.vt) * h;
-    if (first) { ctx.moveTo(x, y); first = false; }
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
+  if (start!==null && lastT-start >= 200) gaps.push([start, lastT]);
+  return gaps;
 }
 
-function drawLineLane(ctx, w, h, startMs, endMs, valueFn, maxVal, color) {
-  ctx.beginPath();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  let first = true;
-  for (const s of S) {
-    if (s.t < startMs || s.t > endMs) continue;
-    const x = (s.t - startMs) / (endMs - startMs) * w;
-    const y = h - (valueFn(s) / maxVal) * h;
-    if (first) { ctx.moveTo(x, y); first = false; }
-    else ctx.lineTo(x, y);
+/// Group rank samples into per-(host, rank) sparse series.
+function rankSeries(rankSamples){
+  const map = new Map();
+  for (const s of rankSamples){
+    const key = `${s.host||'?'} r${s.rank}`;
+    if (!map.has(key)) map.set(key, {host:s.host, rank:s.rank, t:[], cpu:[], ramPct:[], gpus:new Map()});
+    const e = map.get(key);
+    e.t.push(s.t);
+    e.cpu.push(s.cpu!==undefined ? s.cpu : null);
+    e.ramPct.push(s.ram_used!==undefined && s.ram_total ? s.ram_used/s.ram_total*100 : null);
+    for (const g of (s.gpus||[])){
+      if (!e.gpus.has(g.d)) e.gpus.set(g.d, {u:[], vaPct:[], vt:g.vt||null});
+      const gg = e.gpus.get(g.d);
+      // Backfill so all per-gpu arrays stay index-aligned with e.t.
+      while (gg.u.length < e.t.length-1){ gg.u.push(null); gg.vaPct.push(null); }
+      gg.u.push(g.u!==undefined ? g.u : null);
+      gg.vaPct.push(g.va!==undefined && g.vt ? g.va/g.vt*100 : null);
+      if (g.vt) gg.vt = g.vt;
+    }
+    for (const gg of e.gpus.values()){
+      while (gg.u.length < e.t.length){ gg.u.push(null); gg.vaPct.push(null); }
+    }
   }
-  ctx.stroke();
+  return map;
+}
 
-  // Fill below
-  if (!first) {
-    ctx.lineTo(((S[S.length-1].t - startMs) / (endMs - startMs)) * w, h);
-    ctx.lineTo(((S[0].t - startMs) / (endMs - startMs)) * w, h);
-    ctx.closePath();
-    ctx.fillStyle = color.replace(')', ',0.1)').replace('rgb', 'rgba');
-    ctx.fill();
+// ===========================================================================
+// Prepared model.
+// ===========================================================================
+const totalMs = Math.max(
+  S.length ? S[S.length-1].t : 0,
+  E.length ? E[E.length-1].t : 0,
+  R.length ? R[R.length-1].t : 0,
+) || 1;
+
+const M = (() => {
+  const t = S.map(s=>s.t);
+  const gpuIds = [...new Set(S.flatMap(s=>(s.gpus||[]).map(g=>g.d)))].sort((a,b)=>a-b);
+  const gpu = {};
+  for (const d of gpuIds){
+    gpu[d] = {
+      t, // shared clock
+      u:    S.map(s=>{const g=(s.gpus||[]).find(x=>x.d===d); return g?g.u:null;}),
+      vaPct:S.map(s=>{const g=(s.gpus||[]).find(x=>x.d===d); return g&&g.vt?g.va/g.vt*100:null;}),
+      vuPct:S.map(s=>{const g=(s.gpus||[]).find(x=>x.d===d); return g&&g.vt?g.vu/g.vt*100:null;}),
+      vt:   (S.find(s=>(s.gpus||[]).some(x=>x.d===d&&x.vt))||{gpus:[]}).gpus.find(x=>x.d===d)?.vt||null,
+      idle: idleGaps(S, d),
+    };
+  }
+  const ev = k => E.filter(e=>e.k===k);
+  return {
+    t,
+    cpu: S.map(s=>s.cpu),
+    ramPct: S.map(s=>s.ram[1] ? s.ram[0]/s.ram[1]*100 : null),
+    ramTotal: S.length ? S[0].ram[1] : null,
+    gpuIds, gpu,
+    syncSpans: pairSpans(E,'sync_start','sync_end'),
+    avgSpans:  pairSpans(E,'cpu_avg_start','cpu_avg_end'),
+    anchor: anchorSteps(E),
+    syncMs: ev('sync_end').map(e=>({t:e.t, v:e.ms})),
+    avgMs:  ev('cpu_avg_end').map(e=>({t:e.t, v:e.ms})),
+    d:      ev('div').map(e=>({t:e.t, v:e.d, ev:e})),
+    lambda: ev('div').filter(e=>e.lambda_ema!==undefined).map(e=>({t:e.t, v:e.lambda_ema})),
+    loss:   ev('epoch_end').map(e=>({t:e.t, v:e.loss, epoch:e.epoch})),
+    lr:     ev('epoch_end').map(e=>({t:e.t, v:e.lr})),
+    epochStarts: ev('epoch_start'),
+    guardKeys: [...new Set(ev('guard_telemetry').flatMap(e=>Object.keys(e.values||{})))].sort(),
+    guard: key => ev('guard_telemetry').filter(e=>e.values && e.values[key]!==undefined)
+                    .map(e=>({t:e.t, v:e.values[key]})),
+    ranks: rankSeries(R),
+  };
+})();
+
+// ===========================================================================
+// Formatting.
+// ===========================================================================
+function fmtMs(ms){
+  if (ms >= 3600000) return (ms/3600000).toFixed(2)+'h';
+  if (ms >= 60000) return (ms/60000).toFixed(1)+'m';
+  if (ms >= 1000) return (ms/1000).toFixed(1)+'s';
+  return Math.round(ms)+'ms';
+}
+function fmtBytes(b){
+  if (b===null||b===undefined) return '?';
+  if (b >= 1e9) return (b/1e9).toFixed(1)+' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(0)+' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(0)+' KB';
+  return b+' B';
+}
+function fmtVal(v){
+  if (v===null||v===undefined) return '?';
+  const a = Math.abs(v);
+  if (a!==0 && (a<1e-3 || a>=1e5)) return v.toExponential(2);
+  return +v.toFixed(4)+'';
+}
+
+// ===========================================================================
+// Strips: each is one measure on one axis. A strip declares how to draw its
+// data and what the tooltip should say at a time t.
+// ===========================================================================
+const DPR = window.devicePixelRatio || 1;
+let view = {t0:0, t1:totalMs};
+const strips = [];  // {canvas, ctx, h, draw, tip, label}
+let cursorT = null;
+const kindEnabled = {};
+
+function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function addStrip(parent, name, opts){
+  const div = document.createElement('div');
+  div.className = 'strip';
+  const label = document.createElement('div');
+  label.className = 'strip-label';
+  let legendHtml = '';
+  if (opts.legend && opts.legend.length > 1){
+    legendHtml = '<span class="legend-inline">' + opts.legend.map(([n,c]) =>
+      `<span class="li"><span class="sw" data-sc="${c}"></span>${n}</span>`).join('') + '</span>';
+  }
+  label.innerHTML = `<span><span class="name">${name}</span>${legendHtml}</span><span class="stat">${opts.stat||''}</span>`;
+  const c = document.createElement('canvas');
+  c.className = 'strip-c';
+  const h = opts.h || 46;
+  c.style.height = h+'px';
+  div.appendChild(label); div.appendChild(c);
+  parent.appendChild(div);
+  const strip = {canvas:c, ctx:c.getContext('2d'), h, draw:opts.draw, tip:opts.tip, name};
+  strips.push(strip);
+  hookInteractions(c);
+  return strip;
+}
+
+// -- drawing helpers --------------------------------------------------------
+
+function xOf(t, w){ return (t-view.t0)/(view.t1-view.t0)*w; }
+
+function drawSpans(ctx, w, h, spans, fill){
+  ctx.fillStyle = fill;
+  for (const [a,b] of spans){
+    if (b < view.t0 || a > view.t1) continue;
+    const x1 = Math.max(0, xOf(a,w)), x2 = Math.min(w, xOf(Math.max(b,a+1),w));
+    ctx.fillRect(x1, 0, Math.max(x2-x1,1), h);
   }
 }
 
-function drawRamLane(ctx, w, h, startMs, endMs) {
-  ctx.beginPath();
-  ctx.strokeStyle = COLORS.ram;
-  ctx.lineWidth = 1.5;
-  let first = true;
-  const maxRam = S.length ? S[0].ram[1] : 1;
-  for (const s of S) {
-    if (s.t < startMs || s.t > endMs) continue;
-    const x = (s.t - startMs) / (endMs - startMs) * w;
-    const y = h - (s.ram[0] / maxRam) * h;
-    if (first) { ctx.moveTo(x, y); first = false; }
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
-function drawIdleGaps(ctx, w, h, gpuIdx, startMs, endMs) {
-  // Find consecutive low-util samples (< 5%)
-  let gapStart = null;
-  for (let si = 0; si < S.length; si++) {
-    const s = S[si];
-    const g = s.gpus[gpuIdx];
-    if (!g) continue;
-    if (g.u < 5) {
-      if (gapStart === null) gapStart = s.t;
+/// Dense series: envelope band + mean line. Sparse series (< 2 samples per
+/// column on average) degrade to a plain polyline with point markers.
+function drawSeries(ctx, w, h, ts, vs, yMax, colorKey, fillBand){
+  const color = seriesColor(colorKey);
+  const n = countInView(ts);
+  if (n === 0) return;
+  if (n >= w){
+    const env = envelope(ts, vs, view.t0, view.t1, w);
+    if (fillBand){
+      ctx.fillStyle = color + '33';
+      ctx.beginPath();
+      let started = false;
+      for (let c=0;c<w;c++){ if (!env.cnt[c]) continue;
+        const y = h - Math.min(env.hi[c]/yMax,1)*h;
+        if (!started){ ctx.moveTo(c, h); ctx.lineTo(c, y); started = true; } else ctx.lineTo(c, y);
+      }
+      if (started){ ctx.lineTo(w, h); ctx.closePath(); ctx.fill(); }
     } else {
-      if (gapStart !== null) {
-        const dur = s.t - gapStart;
-        if (dur >= 200) {
-          const x1 = Math.max(0, (gapStart - startMs) / (endMs - startMs) * w);
-          const x2 = Math.min(w, (s.t - startMs) / (endMs - startMs) * w);
-          ctx.fillStyle = COLORS.idle;
-          ctx.fillRect(x1, 0, x2 - x1, h);
-        }
-        gapStart = null;
+      // min/max band so decimation cannot hide spikes
+      ctx.fillStyle = color + '2e';
+      for (let c=0;c<w;c++){ if (!env.cnt[c]) continue;
+        const y1 = h - Math.min(env.hi[c]/yMax,1)*h;
+        const y2 = h - Math.min(env.lo[c]/yMax,1)*h;
+        ctx.fillRect(c, y1, 1, Math.max(y2-y1,1));
       }
     }
-  }
-}
-
-function drawEvents(ctx, w, h, startMs, endMs) {
-  for (const e of E) {
-    if (e.t < startMs || e.t > endMs) continue;
-    const x = (e.t - startMs) / (endMs - startMs) * w;
-    let color = COLORS.custom;
-    let dashed = false;
-
-    switch (e.k) {
-      case 'epoch_start': color = COLORS.epoch_start; break;
-      case 'epoch_end': color = COLORS.epoch_end; dashed = true; break;
-      case 'sync_start': color = COLORS.sync_start; break;
-      case 'sync_end': color = COLORS.sync_end; dashed = true; break;
-      case 'cpu_avg_start': color = COLORS.cpu_avg_start; break;
-      case 'cpu_avg_end': color = COLORS.cpu_avg_end; dashed = true; break;
-      case 'anchor': color = COLORS.anchor; break;
-      case 'throttle': color = COLORS.throttle; break;
-      case 'custom': color = COLORS.custom; break;
-      default: continue;
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+    let pen = false;
+    for (let c=0;c<w;c++){
+      if (!env.cnt[c]){ pen = false; continue; }
+      const y = h - Math.min((env.sum[c]/env.cnt[c])/yMax,1)*h;
+      if (!pen){ ctx.moveTo(c,y); pen = true; } else ctx.lineTo(c,y);
     }
-
-    ctx.beginPath();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1;
-    if (dashed) ctx.setLineDash([3, 3]);
-    else ctx.setLineDash([]);
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
     ctx.stroke();
-    ctx.setLineDash([]);
+  } else {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+    let pen = false;
+    let i = Math.max(0, lowerBound(ts, view.t0)-1);
+    const pts = [];
+    for (; i<ts.length && ts[i]<=view.t1+(view.t1-view.t0)/Math.max(w,1); i++){
+      const v = vs[i];
+      if (v===null||v===undefined||Number.isNaN(v)){ pen = false; continue; }
+      const x = xOf(ts[i],w), y = h - Math.min(v/yMax,1)*h;
+      if (!pen){ ctx.moveTo(x,y); pen = true; } else ctx.lineTo(x,y);
+      pts.push([x,y]);
+    }
+    ctx.stroke();
+    ctx.fillStyle = color;
+    if (pts.length <= 200) for (const [x,y] of pts) { ctx.beginPath(); ctx.arc(x,y,2,0,7); ctx.fill(); }
+    if (fillBand && pts.length){
+      ctx.fillStyle = color + '22';
+      ctx.beginPath(); ctx.moveTo(pts[0][0], h);
+      for (const [x,y] of pts) ctx.lineTo(x,y);
+      ctx.lineTo(pts[pts.length-1][0], h); ctx.closePath(); ctx.fill();
+    }
   }
 }
 
-// Tooltip
-const tooltip = document.getElementById('tooltip');
-const cursorInfo = document.getElementById('cursor-info');
+function countInView(ts){
+  return lowerBound(ts, view.t1) - lowerBound(ts, view.t0);
+}
 
-document.addEventListener('mousemove', (ev) => {
-  const target = ev.target;
-  if (target.tagName !== 'CANVAS') {
-    tooltip.style.display = 'none';
-    cursorInfo.textContent = '';
-    return;
+/// Dots for point series {t, v} on a linear or log axis.
+function drawDots(ctx, w, h, pts, scale, colorKey){
+  const color = seriesColor(colorKey);
+  ctx.fillStyle = color;
+  for (const p of pts){
+    if (p.t < view.t0 || p.t > view.t1) continue;
+    const y = scale(p.v, h);
+    if (y===null) continue;
+    ctx.beginPath(); ctx.arc(xOf(p.t,w), y, 2.5, 0, 7); ctx.fill();
   }
+}
 
-  const rect = target.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
-  const w = rect.width;
-
-  const [startMs, endMs] = getVisibleRange(w);
-  const ms = startMs + (x / w) * (endMs - startMs);
-
-  cursorInfo.textContent = fmtMs(ms);
-
-  // Find nearest sample
-  let nearest = null;
-  let minDist = Infinity;
-  for (const s of S) {
-    const d = Math.abs(s.t - ms);
-    if (d < minDist) { minDist = d; nearest = s; }
+/// Piecewise-constant step line for {t, v} change points.
+function drawStep(ctx, w, h, pts, yMin, yMax, colorKey){
+  if (!pts.length) return;
+  const color = seriesColor(colorKey);
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+  const sy = v => h - (v-yMin)/((yMax-yMin)||1)*(h-8) - 4;
+  let px = xOf(Math.max(pts[0].t, view.t0), w), py = sy(pts[0].v);
+  ctx.moveTo(Math.max(px,0), py);
+  for (let i=1;i<pts.length;i++){
+    const x = xOf(pts[i].t, w);
+    ctx.lineTo(x, py); py = sy(pts[i].v); ctx.lineTo(x, py);
   }
+  ctx.lineTo(w, py); ctx.stroke();
+}
 
-  // Find nearby events (within 500ms)
-  const nearEvents = E.filter(e => Math.abs(e.t - ms) < Math.max(500, (endMs - startMs) * 0.02));
+function linScale(vMin, vMax){ return (v,h) => h - (v-vMin)/((vMax-vMin)||1)*(h-8) - 4; }
+function logScale(vMin, vMax){
+  const a = Math.log10(Math.max(vMin,1e-12)), b = Math.log10(Math.max(vMax,1e-11));
+  return (v,h) => v<=0 ? null : h - (Math.log10(v)-a)/((b-a)||1)*(h-8) - 4;
+}
 
-  if (!nearest && !nearEvents.length) {
-    tooltip.style.display = 'none';
-    return;
+function nearestPoint(pts, t){
+  let best = null, dist = Infinity;
+  for (const p of pts){ const d = Math.abs(p.t-t); if (d<dist){ dist = d; best = p; } }
+  return best;
+}
+function sampleAt(ts, t){
+  if (!ts.length) return -1;
+  const i = lowerBound(ts, t);
+  if (i<=0) return 0;
+  if (i>=ts.length) return ts.length-1;
+  return (t-ts[i-1] <= ts[i]-t) ? i-1 : i;
+}
+
+// ===========================================================================
+// Page construction. Invoked at the bottom of the script, after every
+// declaration below exists (the strip builders assign into them).
+// ===========================================================================
+const groupsDiv = document.getElementById('groups');
+
+function buildPage(){
+  if (!S.length && !E.length && !R.length){
+    document.getElementById('empty').style.display = 'block';
+  } else {
+    buildKindToggles();
+    buildGroups();
+    buildSummary();
   }
+  document.getElementById('chipDur').textContent = fmtMs(totalMs);
+  document.getElementById('chipSamples').textContent = S.length + (R.length ? ` (+${R.length} rank)` : '');
+  if (HOST){ const b = document.getElementById('hostBadge'); b.textContent = HOST; b.style.display = ''; }
+}
 
-  let text = `t = ${fmtMs(ms)}`;
-  if (nearest) {
-    text += `\nCPU: ${nearest.cpu.toFixed(1)}%`;
-    text += `\nRAM: ${fmtBytes(nearest.ram[0])} / ${fmtBytes(nearest.ram[1])}`;
-    for (const g of nearest.gpus) {
-      text += `\nGPU ${g.d}: ${g.u}%  VRAM: ${fmtBytes(g.va)} alloc`;
+function group(title, toggles){
+  const g = document.createElement('div');
+  g.className = 'group';
+  const t = document.createElement('div');
+  t.className = 'group-title';
+  t.innerHTML = `<span>${title}</span>`;
+  if (toggles) t.appendChild(toggles);
+  g.appendChild(t);
+  groupsDiv.appendChild(g);
+  return g;
+}
+
+function buildGroups(){
+  // Compute: one strip per local GPU, single percent axis (util %, VRAM as
+  // % of the card's total; absolutes live in the tooltip).
+  if (M.gpuIds.length){
+    const g = group('Compute');
+    for (const d of M.gpuIds){
+      const G = M.gpu[d];
+      addStrip(g, `GPU ${d}`, {
+        h: 56,
+        legend: [['util', seriesColor('util')], ['vram alloc', seriesColor('va')], ['vram used', seriesColor('vu')]],
+        stat: G.vt ? `total ${fmtBytes(G.vt)}` : '',
+        draw(ctx,w,h){
+          drawSpans(ctx,w,h,G.idle,SHADE.idle);
+          drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
+          drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
+          drawSeries(ctx,w,h,G.t,G.u,100,'util',true);
+          drawSeries(ctx,w,h,G.t,G.vaPct,100,'va',false);
+          drawSeries(ctx,w,h,G.t,G.vuPct,100,'vu',false);
+        },
+        tip(t){
+          const i = sampleAt(G.t,t); if (i<0) return null;
+          const s = S[i], gg = (s.gpus||[]).find(x=>x.d===d);
+          if (!gg) return null;
+          return `GPU ${d}: ${gg.u}%\nvram ${fmtBytes(gg.va)} alloc / ${fmtBytes(gg.vu)} used / ${fmtBytes(gg.vt)}`;
+        },
+      });
     }
   }
-  for (const e of nearEvents) {
-    text += '\n---';
-    text += `\n${fmtMs(e.t)}: ${fmtEvent(e)}`;
+
+  // Engine: what ElChe was doing. Anchor level and the round-trip costs it
+  // was reacting to, each on its own axis.
+  if (M.anchor.length || M.syncMs.length || M.avgMs.length){
+    const g = group('Engine');
+    if (M.anchor.length){
+      const vals = M.anchor.map(p=>p.v);
+      const lo = Math.min(...vals), hi = Math.max(...vals);
+      addStrip(g, 'anchor (batches)', {
+        stat: `now ${vals[vals.length-1]} · range ${lo}–${hi}`,
+        draw(ctx,w,h){ drawStep(ctx,w,h,M.anchor,Math.min(lo,0),hi*1.05||1,'anchor'); },
+        tip(t){
+          let v = M.anchor[0].v;
+          for (const p of M.anchor){ if (p.t<=t) v = p.v; else break; }
+          return `anchor: ${v}`;
+        },
+      });
+    }
+    const dur = M.syncMs.concat(M.avgMs);
+    if (dur.length){
+      const hi = Math.max(...dur.map(p=>p.v));
+      const scale = linScale(0, hi*1.1||1);
+      addStrip(g, 'sync duration (ms)', {
+        legend: [['allreduce', seriesColor('syncMs')], ['cpu avg', seriesColor('avgMs')]],
+        stat: `${M.syncMs.length} syncs` + (M.avgMs.length?` · ${M.avgMs.length} cpu avgs`:''),
+        draw(ctx,w,h){
+          drawDots(ctx,w,h,M.syncMs,scale,'syncMs');
+          drawDots(ctx,w,h,M.avgMs,scale,'avgMs');
+        },
+        tip(t){
+          const p = nearestPoint(dur,t);
+          return p ? `sync ${p.v.toFixed(1)}ms` : null;
+        },
+      });
+    }
   }
 
+  // Convergence: divergence level (log) and its growth rate.
+  if (M.d.length){
+    const g = group('Convergence');
+    const dv = M.d.map(p=>p.v).filter(v=>v>0);
+    const scale = logScale(Math.min(...dv), Math.max(...dv));
+    addStrip(g, 'divergence d (log)', {
+      stat: dv.length?`${fmtVal(Math.min(...dv))} … ${fmtVal(Math.max(...dv))}`:'',
+      draw(ctx,w,h){ drawDots(ctx,w,h,M.d,scale,'d'); },
+      tip(t){
+        const p = nearestPoint(M.d,t); if (!p) return null;
+        let s = `d = ${fmtVal(p.v)} (step ${p.ev.step})`;
+        if (p.ev.lambda_ema!==undefined) s += `\nλ_ema = ${fmtVal(p.ev.lambda_ema)}`;
+        if (p.ev.deltas) s += `\nrank deltas: ${p.ev.deltas.map(fmtVal).join(', ')}`;
+        return s;
+      },
+    });
+    if (M.lambda.length){
+      const lv = M.lambda.map(p=>p.v);
+      const lo = Math.min(...lv,0), hi = Math.max(...lv,0);
+      addStrip(g, 'λ_ema (growth rate)', {
+        stat: `last ${fmtVal(lv[lv.length-1])}`,
+        draw(ctx,w,h){
+          const sy = linScale(lo, hi===lo?lo+1:hi);
+          // zero line: growth above, decay below
+          ctx.strokeStyle = css('--line'); ctx.lineWidth = 1;
+          const y0 = sy(0,h); ctx.beginPath(); ctx.moveTo(0,y0); ctx.lineTo(w,y0); ctx.stroke();
+          drawSeries(ctx,w,h,M.lambda.map(p=>p.t),lv.map(v=>v-lo),(hi-lo)||1,'lambda',false);
+        },
+        tip(t){ const p = nearestPoint(M.lambda,t); return p?`λ_ema = ${fmtVal(p.v)}`:null; },
+      });
+    }
+    for (const key of M.guardKeys){
+      if (!kindEnabled['guard_telemetry']) break;
+      const pts = M.guard(key);
+      if (!pts.length) continue;
+      const vs = pts.map(p=>p.v);
+      const lo = Math.min(...vs), hi = Math.max(...vs);
+      addStrip(g, `guard: ${key}`, {
+        stat: `last ${fmtVal(vs[vs.length-1])}`,
+        h: 36,
+        draw(ctx,w,h){ drawSeries(ctx,w,h,pts.map(p=>p.t),vs.map(v=>v-lo),(hi-lo)||1,'lambda',false); },
+        tip(t){ const p = nearestPoint(pts,t); return p?`${key} = ${fmtVal(p.v)}`:null; },
+      });
+    }
+  }
+
+  // Training: the run's outcome curves, from epoch events.
+  if (M.loss.length){
+    const g = group('Training');
+    const lv = M.loss.map(p=>p.v);
+    const lo = Math.min(...lv), hi = Math.max(...lv);
+    addStrip(g, 'loss (epoch end)', {
+      stat: `last ${fmtVal(lv[lv.length-1])}`,
+      draw(ctx,w,h){
+        drawSeries(ctx,w,h,M.loss.map(p=>p.t),lv.map(v=>v-lo),(hi-lo)||1,'loss',false);
+        drawDots(ctx,w,h,M.loss.map(p=>({t:p.t,v:p.v-lo})),linScale(0,(hi-lo)||1),'loss');
+      },
+      tip(t){ const p = nearestPoint(M.loss,t); return p?`epoch ${p.epoch}: loss ${fmtVal(p.v)}`:null; },
+    });
+    const rv = M.lr.map(p=>p.v);
+    if (rv.length && Math.min(...rv)!==Math.max(...rv)){
+      addStrip(g, 'learning rate', {
+        h: 36,
+        stat: `last ${fmtVal(rv[rv.length-1])}`,
+        draw(ctx,w,h){ drawStep(ctx,w,h,M.lr,Math.min(...rv),Math.max(...rv),'lr'); },
+        tip(t){ const p = nearestPoint(M.lr,t); return p?`lr ${fmtVal(p.v)}`:null; },
+      });
+    }
+  }
+
+  // Host: context, one compact percent strip.
+  if (S.length){
+    const g = group('Host');
+    addStrip(g, HOST ? `cpu / ram · ${HOST}` : 'cpu / ram', {
+      legend: [['cpu', seriesColor('cpu')], ['ram', seriesColor('ram')]],
+      stat: M.ramTotal?`ram total ${fmtBytes(M.ramTotal)}`:'',
+      draw(ctx,w,h){
+        drawSpans(ctx,w,h,M.avgSpans,SHADE.cpu_avg);
+        drawSeries(ctx,w,h,M.t,M.cpu,100,'cpu',true);
+        drawSeries(ctx,w,h,M.t,M.ramPct,100,'ram',false);
+      },
+      tip(t){
+        const i = sampleAt(M.t,t); if (i<0) return null;
+        const s = S[i];
+        return `cpu ${s.cpu.toFixed(1)}%\nram ${fmtBytes(s.ram[0])} / ${fmtBytes(s.ram[1])}`;
+      },
+    });
+  }
+
+  // Remote ranks (controller page): sparse host-qualified strips from the
+  // metrics-cadence rank samples.
+  if (M.ranks.size){
+    const g = group('Remote ranks (metrics cadence)');
+    const ordered = [...M.ranks.entries()].sort((a,b)=>a[1].rank-b[1].rank || a[0].localeCompare(b[0]));
+    for (const [key, e] of ordered){
+      const gpuList = [...e.gpus.entries()];
+      addStrip(g, key, {
+        h: 40,
+        legend: [['gpu util', seriesColor('util')], ['vram', seriesColor('va')], ['cpu', seriesColor('cpu')]],
+        stat: gpuList.length&&gpuList[0][1].vt?`gpu${gpuList[0][0]} · ${fmtBytes(gpuList[0][1].vt)}`:'',
+        draw(ctx,w,h){
+          drawSpans(ctx,w,h,M.syncSpans,SHADE.sync);
+          for (const [,gg] of gpuList){
+            drawSeries(ctx,w,h,e.t,gg.u,100,'util',false);
+            drawSeries(ctx,w,h,e.t,gg.vaPct,100,'va',false);
+          }
+          drawSeries(ctx,w,h,e.t,e.cpu,100,'cpu',false);
+        },
+        tip(t){
+          const i = sampleAt(e.t,t); if (i<0) return null;
+          const parts = [key];
+          for (const [d,gg] of gpuList){
+            if (gg.u[i]!==null) parts.push(`gpu${d} ${gg.u[i].toFixed(0)}%` + (gg.vaPct[i]!==null?` vram ${gg.vaPct[i].toFixed(0)}%`:''));
+          }
+          if (e.cpu[i]!==null) parts.push(`cpu ${e.cpu[i].toFixed(0)}%`);
+          return parts.join('\n');
+        },
+      });
+    }
+  }
+
+  // Event strip: every kind as ticks, toggled from the bar above.
+  addEventStrip();
+  applySwatches();
+}
+
+let eventStrip = null;
+function addEventStrip(){
+  const g = group('Events');
+  eventStrip = addStrip(g, 'event strip', {
+    h: 30,
+    draw(ctx,w,h){
+      for (const e of E){
+        const fam = kindFamily(e.k);
+        if (!fam || !kindEnabled[fam]) continue;
+        if (e.t < view.t0 || e.t > view.t1) continue;
+        const meta = KIND_META.find(m=>m[0]===fam);
+        ctx.strokeStyle = meta ? kindColor(meta[2]) : css('--muted');
+        ctx.lineWidth = 1;
+        const x = xOf(e.t,w);
+        ctx.beginPath(); ctx.moveTo(x, e.k.endsWith('_end')?h/2:2); ctx.lineTo(x, e.k.endsWith('_end')?h-2:h/2); ctx.stroke();
+      }
+      // epoch boundaries get a label when sparse enough
+      if (kindEnabled['epoch']){
+        const starts = M.epochStarts.filter(e=>e.t>=view.t0&&e.t<=view.t1);
+        if (starts.length && starts.length <= 60){
+          ctx.fillStyle = css('--muted'); ctx.font = '9px '+css('--mono');
+          for (const e of starts) ctx.fillText('e'+e.epoch, xOf(e.t,w)+2, 9);
+        }
+      }
+    },
+    tip(t){
+      const radius = (view.t1-view.t0)*0.01;
+      const near = E.filter(e=>{
+        const fam = kindFamily(e.k);
+        return fam && kindEnabled[fam] && Math.abs(e.t-t)<radius;
+      }).slice(0,8);
+      if (!near.length) return null;
+      return near.map(fmtEvent).join('\n');
+    },
+  });
+}
+
+function fmtEvent(e){
+  switch(e.k){
+    case 'epoch_start': return `${fmtMs(e.t)} epoch ${e.epoch} start`;
+    case 'epoch_end': return `${fmtMs(e.t)} epoch ${e.epoch} end loss=${fmtVal(e.loss)} lr=${fmtVal(e.lr)}`;
+    case 'sync_start': return `${fmtMs(e.t)} allreduce start`;
+    case 'sync_end': return `${fmtMs(e.t)} allreduce end (${e.ms.toFixed(1)}ms)`;
+    case 'cpu_avg_start': return `${fmtMs(e.t)} cpu averaging start`;
+    case 'cpu_avg_end': return `${fmtMs(e.t)} cpu averaging end (${e.ms.toFixed(1)}ms)`;
+    case 'anchor': return `${fmtMs(e.t)} anchor ${e.from} → ${e.to}`;
+    case 'throttle': return `${fmtMs(e.t)} throttle rank ${e.rank}`;
+    case 'meta_nudge': return `${fmtMs(e.t)} meta nudge ×${e.factor} (${e.from} → ${e.to})`;
+    case 'lost_broadcast': return `${fmtMs(e.t)} lost broadcast ${e.control} (${e.failures} ranks)`;
+    case 'div': return `${fmtMs(e.t)} d=${fmtVal(e.d)}`;
+    case 'guard_telemetry': return `${fmtMs(e.t)} guard ${Object.entries(e.values||{}).map(([k,v])=>k+'='+fmtVal(v)).join(' ')}`;
+    case 'div_epoch': return `${fmtMs(e.t)} epoch ${e.epoch} div: mean ${fmtVal(e.d_mean)} (${e.syncs} syncs)`;
+    default: return `${fmtMs(e.t)} ${e.k}`;
+  }
+}
+
+function buildKindToggles(){
+  const present = new Set(E.map(e=>kindFamily(e.k)).filter(Boolean));
+  const bar = document.getElementById('kinds');
+  for (const [key,label,colorSpec,def] of KIND_META){
+    kindEnabled[key] = def;
+    if (!present.has(key)) continue;
+    const l = document.createElement('label');
+    const n = E.filter(e=>kindFamily(e.k)===key).length;
+    l.innerHTML = `<input type="checkbox" ${def?'checked':''}> <span class="sw" data-kc="${key}"></span>${label} <span style="opacity:.6">${n}</span>`;
+    l.querySelector('input').addEventListener('change', ev=>{
+      kindEnabled[key] = ev.target.checked;
+      if (key==='guard_telemetry') rebuild();
+      else render();
+    });
+    bar.appendChild(l);
+  }
+  applyKindSwatches();
+}
+
+function applySwatches(){
+  document.querySelectorAll('.sw[data-sc]').forEach(el=>{ el.style.background = el.dataset.sc; });
+  applyKindSwatches();
+}
+function applyKindSwatches(){
+  document.querySelectorAll('.sw[data-kc]').forEach(el=>{
+    const meta = KIND_META.find(m=>m[0]===el.dataset.kc);
+    el.style.background = meta ? kindColor(meta[2]) : css('--muted');
+  });
+}
+
+function rebuild(){
+  strips.length = 0;
+  groupsDiv.innerHTML = '';
+  buildGroups();
+  render();
+}
+
+// ===========================================================================
+// Summary.
+// ===========================================================================
+function buildSummary(){
+  const rows = [];
+  rows.push(['Duration', fmtMs(totalMs)]);
+  rows.push(['Samples', `${S.length} local` + (R.length?` + ${R.length} rank-reported`:'')]);
+  const epochs = E.filter(e=>e.k==='epoch_end').length;
+  if (epochs) rows.push(['Epochs', epochs]);
+  if (M.syncMs.length){
+    const avg = M.syncMs.reduce((a,p)=>a+p.v,0)/M.syncMs.length;
+    rows.push(['Syncs', `${M.syncMs.length} (avg ${avg.toFixed(1)}ms)`]);
+  }
+  if (M.avgMs.length){
+    const avg = M.avgMs.reduce((a,p)=>a+p.v,0)/M.avgMs.length;
+    rows.push(['CPU averagings', `${M.avgMs.length} (avg ${avg.toFixed(1)}ms)`]);
+  }
+  const anchors = E.filter(e=>e.k==='anchor').length;
+  if (anchors) rows.push(['Anchor changes', anchors]);
+  const throttles = E.filter(e=>e.k==='throttle').length;
+  if (throttles) rows.push(['Throttles', throttles]);
+  const lost = E.filter(e=>e.k==='lost_broadcast').length;
+  if (lost) rows.push(['Lost broadcasts', lost]);
+  for (const d of M.gpuIds){
+    const G = M.gpu[d];
+    let idle = 0, tot = 0;
+    for (const u of G.u){ if (u===null) continue; tot++; if (u<5) idle++; }
+    if (tot) rows.push([`GPU ${d} idle`, `${(idle/tot*100).toFixed(1)}% of samples < 5%`]);
+  }
+  if (M.d.length){
+    const dv = M.d.map(p=>p.v);
+    rows.push(['Divergence d', `${fmtVal(Math.min(...dv))} … ${fmtVal(Math.max(...dv))} over ${dv.length} syncs`]);
+  }
+  if (M.lambda.length) rows.push(['λ_ema at end', fmtVal(M.lambda[M.lambda.length-1].v)]);
+  const el = document.getElementById('summary');
+  el.style.display = '';
+  document.getElementById('summaryBody').innerHTML =
+    '<table>' + rows.map(([k,v])=>`<tr><th>${k}</th><td>${v}</td></tr>`).join('') + '</table>';
+}
+
+// ===========================================================================
+// Render loop: axis + every strip, one shared view window.
+// ===========================================================================
+const axis = document.getElementById('axis');
+const axisCtx = axis.getContext('2d');
+hookInteractions(axis);
+
+function render(){
+  renderAxis();
+  for (const s of strips){
+    const w = s.canvas.parentElement.clientWidth;
+    s.canvas.width = w*DPR; s.canvas.height = s.h*DPR;
+    s.canvas.style.width = w+'px';
+    const ctx = s.ctx;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    ctx.clearRect(0,0,w,s.h);
+    s.draw(ctx,w,s.h);
+    drawCursor(ctx,w,s.h);
+    drawDrag(ctx,w,s.h,s.canvas);
+  }
+  const zoomed = view.t0>0 || view.t1<totalMs;
+  document.getElementById('chipView').innerHTML = zoomed
+    ? `view <b>${fmtMs(view.t0)} – ${fmtMs(view.t1)}</b>` : '';
+}
+
+function renderAxis(){
+  const w = axis.parentElement.clientWidth - 0;
+  axis.width = w*DPR; axis.height = 26*DPR;
+  axis.style.width = w+'px';
+  const ctx = axisCtx;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.clearRect(0,0,w,26);
+  const span = view.t1-view.t0;
+  // 1-2-5 tick progression sized to ~90px spacing.
+  let step = Math.pow(10, Math.floor(Math.log10(span/ (w/90) )));
+  if (span/step > w/45) step *= 5; else if (span/step > w/90) step *= 2;
+  ctx.strokeStyle = css('--line'); ctx.fillStyle = css('--muted');
+  ctx.font = '10px '+css('--mono');
+  for (let t = Math.ceil(view.t0/step)*step; t <= view.t1; t += step){
+    const x = xOf(t,w);
+    ctx.beginPath(); ctx.moveTo(x,18); ctx.lineTo(x,26); ctx.stroke();
+    ctx.fillText(fmtMs(t), x+3, 14);
+  }
+  drawCursor(ctx,w,26);
+}
+
+function drawCursor(ctx,w,h){
+  if (cursorT===null || cursorT<view.t0 || cursorT>view.t1) return;
+  ctx.strokeStyle = css('--muted'); ctx.lineWidth = 1; ctx.setLineDash([2,3]);
+  const x = xOf(cursorT,w);
+  ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ===========================================================================
+// Interactions: drag-select zoom, wheel zoom, double-click reset, linked
+// crosshair + tooltip.
+// ===========================================================================
+let drag = null; // {canvas, x0, x1}
+const tooltip = document.getElementById('tooltip');
+
+function tAtEvent(ev, el){
+  const r = el.getBoundingClientRect();
+  return view.t0 + (ev.clientX-r.left)/r.width*(view.t1-view.t0);
+}
+
+function hookInteractions(c){
+  c.addEventListener('mousedown', ev=>{
+    drag = {canvas:c, x0:ev.clientX, x1:ev.clientX};
+    ev.preventDefault();
+  });
+  c.addEventListener('dblclick', ()=>{ view = {t0:0, t1:totalMs}; render(); });
+  c.addEventListener('wheel', ev=>{
+    ev.preventDefault();
+    const t = tAtEvent(ev, c);
+    const f = ev.deltaY > 0 ? 1.25 : 0.8;
+    let t0 = t - (t-view.t0)*f, t1 = t + (view.t1-t)*f;
+    t0 = Math.max(0, t0); t1 = Math.min(totalMs, t1);
+    if (t1-t0 >= 50){ view = {t0, t1}; render(); }
+  }, {passive:false});
+}
+
+document.addEventListener('mousemove', ev=>{
+  if (drag){
+    drag.x1 = ev.clientX;
+    render();
+    return;
+  }
+  const el = ev.target;
+  if (!(el instanceof HTMLCanvasElement)){
+    if (cursorT!==null){ cursorT = null; render(); }
+    tooltip.style.display = 'none';
+    return;
+  }
+  cursorT = tAtEvent(ev, el);
+  const strip = strips.find(s=>s.canvas===el);
+  let text = fmtMs(cursorT);
+  if (strip && strip.tip){
+    const t = strip.tip(cursorT);
+    if (t) text += '\n'+t;
+  }
   tooltip.textContent = text;
   tooltip.style.display = 'block';
-  tooltip.style.left = Math.min(ev.clientX + 12, window.innerWidth - 320) + 'px';
-  tooltip.style.top = (ev.clientY + 12) + 'px';
-});
-
-document.addEventListener('mouseleave', () => {
-  tooltip.style.display = 'none';
-});
-
-function fmtEvent(e) {
-  switch (e.k) {
-    case 'epoch_start': return `Epoch ${e.epoch} start`;
-    case 'epoch_end': return `Epoch ${e.epoch} end (loss=${e.loss.toFixed(4)})`;
-    case 'sync_start': return 'AllReduce start';
-    case 'sync_end': return `AllReduce end (${e.ms.toFixed(1)}ms)`;
-    case 'cpu_avg_start': return 'CPU averaging start';
-    case 'cpu_avg_end': return `CPU averaging end (${e.ms.toFixed(1)}ms)`;
-    case 'anchor': return `Anchor: ${e.from} -> ${e.to}`;
-    case 'throttle': return `Throttle rank ${e.rank}`;
-    case 'idle': return `GPU ${e.dev} idle ${e.ms.toFixed(0)}ms`;
-    case 'custom': return e.label;
-    default: return e.k;
-  }
-}
-
-// Summary table
-function buildSummary() {
-  if (!S.length) return;
-  const div = document.getElementById('summary');
-
-  const syncStarts = E.filter(e => e.k === 'sync_start').length;
-  const syncEnds = E.filter(e => e.k === 'sync_end');
-  const avgSync = syncEnds.length ? (syncEnds.reduce((a,e) => a + e.ms, 0) / syncEnds.length) : 0;
-  const cpuAvgEnds = E.filter(e => e.k === 'cpu_avg_end');
-  const avgCpuAvg = cpuAvgEnds.length ? (cpuAvgEnds.reduce((a,e) => a + e.ms, 0) / cpuAvgEnds.length) : 0;
-  const anchors = E.filter(e => e.k === 'anchor').length;
-  const throttles = E.filter(e => e.k === 'throttle').length;
-  const epochs = E.filter(e => e.k === 'epoch_end');
-
-  let html = '<table>';
-  html += '<tr><th>Duration</th><td>' + fmtMs(totalMs) + '</td></tr>';
-  html += '<tr><th>Samples</th><td>' + S.length + ' (' + (S.length > 1 ? Math.round(totalMs / S.length) : '?') + 'ms interval)</td></tr>';
-  html += '<tr><th>Epochs</th><td>' + epochs.length + '</td></tr>';
-  html += '<tr><th>Syncs</th><td>' + syncStarts + (avgSync > 0 ? ' (avg ' + avgSync.toFixed(1) + 'ms)' : '') + '</td></tr>';
-  if (cpuAvgEnds.length) html += '<tr><th>CPU Avgs</th><td>' + cpuAvgEnds.length + ' (avg ' + avgCpuAvg.toFixed(1) + 'ms)</td></tr>';
-  if (anchors) html += '<tr><th>Anchor changes</th><td>' + anchors + '</td></tr>';
-  if (throttles) html += '<tr><th>Throttle events</th><td>' + throttles + '</td></tr>';
-
-  // Per-GPU idle
-  for (let i = 0; i < nGpus; i++) {
-    let idle = 0;
-    for (const s of S) {
-      if (s.gpus[i] && s.gpus[i].u < 5) idle++;
-    }
-    const pct = (idle / S.length * 100).toFixed(1);
-    html += '<tr><th>GPU ' + i + ' idle</th><td>' + pct + '% (' + idle + '/' + S.length + ' samples < 5%)</td></tr>';
-  }
-
-  html += '</table>';
-  div.innerHTML = html;
-}
-
-// Mouse wheel zoom
-document.addEventListener('wheel', (ev) => {
-  if (ev.target.tagName !== 'CANVAS') return;
-  ev.preventDefault();
-  const delta = ev.deltaY > 0 ? -0.5 : 0.5;
-  zoomLevel = Math.max(1, Math.min(20, zoomLevel + delta));
-  zoomInput.value = zoomLevel;
+  tooltip.style.left = Math.min(ev.clientX+14, window.innerWidth-360)+'px';
+  tooltip.style.top = (ev.clientY+14)+'px';
   render();
-}, {passive: false});
+});
 
-// Initial render
+document.addEventListener('mouseup', ev=>{
+  if (!drag) return;
+  const r = drag.canvas.getBoundingClientRect();
+  const a = Math.min(drag.x0, drag.x1), b = Math.max(drag.x0, drag.x1);
+  drag = null;
+  if (b-a > 6){
+    const t0 = view.t0 + (a-r.left)/r.width*(view.t1-view.t0);
+    const t1 = view.t0 + (b-r.left)/r.width*(view.t1-view.t0);
+    if (t1-t0 >= 50) view = {t0:Math.max(0,t0), t1:Math.min(totalMs,t1)};
+  }
+  render();
+});
+
+function drawDrag(ctx,w,h,canvas){
+  if (!drag || drag.canvas!==canvas) return;
+  const r = canvas.getBoundingClientRect();
+  const a = Math.min(drag.x0,drag.x1)-r.left, b = Math.max(drag.x0,drag.x1)-r.left;
+  ctx.fillStyle = 'rgba(121,134,203,0.15)';
+  ctx.fillRect(a,0,b-a,h);
+  ctx.strokeStyle = css('--actor');
+  ctx.strokeRect(a+0.5,0.5,b-a-1,h-1);
+}
+
+document.getElementById('resetBtn').addEventListener('click', ()=>{ view={t0:0,t1:totalMs}; render(); });
+document.getElementById('themeBtn').addEventListener('click', ()=>{
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur==='light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('flodl-theme', next); } catch(e) {}
+  applySwatches();
+  render();
+});
+
 window.addEventListener('resize', render);
+buildPage();
 render();
-buildSummary();
 </script>
 </body>
 </html>
