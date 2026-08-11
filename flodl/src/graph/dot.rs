@@ -263,7 +263,9 @@ fn is_norm(prefix: &str) -> bool {
 }
 
 /// Interpolate green (#27ae60) → yellow (#f39c12) → red (#e74c3c).
-fn heat_color(ratio: f64) -> String {
+/// Shared with the cluster heat-map bake (`graph::heatmap`), so the
+/// solo profiled SVG and the aggregated one read on the same scale.
+pub(crate) fn heat_color(ratio: f64) -> String {
     let ratio = ratio.clamp(0.0, 1.0);
     let (r, g, b) = if ratio < 0.5 {
         let t = ratio * 2.0;

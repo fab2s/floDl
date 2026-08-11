@@ -28,6 +28,7 @@ pub mod gate;
 #[allow(clippy::module_inception)]
 mod graph;
 pub mod halt;
+pub(crate) mod heatmap;
 pub mod loop_node;
 pub mod map;
 pub mod node;

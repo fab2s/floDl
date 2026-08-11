@@ -18,6 +18,7 @@
 //! which at real cluster scale is the only option — workers sit on a private
 //! network and are not browser-reachable.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,7 @@ pub(crate) enum ServerMsg {
     Epoch(String),
     /// Updated SVG graph.
     SetSvg(String),
+    SetHeatmaps(Vec<(String, String)>),
     /// Graph label and structural hash for dashboard header.
     SetLabelHash(Option<String>, Option<String>),
     /// Hardware summary for dashboard header.
@@ -89,6 +91,8 @@ struct SharedState {
     epochs: Mutex<Vec<String>>,
     /// Current SVG graph.
     svg: Mutex<Option<String>>,
+    /// Baked per-GPU-model timing heat maps `(model label, finished SVG)`.
+    heatmaps: Mutex<Vec<(String, String)>>,
     /// SSE clients — each has a bounded channel (see [`SSE_CLIENT_QUEUE`])
     /// and a path scope (`None` for the whole-run `/events` feed).
     sse_senders: Mutex<Vec<SseClient>>,
@@ -179,6 +183,7 @@ impl DashboardServer {
         let state = Arc::new(SharedState {
             epochs: Mutex::new(Vec::new()),
             svg: Mutex::new(None),
+            heatmaps: Mutex::new(Vec::new()),
             sse_senders: Mutex::new(Vec::new()),
             label: Mutex::new(None),
             hash: Mutex::new(None),
@@ -230,6 +235,11 @@ impl DashboardServer {
     /// Update the graph SVG.
     pub fn set_svg(&self, svg: String) {
         let _ = self.tx.send(ServerMsg::SetSvg(svg));
+    }
+
+    /// Install the baked timing heat maps (replaces the whole set).
+    pub fn set_heatmaps(&self, maps: Vec<(String, String)>) {
+        let _ = self.tx.send(ServerMsg::SetHeatmaps(maps));
     }
 
     /// Set graph label and structural hash for the dashboard header.
@@ -340,6 +350,9 @@ fn handle_messages(rx: Receiver<ServerMsg>, state: Arc<SharedState>) {
                     true
                 });
             }
+            ServerMsg::SetHeatmaps(maps) => {
+                *state.heatmaps.lock().unwrap() = maps;
+            }
             ServerMsg::SetSvg(svg) => {
                 *state.svg.lock().unwrap() = Some(svg);
             }
@@ -387,6 +400,8 @@ fn handle_connection(mut stream: TcpStream, state: &SharedState) {
         "/" => serve_html(&mut stream, state),
         "/events" => serve_sse(stream, state, None),
         "/graph.svg" => serve_svg(&mut stream, state),
+        "/api/heatmaps" => serve_heatmap_index(&mut stream, state),
+        "/heatmap.svg" => serve_heatmap(&mut stream, state, query),
         "/api/history" => serve_history(&mut stream, state),
         // Portal record plane — all three keyed by `?path=`.
         "/node" => serve_node(&mut stream, state, query),
@@ -670,6 +685,60 @@ fn serve_svg(stream: &mut TcpStream, state: &SharedState) {
     }
 }
 
+/// Serve the heat-map index as JSON: `[{"model":..,"url":..}]`. The
+/// page shows the switcher only when this is non-empty (frames arrive
+/// at teardown, so it usually fills right as the run completes).
+fn serve_heatmap_index(stream: &mut TcpStream, state: &SharedState) {
+    let body = {
+        let maps = state.heatmaps.lock().unwrap();
+        let mut b = String::from("[");
+        for (i, (model, _)) in maps.iter().enumerate() {
+            if i > 0 {
+                b.push(',');
+            }
+            let _ = write!(
+                b,
+                "{{\"model\":\"{}\",\"url\":\"/heatmap.svg?i={}\"}}",
+                model.replace('\\', "\\\\").replace('"', "\\\""),
+                i
+            );
+        }
+        b.push(']');
+        b
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// Serve one baked heat-map SVG by index (`?i=N`). The
+/// `Content-Disposition` filename makes a browser "save as" land on a
+/// publication-ready name; the bytes are exactly what the page displays.
+fn serve_heatmap(stream: &mut TcpStream, state: &SharedState, query: &str) {
+    let entry = query_param(query, "i")
+        .and_then(|i| i.parse::<usize>().ok())
+        .and_then(|i| state.heatmaps.lock().unwrap().get(i).cloned());
+    if let Some((model, svg)) = entry {
+        let slug: String = model
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Disposition: inline; filename=\"heatmap-{}.svg\"\r\nContent-Length: {}\r\n\r\n{}",
+            slug.trim_matches('-'),
+            svg.len(),
+            svg,
+        );
+        let _ = stream.write_all(response.as_bytes());
+    } else {
+        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    }
+}
+
 /// Serve all epoch history as JSON (for late-connecting dashboards).
 fn serve_history(stream: &mut TcpStream, state: &SharedState) {
     // Body built under the lock, written outside it (same rule as the
@@ -689,6 +758,61 @@ fn serve_history(stream: &mut TcpStream, state: &SharedState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two heat-map routes, over a real socketpair: the index lists
+    /// installed maps with stable urls, the svg route serves the exact
+    /// bytes with a save-as filename, and a bad index is a plain 404.
+    #[test]
+    fn heatmap_routes_serve_index_and_artifact() {
+        let state = Arc::new(SharedState {
+            epochs: Mutex::new(Vec::new()),
+            svg: Mutex::new(None),
+            heatmaps: Mutex::new(vec![(
+                "RTX 5060 Ti".to_string(),
+                "<svg>baked</svg>".to_string(),
+            )]),
+            sse_senders: Mutex::new(Vec::new()),
+            label: Mutex::new(None),
+            hash: Mutex::new(None),
+            hardware: Mutex::new(None),
+            metadata: Mutex::new(None),
+            gpu_init: Mutex::new(None),
+            records: Arc::new(Mutex::new(RecordStore::new())),
+            shutting_down: AtomicBool::new(false),
+        });
+
+        let respond = |path: &str, query: &str| -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(addr).unwrap();
+            let (mut server_side, _) = listener.accept().unwrap();
+            match path {
+                "/api/heatmaps" => serve_heatmap_index(&mut server_side, &state),
+                "/heatmap.svg" => serve_heatmap(&mut server_side, &state, query),
+                _ => unreachable!(),
+            }
+            drop(server_side);
+            let mut out = String::new();
+            let mut c = client;
+            let _ = c.read_to_string(&mut out);
+            out
+        };
+
+        let index = respond("/api/heatmaps", "");
+        assert!(index.contains("200 OK"));
+        assert!(index.contains(r#"{"model":"RTX 5060 Ti","url":"/heatmap.svg?i=0"}"#));
+
+        let svg = respond("/heatmap.svg", "i=0");
+        assert!(svg.contains("200 OK"));
+        assert!(svg.contains("<svg>baked</svg>"));
+        assert!(
+            svg.contains("filename=\"heatmap-rtx-5060-ti.svg\""),
+            "save-as filename missing: {svg}",
+        );
+
+        assert!(respond("/heatmap.svg", "i=7").contains("404"));
+        assert!(respond("/heatmap.svg", "").contains("404"));
+    }
 
     #[test]
     fn is_loopback_addr_classifies_bind_targets() {
@@ -769,6 +893,11 @@ mod tests {
             "EventSource('/events')",
             "ARCHIVE_DATA",
             "LIVE_GPU_INIT",
+            // The heat-map plane: the archive writes ARCHIVE_HEATMAPS and
+            // the live page polls the index route; losing either name
+            // silently reduces the graph card to the plain SVG.
+            "ARCHIVE_HEATMAPS",
+            "'/api/heatmaps'",
         ] {
             assert!(DASHBOARD_HTML.contains(needle), "page lost {needle}");
         }
