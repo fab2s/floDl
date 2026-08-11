@@ -9,8 +9,8 @@
 pub(crate) use super::*;
 pub(crate) use crate::autograd::Variable;
 pub(crate) use crate::graph::{
-    ArgmaxSelector, FixedSelector, FlowBuilder, LearnedHalt, MergeOp, Reduce, SigmoidRouter,
-    SoftmaxRouter, ThresholdHalt,
+    ArgmaxSelector, FixedSelector, FlowBuilder, LearnedHalt, MergeOp, ProfileSource, Reduce,
+    SigmoidRouter, SoftmaxRouter, ThresholdHalt,
 };
 pub(crate) use crate::nn::{
     Identity, Linear, LoopBody, NamedInputModule, Optimizer, ReLU, SGD, Sigmoid, TraceEmit,

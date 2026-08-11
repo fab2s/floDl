@@ -71,6 +71,12 @@ fn test_profiling_basic() {
     assert!(p.total.as_nanos() > 0, "total should be nonzero");
     assert!(!p.nodes.is_empty(), "should have node timings");
     assert!(!p.levels.is_empty(), "should have level timings");
+    let expected_source = if crate::tensor::test_device().is_cuda() {
+        ProfileSource::GpuEvents
+    } else {
+        ProfileSource::HostWallClock
+    };
+    assert_eq!(p.source, expected_source);
 
     // Tagged node timing
     let enc_dur = p.timing("encoder");
@@ -92,6 +98,52 @@ fn test_profiling_basic() {
     assert!(!graph.profiling());
     graph.forward(&x).unwrap();
     assert!(graph.profile().is_none());
+}
+
+#[test]
+fn test_profiling_gpu_event_telescoping() {
+    if !crate::tensor::test_device().is_cuda() {
+        return;
+    }
+    let dev = crate::tensor::test_device();
+    let graph = FlowBuilder::from(Linear::on_device(64, 64, dev).unwrap())
+        .through(ReLU::new())
+        .through(Linear::on_device(64, 64, dev).unwrap())
+        .through(ReLU::new())
+        .through(Linear::on_device(64, 8, dev).unwrap())
+        .build()
+        .unwrap();
+    graph.enable_profiling();
+
+    let x = Variable::new(from_f32(&[0.5; 64], &[1, 64]), false);
+    // Several passes: pass N resolves at the start of pass N+1, so the
+    // event pool is exercised through re-records, not just once.
+    for _ in 0..3 {
+        graph.forward(&x).unwrap();
+    }
+
+    let p = graph.profile().unwrap();
+    assert_eq!(p.source, ProfileSource::GpuEvents);
+    assert_eq!(p.nodes.len(), 5);
+    assert_eq!(
+        p.levels.iter().map(|l| l.num_nodes).sum::<usize>(),
+        p.nodes.len()
+    );
+
+    // Boundary events telescope: the node sum IS the pass total, up to
+    // the f32-millisecond rounding of each delta.
+    let sum: f64 = p.nodes.iter().map(|n| n.duration.as_secs_f64()).sum();
+    let total = p.total.as_secs_f64();
+    assert!(total > 0.0, "event-timed total should be nonzero");
+    assert!(
+        (sum - total).abs() <= total * 0.05 + 5e-6,
+        "node sum {sum}s should telescope to total {total}s"
+    );
+
+    // A read right after a forward (pass still pending) serves the
+    // freshest drained pass without erroring.
+    graph.forward(&x).unwrap();
+    assert!(graph.profile().is_some());
 }
 
 #[test]

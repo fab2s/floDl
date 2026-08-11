@@ -25,6 +25,10 @@ impl Graph {
     /// Nodes are color-coded green → yellow → red by relative execution time,
     /// with per-node microsecond timings and per-level wall clock + parallelism.
     pub fn dot_with_profile(&self) -> String {
+        // Serve the freshest drained GPU pass; block only when there is
+        // nothing else to serve (e.g. teardown right after a single pass).
+        let nothing_to_serve = self.last_profile.borrow().is_none();
+        self.resolve_gpu_profile(nothing_to_serve);
         let profile = self.last_profile.borrow().clone();
         self.build_dot(profile.as_ref())
     }
@@ -170,10 +174,15 @@ impl Graph {
             );
         }
 
-        // Total timing as graph label.
+        // Total timing as graph label, with the clock that produced it.
         if let Some(p) = profile {
             let _ = writeln!(b);
-            let _ = writeln!(b, "  label=\"Forward: {:.0?}\";", p.total);
+            let _ = writeln!(
+                b,
+                "  label=\"Forward: {:.0?} ({})\";",
+                p.total,
+                p.source.label()
+            );
             let _ = writeln!(b, "  labelloc=t;");
             let _ = writeln!(b, "  fontsize=14;");
         }
