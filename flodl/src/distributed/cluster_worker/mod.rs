@@ -722,7 +722,14 @@ impl<M: Module + 'static> ClusterWorker<M> {
         }
         if let Some(ref f) = self.epoch_fn {
             let start = std::time::Instant::now();
+            // Same single-elected-rank asymmetry as the eval wrap: any
+            // forwards the user's callback runs must not feed this
+            // rank's profiling accumulator.
+            let profiling_paused = inner.pause_graph_profiling();
             f(epoch, inner);
+            if profiling_paused {
+                inner.resume_graph_profiling();
+            }
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             inner.report_epoch_fn_elapsed(epoch, elapsed_ms);
         }
@@ -779,6 +786,13 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // launcher's child-exit report lands in milliseconds; heartbeat
         // staleness is the 30s backstop).
         if clean {
+            // Ship the accumulated graph timings before the outbound
+            // bridge is signalled: it drains its channel on shutdown, so
+            // a frame queued here still reaches the coordinator. Clean
+            // exits only: on error the device may hold an aborted
+            // collective, and resolving profile events synchronizes on
+            // the compute stream.
+            inner.emit_graph_profile();
             inner.report_exiting();
         }
 

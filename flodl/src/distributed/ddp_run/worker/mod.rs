@@ -680,4 +680,67 @@ impl<M: Module> GpuWorker<M> {
     pub fn model(&self) -> &M {
         &self.model
     }
+
+    /// Suspend graph profiling around a non-training forward (eval,
+    /// epoch callbacks), returning whether it was active. Those fire on
+    /// ONE elected rank, so letting them feed the accumulator would
+    /// tilt exactly that rank's per-node means. Pair with
+    /// [`resume_graph_profiling`](Self::resume_graph_profiling) when
+    /// this returns true.
+    pub(crate) fn pause_graph_profiling(&self) -> bool {
+        use crate::graph::GraphExt;
+        (&self.model as &dyn Module)
+            .as_graph()
+            .is_some_and(|g| g.pause_profiling())
+    }
+
+    /// Re-activate graph profiling after
+    /// [`pause_graph_profiling`](Self::pause_graph_profiling).
+    pub(crate) fn resume_graph_profiling(&self) {
+        use crate::graph::GraphExt;
+        if let Some(g) = (&self.model as &dyn Module).as_graph() {
+            g.resume_profiling();
+        }
+    }
+
+    /// Ship the accumulated graph timings to the coordinator (one
+    /// frame, clean teardown only). Best-effort: no graph, no samples,
+    /// or a dropped channel all mean no frame, never an error: the
+    /// heat map is optional UX, not a training invariant.
+    pub(crate) fn emit_graph_profile(&self) {
+        use crate::graph::GraphExt;
+        let Some(stats) = (&self.model as &dyn Module)
+            .as_graph()
+            .and_then(|g| g.profile_stats())
+        else {
+            return;
+        };
+        let gpu_model = match self.device {
+            Device::CUDA(idx) => crate::tensor::gpu_device_name_idx(i32::from(idx))
+                .unwrap_or_else(|| "gpu".to_string()),
+            Device::CPU => "cpu".to_string(),
+        };
+        let profile = crate::distributed::wire::GraphProfileWire {
+            hash: stats.structural_hash,
+            gpu_model,
+            source: stats.source.label().to_string(),
+            samples: stats.samples as u64,
+            total_min_ms: stats.total_min.as_secs_f64() * 1000.0,
+            total_mean_ms: stats.total_mean.as_secs_f64() * 1000.0,
+            nodes: stats
+                .nodes
+                .into_iter()
+                .map(|n| crate::distributed::wire::GraphNodeTimingWire {
+                    id: n.id,
+                    level: n.level as u32,
+                    min_ms: n.min.as_secs_f64() * 1000.0,
+                    mean_ms: n.mean.as_secs_f64() * 1000.0,
+                })
+                .collect(),
+        };
+        let _ = self.timing_tx.send(TimingMsg::GraphProfile {
+            rank: self.rank,
+            profile,
+        });
+    }
 }

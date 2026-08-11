@@ -496,6 +496,13 @@ pub struct DdpRunConfig {
     /// worker's `env:` block is the runtime kill-switch. Default:
     /// `true`.
     pub vram_pool: bool,
+    /// Profile each rank's training graph with device-side events and
+    /// ship the accumulated per-node min/mean to the controller's
+    /// dashboard at clean teardown. Symmetric across ranks by
+    /// construction (this config reaches every rank), which is what
+    /// keeps ElChe's delivered-cost scheduling undisturbed. No-op when
+    /// the model is not a [`crate::graph::Graph`]. Default: `false`.
+    pub profile_graph: bool,
     /// Augmentation multiplicity: each sample appears `k` times per
     /// epoch in the shared shuffle (pick space `len()*k`). Pure
     /// scheduling — data variation comes from `transform`, keyed per
@@ -712,6 +719,7 @@ impl DdpRunConfig {
             progressive_dispatch: None,
             max_grad_norm: None,
             vram_pool: crate::data::vram_pool::VRAM_POOL_DEFAULT,
+            profile_graph: false,
             augment: 1,
             epoch_splits: 1,
             transform: None,
@@ -962,6 +970,13 @@ impl DdpRunConfig {
     /// workers (see [`Self::vram_pool`]). Default: enabled.
     pub fn with_vram_pool(mut self, enabled: bool) -> Self {
         self.vram_pool = enabled;
+        self
+    }
+
+    /// Profile each rank's training graph and ship accumulated per-node
+    /// timings to the dashboard at teardown (see [`Self::profile_graph`]).
+    pub fn with_profile_graph(mut self, on: bool) -> Self {
+        self.profile_graph = on;
         self
     }
 
@@ -1236,6 +1251,13 @@ pub(crate) enum TimingMsg {
         rank: usize,
         epoch: usize,
         elapsed_ms: f64,
+    },
+    /// Accumulated graph timings, sent once per rank at clean teardown
+    /// (see [`crate::distributed::wire::TimingMsgWire::DashboardGraphTimings`]).
+    /// Carries the wire struct directly, the frame is forward-only.
+    GraphProfile {
+        rank: usize,
+        profile: crate::distributed::wire::GraphProfileWire,
     },
 }
 
@@ -1655,6 +1677,11 @@ pub struct WorkerConfig {
     /// single-process path leaves it zeroed (all ranks share one
     /// process, so there is nothing to disagree about).
     pub model_sig: [u8; 32],
+    /// Profile this rank's training graph with device-side events and
+    /// ship accumulated per-node timings at clean teardown (see
+    /// [`DdpRunConfig::profile_graph`]). No-op when the model is not a
+    /// [`crate::graph::Graph`].
+    pub profile_graph: bool,
 }
 
 /// Default coordinator-liveness deadline (seconds), matching the

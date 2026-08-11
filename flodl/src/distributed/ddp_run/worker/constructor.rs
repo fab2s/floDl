@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use crate::autograd::{NoGradGuard, Variable};
 use crate::data::BatchDataSet;
 use crate::distributed::nccl::NcclRankComm;
+use crate::graph::GraphExt;
 use crate::nn::{Module, Optimizer, Parameter};
 use crate::tensor::cuda_event::{GpuEvent, GpuEventFlags};
 use crate::tensor::cuda_stream::{GpuStream, StreamGuard};
@@ -118,6 +119,16 @@ impl<M: Module> GpuWorker<M> {
             let _guard = compute_stream.as_ref().map(StreamGuard::new);
             model_factory(config.device)?
         };
+        if config.profile_graph {
+            match (&model as &dyn Module).as_graph() {
+                Some(g) => g.enable_profiling(),
+                None => crate::verbose!(
+                    "GpuWorker rank {}: profile_graph set but the model is \
+                     not a Graph; no timings will be collected",
+                    config.rank
+                ),
+            }
+        }
         let params = model.parameters();
         let buffers = model.buffers();
         crate::distributed::ddp_run::ensure_trainable_params(

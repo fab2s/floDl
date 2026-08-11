@@ -513,6 +513,15 @@ where
         self
     }
 
+    /// Profile each rank's training graph with device-side events and
+    /// ship accumulated per-node min/mean timings to the controller's
+    /// dashboard at clean teardown (see
+    /// [`DdpRunConfig::profile_graph`](crate::distributed::DdpRunConfig::profile_graph)).
+    pub fn profile_graph(mut self, on: bool) -> Self {
+        self.config = self.config.with_profile_graph(on);
+        self
+    }
+
     /// VRAM share for each rank's data plane — prefetch channel +
     /// device sample pool (see [`DdpRunConfig::vram_max_usage`]).
     /// Same knob as `DataLoaderBuilder::vram_max_usage` on the solo

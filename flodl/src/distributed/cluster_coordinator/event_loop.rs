@@ -44,7 +44,8 @@ impl ClusterCoordinator {
             | TimingMsgWire::DashboardSetSvg { rank, .. }
             | TimingMsgWire::DashboardSetMetadata { rank, .. }
             | TimingMsgWire::DashboardSetHardware { rank, .. }
-            | TimingMsgWire::ResourceSample { rank, .. } => Some(*rank as usize),
+            | TimingMsgWire::ResourceSample { rank, .. }
+            | TimingMsgWire::DashboardGraphTimings { rank, .. } => Some(*rank as usize),
         };
         if let Some(r) = rank_for_liveness
             && r < self.last_heartbeat.len()
@@ -264,6 +265,11 @@ impl ClusterCoordinator {
                 let rank = rank as usize;
                 if rank < self.world_size {
                     self.absorb_resource_sample(rank, sample);
+                }
+            }
+            TimingMsgWire::DashboardGraphTimings { rank, profile } => {
+                if let Some(ref sink) = self.dashboard_sink {
+                    sink.set_graph_timings(rank as usize, profile);
                 }
             }
         }

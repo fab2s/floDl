@@ -713,6 +713,7 @@ impl DdpHandle {
                 )
             }),
             model_sig,
+            profile_graph: config.profile_graph,
         };
 
         // ClusterWorker bridges set up heartbeat + NCCL watchdog + inbound

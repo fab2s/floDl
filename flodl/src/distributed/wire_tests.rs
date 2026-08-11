@@ -434,6 +434,43 @@ fn timing_msg_round_trip_dashboard_variants() {
             rank: 2,
             summary: "CPU=8 cores | RAM=32GB | GPU=2x RTX 5060 Ti".to_string(),
         },
+        TimingMsgWire::DashboardGraphTimings {
+            rank: 1,
+            profile: crate::distributed::wire::GraphProfileWire {
+                hash: "a".repeat(64),
+                gpu_model: "NVIDIA GeForce RTX 5060 Ti".to_string(),
+                source: "gpu events".to_string(),
+                samples: 42,
+                total_min_ms: 1.5,
+                total_mean_ms: 1.75,
+                nodes: vec![
+                    crate::distributed::wire::GraphNodeTimingWire {
+                        id: "conv2d_1".to_string(),
+                        level: 0,
+                        min_ms: 0.4,
+                        mean_ms: 0.5,
+                    },
+                    crate::distributed::wire::GraphNodeTimingWire {
+                        id: "relu_2".to_string(),
+                        level: 1,
+                        min_ms: 0.1,
+                        mean_ms: 0.12,
+                    },
+                ],
+            },
+        },
+        TimingMsgWire::DashboardGraphTimings {
+            rank: 0,
+            profile: crate::distributed::wire::GraphProfileWire {
+                hash: String::new(),
+                gpu_model: "cpu".to_string(),
+                source: "host wall clock".to_string(),
+                samples: 0,
+                total_min_ms: 0.0,
+                total_mean_ms: 0.0,
+                nodes: Vec::new(),
+            },
+        },
     ];
     for c in cases {
         let frame = ControlFrame::encode(&SAMPLE_SALT, MsgKind::Timing, &c).unwrap();

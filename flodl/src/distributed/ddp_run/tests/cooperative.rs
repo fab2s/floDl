@@ -77,6 +77,7 @@ fn make_det_worker(total: usize) -> (GpuWorker<Linear>, WorkerChannels) {
         policy: ApplyPolicy::Sync,
         save_path: None,
         model_sig: [0u8; 32],
+        profile_graph: false,
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };

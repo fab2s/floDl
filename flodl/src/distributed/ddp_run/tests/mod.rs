@@ -125,6 +125,7 @@ fn test_worker_config_clone() {
         policy: ApplyPolicy::Sync,
         save_path: None,
         model_sig: [0u8; 32],
+        profile_graph: false,
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -235,6 +236,7 @@ pub(super) fn make_test_worker_customized(
         policy: ApplyPolicy::Sync,
         save_path: None,
         model_sig: [0u8; 32],
+        profile_graph: false,
         coord_liveness_timeout_secs:
             crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
     };
@@ -355,4 +357,113 @@ fn later_events_of_a_pass_reuse_nothing() {
         }
     }
     assert_eq!(seen.len(), total, "one pass must still cover the corpus");
+}
+
+#[test]
+fn profile_graph_worker_accumulates_and_emits_at_teardown() {
+    // The rank-side heat-map chain, no cluster required: profile_graph
+    // in the WorkerConfig enables profiling on the factory-built Graph,
+    // training-shaped forwards feed the accumulator, and
+    // emit_graph_profile ships one GraphProfile frame on the timing
+    // channel with the graph's identity attached.
+    use crate::graph::{FlowBuilder, Graph};
+
+    let dev = test_device();
+    let build = |d: Device| -> crate::tensor::Result<Graph> {
+        FlowBuilder::from(Linear::on_device(4, 2, d)?).build()
+    };
+    let tmp_model = build(dev).unwrap();
+    let tmp_params: Vec<Tensor> = tmp_model
+        .parameters()
+        .iter()
+        .map(|p| p.variable.data())
+        .collect();
+    let tmp_buffers: Vec<Tensor> = tmp_model.buffers().iter().map(|b| b.get()).collect();
+    let expected_hash = tmp_model.structural_hash().to_string();
+    drop(tmp_model);
+
+    let config = WorkerConfig {
+        rank: 0,
+        world_size: 1,
+        device: dev,
+        initial_params: tmp_params,
+        initial_buffers: tmp_buffers,
+        total_samples: 16,
+        augment: 1,
+        transform: None,
+        vram_max_usage: 0.90,
+        ram_max_usage: 0.50,
+        gpu_ram_share: None,
+        sample_cache: true,
+        disk_stage_gb: 0,
+        disk_stage_dir: None,
+        batch_size: 4,
+        seed: 42,
+        epoch_splits: 1,
+        max_grad_norm: None,
+        vram_pool: false,
+        easgd_alpha: None,
+        gamma: 1.0,
+        bf16_wire: false,
+        timeline: None,
+        policy: ApplyPolicy::Sync,
+        save_path: None,
+        model_sig: [0u8; 32],
+        profile_graph: true,
+        coord_liveness_timeout_secs:
+            crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+    };
+    let ((timing_tx, metrics_tx, param_tx, final_param_tx, control_rx), ch) =
+        GpuWorker::<Graph>::channels();
+    let dataset: Arc<dyn crate::data::BatchDataSet> = Arc::new(TestDataset { n: 16 });
+    let worker = GpuWorker::new(
+        &config,
+        build,
+        |params| crate::nn::SGD::new(params, 0.01, 0.0),
+        dataset,
+        None,
+        None,
+        None,
+        None,
+        timing_tx,
+        metrics_tx,
+        param_tx,
+        final_param_tx,
+        control_rx,
+        None,
+    )
+    .unwrap();
+
+    // The constructor honoured the knob.
+    assert!(worker.model().profiling());
+
+    // Enough forwards to clear the 3-pass warmup (plus the one-pass lag
+    // on a CUDA test device).
+    let x = Variable::new(Tensor::from_f32(&[0.5; 4], &[1, 4], dev).unwrap(), false);
+    for _ in 0..6 {
+        worker.model().forward(&x).unwrap();
+    }
+
+    worker.emit_graph_profile();
+    let msg = ch
+        .timing_rx
+        .try_recv()
+        .expect("emit_graph_profile should queue one frame");
+    match msg {
+        TimingMsg::GraphProfile { rank, profile } => {
+            assert_eq!(rank, 0);
+            assert_eq!(profile.hash, expected_hash);
+            assert_eq!(profile.nodes.len(), 1);
+            assert!(profile.samples >= 1);
+            assert!(profile.total_mean_ms >= 0.0);
+            let expected_source = if dev.is_cuda() {
+                "gpu events"
+            } else {
+                "host wall clock"
+            };
+            assert_eq!(profile.source, expected_source);
+            assert!(!profile.gpu_model.is_empty());
+        }
+        other => panic!("expected GraphProfile, got {other:?}"),
+    }
 }

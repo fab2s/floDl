@@ -967,6 +967,11 @@ fn run_unified(
     }
     if let Some(path) = dashboard_path {
         builder = builder.save_dashboard(path);
+        // The heat map's only consumer is the dashboard artifact, so the
+        // bench derives profiling from the dashboard ask rather than
+        // growing a second flag (overhead: one event record per node per
+        // pass, symmetric across ranks).
+        builder = builder.profile_graph(true);
         if let Some(theme) = config.dashboard_theme.as_deref() {
             builder = builder.dashboard_theme(theme);
         }

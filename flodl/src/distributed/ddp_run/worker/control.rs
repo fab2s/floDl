@@ -302,9 +302,16 @@ impl<M: Module> GpuWorker<M> {
                     let start = std::time::Instant::now();
                     let result = match self.eval_dataset.as_ref() {
                         Some(ds) => {
+                            // Eval forwards run on ONE elected rank; letting
+                            // them feed the profiling accumulator would tilt
+                            // exactly this rank's per-node means.
+                            let profiling_paused = self.pause_graph_profiling();
                             self.model.eval();
                             let r = f(&self.model, ds.as_ref());
                             self.model.train();
+                            if profiling_paused {
+                                self.resume_graph_profiling();
+                            }
                             r
                         }
                         None => Err(TensorError::new(
