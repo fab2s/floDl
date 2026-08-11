@@ -969,9 +969,11 @@ fn run_unified(
         builder = builder.save_dashboard(path);
         // The heat map's only consumer is the dashboard artifact, so the
         // bench derives profiling from the dashboard ask rather than
-        // growing a second flag (overhead: one event record per node per
-        // pass, symmetric across ranks).
-        builder = builder.profile_graph(true);
+        // growing an opt-in flag (overhead: one event record per node per
+        // pass, symmetric across ranks). --no-profile-graph is the A/B
+        // lever: two dashboard runs differing only in it isolate the
+        // profiling cost.
+        builder = builder.profile_graph(!config.no_profile_graph);
         if let Some(theme) = config.dashboard_theme.as_deref() {
             builder = builder.dashboard_theme(theme);
         }
