@@ -116,6 +116,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The engine scalars' roll-up declarations: controller-emitted point
+/// observations on the root record (`anchor`, `sync_ms`, `cpu_avg_ms`,
+/// `d_raw`, `lambda_ema` — see `window_records::insert_engine_metrics`), so
+/// the honest legend is `last`, never a work-weighted mean they are not.
+fn engine_reductions() -> crate::monitor::record::Reductions {
+    use crate::monitor::record::Reduction;
+    let mut r = crate::monitor::record::Reductions::new();
+    for key in ["anchor", "sync_ms", "cpu_avg_ms", "d_raw", "lambda_ema"] {
+        r.insert(key.to_string(), Reduction::Last);
+    }
+    r
+}
+
 /// Trim vendor boilerplate off a GPU model so a legend entry stays short
 /// (`NVIDIA GeForce RTX 5060 Ti` → `RTX 5060 Ti`). Mirrors the dashboard's own
 /// `shortGpuName`.
@@ -213,10 +226,11 @@ pub struct ClusterDashboardSink {
     /// `None` for live-only. Sink-driven because on a cluster run this is the
     /// only `Monitor` holding the epochs and the record plane.
     dashboard_html: Option<String>,
-    /// Non-core roll-up declarations for user scalars. Applied when building
+    /// Roll-up declarations: the engine scalars' built-in `Last` entries
+    /// ([`engine_reductions`]) plus the user's own. Applied when building
     /// the epoch record tree (the only cadence carrying user scalars) and
-    /// published once as the stream's `meta` record so consumers roll up the
-    /// same way the controller did.
+    /// published once as the stream's `meta` record so consumers roll up
+    /// (and label) the same way the controller did.
     scalar_reductions: crate::monitor::record::Reductions,
     /// Whether the `meta` record has been published yet. It is emitted lazily
     /// with the first record push rather than at construction, so it carries a
@@ -264,7 +278,7 @@ impl ClusterDashboardSink {
             record_log: None,
             record_shipper: Mutex::new(None),
             dashboard_html: None,
-            scalar_reductions: crate::monitor::record::Reductions::new(),
+            scalar_reductions: engine_reductions(),
             meta_published: Mutex::new(false),
             start_time: Instant::now(),
         }
@@ -316,11 +330,13 @@ impl ClusterDashboardSink {
     }
 
     /// Install the user-scalar roll-up declarations from the run config.
+    /// Merge the user's roll-up declarations onto the engine defaults. A
+    /// user entry for an engine key wins (their stream, their call).
     pub fn with_scalar_reductions(
         mut self,
         reductions: crate::monitor::record::Reductions,
     ) -> Self {
-        self.scalar_reductions = reductions;
+        self.scalar_reductions.extend(reductions);
         self
     }
 
@@ -1115,6 +1131,12 @@ mod tests {
         assert_eq!(meta["kind"], "meta");
         assert_eq!(meta["ts"], 7);
         assert_eq!(meta["reductions"]["tokens_seen"], "sum");
+        // The engine scalars' built-in declarations survive the user merge:
+        // they are point observations, and a `(mean)` legend would state a
+        // roll-up they are not.
+        assert_eq!(meta["reductions"]["anchor"], "last");
+        assert_eq!(meta["reductions"]["sync_ms"], "last");
+        assert_eq!(meta["reductions"]["d_raw"], "last");
     }
 
     /// A `meta` record carries no `path`, and `RecordLog::append` skips

@@ -448,11 +448,17 @@ mod tests {
     /// and a primary context pins VRAM on every device for the life of
     /// the process.
     ///
-    /// Only verifiable in a process that has done no CUDA work yet; in
-    /// the parallel CUDA test harness another test may already hold a
-    /// context, in which case this degrades to a no-op. Run it alone
-    /// (`--exact`) for the meaningful negative check.
+    /// Only verifiable when nothing else can create a context during the
+    /// sampling window, which is why this test is `#[ignore]`: it runs in
+    /// the SERIAL lane (`fdl gpu-test-serial`, `--test-threads=1`), where
+    /// a context appearing after the start guard can only be the
+    /// sampler's own. In the parallel lane the attribution is impossible —
+    /// the unignored version failed every `fdl gpu-test -- monitor`-style
+    /// filtered run when a concurrently scheduled CUDA test landed a
+    /// context inside the 550ms window (its start guard, checked before
+    /// the window, had rightly passed).
     #[test]
+    #[ignore = "serial lane: context attribution needs --test-threads=1"]
     fn test_resource_sampler_never_initializes_cuda() {
         if crate::tensor::gpu_has_primary_context(0) {
             eprintln!("skipped: CUDA context already present in this process");

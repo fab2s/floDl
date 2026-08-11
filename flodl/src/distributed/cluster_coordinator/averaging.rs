@@ -369,6 +369,19 @@ impl ClusterCoordinator {
                 ),
             );
         }
+        // Stash for the window report's curated `d_raw` / `lambda_ema`
+        // (independent of the timeline sinks below). The lambda proxy comes
+        // from the active guard's telemetry, so a guard that computes none
+        // (NoGuard, LevelGuard) simply never sets it.
+        self.last_divergence_d = Some(d_raw);
+        if let Some((_, v)) = self
+            .convergence_guard
+            .telemetry()
+            .iter()
+            .find(|(k, _)| *k == "lambda_ema")
+        {
+            self.last_lambda_ema = Some(*v);
+        }
         if let Some(ref tl) = self.timeline {
             tl.event(crate::monitor::EventKind::Divergence {
                 d_raw,
@@ -481,7 +494,17 @@ impl ClusterCoordinator {
             .collect();
 
         let ts = super::alerts::now_ms();
-        let tree = super::window_records::build_window_tree(&stats);
+        let mut tree = super::window_records::build_window_tree(&stats);
+        super::window_records::insert_engine_metrics(
+            &mut tree,
+            &super::window_records::EngineWindow {
+                anchor: self.el_che.anchor(),
+                sync_ms: self.last_sync_ms,
+                cpu_avg_ms: self.last_cpu_avg_ms,
+                d_raw: self.last_divergence_d,
+                lambda_ema: self.last_lambda_ema,
+            },
+        );
         let records = tree.flat_records(ts, Some(self.avg_count), Some(in_flight_epoch));
         if let Some(sink) = self.dashboard_sink.as_ref() {
             sink.push_window_records(records);
@@ -518,11 +541,15 @@ impl ClusterCoordinator {
     /// Called from the end of both `finish_averaging_nccl` and
     /// `finish_averaging_cpu`.
     pub(super) fn emit_sync_end(&mut self) {
-        if let Some(start) = self.sync_start.take()
-            && let Some(ref tl) = self.timeline
-        {
+        if let Some(start) = self.sync_start.take() {
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
+            // Stash for the window report's curated `sync_ms` regardless of
+            // whether a timeline is attached — the record stream and the
+            // timeline are independent sinks.
+            self.last_sync_ms = Some(duration_ms);
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::SyncEnd { duration_ms });
+            }
         }
     }
 

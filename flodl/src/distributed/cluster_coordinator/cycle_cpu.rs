@@ -227,11 +227,12 @@ impl ClusterCoordinator {
         // duration_ms is the bridge round-trip time (RequestParams
         // broadcast -> all alive SyncAcks landed). Distinct from the
         // outer SyncEnd which also covers the post-finalize work.
-        if let Some(start) = self.cycle.finish_cpu_pending()
-            && let Some(ref tl) = self.timeline
-        {
+        if let Some(start) = self.cycle.finish_cpu_pending() {
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
+            self.last_cpu_avg_ms = Some(duration_ms);
+            if let Some(ref tl) = self.timeline {
+                tl.event(crate::monitor::EventKind::CpuAvgEnd { duration_ms });
+            }
         }
         self.finish_pending_checkpoint_meta();
         self.emit_sync_end();

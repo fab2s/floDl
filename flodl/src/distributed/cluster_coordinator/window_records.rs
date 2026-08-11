@@ -110,9 +110,82 @@ pub(super) fn build_window_tree(stats: &[WindowRankStat]) -> NodeRecord {
     build_tree(&leaves, &Reductions::new())
 }
 
+/// The engine's state as of this window, for the curated root metrics.
+#[derive(Debug, Clone, Default)]
+pub(super) struct EngineWindow {
+    /// Current ElChe anchor (batches per reduce window).
+    pub anchor: usize,
+    /// Last AllReduce round-trip (ms), when one has completed.
+    pub sync_ms: Option<f64>,
+    /// Last CPU-averaging round-trip (ms), CPU modes only.
+    pub cpu_avg_ms: Option<f64>,
+    /// Last observed divergence `d_raw`, when the guard reported one.
+    pub d_raw: Option<f64>,
+    /// Last `lambda_ema` from the active guard's telemetry (GrowthGuard);
+    /// guards that compute no growth rate never set it.
+    pub lambda_ema: Option<f64>,
+}
+
+/// Insert the curated engine scalars into the ROOT record only.
+///
+/// These are controller-emitted point observations (declared
+/// [`Reduction::Last`](crate::monitor::record::Reduction) in the stream's
+/// `meta`), never per-rank rollups — no leaf carries them, so `build_tree`'s
+/// reductions never touch them. Absent stays absent: a mode without CPU
+/// averaging contributes no `cpu_avg_ms` key at all.
+pub(super) fn insert_engine_metrics(root: &mut NodeRecord, e: &EngineWindow) {
+    root.metrics.insert("anchor".to_string(), e.anchor as f64);
+    if let Some(v) = e.sync_ms {
+        root.metrics.insert("sync_ms".to_string(), v);
+    }
+    if let Some(v) = e.cpu_avg_ms {
+        root.metrics.insert("cpu_avg_ms".to_string(), v);
+    }
+    if let Some(v) = e.d_raw {
+        root.metrics.insert("d_raw".to_string(), v);
+    }
+    if let Some(v) = e.lambda_ema {
+        root.metrics.insert("lambda_ema".to_string(), v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine scalars land on the ROOT record only — point observations,
+    /// not rollups — and absent stays absent (`cpu_avg_ms` under NCCL).
+    #[test]
+    fn engine_metrics_are_root_only_and_sparse() {
+        let stats = vec![
+            stat(0, "exa", 10, Some(0.5)),
+            stat(1, "pascal", 10, Some(0.7)),
+        ];
+        let mut tree = build_window_tree(&stats);
+        insert_engine_metrics(
+            &mut tree,
+            &EngineWindow {
+                anchor: 40,
+                sync_ms: Some(3.5),
+                cpu_avg_ms: None,
+                d_raw: Some(1e-3),
+                lambda_ema: Some(-0.02),
+            },
+        );
+        assert_eq!(tree.metrics.get("anchor"), Some(&40.0));
+        assert_eq!(tree.metrics.get("sync_ms"), Some(&3.5));
+        assert!(!tree.metrics.contains_key("cpu_avg_ms"), "absent != zero");
+        assert_eq!(tree.metrics.get("d_raw"), Some(&1e-3));
+        for child in &tree.children {
+            for key in ["anchor", "sync_ms", "d_raw", "lambda_ema"] {
+                assert!(
+                    !child.metrics.contains_key(key),
+                    "{key} must not reach {:?}",
+                    child.path
+                );
+            }
+        }
+    }
 
     fn stat(rank: usize, host: &str, steps: usize, loss: Option<f64>) -> WindowRankStat {
         WindowRankStat {

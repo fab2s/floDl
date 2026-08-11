@@ -1056,11 +1056,12 @@ impl Monitor {
         self.build_archive_with_index(&[])
     }
 
-    /// [`Self::build_archive`] plus the per-host telemetry index: `(host,
-    /// run)` pairs become relative links (`telemetry/<host>/<run>/
-    /// timeline.html`) the archived page renders as a card. The production
-    /// bake sites discover the pairs beside the archive path at write time
-    /// ([`discover_telemetry`]); an empty slice keeps the card hidden.
+    /// The archive build plus the per-host telemetry index: `(host, run)`
+    /// pairs become relative links (`telemetry/<host>/<run>/timeline.html`)
+    /// the archived page renders as a card. The production bake sites
+    /// discover the pairs beside the archive path at write time
+    /// ([`discover_telemetry`]); an empty slice keeps the card hidden
+    /// (`build_archive`, the test-only wrapper, passes exactly that).
     fn build_archive_with_index(
         &self,
         telemetry: &[(String, String)],
