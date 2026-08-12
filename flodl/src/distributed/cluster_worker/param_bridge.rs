@@ -47,10 +47,6 @@ pub(super) fn param_bridge_loop(
     // Monotonic local version counter; bumped per round so the
     // synthesized AveragedParams.version increases consistently.
     let mut version: u64 = 0;
-    // Pre-sync scratch for weight-space divergence math. Allocated
-    // lazily on the first ParamSnapshot (shapes match the inner
-    // GpuWorker's param tensors; reused unchanged across rounds).
-    let mut pre_scratch: Option<Vec<Tensor>> = None;
 
     while let Ok(snapshot) = param_rx.recv() {
         let ParamSnapshot {
@@ -63,52 +59,6 @@ pub(super) fn param_bridge_loop(
             snap_rank as u64, rank,
             "param bridge: snapshot.rank mismatch with bridge rank"
         );
-
-        // One-time scratch allocation matched to the snapshot shapes.
-        // Explicitly f32 (NOT zeros_like): under `bf16_wire` the snapshot
-        // tensors are bf16, and the divergence math mutates the scratch
-        // in place (`foreach_add_list_`), where a bf16 output cannot
-        // absorb the f32 consensus. The `copy_` below upcasts bf16 →
-        // f32 exactly, so the triple keeps full precision either way.
-        if pre_scratch.is_none() {
-            let allocated: Result<Vec<Tensor>> = params
-                .iter()
-                .map(|t| {
-                    Tensor::zeros(
-                        &t.shape(),
-                        crate::tensor::TensorOptions {
-                            dtype: crate::tensor::DType::Float32,
-                            device: crate::tensor::Device::CPU,
-                        },
-                    )
-                })
-                .collect();
-            match allocated {
-                Ok(s) => pre_scratch = Some(s),
-                Err(e) => {
-                    eprintln!("cluster_worker: param bridge r{rank} scratch alloc: {e}");
-                    inject_shutdown();
-                    return;
-                }
-            }
-        }
-        let scratch = pre_scratch.as_ref().expect("scratch just allocated");
-
-        // Capture pre-sync params into scratch (deep copy; scratch
-        // never shares storage with snapshot.params, so the math
-        // stays correct regardless of device or ApplyPolicy).
-        let mut copy_failed = false;
-        for (dst, src) in scratch.iter().zip(params.iter()) {
-            if let Err(e) = dst.copy_(src, false) {
-                eprintln!("cluster_worker: param bridge r{rank} pre_scratch copy_: {e}");
-                copy_failed = true;
-                break;
-            }
-        }
-        if copy_failed {
-            inject_shutdown();
-            return;
-        }
 
         // Emit SnapshotReady BEFORE entering the AllReduce barrier so
         // the coord's per-rank capacity signal (T_ready - T_request)
@@ -174,31 +124,54 @@ pub(super) fn param_bridge_loop(
         // values are bf16-representable, so re-quantizing is a no-op);
         // only an EASGD-blended state could pick up one ~2⁻⁹-relative
         // rounding on an (already rare) all-idle round.
-        let avg_params = if total_n == 0.0 {
-            params.clone()
+        //
+        // Weight-space divergence (||pre - post|| / ||post||, plus
+        // pre_norm / post_norm) streams THROUGH the reduce: the client
+        // is armed with the pre-images (the snapshot staging) and folds
+        // each (pre, consensus) pair into the accumulator at decode
+        // time, holding one f32 tensor transient instead of the retired
+        // model-sized `pre_scratch`. On the all-idle skip (no reduce at
+        // all) the triple degenerates to (0, n, n) — pre == post — from
+        // a norm-only pass. Computed before the buffer reduce so a
+        // later buffer error path can't mask the params triple.
+        let (avg_params, divergence, post_norm, pre_norm) = if total_n == 0.0 {
+            let n = match crate::distributed::divergence::exact_norm(&params) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("cluster_worker: param bridge r{rank} all-idle norm: {e}");
+                    inject_shutdown();
+                    return;
+                }
+            };
+            (params.clone(), 0.0, n, n)
         } else {
-            match sumcount_reduce(&mut client, &params, my_w) {
+            client.arm_divergence(&params);
+            let (adopted, realized) = match sumcount_reduce(&mut client, &params, my_w) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("cluster_worker: param bridge r{rank} all_reduce params: {e}");
                     inject_shutdown();
                     return;
                 }
-            }
-        };
-
-        // Weight-space divergence (||pre - post|| / ||post||, plus
-        // pre_norm / post_norm) computed before the buffer reduce so
-        // a later buffer error path can't mask the params triple.
-        let (divergence, post_norm, pre_norm) =
-            match crate::distributed::divergence::divergence_triple(scratch, &avg_params) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("cluster_worker: param bridge r{rank} divergence: {e}");
-                    inject_shutdown();
-                    return;
-                }
             };
+            let Some(accum) = client.take_divergence() else {
+                eprintln!(
+                    "cluster_worker: param bridge r{rank} divergence accumulator \
+                     missing after armed reduce (protocol bug)"
+                );
+                inject_shutdown();
+                return;
+            };
+            // Keep-local (zero realized mass): pre == post by
+            // definition — the decoded payloads were meaningless, only
+            // the pre sums are trusted.
+            let (d, post_n, pre_n) = if realized {
+                accum.finish()
+            } else {
+                accum.finish_keep_local()
+            };
+            (adopted, d, post_n, pre_n)
+        };
 
         // Buffers (BatchNorm running stats etc.): equal weight among the
         // ranks that moved (idle excluded via the 0/1 indicator); the
@@ -225,7 +198,7 @@ pub(super) fn param_bridge_loop(
             let subset: Vec<Tensor> = f32_buffer_idx.iter().map(|&i| buffers[i].clone()).collect();
             let my_indicator = crate::distributed::realized_work::mover_mass(n_i as f64);
             match sumcount_reduce(&mut client, &subset, my_indicator) {
-                Ok(reduced) => {
+                Ok((reduced, _realized)) => {
                     let mut merged = buffers.clone();
                     for (k, &i) in f32_buffer_idx.iter().enumerate() {
                         merged[i] = reduced[k].clone();
@@ -294,10 +267,12 @@ pub(super) fn param_bridge_loop(
 /// consensus, which is therefore also what the checkpoint forge writes
 /// and what the outer optimizer steps.
 ///
-/// Returns the adopted tensors: the scattered consensus, or shallow
-/// clones of `tensors` when the round realized no work (returned mass
-/// `0.0`, e.g. every accepted contributor was idle) — the caller keeps
-/// its local state, mirroring the all-idle collective skip.
+/// Returns `(adopted, realized)`: the scattered consensus and `true`,
+/// or shallow clones of `tensors` and `false` when the round realized
+/// no work (returned mass `0.0`, e.g. every accepted contributor was
+/// idle) — the caller keeps its local state, mirroring the all-idle
+/// collective skip, and `realized` tells a divergence-armed caller to
+/// trust only the accumulator's pre sums (`finish_keep_local`).
 ///
 /// When the client has decode-into-request enabled (barrier-paced CUDA
 /// ranks — see [`CpuReduceClient::arm_decode_into`]), the reply decodes
@@ -313,7 +288,7 @@ pub(crate) fn sumcount_reduce(
     client: &mut crate::distributed::cpu_reduce::CpuReduceClient,
     tensors: &[Tensor],
     my_weight: f64,
-) -> Result<Vec<Tensor>> {
+) -> Result<(Vec<Tensor>, bool)> {
     // The `my_weight` pre-scale is FUSED into the streaming wire encode
     // (byte-level, per tensor) — no model-sized scaled scratch exists,
     // and reading `tensors` (the pinned snapshot staging) at stream time
@@ -330,7 +305,7 @@ pub(crate) fn sumcount_reduce(
         crate::debug!(
             "cluster_worker: reduce round realized no work (mass 0); keeping local state"
         );
-        return Ok(tensors.to_vec());
+        return Ok((tensors.to_vec(), false));
     }
-    Ok(consensus)
+    Ok((consensus, true))
 }
