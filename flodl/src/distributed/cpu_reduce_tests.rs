@@ -1062,7 +1062,9 @@ fn window_round(
     c.all_reduce_per_rank_f64(&mut counts).unwrap();
     let my_w = gamma_mass(n_i as f64, gamma);
     let t = Tensor::from_f32(&[t_val], &[1], Device::CPU).unwrap();
-    let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w).unwrap()[0]
+    let adopted = sumcount_reduce(c, std::slice::from_ref(&t), my_w)
+        .unwrap()
+        .0[0]
         .to_f32_vec()
         .unwrap()[0];
     // Second round replicating `sumcount_reduce`'s send side, keeping
@@ -1115,6 +1117,109 @@ fn realized_work_all_alive_scattered_frame_is_consensus() {
     }
 }
 
+/// The streamed divergence accumulator (armed on the client, folded at
+/// decode time inside `read_reduced_tensors`) must equal the post-hoc
+/// [`divergence_triple`] over saved pre-copies and the adopted
+/// consensus — in BOTH decode modes: fresh allocs, and
+/// decode-into-request, where the decode destroys the pre-image in
+/// place (the mode whose destruction is why `pre_scratch` existed and
+/// why capture-before-decode replaces it).
+#[test]
+fn armed_divergence_matches_post_hoc_reference() {
+    use crate::distributed::divergence::divergence_triple;
+    for decode_into in [false, true] {
+        let dead = DeadRanks::new(2);
+        let (r0, r1) =
+            with_relayed_controller_and_ledger(2, vec![0, 1], TEST_SALT, dead, move |addr| {
+                let spawn = |rank: usize, base: f32| {
+                    thread::spawn(move || {
+                        let mut c =
+                            CpuReduceClient::connect(addr, rank as u32, 2, TEST_SALT).unwrap();
+                        c.set_decode_into_request(decode_into);
+                        // Two tensors so the cross-tensor accumulation is
+                        // exercised, with per-rank distinct values.
+                        let vals_a = [base, base + 1.0];
+                        let vals_b = [base * 2.0];
+                        let tensors = vec![
+                            Tensor::from_f32(&vals_a, &[2], Device::CPU).unwrap(),
+                            Tensor::from_f32(&vals_b, &[1], Device::CPU).unwrap(),
+                        ];
+                        // Independent pre-copies for the post-hoc reference.
+                        let pre_copies = [
+                            Tensor::from_f32(&vals_a, &[2], Device::CPU).unwrap(),
+                            Tensor::from_f32(&vals_b, &[1], Device::CPU).unwrap(),
+                        ];
+                        c.arm_divergence(&tensors);
+                        let (adopted, realized) = sumcount_reduce(&mut c, &tensors, 1.0).unwrap();
+                        assert!(realized, "both ranks carry mass 1.0");
+                        let streamed = c.take_divergence().expect("armed reply").finish();
+                        let reference = divergence_triple(&pre_copies, &adopted).unwrap();
+                        (streamed, reference)
+                    })
+                };
+                let t0 = spawn(0, 1.0);
+                let t1 = spawn(1, 5.0);
+                (t0.join().unwrap(), t1.join().unwrap())
+            });
+        for (rank, (streamed, reference)) in [(0, &r0), (1, &r1)] {
+            assert!(
+                (streamed.0 - reference.0).abs() < 1e-9,
+                "rank {rank} decode_into={decode_into}: streamed divergence \
+                 {} != post-hoc {}",
+                streamed.0,
+                reference.0,
+            );
+            assert!(
+                (streamed.1.unwrap() - reference.1.unwrap()).abs() < 1e-9,
+                "rank {rank} decode_into={decode_into}: post_norm"
+            );
+            assert!(
+                (streamed.2.unwrap() - reference.2.unwrap()).abs() < 1e-9,
+                "rank {rank} decode_into={decode_into}: pre_norm"
+            );
+        }
+    }
+}
+
+/// A zero-mass round (every contributor idle) keep-locals: `realized`
+/// comes back false and `finish_keep_local` yields exactly
+/// `(0, pre_norm, pre_norm)` — the decoded payloads are meaningless
+/// zeros and must not leak into the triple.
+#[test]
+fn armed_divergence_keep_local_on_zero_mass_round() {
+    let dead = DeadRanks::new(2);
+    let (r0, r1) = with_relayed_controller_and_ledger(2, vec![0, 1], TEST_SALT, dead, |addr| {
+        let spawn = |rank: usize, vals: [f32; 2]| {
+            thread::spawn(move || {
+                let mut c = CpuReduceClient::connect(addr, rank as u32, 2, TEST_SALT).unwrap();
+                let tensors = vec![Tensor::from_f32(&vals, &[2], Device::CPU).unwrap()];
+                c.arm_divergence(&tensors);
+                // Idle rank: gamma_mass(0, γ) = 0 on both ranks → the
+                // round realizes no work.
+                let (adopted, realized) =
+                    sumcount_reduce(&mut c, &tensors, gamma_mass(0.0, 1.0)).unwrap();
+                assert!(!realized, "all-idle round must not realize work");
+                // Keep-local hands back the caller's own tensors.
+                assert_eq!(adopted[0].to_f32_vec().unwrap(), vals.to_vec());
+                c.take_divergence()
+                    .expect("armed reply")
+                    .finish_keep_local()
+            })
+        };
+        let t0 = spawn(0, [3.0, 4.0]); // ||pre|| = 5
+        let t1 = spawn(1, [6.0, 8.0]); // ||pre|| = 10
+        (t0.join().unwrap(), t1.join().unwrap())
+    });
+    let (d0, post0, pre0) = r0;
+    assert_eq!(d0, 0.0);
+    assert!((pre0.unwrap() - 5.0).abs() < 1e-6);
+    assert!((post0.unwrap() - 5.0).abs() < 1e-6);
+    let (d1, post1, pre1) = r1;
+    assert_eq!(d1, 0.0);
+    assert!((pre1.unwrap() - 10.0).abs() < 1e-6);
+    assert!((post1.unwrap() - 10.0).abs() < 1e-6);
+}
+
 /// Rank 2 declared dead before the window; ranks 0,1 do counts [3,5],
 /// values [1,2], buffers [1,2]. Realized work says: params
 /// consensus = 13/8 = 1.625 (γ=1), buffers = mean of movers = 1.5,
@@ -1140,7 +1245,9 @@ fn realized_work_after_death() {
                     let g1 = window_round(&mut c, rank, 3, n, v, 1.0);
                     // Buffer window: mover-indicator weighting.
                     let bt = Tensor::from_f32(&[b], &[1], Device::CPU).unwrap();
-                    let buf = sumcount_reduce(&mut c, std::slice::from_ref(&bt), 1.0).unwrap()[0]
+                    let buf = sumcount_reduce(&mut c, std::slice::from_ref(&bt), 1.0)
+                        .unwrap()
+                        .0[0]
                         .to_f32_vec()
                         .unwrap()[0];
                     let g_half = window_round(&mut c, rank, 3, n, v, 0.5);

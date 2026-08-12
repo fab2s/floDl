@@ -76,29 +76,65 @@ pub(crate) fn divergence_triple(
         }
         (pre_sq, diff_sq, post_sq)
     } else {
-        let mut pre_sq = 0.0f64;
-        let mut diff_sq = 0.0f64;
-        let mut post_sq = 0.0f64;
+        let mut sums = (0.0f64, 0.0f64, 0.0f64);
         for (p, q) in pre.iter().zip(post.iter()) {
-            let pre_n: f64 = Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
-            pre_sq += pre_n * pre_n;
-            // One upcast transient at a time; shallow clone when
-            // already f32 (mixed lists — f32 buffers among bf16 params
-            // — never reach here today, but per-tensor is free).
-            let q32 = if q.dtype() == crate::tensor::DType::Float32 {
-                q.clone()
-            } else {
-                q.to_dtype(crate::tensor::DType::Float32)?
-            };
-            Tensor::foreach_add_list_(std::slice::from_ref(p), std::slice::from_ref(&q32), -1.0)?;
-            let diff_n: f64 = Tensor::foreach_norm(std::slice::from_ref(p), 2.0)?[0].item()?;
-            diff_sq += diff_n * diff_n;
-            let post_n: f64 = Tensor::foreach_norm(std::slice::from_ref(&q32), 2.0)?[0].item()?;
-            post_sq += post_n * post_n;
+            observe_pair(p, q, &mut sums)?;
         }
-        (pre_sq, diff_sq, post_sq)
+        sums
     };
 
+    Ok(triple_from_sums(pre_sq, diff_sq, post_sq))
+}
+
+/// Accumulate one `(pre_f32, post)` pair's contribution into the three
+/// running sums `(pre_sq, diff_sq, post_sq)`. `pre_f32` must be an f32
+/// tensor and is MUTATED into `pre - post` (the same round-scratch
+/// contract as [`divergence_triple`]). `post` may be bf16: one upcast
+/// transient at a time, norms computed on the f32 image so the triple
+/// keeps f32 precision (a norm READ from a bf16 result tensor would
+/// round to ~3 digits).
+///
+/// This is the per-pair definition both [`divergence_triple`]'s mixed
+/// path and [`DivergenceAccum`] share, so the streaming and the
+/// list-at-once callers can never drift apart.
+fn observe_pair(pre_f32: &Tensor, post: &Tensor, sums: &mut (f64, f64, f64)) -> Result<()> {
+    let pre_n: f64 = Tensor::foreach_norm(std::slice::from_ref(pre_f32), 2.0)?[0].item()?;
+    sums.0 += pre_n * pre_n;
+    // Bring `post` to the pre-image's device + f32. Same-device f32 is
+    // a shallow clone (the production CPU-averaging pair, and the
+    // NCCL path's device-resident triple, both stay move-free); the
+    // cross-device leg exists for [`DivergenceAccum`], whose transient
+    // is CPU by design while a caller's post may live elsewhere.
+    let q32 = if post.device() == pre_f32.device() && post.dtype() == crate::tensor::DType::Float32
+    {
+        post.clone()
+    } else {
+        let moved = if post.device() == pre_f32.device() {
+            post.clone()
+        } else {
+            post.to_device(pre_f32.device())?
+        };
+        if moved.dtype() == crate::tensor::DType::Float32 {
+            moved
+        } else {
+            moved.to_dtype(crate::tensor::DType::Float32)?
+        }
+    };
+    Tensor::foreach_add_list_(
+        std::slice::from_ref(pre_f32),
+        std::slice::from_ref(&q32),
+        -1.0,
+    )?;
+    let diff_n: f64 = Tensor::foreach_norm(std::slice::from_ref(pre_f32), 2.0)?[0].item()?;
+    sums.1 += diff_n * diff_n;
+    let post_n: f64 = Tensor::foreach_norm(std::slice::from_ref(&q32), 2.0)?[0].item()?;
+    sums.2 += post_n * post_n;
+    Ok(())
+}
+
+/// Finish the triple from the three accumulated sums — the single
+/// definition of the ratio and its ~zero-post-norm guard.
+fn triple_from_sums(pre_sq: f64, diff_sq: f64, post_sq: f64) -> (f64, Option<f64>, Option<f64>) {
     let pre_norm = pre_sq.sqrt();
     let post_norm = post_sq.sqrt();
     let divergence = if post_norm > 1e-10 {
@@ -106,8 +142,118 @@ pub(crate) fn divergence_triple(
     } else {
         0.0
     };
+    (divergence, Some(post_norm), Some(pre_norm))
+}
 
-    Ok((divergence, Some(post_norm), Some(pre_norm)))
+/// Streaming counterpart of [`divergence_triple`]: same triple, one
+/// tensor pair at a time, holding at most ONE pre-image transient (the
+/// current tensor's f32 copy) instead of a resident model-sized
+/// scratch. This is what retired `param_bridge`'s `pre_scratch` (a full
+/// f32 CPU model copy per rank, steady for the whole run, whose only
+/// output was these three scalars).
+///
+/// Protocol per tensor, in decode order: [`Self::capture_pre`] BEFORE
+/// the consensus decode overwrites the staging tensor (under
+/// decode-into-request the staging IS the destination, so the pre-image
+/// is destroyed by the decode), then [`Self::observe_post`] with the
+/// decoded consensus. [`Self::finish`] yields the exact triple;
+/// [`Self::finish_keep_local`] yields the keep-local round's triple
+/// `(0, pre_norm, pre_norm)` — pre == post by definition there, and the
+/// post-side sums may hold a zero-mass reply's meaningless payloads, so
+/// only the pre sums are trusted.
+#[derive(Debug)]
+pub(crate) struct DivergenceAccum {
+    sums: (f64, f64, f64),
+    pairs: usize,
+    /// The current tensor's pre-image (f32 CPU copy), between
+    /// `capture_pre` and its matching `observe_post`.
+    held: Option<Tensor>,
+}
+
+impl DivergenceAccum {
+    pub(crate) fn new() -> Self {
+        Self {
+            sums: (0.0, 0.0, 0.0),
+            pairs: 0,
+            held: None,
+        }
+    }
+
+    /// Copy `pre`'s current values into the held f32 transient. Must be
+    /// called before the decode lands in `pre`'s storage. Upcasts bf16
+    /// exactly (same explicit-f32 + `copy_` shape the retired scratch
+    /// used).
+    pub(crate) fn capture_pre(&mut self, pre: &Tensor) -> Result<()> {
+        if self.held.is_some() {
+            return Err(TensorError::new(
+                "DivergenceAccum::capture_pre: previous pre-image not yet observed",
+            ));
+        }
+        let copy = Tensor::zeros(
+            &pre.shape(),
+            crate::tensor::TensorOptions {
+                dtype: crate::tensor::DType::Float32,
+                device: crate::tensor::Device::CPU,
+            },
+        )?;
+        copy.copy_(pre, false)?;
+        self.held = Some(copy);
+        Ok(())
+    }
+
+    /// Fold the held pre-image and the decoded `post` into the sums,
+    /// dropping the transient.
+    pub(crate) fn observe_post(&mut self, post: &Tensor) -> Result<()> {
+        let Some(held) = self.held.take() else {
+            return Err(TensorError::new(
+                "DivergenceAccum::observe_post: no captured pre-image",
+            ));
+        };
+        observe_pair(&held, post, &mut self.sums)?;
+        self.pairs += 1;
+        Ok(())
+    }
+
+    /// The exact triple over every observed pair. Empty (no pairs)
+    /// mirrors [`divergence_triple`]'s empty contract: `(0, None, None)`.
+    pub(crate) fn finish(self) -> (f64, Option<f64>, Option<f64>) {
+        if self.pairs == 0 {
+            return (0.0, None, None);
+        }
+        triple_from_sums(self.sums.0, self.sums.1, self.sums.2)
+    }
+
+    /// Keep-local round (zero realized mass — the caller keeps its own
+    /// tensors, so pre == post): `(0, pre_norm, pre_norm)`, trusting
+    /// only the pre-side sums (the reply's payloads were meaningless).
+    pub(crate) fn finish_keep_local(self) -> (f64, Option<f64>, Option<f64>) {
+        if self.pairs == 0 {
+            return (0.0, None, None);
+        }
+        let pre_norm = self.sums.0.sqrt();
+        (0.0, Some(pre_norm), Some(pre_norm))
+    }
+}
+
+/// Exact global L2 norm of a tensor list, computed on the f32 image
+/// (per-tensor upcast when needed — same precision contract as the
+/// triple). Used by the all-idle path, where no reduce runs and the
+/// triple degenerates to `(0, n, n)` without any pre-image copy.
+pub(crate) fn exact_norm(tensors: &[Tensor]) -> Result<Option<f64>> {
+    if tensors.is_empty() {
+        return Ok(None);
+    }
+    let mut sq = 0.0f64;
+    for t in tensors {
+        let t32 = if t.dtype() == crate::tensor::DType::Float32 {
+            t.clone()
+        } else {
+            t.to_dtype(crate::tensor::DType::Float32)?
+        };
+        let n: f64 = Tensor::foreach_norm(std::slice::from_ref(&t32), 2.0)?[0].item()?;
+        sq += n * n;
+    }
+    Ok(Some(sq.sqrt()))
 }
 
 #[cfg(test)]
@@ -189,5 +335,120 @@ mod tests {
         // The scratch mutation contract holds on the mixed path too:
         // pre became pre - post, in f32.
         assert_eq!(pre_b[0].to_f32_vec().unwrap(), vec![-3.0, -4.0]);
+    }
+
+    /// The streaming accumulator must produce the SAME triple as
+    /// `divergence_triple` over the same pairs — they share the
+    /// per-pair math by construction, and this pins the sharing.
+    #[test]
+    fn accum_matches_divergence_triple() {
+        let pre = [t(&[3.0, 4.0]), t(&[1.0, 2.0])];
+        let post = [t(&[6.0, 8.0]), t(&[2.0, 4.0])];
+        let reference = divergence_triple(&pre, &post).unwrap();
+
+        let pre_b = [t(&[3.0, 4.0]), t(&[1.0, 2.0])];
+        let mut accum = DivergenceAccum::new();
+        for (p, q) in pre_b.iter().zip(post.iter()) {
+            accum.capture_pre(p).unwrap();
+            accum.observe_post(q).unwrap();
+        }
+        let streamed = accum.finish();
+        assert!((streamed.0 - reference.0).abs() < 1e-12, "divergence");
+        assert!(
+            (streamed.1.unwrap() - reference.1.unwrap()).abs() < 1e-12,
+            "post_norm"
+        );
+        assert!(
+            (streamed.2.unwrap() - reference.2.unwrap()).abs() < 1e-12,
+            "pre_norm"
+        );
+        // capture_pre copies — the caller's tensors are NOT mutated
+        // (unlike divergence_triple's scratch contract).
+        assert_eq!(pre_b[0].to_f32_vec().unwrap(), vec![3.0, 4.0]);
+    }
+
+    /// bf16 pre AND post (the decode-into staging under `bf16_wire`
+    /// holds bf16 both before and after the decode) must match the f32
+    /// reference: `capture_pre` upcasts exactly, `observe_pair` upcasts
+    /// the post side.
+    #[test]
+    fn accum_bf16_staging_matches_f32_reference() {
+        let pre_f32 = [t(&[3.0, 4.0]), t(&[1.0, 2.0])];
+        let post_f32 = [t(&[6.0, 8.0]), t(&[2.0, 4.0])];
+        let reference = divergence_triple(&pre_f32, &post_f32).unwrap();
+
+        let to_bf16 = |ts: &[Tensor]| -> Vec<Tensor> {
+            ts.iter()
+                .map(|p| p.to_dtype(crate::tensor::DType::BFloat16).unwrap())
+                .collect()
+        };
+        // Rebuild pre (divergence_triple mutated the f32 originals).
+        let pre_bf16 = to_bf16(&[t(&[3.0, 4.0]), t(&[1.0, 2.0])]);
+        let post_bf16 = to_bf16(&post_f32);
+        let mut accum = DivergenceAccum::new();
+        for (p, q) in pre_bf16.iter().zip(post_bf16.iter()) {
+            accum.capture_pre(p).unwrap();
+            accum.observe_post(q).unwrap();
+        }
+        let streamed = accum.finish();
+        assert!((streamed.0 - reference.0).abs() < 1e-6, "divergence");
+        assert!(
+            (streamed.1.unwrap() - reference.1.unwrap()).abs() < 1e-6,
+            "post_norm"
+        );
+        assert!(
+            (streamed.2.unwrap() - reference.2.unwrap()).abs() < 1e-6,
+            "pre_norm"
+        );
+    }
+
+    /// Keep-local rounds trust only the pre sums: divergence exactly 0,
+    /// both norms = the pre norm — regardless of what garbage the
+    /// zero-mass reply decoded into the post side.
+    #[test]
+    fn accum_keep_local_is_zero_with_pre_norms() {
+        let pre = [t(&[3.0, 4.0])]; // ||pre|| = 5
+        let garbage_post = [t(&[0.0, 0.0])];
+        let mut accum = DivergenceAccum::new();
+        accum.capture_pre(&pre[0]).unwrap();
+        accum.observe_post(&garbage_post[0]).unwrap();
+        let (d, post_n, pre_n) = accum.finish_keep_local();
+        assert_eq!(d, 0.0);
+        assert!((pre_n.unwrap() - 5.0).abs() < 1e-5);
+        assert!((post_n.unwrap() - 5.0).abs() < 1e-5, "post_norm = pre_norm");
+    }
+
+    /// Empty accumulator mirrors divergence_triple's empty contract.
+    #[test]
+    fn accum_empty_is_zero_none_none() {
+        let (d, post, pre) = DivergenceAccum::new().finish();
+        assert_eq!(d, 0.0);
+        assert!(post.is_none() && pre.is_none());
+        let (d, post, pre) = DivergenceAccum::new().finish_keep_local();
+        assert_eq!(d, 0.0);
+        assert!(post.is_none() && pre.is_none());
+    }
+
+    /// Protocol misuse errors loudly rather than corrupting the sums.
+    #[test]
+    fn accum_protocol_misuse_errors() {
+        let a = t(&[1.0]);
+        let mut accum = DivergenceAccum::new();
+        assert!(accum.observe_post(&a).is_err(), "observe without capture");
+        accum.capture_pre(&a).unwrap();
+        assert!(accum.capture_pre(&a).is_err(), "double capture");
+    }
+
+    /// exact_norm: f32 image, empty contract, bf16 parity.
+    #[test]
+    fn exact_norm_contracts() {
+        assert!(exact_norm(&[]).unwrap().is_none());
+        let ts = [t(&[3.0, 4.0]), t(&[0.0, 0.0])];
+        assert!((exact_norm(&ts).unwrap().unwrap() - 5.0).abs() < 1e-6);
+        let bf: Vec<Tensor> = ts
+            .iter()
+            .map(|p| p.to_dtype(crate::tensor::DType::BFloat16).unwrap())
+            .collect();
+        assert!((exact_norm(&bf).unwrap().unwrap() - 5.0).abs() < 1e-6);
     }
 }

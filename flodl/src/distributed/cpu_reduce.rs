@@ -62,8 +62,10 @@ use crate::tensor::{DType, Device, Result, Tensor, TensorError, TensorOptions};
 /// pages are unswappable, the kernel evicts OTHER pages under
 /// pressure, so the gate must also cover what the reduce path
 /// re-touches EVERY window and cannot afford to have evicted: the
-/// pinned snapshot staging (1×), the pre-sync divergence scratch (1×),
-/// and the streamed wire transient (1×); the remaining 2× stands in
+/// pinned snapshot staging (1×), the pre-sync divergence scratch (1×,
+/// since retired — the triple now streams through the reduce holding
+/// one tensor transient; the factor keeps the calibrated value), and
+/// the streamed wire transient (1×); the remaining 2× stands in
 /// for the per-rank runtime overhead MemAvailable must also fund
 /// (CUDA host context, allocator arenas, data staging — ~1.5GB at the
 /// model sizes where this gate can trip at all; at small stagings the
@@ -165,6 +167,17 @@ pub struct CpuReduceClient {
     /// refused (non-CPU / non-f32 — the degenerate snapshot-fallback
     /// class); values still land via fresh allocs.
     decode_dst_fallback_logged: bool,
+    /// One-shot arm for streaming weight-space divergence (see
+    /// [`Self::arm_divergence`]): shallow clones of the REQUEST tensors
+    /// (the pre-images) paired with the accumulator. Consumed by
+    /// `read_reduced_tensors`, which captures each pre-image just
+    /// before its payload decodes (under decode-into-request the decode
+    /// destroys it in place) and folds the pair into the accumulator.
+    /// Error paths leave the client un-armed.
+    armed_divergence: Option<(Vec<Tensor>, crate::distributed::divergence::DivergenceAccum)>,
+    /// The completed accumulator from the last armed reply, retrieved
+    /// via [`Self::take_divergence`].
+    finished_divergence: Option<crate::distributed::divergence::DivergenceAccum>,
 }
 
 impl CpuReduceClient {
@@ -236,6 +249,8 @@ impl CpuReduceClient {
             decode_into_request: false,
             armed_decode_dsts: None,
             decode_dst_fallback_logged: false,
+            armed_divergence: None,
+            finished_divergence: None,
         };
         client.send_handshake()?;
         client.read_handshake_ack()?;
@@ -355,6 +370,38 @@ impl CpuReduceClient {
         if self.decode_into_request {
             self.armed_decode_dsts = Some(dsts.to_vec());
         }
+    }
+
+    /// Arm the NEXT reply to stream the weight-space divergence triple:
+    /// `pre` holds this round's request tensors (the pre-images the
+    /// reply's consensus replaces). As each payload comes off the wire,
+    /// the matching pre-image is captured into a single f32 transient
+    /// JUST BEFORE the decode lands (under decode-into-request the
+    /// destination IS the pre-image, so capture-before-decode is what
+    /// replaces `param_bridge`'s retired model-sized `pre_scratch`),
+    /// then the `(pre, consensus)` pair folds into the accumulator.
+    /// Retrieve with [`Self::take_divergence`] after the round; the
+    /// caller picks `finish()` (realized round) or `finish_keep_local()`
+    /// (zero-mass round, where the decoded payloads are meaningless and
+    /// only the pre sums are trusted).
+    ///
+    /// One-shot, mode-independent (works with fresh-alloc decodes too);
+    /// error paths leave the client un-armed. Peak marginal RAM: ONE
+    /// tensor's f32 copy, vs the retired scratch's full model copy.
+    pub(crate) fn arm_divergence(&mut self, pre: &[Tensor]) {
+        self.armed_divergence = Some((
+            pre.to_vec(),
+            crate::distributed::divergence::DivergenceAccum::new(),
+        ));
+        self.finished_divergence = None;
+    }
+
+    /// Take the completed divergence accumulator from the last armed
+    /// reply. `None` if no armed reply completed since the last take.
+    pub(crate) fn take_divergence(
+        &mut self,
+    ) -> Option<crate::distributed::divergence::DivergenceAccum> {
+        self.finished_divergence.take()
     }
 
     /// Send this rank's frame for the current round and receive the
@@ -597,6 +644,10 @@ impl CpuReduceClient {
         // One-shot: an error path below leaves the client un-armed, so a
         // stale arm can never bleed into an unrelated later reply.
         let armed_dsts = self.armed_decode_dsts.take();
+        // Same one-shot contract for the divergence arm. The pre-image
+        // capture MUST run before its payload's decode: under armed
+        // destinations the decode overwrites the pre-image in place.
+        let mut armed_div = self.armed_divergence.take();
         let prof = self.prof_enabled;
         let mut decode_ns: u128 = 0;
         let mut out: Vec<Tensor> = Vec::new();
@@ -613,6 +664,20 @@ impl CpuReduceClient {
             &self.salt,
             Some(&mut on_header),
             &mut |i, payload| {
+                // Capture the pre-image ahead of the decode; outside the
+                // decode_ns window so the deserialize profile keeps its
+                // meaning. A missing index is a protocol break (the reply
+                // mirrors the sent frame's schema), not a skippable pair.
+                if let Some((pre_list, accum)) = armed_div.as_mut() {
+                    let pre = pre_list.get(i).ok_or_else(|| {
+                        TensorError::new(&format!(
+                            "cpu_reduce: divergence armed with {} pre-images \
+                             but reply carries payload index {i}",
+                            pre_list.len(),
+                        ))
+                    })?;
+                    accum.capture_pre(pre)?;
+                }
                 let tp = Instant::now();
                 let realized = crate::distributed::realized_work::is_realized(hdr_weight.get());
                 let t = match armed_dsts.as_deref() {
@@ -621,16 +686,25 @@ impl CpuReduceClient {
                     }
                     _ => payload_to_cpu_tensor(i, &payload)?,
                 };
-                out.push(t);
                 if prof {
                     decode_ns += tp.elapsed().as_nanos();
                 }
+                // Fold the pair (drops the pre-image transient). On a
+                // zero-mass reply the decoded values are meaningless —
+                // the caller's finish_keep_local() trusts only the pre
+                // sums, so folding them here is inert.
+                if let Some((_, accum)) = armed_div.as_mut() {
+                    accum.observe_post(&t)?;
+                }
+                out.push(t);
                 Ok(())
                 // `payload` drops here — per-payload draining.
             },
         )?;
         let leftover = body.limit();
         finish_framed_body(hdr.is_some(), leftover)?;
+        // Publish the completed accumulator only on a verified frame.
+        self.finished_divergence = armed_div.map(|(_, accum)| accum);
         if let Some(msg) = dst_fallback
             && !self.decode_dst_fallback_logged
         {
