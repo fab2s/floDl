@@ -802,6 +802,7 @@ impl<M: Module> GpuWorker<M> {
         use crate::distributed::CheckpointBundle;
         use crate::distributed::checkpoint_forge::{consensus_buffer_key, consensus_param_key};
         let model_path = CheckpointBundle::model_path(stem);
+        crate::distributed::checkpoint_meta::ensure_parent_dir(&model_path);
         // Positional keys (p{i}/b{j}) — NOT the model's own names, which repeat
         // across stacked layers and would collide in the on-disk map. Matches
         // the CPU forge + `load_consensus_checkpoint` convention so any
@@ -855,6 +856,7 @@ impl<M: Module> GpuWorker<M> {
             return; // stateless outer optimizer — no artifact
         };
         let outer_path = CheckpointBundle::model_path(stem).with_extension("outer.fdl");
+        crate::distributed::checkpoint_meta::ensure_parent_dir(&outer_path);
         let params: Vec<(String, Parameter)> = momentum
             .into_iter()
             .enumerate()
@@ -932,6 +934,7 @@ impl<M: Module> GpuWorker<M> {
             }
             p
         };
+        crate::distributed::checkpoint_meta::ensure_parent_dir(&rank_optim_path);
         match rank_optim_path.to_str() {
             Some(path_str) => {
                 if let Err(e) = self.optimizer.save_state_to(path_str) {

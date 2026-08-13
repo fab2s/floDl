@@ -490,6 +490,7 @@ fn write_consensus_fdl(
             path.display(),
         ))
     })?;
+    crate::distributed::checkpoint_meta::ensure_parent_dir(path);
     let tmp = format!("{path_str}.tmp");
     save_checkpoint_from_raw_file(&tmp, &entries, None)?;
     std::fs::rename(&tmp, path_str).map_err(|e| {
@@ -531,6 +532,7 @@ fn write_outer_momentum_fdl(payloads: &[TensorPayload], path: &Path) -> Result<(
             path.display(),
         ))
     })?;
+    crate::distributed::checkpoint_meta::ensure_parent_dir(path);
     let tmp = format!("{path_str}.tmp");
     save_checkpoint_from_raw_file(&tmp, &entries, None)?;
     std::fs::rename(&tmp, path_str).map_err(|e| {
@@ -984,6 +986,51 @@ mod tests {
         let err = wrap(1, &schema, &frame.tensors).unwrap_err();
         assert!(err.to_string().contains("panicked"), "got: {err}");
         assert!(err.to_string().contains("boom"), "got: {err}");
+    }
+
+    /// A stem whose parent directory does not exist yet: the writer creates
+    /// it (`mkdir -p` semantics) instead of failing the run's only persist
+    /// with ENOENT — a fresh run layout is normal, not an error.
+    #[test]
+    fn writer_creates_missing_parent_dirs() {
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+            f32_buffer_idx: vec![],
+        };
+        let forge = CheckpointForge::new(Some(schema), None);
+        let dir = std::env::temp_dir().join(format!("flodl_forge_mkdirp_{}", std::process::id()));
+        // Two levels of missing parents below an existing root.
+        let path = dir.join("nested").join("deeper").join("c.fdl");
+
+        forge.arm(Some(path.clone()), None);
+        let w = cpu_tensor(&[1.0, 2.0], &[2]);
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap());
+
+        let mut found = false;
+        for _ in 0..200 {
+            if path.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(found, "missing parents were created and the .fdl written");
+
+        // The meta writer shares the semantics.
+        let meta_path = dir.join("also").join("new").join("c.meta.json");
+        crate::distributed::CheckpointMeta::new(
+            0,
+            0,
+            0,
+            2,
+            crate::distributed::SaveReason::Checkpoint,
+        )
+        .write_to_file(&meta_path)
+        .expect("meta write creates its parents");
+        assert!(meta_path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
