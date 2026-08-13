@@ -405,6 +405,7 @@ impl CheckpointMeta {
                 path.display(),
             ))
         })?;
+        ensure_parent_dir(path);
         // Atomic commit: write a temp sibling then rename, so a crash
         // mid-write never leaves a torn meta that resume parses as valid.
         // The meta is the bundle's commit marker — it must appear whole.
@@ -502,6 +503,20 @@ impl RankDeathRecord {
         std::fs::write(path, content).map_err(|e| {
             TensorError::new(&format!("RankDeathRecord: write {}: {e}", path.display(),))
         })
+    }
+}
+
+/// Create `path`'s parent directories if missing (`mkdir -p` semantics): a
+/// checkpoint stem is once-per-run config and its directory not existing yet
+/// is normal on a fresh run layout. Best-effort and race-safe across
+/// concurrent writers (create_dir_all succeeds on already-exists); a real
+/// failure (permissions, a file in the way) is not reported here — the write
+/// that follows fails loudly with the actual error.
+pub(crate) fn ensure_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
 }
 

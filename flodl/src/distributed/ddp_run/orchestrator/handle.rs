@@ -306,6 +306,29 @@ impl DdpHandle {
                 ) {
                     eprintln!("{msg}");
                 }
+                // Print where the bundle stem RESOLVES, once, up front: a
+                // relative stem resolves against each process's own working
+                // directory (which under a launcher-managed run is the
+                // command's configured cwd, not necessarily where the
+                // operator typed the command), so surfacing the controller's
+                // resolution in the first seconds turns a misplaced-bundle
+                // surprise into a first-line read. Ranks on other hosts
+                // resolve the same relative stem against their own project
+                // roots — the shared-storage warning above covers that half.
+                if let Some(stem) = config.save_path.as_deref() {
+                    let p = std::path::Path::new(stem);
+                    let resolved = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(p))
+                            .unwrap_or_else(|_| p.to_path_buf())
+                    };
+                    eprintln!(
+                        "  ddp: checkpoint bundle stem resolves to {} (controller side)",
+                        resolved.display(),
+                    );
+                }
                 // Sink for aggregated EpochMetrics. The coord pushes
                 // each completed epoch's metrics here; the user's
                 // `DdpHandle::next_metrics()` polls them off. Wired
