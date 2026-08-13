@@ -455,6 +455,8 @@ impl<M: Module> GpuWorker<M> {
             checkpoint_fn,
             eval_fn,
             eval_dataset,
+            pending_consensus_eval: None,
+            last_consensus: None,
             save_path: config.save_path.clone(),
             prefetch,
             stager,

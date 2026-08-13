@@ -256,6 +256,11 @@ impl ClusterCoordinator {
         // `.meta.json` is written at the matching `finish_averaging_*` from the
         // stashed coverage + final counters.
         self.maybe_arm_checkpoint();
+        // EVAL ARM (CPU path, same placement rationale): the arm frame must
+        // precede this round's RequestParams on the control channel (FIFO),
+        // so the elected rank is armed before it snapshots and the round's
+        // realized Update fires the consensus eval.
+        self.maybe_arm_eval();
         match self.backend {
             AverageBackend::Nccl => self.arm_nccl_cycle(),
             AverageBackend::Cpu => self.arm_cpu_cycle(),
@@ -711,6 +716,71 @@ impl ClusterCoordinator {
                 // its elected-rank wire dispatch in `dispatch_epoch`. Nothing
                 // to do here beyond the coverage capture already done above.
             }
+        }
+    }
+
+    /// Arm a consensus eval on the elected rank for the reduce round being
+    /// triggered (CPU backend only — NCCL's eval stays boundary-dispatched
+    /// in `dispatch_epoch`, where the post-collective model is the
+    /// consensus). Two triggers, mirroring the checkpoint cadence shape:
+    ///
+    /// - **Recurring cadence** (`eval_every_epochs`): the first reduce after
+    ///   the cohort crosses a new multiple, once per multiple
+    ///   (`last_eval_arm_epoch`). Epochs are `epoch_splits` slices, so
+    ///   single-pass runs get interior evals with no extra mechanism.
+    /// - **Cooperative intent** (`request_eval`): served at this reduce —
+    ///   sooner than the old epoch-boundary fold.
+    ///
+    /// The frame precedes the round's `RequestParams` broadcast (see the
+    /// call site in `trigger_averaging`), so control-channel FIFO
+    /// guarantees the rank is armed before it snapshots — the directive can
+    /// never race its own round. Best-effort like the checkpoint dispatch:
+    /// a missed arm is a missed cadence, and role failover re-targets on
+    /// rank death. The worker scores the round's consensus and restores its
+    /// state verbatim, so arming perturbs nothing.
+    pub(super) fn maybe_arm_eval(&mut self) {
+        if !matches!(self.backend, AverageBackend::Cpu) {
+            return;
+        }
+        let cluster_epoch = (0..self.world_size)
+            .filter(|&r| !self.is_dead(r))
+            .map(|r| self.rank_epoch[r])
+            .max()
+            .unwrap_or(0);
+        let cadence_target = match self.eval_every_epochs {
+            Some(every) if every > 0 && cluster_epoch >= every => (cluster_epoch / every) * every,
+            _ => 0,
+        };
+        let cadence_crossed = cadence_target > self.last_eval_arm_epoch;
+        let intent_due = self.pending_eval_intent;
+        if !(cadence_crossed || intent_due) {
+            return;
+        }
+        if cadence_crossed {
+            self.last_eval_arm_epoch = cadence_target;
+        }
+        self.pending_eval_intent = false;
+        // Version label mirrors the checkpoint arm: the crossed multiple
+        // for a cadence fire, the in-flight epoch for an on-request fire.
+        let label = if cadence_crossed {
+            cadence_target as u64
+        } else {
+            cluster_epoch as u64
+        };
+        let target = self.eval_role;
+        if target >= self.world_size || self.is_dead(target) {
+            return;
+        }
+        let msg = ControlMsgWire::ArmConsensusEval {
+            schedule_id: label,
+            epoch: label,
+            target_rank: target as u64,
+        };
+        if let Err(e) = self.send_control(target, &msg) {
+            eprintln!(
+                "flodl ddp: consensus-eval arm to rank {target} failed \
+                 (epoch {cluster_epoch}): {e}"
+            );
         }
     }
 

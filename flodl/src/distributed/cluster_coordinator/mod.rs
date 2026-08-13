@@ -566,6 +566,13 @@ pub struct ClusterCoordinator {
     /// so `0` is never a valid target).
     last_cadence_arm_epoch: usize,
 
+    /// Highest epoch the eval cadence (`eval_every_epochs`) has already
+    /// armed for on the CPU backend, once per multiple — the eval mirror
+    /// of [`Self::last_cadence_arm_epoch`] (see
+    /// [`Self::maybe_arm_eval`]). NCCL never touches it (eval stays
+    /// boundary-dispatched there).
+    last_eval_arm_epoch: usize,
+
     /// Resume coverage: in-progress epoch pools to reconstruct on kickoff
     /// (via [`crate::distributed::chunk_pool::ChunkPool::from_coverage`])
     /// instead of fresh dispatch. Consumed once at resume; `None` for fresh

@@ -14,7 +14,8 @@ use crate::tensor::cuda_stream::GpuStream;
 use crate::tensor::{Device, Tensor};
 
 use super::{
-    CheckpointFn, ControlMsg, EpochMetrics, EpochPlan, EvalFn, MetricsMsg, ParamSnapshot, TimingMsg,
+    AveragedParams, CheckpointFn, ControlMsg, EpochMetrics, EpochPlan, EvalFn, MetricsMsg,
+    ParamSnapshot, TimingMsg,
 };
 
 mod constructor;
@@ -289,6 +290,22 @@ pub struct GpuWorker<M: Module> {
     /// firing time). `Arc<dyn BatchDataSet>` matches the training
     /// `dataset` shape; user iterates batches inside the closure.
     pub(super) eval_dataset: Option<Arc<dyn BatchDataSet>>,
+    /// Armed consensus eval (`ControlMsg::ArmConsensusEval`): fires at
+    /// the next REALIZED `ControlMsg::Update`, scoring that round's
+    /// consensus. `(schedule_id, epoch)` ride back on the
+    /// `TimingMsg::EvalResult`. Survives unrealized (all-idle) rounds;
+    /// evaporates at shutdown if no realized round follows (best-effort,
+    /// like every callback dispatch).
+    pub(super) pending_consensus_eval: Option<(u64, u64)>,
+    /// The last realized averaging round's consensus, retained for the
+    /// final canonical eval (`ExecuteEvalCallback { adopt_consensus }`).
+    /// Shallow clones — under decode-into they alias the pinned snapshot
+    /// staging, so the retained tensors are only valid until the next
+    /// snapshot D2H clobbers those bytes: `RequestParams` clears this
+    /// BEFORE snapshotting, and a realized `Update` re-retains. At the
+    /// natural end the settle sequencing guarantees the last realized
+    /// round is retained when the final eval frame arrives.
+    pub(super) last_consensus: Option<AveragedParams>,
     /// Checkpoint-bundle stem for the cluster save-on-unrecoverable-
     /// failure flow. Populated from [`super::WorkerConfig::save_path`]. When
     /// set, the worker writes a `<save_path>.fdl` / `<save_path>.optim`

@@ -283,11 +283,13 @@ fn control_frame_round_trip_eval_targeted() {
             schedule_id: 10,
             epoch: 5,
             target_rank: 0,
+            adopt_consensus: false,
         },
         ControlMsgWire::ExecuteEvalCallback {
             schedule_id: 11,
             epoch: 6,
             target_rank: 2,
+            adopt_consensus: false,
         },
     ];
     for msg in cases {

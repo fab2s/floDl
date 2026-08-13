@@ -59,6 +59,7 @@ fn test_worker_load_averaged() {
         params: vec![new_weight, new_bias],
         buffers: vec![],
         version: 42,
+        realized: true,
     };
 
     worker.load_averaged(&update).unwrap();
@@ -116,6 +117,7 @@ fn test_worker_load_averaged_bf16_update() {
         params: vec![new_weight, new_bias],
         buffers: vec![],
         version: 43,
+        realized: true,
     };
     worker.load_averaged(&update).unwrap();
 
@@ -177,6 +179,7 @@ fn test_worker_load_averaged_easgd_blends() {
         params: vec![avg_w, avg_b],
         buffers: vec![],
         version: 7,
+        realized: true,
     };
     worker.load_averaged(&update).unwrap();
 
@@ -234,6 +237,7 @@ fn test_worker_load_averaged_easgd_blends_bf16_update() {
         ],
         buffers: vec![],
         version: 8,
+        realized: true,
     };
     worker.load_averaged(&update).unwrap();
 
@@ -275,6 +279,7 @@ fn test_update_subtracts_snapshot_steps_not_zeroes() {
         ],
         buffers: vec![],
         version: 1,
+        realized: true,
     };
     worker.dispatch_control(ControlMsg::Update(update)).unwrap();
 
@@ -294,6 +299,7 @@ fn test_update_subtracts_snapshot_steps_not_zeroes() {
         ],
         buffers: vec![],
         version: 2,
+        realized: true,
     };
     worker
         .dispatch_control(ControlMsg::Update(update2))
@@ -352,6 +358,7 @@ fn test_worker_load_averaged_wrong_count() {
         params: vec![], // wrong count
         buffers: vec![],
         version: 1,
+        realized: true,
     };
     assert!(worker.load_averaged(&update).is_err());
 }
@@ -442,6 +449,7 @@ fn test_worker_handle_control_update() {
         ],
         buffers: vec![],
         version: 7,
+        realized: true,
     };
     ch.control_tx.send(ControlMsg::Update(update)).unwrap();
 
@@ -515,6 +523,7 @@ fn test_worker_full_roundtrip() {
         params: snap.params,
         buffers: snap.buffers,
         version: 1,
+        realized: true,
     };
     ch.control_tx.send(ControlMsg::Update(update)).unwrap();
     worker.handle_control().unwrap();

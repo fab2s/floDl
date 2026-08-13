@@ -607,6 +607,146 @@ impl<M: Module> GpuWorker<M> {
         Ok(())
     }
 
+    /// Host-sync the comm stream so its in-flight copies (writeback H2D,
+    /// consensus adopt) are visible to work on other streams. Eval
+    /// forwards are not a train step, so `sync_before_forward` never
+    /// covers them — the consensus-eval paths fence explicitly.
+    pub(super) fn fence_comm_stream(&self) {
+        if let Some(stream) = &self.comm_stream {
+            let _ = stream.synchronize();
+        }
+    }
+
+    /// Detached host copies of the current params (the consensus-eval
+    /// stash). Pageable on purpose: the stash is a stop-the-rank moment
+    /// already (an eval follows) and its lifetime is one eval — no
+    /// pinned residency. A CPU-resident param must be deep-copied
+    /// explicitly (`to_device(CPU)` on a CPU tensor aliases live
+    /// storage, and the adopt below overwrites it); unlike the snapshot
+    /// path there is no alias fallback — a failed copy aborts the eval,
+    /// never corrupts the stash.
+    fn stash_params_detached(&self) -> Result<Vec<Tensor>> {
+        self.param_vars
+            .iter()
+            .map(|v| {
+                let t = v.data();
+                if t.device() == Device::CPU {
+                    let c = Tensor::zeros_like(&t)?;
+                    c.copy_(&t, false)?;
+                    Ok(c)
+                } else {
+                    t.to_device(Device::CPU)
+                }
+            })
+            .collect()
+    }
+
+    /// Overwrite the model's params from `src` (host tensors: the round's
+    /// consensus, the retained consensus, or an eval stash). The
+    /// overwrite half of `load_averaged` — comm-stream enqueued,
+    /// bf16-wire sources staged through the device-side bounce.
+    fn overwrite_params_from(&mut self, src: &[Tensor]) -> Result<()> {
+        if src.len() != self.param_vars.len() {
+            return Err(TensorError::new(&format!(
+                "overwrite_params_from: expected {} params, got {}",
+                self.param_vars.len(),
+                src.len()
+            )));
+        }
+        let non_blocking = self.comm_stream.is_some();
+        let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+        let bf16_bounce: Option<Tensor> = if non_blocking {
+            src.iter()
+                .filter(|t| t.dtype() == crate::tensor::DType::BFloat16)
+                .map(|t| t.numel())
+                .max()
+                .map(|max_numel| {
+                    Tensor::empty(
+                        &[max_numel],
+                        TensorOptions {
+                            dtype: crate::tensor::DType::BFloat16,
+                            device: self.device,
+                        },
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let _no_grad = NoGradGuard::new();
+        for (var, s) in self.param_vars.iter().zip(src) {
+            h2d_copy_via_bounce(&var.data(), s, bf16_bounce.as_ref(), non_blocking)?;
+        }
+        Ok(())
+    }
+
+    /// Swap-score-restore: score a realized round's consensus on an
+    /// EASGD rank without perturbing training. Runs inside the `Update`
+    /// arm, AFTER `load_averaged` applied the blend, so the model holds
+    /// the post-reduce blend and `avg.params` still holds the consensus.
+    ///
+    /// 1. fence (the blend's comm-stream H2D may be in flight),
+    /// 2. stash the blend (detached host copies),
+    /// 3. adopt the consensus, fence, score it,
+    /// 4. restore the blend VERBATIM — bit-identical to a round with no
+    ///    eval (no lerp re-derivation, no float-order deviation).
+    ///
+    /// Buffers need no stash: `load_averaged` always overwrites them to
+    /// the consensus, which is also what the normal round leaves.
+    /// An error after the adopt leaves the model at the consensus — the
+    /// message says so; training continuing from the consensus is a
+    /// bounded perturbation, not corruption.
+    pub(super) fn scored_consensus_swap(
+        &mut self,
+        avg: &AveragedParams,
+    ) -> Result<(f64, Option<String>)> {
+        self.fence_comm_stream();
+        let stash = self.stash_params_detached()?;
+        self.overwrite_params_from(&avg.params)?;
+        self.fence_comm_stream();
+        let me = self.eval_metric();
+        self.overwrite_params_from(&stash).map_err(|e| {
+            TensorError::new(&format!(
+                "restore after consensus eval failed — the model is left AT \
+                 the consensus (training resumes from it): {e}"
+            ))
+        })?;
+        self.fence_comm_stream();
+        Ok(me)
+    }
+
+    /// Adopt the retained consensus for the FINAL canonical eval:
+    /// overwrite params and f32 buffers (the reduced subset — non-f32
+    /// buffers are deterministic per-rank passthroughs whose retained
+    /// values are stale clones, so the live ones are kept). No restore:
+    /// this fires only at the run's settled end, and the elected rank
+    /// deliberately ends holding the consensus.
+    pub(super) fn adopt_consensus_for_final_eval(
+        &mut self,
+        params: &[Tensor],
+        buffers: &[Tensor],
+    ) -> Result<()> {
+        // Entry fences mirror `snapshot_params`: nothing should be in
+        // flight at the settled end, but a straggler compute kernel
+        // racing the overwrite would corrupt the scored model silently.
+        if let Some(stream) = &self.compute_stream {
+            let _ = stream.synchronize();
+        }
+        self.fence_comm_stream();
+        self.overwrite_params_from(params)?;
+        if buffers.len() == self.buffer_list.len() {
+            let non_blocking = self.comm_stream.is_some();
+            let _guard = self.comm_stream.as_ref().map(StreamGuard::new);
+            for (buf, src) in self.buffer_list.iter().zip(buffers) {
+                if buf.get().dtype() == crate::tensor::DType::Float32 {
+                    buf.get().copy_(src, non_blocking)?;
+                }
+            }
+        }
+        self.fence_comm_stream();
+        Ok(())
+    }
+
     /// Perform the in-place NCCL weighted AllReduce on this rank's
     /// parameters (work-weighted) and f32 buffers (mover-averaged —
     /// BatchNorm running stats and the like; see

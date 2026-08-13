@@ -269,10 +269,13 @@ impl<M: Module + 'static> Worker<M> {
 
     /// Ask the controller to run the eval callback at its next coherent
     /// occasion (a **request, not a command**): the intent flows to the
-    /// controller, which folds it into the role-elected `ExecuteEvalCallback`
-    /// dispatch at the next epoch boundary — on the rank its policy elects, not
-    /// necessarily this one. The user expresses intent; the controller decides
-    /// *when* and *which rank*, preserving the collective's coherence.
+    /// controller — on the rank its policy elects, not necessarily this
+    /// one. On the CPU backend the request is served at the next reduce
+    /// (the elected rank scores that round's consensus — sooner than the
+    /// next epoch boundary); on NCCL it folds into the role-elected
+    /// `ExecuteEvalCallback` dispatch at the next epoch boundary. The user
+    /// expresses intent; the controller decides *when* and *which rank*,
+    /// preserving the collective's coherence.
     ///
     /// Fire-and-forget. **No-op on the single-device path** (no controller to
     /// service it — drive eval directly in your loop there).

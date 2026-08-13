@@ -555,24 +555,32 @@ fn cooperative_intent_sets_and_folds() {
         "CheckpointNow intent must set the pending flag"
     );
 
-    // The next epoch boundary folds the EVAL intent (send_control is
-    // best-effort without a live rank connection; the fold + clear runs
-    // regardless). The CHECKPOINT intent is CPU-served at the next reduce
-    // (`maybe_arm_checkpoint`), not at the boundary — the wire dispatch is
-    // NCCL-only.
+    // On the CPU backend BOTH intents survive the epoch boundary: the
+    // wire dispatches in `dispatch_epoch` are NCCL-only, and the CPU path
+    // serves each at the next reduce (`maybe_arm_checkpoint` /
+    // `maybe_arm_eval`) — a coherent point that arrives sooner than the
+    // next boundary.
     let _ = coord.dispatch_epoch(1);
     assert!(
-        !coord.pending_eval_intent_for_test(),
-        "dispatch_epoch must fold + clear the eval intent"
+        coord.pending_eval_intent_for_test(),
+        "the CPU boundary leaves the eval intent for the reduce"
     );
     assert!(
         coord.pending_checkpoint_intent_for_test(),
         "the CPU boundary leaves the checkpoint intent for the reduce"
     );
+    // The reduce-side eval service consumes the intent (the arm frame is
+    // best-effort without a live rank connection; the clear runs
+    // regardless — a lost frame is a missed cadence, not a stuck flag).
+    coord.rank_epoch = vec![1, 1];
+    coord.maybe_arm_eval();
+    assert!(
+        !coord.pending_eval_intent_for_test(),
+        "maybe_arm_eval must consume the eval intent at the reduce"
+    );
     // No checkpoint_fn and no save_path on this coord: the reduce-side
     // service point drops the request loudly rather than leaving it
     // pending forever.
-    coord.rank_epoch = vec![1, 1];
     coord.maybe_arm_checkpoint();
     assert!(
         !coord.pending_checkpoint_intent_for_test(),

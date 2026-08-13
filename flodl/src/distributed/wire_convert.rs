@@ -193,6 +193,7 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
             schedule_id,
             epoch,
             target_rank,
+            adopt_consensus,
         } => {
             if target_rank == u64::MAX {
                 return Err(TensorError::new(
@@ -205,8 +206,18 @@ pub(crate) fn control_wire_to_msg(wire: ControlMsgWire) -> Result<Option<Control
                 schedule_id,
                 epoch,
                 target_rank: target_rank as usize,
+                adopt_consensus,
             }))
         }
+        ControlMsgWire::ArmConsensusEval {
+            schedule_id,
+            epoch,
+            target_rank,
+        } => Ok(Some(ControlMsg::ArmConsensusEval {
+            schedule_id,
+            epoch,
+            target_rank: target_rank as usize,
+        })),
         ControlMsgWire::SetEpochCallbackRole { rank } => {
             Ok(Some(ControlMsg::SetEpochCallbackRole {
                 rank: rank as usize,

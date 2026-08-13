@@ -151,6 +151,7 @@ impl<M: Module> GpuWorker<M> {
                             ControlMsg::RequestNewNcclId => "RequestNewNcclId",
                             ControlMsg::ShutdownWithSave { .. } => "ShutdownWithSave",
                             ControlMsg::ExecuteEvalCallback { .. } => "ExecuteEvalCallback",
+                            ControlMsg::ArmConsensusEval { .. } => "ArmConsensusEval",
                             ControlMsg::SetEpochCallbackRole { .. } => "SetEpochCallbackRole",
                             ControlMsg::EpochAggregated(_) => "EpochAggregated",
                             ControlMsg::EvalBroadcast { .. } => "EvalBroadcast",

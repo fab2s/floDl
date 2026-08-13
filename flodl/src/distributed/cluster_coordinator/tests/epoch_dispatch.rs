@@ -1792,3 +1792,81 @@ fn resume_from_coverage_accepts_matching_epoch_splits() {
         "a matching coverage block must reconstruct the pool",
     );
 }
+
+#[test]
+fn cpu_eval_cadence_arms_once_per_multiple() {
+    // `eval_every_epochs` on the CPU backend: the first reduce after the
+    // cohort crosses each new multiple arms a consensus eval on the
+    // elected rank, exactly once per multiple (the frame send is
+    // best-effort — no live connection here — but the crossing ledger
+    // advances regardless). Epochs are `epoch_splits` slices, so this is
+    // also the sub-epoch cadence for single-pass runs.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100)
+    .eval_every_epochs(2);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.rank_epoch = vec![1, 1];
+    coord.maybe_arm_eval();
+    assert_eq!(
+        coord.last_eval_arm_epoch, 0,
+        "below the first multiple: no arm"
+    );
+
+    coord.rank_epoch = vec![2, 1]; // any live rank crossing counts
+    coord.maybe_arm_eval();
+    assert_eq!(coord.last_eval_arm_epoch, 2, "multiple 2 crossed: armed");
+
+    coord.maybe_arm_eval();
+    assert_eq!(coord.last_eval_arm_epoch, 2, "same multiple: once only");
+
+    coord.rank_epoch = vec![5, 5];
+    coord.maybe_arm_eval();
+    assert_eq!(
+        coord.last_eval_arm_epoch, 4,
+        "skipped multiples collapse to the latest crossed"
+    );
+}
+
+#[test]
+fn nccl_eval_cadence_stays_at_the_boundary() {
+    // The NCCL backend keeps its epoch-boundary wire dispatch: the
+    // reduce-side arm must be a CPU-only path (a post-collective NCCL
+    // model already IS the consensus, and `ArmConsensusEval` has no
+    // meaning without the CPU `Update` writeback to fire on).
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Nccl,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100)
+    .eval_every_epochs(1);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.rank_epoch = vec![3, 3];
+    coord.maybe_arm_eval();
+    assert_eq!(
+        coord.last_eval_arm_epoch, 0,
+        "NCCL never advances the reduce-side eval ledger"
+    );
+}

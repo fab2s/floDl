@@ -1115,7 +1115,23 @@ pub enum ControlMsgWire {
     /// [`EvalFn`]: crate::distributed::ddp_run::EvalFn
     /// [`EpochCallbackPolicy`]:
     ///     crate::distributed::ddp_run::EpochCallbackPolicy
+    /// `adopt_consensus`: score the rank's retained last realized
+    /// consensus instead of its live model (CPU final canonical eval —
+    /// an EASGD rank's live model is a blend). See the worker-side doc
+    /// on `ControlMsg::ExecuteEvalCallback`.
     ExecuteEvalCallback {
+        schedule_id: u64,
+        epoch: u64,
+        target_rank: u64,
+        #[serde(default)]
+        adopt_consensus: bool,
+    },
+    /// \[CPU path\] Arm a consensus eval on `target_rank` for the next
+    /// realized averaging round. Sent BEFORE the round's
+    /// `RequestParams` broadcast (control-channel FIFO orders the arm
+    /// ahead of the round's snapshot). See
+    /// `ControlMsg::ArmConsensusEval` for the worker-side semantics.
+    ArmConsensusEval {
         schedule_id: u64,
         epoch: u64,
         target_rank: u64,
