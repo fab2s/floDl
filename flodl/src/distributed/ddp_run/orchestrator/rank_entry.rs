@@ -283,21 +283,19 @@ impl DdpHandle {
                     rank_callbacks,
                 )?;
 
-                let final_snapshot = cluster_worker.run_until_shutdown(train_fn)?;
+                cluster_worker.run_until_shutdown(train_fn)?;
 
-                // Final snapshot captured before teardown; `None` (worker
-                // errored before send_final_snapshot) falls back to an empty
-                // TrainedState so callers can still consume the ShutdownWithSave
-                // bundle. Tensors land on CPU per snapshot_params' contract.
-                Ok(final_snapshot
-                    .map(|snap| TrainedState {
-                        params: snap.params,
-                        buffers: snap.buffers,
-                    })
-                    .unwrap_or(TrainedState {
-                        params: Vec::new(),
-                        buffers: Vec::new(),
-                    }))
+                // Managed rank children return the empty TrainedState, exactly
+                // like the launcher: the per-child final-model materialization
+                // (a full exact CPU readout per rank) had no consumer, and the
+                // run's final model is persisted controller-side as the
+                // consensus bundle — on cpu-async a rank's own model is an
+                // EASGD blend, never the consensus. The cooperative tier keeps
+                // rank-local final state through its own `finish()` contract.
+                Ok(TrainedState {
+                    params: Vec::new(),
+                    buffers: Vec::new(),
+                })
             },
         ));
         // Last-gasp forensic record (see `write_rank_death_record`): tells a

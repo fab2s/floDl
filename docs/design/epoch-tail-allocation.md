@@ -223,9 +223,12 @@ and only because an epoch has meaning for data coverage on resume.
   aggregate hook when every rank has crossed the epoch (`is_epoch_done`), with
   the aggregated metrics in hand. This *is* the epoch-report hook; no separate
   rank-side reporting callback is needed. No barrier.
-- **`eval_fn` / `checkpoint_fn` - elected rank, on the consensus.** These read
-  the model, so they must operate on the **consensus average**, not the
-  elected rank's own (overshot, or EASGD-blended) weights.
+- **`eval_fn` - elected rank, on the consensus.** Reads the model, so it must
+  operate on the **consensus average**, not the elected rank's own (overshot,
+  or EASGD-blended) weights.
+- **`checkpoint_fn` - consensus by construction.** CPU backend: fires
+  controller-side on the forge's consensus materialization (no rank stall, no
+  slack accounting on that path). NCCL: elected rank, post-collective.
 - **`epoch_fn` - elected rank, generic per-epoch model hook.** Unchanged; the
   rank-side callback that may touch the model for arbitrary user purposes.
 

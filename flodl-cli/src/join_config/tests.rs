@@ -15,13 +15,14 @@ use super::wizard::wizard_at;
 use super::*;
 
 fn tempdir() -> PathBuf {
+    // A process-global sequence, not a clock: two parallel tests can read
+    // the same subsec_nanos (coarse clock granularity), share the directory,
+    // and one's remove_dir_all then deletes the other's files mid-test.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let d = std::env::temp_dir().join(format!(
         "fdl-join-config-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     fs::create_dir_all(&d).unwrap();
     d

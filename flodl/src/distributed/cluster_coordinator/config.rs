@@ -330,6 +330,14 @@ pub struct ClusterCoordinatorConfig {
     /// (it never writes the model) and for entry paths without a factory.
     pub model_schema: Option<crate::distributed::ModelSchema>,
 
+    /// Type-erased consensus-model callback (the launch-wrapped user
+    /// `checkpoint_fn`), carried like [`Self::model_schema`]: from the typed
+    /// `DdpHandle::launch` (which has the model factory + the user's typed
+    /// callback) to `run_launcher_with_config`, which installs it on the
+    /// forge. CPU backend only; `None` when no callback is configured, on
+    /// NCCL (elected-rank fire), and for entry paths without a launcher.
+    pub consensus_checkpoint_fn: Option<crate::distributed::checkpoint_forge::ConsensusModelFn>,
+
     /// Shared CPU-forge handle, set by the launcher so the coordinator can arm
     /// a consensus model save the controller reduce thread fulfills. Not serde
     /// (an `Arc`); `None` on NCCL / non-launcher paths.
@@ -414,6 +422,7 @@ impl ClusterCoordinatorConfig {
             checkpoint_at_epoch: None,
             start_coverage: None,
             model_schema: None,
+            consensus_checkpoint_fn: None,
             checkpoint_forge: None,
             timeline: None,
             dashboard_sink: None,
@@ -478,6 +487,17 @@ impl ClusterCoordinatorConfig {
     /// averaged frame's tensors.
     pub fn model_schema(mut self, schema: crate::distributed::ModelSchema) -> Self {
         self.model_schema = Some(schema);
+        self
+    }
+
+    /// Attach the launch-wrapped consensus-model callback (the user's
+    /// `checkpoint_fn`, type-erased). The launcher takes it out alongside
+    /// [`Self::model_schema`] and installs it on the forge.
+    pub fn consensus_checkpoint_fn(
+        mut self,
+        f: crate::distributed::checkpoint_forge::ConsensusModelFn,
+    ) -> Self {
+        self.consensus_checkpoint_fn = Some(f);
         self
     }
 

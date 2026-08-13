@@ -553,53 +553,153 @@ impl ClusterCoordinator {
         }
     }
 
-    /// ARM a one-shot coverage-granular checkpoint at the START of a reduce
+    /// ARM a coverage-granular consensus checkpoint at the START of a reduce
     /// cycle (called from `trigger_averaging`, before any
     /// `RequestParams`/`SyncNow` broadcast — i.e. before the workers freeze
     /// their params for this reduce).
     ///
-    /// When `checkpoint_at_epoch` is armed and the cohort has reached that
-    /// epoch, this:
+    /// Four independent triggers share the one capture+arm tail:
+    /// - **One-shot** (`checkpoint_at_epoch`): the first reduce where any
+    ///   live rank has reached the target epoch; disarmed on fire.
+    /// - **Recurring cadence** (`checkpoint_every`): the first reduce after
+    ///   the cohort crosses a new multiple of `checkpoint_every`, once per
+    ///   multiple (`last_cadence_arm_epoch`). Two independent consumers: the
+    ///   consensus bundle (`save_path` — zero extra communication, the frame
+    ///   is already in stream; each write atomically supersedes the previous
+    ///   `<stem>.fdl`, so the bundle is always the latest resume point) and,
+    ///   on the CPU path, the controller-side `checkpoint_fn` fire (the
+    ///   launch-wrapped callback on the forge). NCCL's `checkpoint_fn` keeps
+    ///   its elected-rank wire dispatch in `dispatch_epoch`.
+    /// - **Cooperative intent** (`request_checkpoint`, CPU path): served at
+    ///   this reduce; see the inline comment.
+    /// - **Final consensus** (`save_path`): every reduce of the run's tail —
+    ///   the final epoch with less than one window of work remaining
+    ///   ([`Self::run_tail_within_one_window`]) — so a natural clean end
+    ///   always persists the final consensus bundle, single-epoch runs
+    ///   included. The last realized reduce (the forced end-of-run reduce
+    ///   when trailing steps exist, the boundary-landing window otherwise)
+    ///   wins by construction; a zero-mass tail round is skipped by the
+    ///   forge's realized-work guard and leaves the previous write standing
+    ///   (zero mass ⇔ zero new steps ⇔ coverage unchanged, so bundle and
+    ///   meta stay paired).
+    ///
+    /// The shared tail:
     /// 1. captures coverage NOW (`snapshot_coverage`) and stashes it in
     ///    `pending_checkpoint_coverage` for the matching `finish_*` to write —
     ///    capturing before the param freeze guarantees `covered ⊆ consensus`
     ///    (a chunk completed-and-drained before the freeze is provably in each
     ///    rank's frozen params; anything later is recorded uncovered → bounded
     ///    redo on resume, never lost data);
-    /// 2. arms the consensus MODEL write at the forge — CPU: the controller
-    ///    reduce thread taps this round's averaged frame
+    /// 2. arms the consensus MODEL write — CPU: the controller reduce thread
+    ///    taps this round's averaged frame
     ///    ([`crate::distributed::CheckpointForge::arm`]); NCCL: elected-rank
-    ///    write (wired in a follow-on step);
-    /// 3. disarms `checkpoint_at_epoch` so it fires exactly once.
+    ///    post-collective write, dispatched from
+    ///    `finish_pending_checkpoint_meta`.
     pub(super) fn maybe_arm_checkpoint(&mut self) {
-        let Some(target_epoch) = self.checkpoint_at_epoch else {
-            return;
+        let cluster_epoch = (0..self.world_size)
+            .filter(|&r| !self.is_dead(r))
+            .map(|r| self.rank_epoch[r])
+            .max()
+            .unwrap_or(0);
+        // One-shot: any live rank reached the target epoch (typically
+        // mid-epoch, so the coverage block is non-trivial).
+        let one_shot_due = self
+            .checkpoint_at_epoch
+            .is_some_and(|target| cluster_epoch >= target);
+        // Recurring cadence: a new multiple of `checkpoint_every` crossed.
+        // The crossing has two independent consumers — the bundle write
+        // (needs `save_path`) and, on the CPU path, the controller-side
+        // `checkpoint_fn` fire (needs the launch-wrapped callback on the
+        // forge) — and advances once when either consumes it.
+        let cadence_target = match self.checkpoint_every {
+            Some(every) if every > 0 && cluster_epoch >= every => (cluster_epoch / every) * every,
+            _ => 0,
         };
-        // Fire at the first reduce where any live rank has reached the target
-        // epoch (typically mid-epoch, so the coverage block is non-trivial).
-        let reached =
-            (0..self.world_size).any(|r| !self.is_dead(r) && self.rank_epoch[r] >= target_epoch);
-        if !reached {
+        let cadence_crossed = cadence_target > self.last_cadence_arm_epoch;
+        let cpu = matches!(self.backend, AverageBackend::Cpu);
+        let user_fn_ready = cpu
+            && self
+                .checkpoint_forge
+                .as_ref()
+                .is_some_and(|f| f.has_consensus_fn());
+        let bundle_cadence_due = cadence_crossed && self.save_path.is_some();
+        let user_cadence_due = cadence_crossed && user_fn_ready;
+        // Cooperative `request_checkpoint` intent: on the CPU path it is
+        // served HERE, at the next reduce (a coherent boundary that arrives
+        // sooner than the next epoch); NCCL keeps the epoch-boundary wire
+        // fold in `dispatch_epoch`. With NEITHER consumer configured the
+        // request has nothing to do — drop it loudly instead of leaving it
+        // pending forever (parity with the old elected-rank "checkpoint_fn
+        // is None" error).
+        let intent_due =
+            cpu && self.pending_checkpoint_intent && (user_fn_ready || self.save_path.is_some());
+        if cpu && self.pending_checkpoint_intent && !intent_due {
+            self.pending_checkpoint_intent = false;
+            eprintln!(
+                "flodl ddp: request_checkpoint with no checkpoint_fn and no \
+                 save_path configured; nothing to checkpoint"
+            );
+        }
+        // Final consensus: the run's tail is in flight.
+        let final_due = self.save_path.is_some()
+            && self.num_epochs > 0
+            && cluster_epoch + 1 >= self.num_epochs
+            && self.run_tail_within_one_window(cluster_epoch);
+        if !(one_shot_due || bundle_cadence_due || user_cadence_due || intent_due || final_due) {
             return;
         }
-        self.checkpoint_at_epoch = None; // exactly once
-        // Capture coverage at the freeze boundary; consumed at finish.
-        self.pending_checkpoint_coverage = Some(self.snapshot_coverage());
-        // Arm the model write at the forge.
+        if one_shot_due {
+            self.checkpoint_at_epoch = None; // exactly once
+        }
+        if bundle_cadence_due || user_cadence_due {
+            self.last_cadence_arm_epoch = cadence_target;
+        }
+        if intent_due {
+            self.pending_checkpoint_intent = false;
+        }
+        // User-fire version: the crossed multiple for a cadence fire (the
+        // same "entering epoch N" label the wire dispatch used), the
+        // in-flight epoch for an on-request fire.
+        let user_version = if user_cadence_due {
+            Some(cadence_target as u64)
+        } else if intent_due && user_fn_ready {
+            Some(cluster_epoch as u64)
+        } else {
+            None
+        };
+        // Coverage + meta ride the bundle. The one-shot keeps its historical
+        // shape: coverage is captured even without a save_path, and the
+        // finish reports the missing destination loudly. A user-fire-only
+        // arm writes no meta, so it captures nothing.
+        let wants_bundle = one_shot_due
+            || bundle_cadence_due
+            || final_due
+            || (intent_due && self.save_path.is_some());
+        if wants_bundle {
+            // Capture coverage at the freeze boundary; consumed at finish.
+            self.pending_checkpoint_coverage = Some(self.snapshot_coverage());
+        }
         match self.backend {
             AverageBackend::Cpu => {
-                if let (Some(stem), Some(forge)) =
-                    (self.save_path.as_ref(), self.checkpoint_forge.as_ref())
-                {
-                    let model_path = crate::distributed::CheckpointBundle::model_path(stem);
-                    if forge.can_write_model() {
-                        forge.arm(model_path);
+                if let Some(forge) = self.checkpoint_forge.as_ref() {
+                    let model_path = if wants_bundle {
+                        match self.save_path.as_ref() {
+                            Some(stem) if forge.can_write_model() => {
+                                Some(crate::distributed::CheckpointBundle::model_path(stem))
+                            }
+                            Some(_) => {
+                                crate::verbose!(
+                                    "  ddp: checkpoint armed but no model schema captured; \
+                                     writing meta-only (epoch {cluster_epoch})"
+                                );
+                                None
+                            }
+                            None => None,
+                        }
                     } else {
-                        crate::verbose!(
-                            "  ddp: checkpoint armed but no model schema captured; \
-                             writing meta-only (epoch {target_epoch})"
-                        );
-                    }
+                        None
+                    };
+                    forge.arm(model_path, user_version);
                 }
             }
             AverageBackend::Nccl => {
@@ -607,11 +707,59 @@ impl ClusterCoordinator {
                 // controller-side). The elected-rank model write is dispatched
                 // from `finish_pending_checkpoint_meta` at the tail of
                 // `finish_averaging_nccl`, AFTER the collective, so the rank
-                // holds the post-collective consensus. Nothing to do here
-                // beyond the coverage capture already done above.
-                let _ = target_epoch;
+                // holds the post-collective consensus; the user callback keeps
+                // its elected-rank wire dispatch in `dispatch_epoch`. Nothing
+                // to do here beyond the coverage capture already done above.
             }
         }
+    }
+
+    /// Whether the run's remaining work fits within one reduce window: the
+    /// tail criterion the final-consensus arm in
+    /// [`Self::maybe_arm_checkpoint`] checks for `epoch` (the in-flight FINAL
+    /// epoch). Same near-empty shape as `refresh_final_window_plan`
+    /// (`remaining < Σcounts + world_size`), but policy-independent —
+    /// progressive dispatch reads the epoch pool's undispatched remainder,
+    /// non-progressive derives the remainder from the cached epoch plans
+    /// minus each live rank's steps since epoch start. Both remainders can
+    /// lag reality by up to a heartbeat (undispatched work excludes in-flight
+    /// chunks; step counters ride timing reports), which only ever fires the
+    /// arm a window early — an extra superseded bundle write, never a miss.
+    pub(super) fn run_tail_within_one_window(&self, epoch: usize) -> bool {
+        let counts = self.el_che.batch_counts();
+        let alive = |r: &usize| !self.is_dead(*r);
+        let total_counts: usize = (0..self.world_size)
+            .filter(alive)
+            .map(|r| counts.get(r).copied().unwrap_or(0))
+            .sum();
+        let remaining = if self.progressive {
+            let Some(pool) = self.chunk_pools.get(&epoch) else {
+                return false; // final epoch not dispatched yet
+            };
+            pool.remaining() / self.batch_size
+        } else {
+            let Some(plans) = self.epoch_plan_cache.get(&epoch) else {
+                return false; // final epoch not dispatched yet
+            };
+            (0..self.world_size)
+                .filter(alive)
+                .map(|r| {
+                    let total_r = plans
+                        .get(r)
+                        .map(|p| p.partition_size as usize / self.batch_size)
+                        .unwrap_or(0);
+                    let done_r = self.last_step_count[r]
+                        .saturating_sub(self.last_step_count_at_epoch_start[r]);
+                    total_r.saturating_sub(done_r)
+                })
+                .sum()
+        };
+        if total_counts == 0 {
+            // No schedule to size a window from (pre-calibration edge):
+            // treat only a fully-drained tail as final.
+            return remaining == 0;
+        }
+        remaining < total_counts + self.world_size
     }
 
     /// Write the stashed checkpoint `.meta.json` at the end of a reduce cycle

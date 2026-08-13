@@ -385,6 +385,8 @@ fn epoch_fn_per_rank_isolation() {
 
 /// Integration test: dispatch is targeted — only the role rank
 /// receives the `Checkpoint` frame; non-role ranks never see it.
+/// NCCL config: the `Checkpoint` wire dispatch is NCCL-only (the CPU
+/// path fires the callback controller-side at the reduce).
 #[test]
 fn checkpoint_dispatched_to_role_only() {
     let world_size = 2;
@@ -396,7 +398,7 @@ fn checkpoint_dispatched_to_role_only() {
     let (port, coord_handle) = spawn_coord(
         world_size,
         move || {
-            cfg_sync_cpu(world_size)
+            cfg_sync_nccl(world_size)
                 .total_samples(8)
                 .batch_size(4)
                 .num_epochs(2)
@@ -553,15 +555,27 @@ fn cooperative_intent_sets_and_folds() {
         "CheckpointNow intent must set the pending flag"
     );
 
-    // The next epoch boundary folds both (send_control is best-effort
-    // without a live rank connection; the fold + clear runs regardless).
+    // The next epoch boundary folds the EVAL intent (send_control is
+    // best-effort without a live rank connection; the fold + clear runs
+    // regardless). The CHECKPOINT intent is CPU-served at the next reduce
+    // (`maybe_arm_checkpoint`), not at the boundary — the wire dispatch is
+    // NCCL-only.
     let _ = coord.dispatch_epoch(1);
     assert!(
         !coord.pending_eval_intent_for_test(),
         "dispatch_epoch must fold + clear the eval intent"
     );
     assert!(
+        coord.pending_checkpoint_intent_for_test(),
+        "the CPU boundary leaves the checkpoint intent for the reduce"
+    );
+    // No checkpoint_fn and no save_path on this coord: the reduce-side
+    // service point drops the request loudly rather than leaving it
+    // pending forever.
+    coord.rank_epoch = vec![1, 1];
+    coord.maybe_arm_checkpoint();
+    assert!(
         !coord.pending_checkpoint_intent_for_test(),
-        "dispatch_epoch must fold + clear the checkpoint intent"
+        "an unserviceable intent is dropped (loudly), not left pending"
     );
 }

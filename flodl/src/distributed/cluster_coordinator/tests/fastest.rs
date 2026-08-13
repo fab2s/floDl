@@ -261,13 +261,15 @@ fn epoch_callback_role_broadcast_at_first_dispatch() {
 
 /// Integration test: a full success round-trip — rank reports
 /// CheckpointResult{ok}; coord updates EWMA + clears tried set.
+/// NCCL config: the `Checkpoint` wire dispatch is NCCL-only (the CPU
+/// path fires the callback controller-side at the reduce).
 #[test]
 fn checkpoint_success_round_trip_updates_ewma() {
     let world_size = 2;
     let (port, coord_handle) = spawn_coord(
         world_size,
         move || {
-            cfg_sync_cpu(world_size)
+            cfg_sync_nccl(world_size)
                 .total_samples(8)
                 .batch_size(4)
                 .num_epochs(2)

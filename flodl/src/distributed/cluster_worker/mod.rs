@@ -540,10 +540,7 @@ impl<M: Module + 'static> ClusterWorker<M> {
     /// `send_final_snapshot` (best-effort: snapshot is opportunistic, not
     /// load-bearing for the shutdown path). The via_coord callers in
     /// `orchestrator.rs` convert it into a `TrainedState`.
-    pub fn run_until_shutdown<T>(
-        mut self,
-        train_fn: T,
-    ) -> Result<Option<crate::distributed::ddp_run::ParamSnapshot>>
+    pub fn run_until_shutdown<T>(mut self, train_fn: T) -> Result<()>
     where
         T: Fn(&M, &[Tensor]) -> Result<Variable>,
     {
@@ -689,8 +686,15 @@ impl<M: Module + 'static> ClusterWorker<M> {
             }
         }
 
-        let final_snapshot = self.teardown(exit_clean.is_ok());
-        exit_clean.map(|_| final_snapshot)
+        // Managed tier: no final-snapshot materialization. The rank children's
+        // TrainedState had no consumer, and the run's final model is persisted
+        // controller-side as the consensus bundle (a rank's own model is an
+        // EASGD blend on cpu-async, so it was never the right thing to hand
+        // back anyway). The cooperative tier calls `teardown` directly with
+        // `want_final = true` — its `finish()` contract keeps the rank-local
+        // state.
+        let _ = self.teardown(exit_clean.is_ok(), false);
+        exit_clean.map(|_| ())
     }
 
     /// Fire the user's `epoch_fn` once per epoch transition, on the
@@ -735,17 +739,24 @@ impl<M: Module + 'static> ClusterWorker<M> {
         }
     }
 
-    /// End-of-run teardown: drain any queued shutdown-save, abort NCCL, publish
-    /// and drain the final snapshot, drop the inner (disconnecting the bridge
-    /// senders), signal the bridges, and join them. Returns the rank's final
-    /// [`crate::distributed::ddp_run::ParamSnapshot`] when one was captured
-    /// (best-effort). Called at the end of `run_until_shutdown` (managed) and
-    /// from the cooperative tier's `Worker::finish`.
+    /// End-of-run teardown: drain any queued shutdown-save, abort NCCL,
+    /// optionally publish and drain the final snapshot, drop the inner
+    /// (disconnecting the bridge senders), signal the bridges, and join them.
+    ///
+    /// `want_final` gates the final-snapshot materialization (a full exact
+    /// model readout to CPU). The cooperative tier passes `true` — its
+    /// `Worker::finish` contract returns the rank's own final state. The
+    /// managed tier passes `false`: its rank children's `TrainedState` had
+    /// no consumer, and everything it offered is on disk in better form
+    /// (the controller's consensus bundle — on cpu-async a rank's own model
+    /// is an EASGD blend, never the consensus).
+    ///
     /// `clean` distinguishes normal completion from an error exit and
     /// gates the `Exiting` report — see below.
     pub(crate) fn teardown(
         &mut self,
         clean: bool,
+        want_final: bool,
     ) -> Option<crate::distributed::ddp_run::ParamSnapshot> {
         // `?`: already torn down (inner taken) -> nothing to snapshot.
         let mut inner = self.inner.take()?;
@@ -771,8 +782,11 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // send_final_snapshot uses the dedicated final_param channel;
         // the receiver now lives on `self.final_param_rx` (no
         // background discard bridge), so the send + receive happen
-        // sequentially on this thread.
-        inner.send_final_snapshot();
+        // sequentially on this thread. Skipped entirely when the caller
+        // has no consumer (`want_final == false`, the managed tier).
+        if want_final {
+            inner.send_final_snapshot();
+        }
         // `Exiting` is the CLEAN-completion latch: the coordinator
         // marks the rank `exited`, decrements `active_count`, and — by
         // design — suppresses BOTH death detectors for it (heartbeat
@@ -804,16 +818,19 @@ impl<M: Module + 'static> ClusterWorker<M> {
         // ready. Best-effort: an error from snapshot_params (e.g. CUDA
         // pinned-memory failure inside send_final_snapshot) leaves the
         // channel empty and we surface `None` up to the caller.
-        let final_snapshot = self
-            .final_param_rx
-            .take()
-            .and_then(|rx| match rx.try_recv() {
-                Ok(snap) => Some(snap),
-                Err(mpsc::TryRecvError::Empty) => {
-                    rx.recv_timeout(std::time::Duration::from_millis(500)).ok()
-                }
-                Err(mpsc::TryRecvError::Disconnected) => None,
-            });
+        let final_snapshot = if want_final {
+            self.final_param_rx
+                .take()
+                .and_then(|rx| match rx.try_recv() {
+                    Ok(snap) => Some(snap),
+                    Err(mpsc::TryRecvError::Empty) => {
+                        rx.recv_timeout(std::time::Duration::from_millis(500)).ok()
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => None,
+                })
+        } else {
+            None
+        };
 
         // Drop inner → all mpsc::Sender clones held by the inner
         // disconnect → bridges see Disconnected on their Receivers and

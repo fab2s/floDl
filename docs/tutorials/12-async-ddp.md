@@ -338,12 +338,14 @@ re-run.
 
 ## `EpochCallbackPolicy::Fastest` - free-compute callbacks
 
-By default, per-epoch callbacks (`checkpoint_fn`, `epoch_fn`,
-`eval_fn`) fire on the **fastest rank** (lowest
-`smoothed_ms_per_batch`). The reasoning: on heterogeneous rigs the
-fastest rank has the most idle time at the sync barrier, so eval /
+By default, rank-side per-epoch callbacks (`epoch_fn`, `eval_fn` —
+and `checkpoint_fn` on the NCCL backend) fire on the **fastest rank**
+(lowest `smoothed_ms_per_batch`). The reasoning: on heterogeneous rigs
+the fastest rank has the most idle time at the sync barrier, so eval /
 save runs as free compute. Sticky within a run; re-resolves only on
-rank death.
+rank death. On the CPU backend `checkpoint_fn` fires controller-side
+instead, on the reduce's consensus — a rank's own model is an EASGD
+blend under cpu-async, never the consensus.
 
 Pin to a specific global rank with `EpochCallbackPolicy::Rank(n)`
 when the research convention demands it. `n` is the **global rank**

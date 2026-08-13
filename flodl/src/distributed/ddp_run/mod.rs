@@ -156,9 +156,13 @@ pub(crate) fn ensure_trainable_params(n_params: usize, entry: &str) -> Result<()
 
 /// Checkpoint callback type: `(version, &model) -> Result<()>`.
 ///
-/// Called on the rank selected by [`EpochCallbackPolicy`] (default
-/// `Fastest`) at checkpoint events (multi-GPU) or at epoch boundaries
-/// (single-GPU). Errors are logged but do not stop training.
+/// Always receives the CONSENSUS model at checkpoint events. On the CPU
+/// backend it runs controller-side against a CPU-built copy loaded from the
+/// reduce's averaged frame (a rank's own model is an EASGD blend on
+/// cpu-async, never the consensus); on NCCL it runs on the rank selected by
+/// [`EpochCallbackPolicy`] (default `Fastest`), whose post-collective model
+/// is the consensus. Single-GPU runs call it at epoch boundaries on the
+/// training device. Errors are logged but do not stop training.
 pub type CheckpointFn<M> = Arc<dyn Fn(u64, &M) -> Result<()> + Send + Sync>;
 
 /// Epoch callback type: `(epoch, &mut worker)`.

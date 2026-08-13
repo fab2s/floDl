@@ -36,10 +36,11 @@ A shared filesystem accessible by every node in the cluster, hosting:
   Bundle layout per
   [`CheckpointBundle`](../../flodl/src/distributed/checkpoint_meta.rs).
   The bundle is **split across hosts** and each piece is written on its
-  writer's host: the elected checkpoint rank runs the user's
-  `checkpoint_fn` on its host, each surviving worker writes its
-  `.fdl` / `.optim` on its host, and the controller writes (and reads
-  back at resume) the `.meta.json` sidecar on its host. So a
+  writer's host: the user's `checkpoint_fn` runs on the controller host
+  (CPU backend) or the elected rank's host (NCCL), each surviving worker
+  writes its `.fdl` / `.optim` on its host, and the controller writes
+  (and reads back at resume) the consensus `.fdl` + `.meta.json` on its
+  host. So a
   `save_path` / `resume_from` that is *not* on this shared layer
   scatters the bundle and breaks resume - which is exactly why
   checkpoints belong here. flodl prints a one-time reminder on any

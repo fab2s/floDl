@@ -7,6 +7,350 @@ use super::*;
 // -----------------------------------------------------------------
 
 #[test]
+fn cadence_checkpoint_arms_once_per_multiple() {
+    // `checkpoint_every` + `save_path`: the first reduce after the cohort
+    // crosses each new multiple of `every` arms a consensus checkpoint,
+    // exactly once per multiple. No disk is touched here — arming only
+    // captures coverage; the meta/model writes ride the (absent) finish.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100) // far from the run tail: only the cadence can fire
+    .save_path("/nonexistent/never-written")
+    .checkpoint_every(2);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.rank_epoch = vec![1, 1];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "below the first multiple: no arm"
+    );
+
+    coord.rank_epoch = vec![2, 1]; // any live rank crossing counts
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_some(),
+        "multiple 2 crossed: armed"
+    );
+    assert_eq!(coord.last_cadence_arm_epoch, 2);
+    coord.pending_checkpoint_coverage = None; // consume (stand-in for finish)
+
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "same multiple: once only"
+    );
+    coord.rank_epoch = vec![3, 3];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "3 is not a multiple of 2"
+    );
+
+    // Skipped multiples catch up to the LATEST crossed one (no burst).
+    coord.rank_epoch = vec![5, 4];
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_some());
+    assert_eq!(coord.last_cadence_arm_epoch, 4);
+}
+
+#[test]
+fn cadence_without_save_path_never_arms() {
+    // A bundle needs a destination: `checkpoint_every` alone keeps the
+    // rank-side `checkpoint_fn` wire cadence but never arms the forge.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100)
+    .checkpoint_every(2);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.rank_epoch = vec![4, 4];
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_none());
+    assert_eq!(coord.last_cadence_arm_epoch, 0);
+}
+
+#[test]
+fn final_tail_arms_progressive() {
+    // `save_path` alone: every reduce of the run's tail (final epoch, less
+    // than one window of pool remainder) arms, so the last realized reduce
+    // supersedes into the final consensus bundle.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let total = 100usize;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4), // batch_counts [4, 4] → window = 8
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(3)
+    .save_path("/nonexistent/never-written");
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.install_chunk_pool_for_test(2, total);
+    coord.rank_epoch = vec![2, 2];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "full pool: not the tail yet"
+    );
+
+    // Drain to within one window (remaining 5 < 8 + 2). Takes draw from
+    // per-rank reservation spans, so drain through both ranks.
+    {
+        let pool = coord.chunk_pools.get_mut(&2).unwrap();
+        pool.take_chunk(48, 0);
+        pool.take_chunk(47, 1);
+        assert_eq!(pool.remaining(), 5);
+    }
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_some(),
+        "tail reduce armed"
+    );
+    coord.pending_checkpoint_coverage = None;
+
+    // The tail keeps re-arming: each write atomically supersedes, and the
+    // LAST realized reduce (forced end-of-run one included) wins.
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_some());
+}
+
+#[test]
+fn final_tail_ignores_non_final_epochs_and_missing_save_path() {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let total = 100usize;
+
+    // Same near-empty pool on a NON-final epoch: no arm.
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(5)
+    .save_path("/nonexistent/never-written");
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.install_chunk_pool_for_test(2, total);
+    {
+        let pool = coord.chunk_pools.get_mut(&2).unwrap();
+        pool.take_chunk(48, 0);
+        pool.take_chunk(47, 1);
+        assert_eq!(pool.remaining(), 5);
+    }
+    coord.rank_epoch = vec![2, 2];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "epoch 2 of 5 is not the run tail"
+    );
+
+    // Final epoch + near-empty pool but NO save_path: no arm.
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(3);
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    coord.install_chunk_pool_for_test(2, total);
+    {
+        let pool = coord.chunk_pools.get_mut(&2).unwrap();
+        pool.take_chunk(48, 0);
+        pool.take_chunk(47, 1);
+        assert_eq!(pool.remaining(), 5);
+    }
+    coord.rank_epoch = vec![2, 2];
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_none());
+}
+
+#[test]
+fn final_tail_arms_non_progressive() {
+    // Sync resolves progressive to OFF: the tail remainder derives from the
+    // cached epoch plans minus each rank's steps since epoch start.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let total = 100usize;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Sync,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(total)
+    .batch_size(1)
+    .num_epochs(3)
+    .save_path("/nonexistent/never-written");
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    assert!(!coord.progressive, "Sync auto-resolves progressive off");
+
+    coord.rank_epoch = vec![2, 2];
+    coord.plans_for_epoch(2); // populate the plan cache (50 samples per rank)
+
+    // Early in the epoch: 20 done of 100 → remaining 80, not the tail.
+    coord.last_step_count = vec![10, 10];
+    coord.last_step_count_at_epoch_start = vec![0, 0];
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_none());
+
+    // 95 done → remaining 5 < 8 + 2: the tail.
+    coord.last_step_count = vec![48, 47];
+    coord.maybe_arm_checkpoint();
+    assert!(coord.pending_checkpoint_coverage.is_some());
+}
+
+/// CPU + `checkpoint_every` + a consensus callback but NO `save_path`: the
+/// cadence crossing arms a user-fire-only capture (no coverage, no meta),
+/// and the forge fires the callback when the cycle's frame materializes.
+/// This is the no-regression guarantee for callback-only configurations
+/// after the CPU `Checkpoint` wire dispatch retirement.
+#[test]
+fn cpu_cadence_fires_consensus_fn_without_save_path() {
+    use crate::distributed::checkpoint_forge::ConsensusModelFn;
+    use crate::distributed::cpu_reduce::tensors_to_round_frame;
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+    use crate::distributed::{CheckpointForge, ModelSchema};
+    use crate::tensor::{Device, Tensor};
+
+    let world_size = 2;
+    let schema = ModelSchema {
+        param_names: vec!["w".to_string()],
+        buffer_names: vec![],
+        f32_buffer_idx: vec![],
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let f: ConsensusModelFn = Arc::new(move |version, _schema, _payloads| {
+        tx.send(version).ok();
+        Ok(())
+    });
+    let forge = CheckpointForge::new(Some(schema), Some(f));
+
+    let mut cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100)
+    .checkpoint_every(2);
+    cfg.checkpoint_forge = Some(Arc::clone(&forge));
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.rank_epoch = vec![2, 2];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_none(),
+        "user-fire-only arm captures no coverage (no meta to pair it with)"
+    );
+    assert_eq!(coord.last_cadence_arm_epoch, 2, "cadence crossing consumed");
+
+    // The reduce thread hands the forge this cycle's Model frame; the fire
+    // carries the crossed multiple as its version.
+    let w = Tensor::from_f32(&[1.0], &[1], Device::CPU).unwrap();
+    forge.accumulate(
+        tensors_to_round_frame(&[&w], crate::distributed::controller::DTYPE_F32).unwrap(),
+    );
+    let version = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("consensus checkpoint_fn fired");
+    assert_eq!(version, 2);
+}
+
+/// CPU backend: `dispatch_epoch` no longer consumes the cooperative
+/// checkpoint intent at the epoch boundary (that is the NCCL wire path);
+/// the intent is served by `maybe_arm_checkpoint` at the next reduce.
+#[test]
+fn cpu_checkpoint_intent_is_served_at_the_reduce_not_the_boundary() {
+    use crate::distributed::checkpoint_forge::ConsensusModelFn;
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+    use crate::distributed::{CheckpointForge, ModelSchema};
+
+    let world_size = 2;
+    let schema = ModelSchema {
+        param_names: vec!["w".to_string()],
+        buffer_names: vec![],
+        f32_buffer_idx: vec![],
+    };
+    let f: ConsensusModelFn = Arc::new(|_, _, _| Ok(()));
+    let forge = CheckpointForge::new(Some(schema), Some(f));
+
+    let mut cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(100)
+    .batch_size(1)
+    .num_epochs(100);
+    cfg.checkpoint_forge = Some(Arc::clone(&forge));
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    coord.pending_checkpoint_intent = true;
+    // Headless dispatch: sends fail best-effort, but the CPU gate must not
+    // even consume the intent here.
+    let _ = coord.dispatch_epoch(1);
+    assert!(
+        coord.pending_checkpoint_intent,
+        "CPU boundary dispatch leaves the intent for the reduce"
+    );
+    coord.rank_epoch = vec![1, 1];
+    coord.maybe_arm_checkpoint();
+    assert!(
+        !coord.pending_checkpoint_intent,
+        "the next reduce serves the intent"
+    );
+}
+
+#[test]
 fn one_shot_checkpoint_meta_round_trips_to_resume_coverage() {
     // End-to-end coverage half of the async resume contract (no network):
     // build partial coverage on an epoch pool, fire the one-shot checkpoint
