@@ -163,7 +163,20 @@ impl<M: Module> GpuWorker<M> {
                         return Ok(None); // Shutdown consumed by handler (e.g. Throttle)
                     }
                 }
-                Err(_) => return Ok(None), // disconnected
+                Err(_) => {
+                    // All control senders dropped without a Shutdown: the
+                    // reader thread died or the coordinator went away. The
+                    // exit stays clean (a launcher abort tears the channel
+                    // down as a matter of course), but name it: a run that
+                    // fell apart otherwise produces the exact same clean
+                    // exit as a natural end, minus its artifacts.
+                    eprintln!(
+                        "flodl ddp: rank {} control channel disconnected while \
+                         waiting for a plan; exiting without Shutdown",
+                        self.rank
+                    );
+                    return Ok(None);
+                }
             }
         }
     }

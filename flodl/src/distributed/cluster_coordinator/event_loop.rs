@@ -1011,6 +1011,20 @@ impl ClusterCoordinator {
             // shuts down; NCCL's finish is inline so its reset lands at once.
             // Skip for a lone survivor (< 2 alive): a single rank's weights
             // ARE the consensus, and NCCL needs world_size >= 2.
+            //
+            // Drain timing ONCE MORE before deciding. `window.steps` is fed
+            // by the drain at the top of `tick()`, while the epoch aggregate
+            // that got us here drains at the bottom; each rank's reader
+            // demuxes ONE socket into the two queues, so a rank's trailing
+            // step reports are enqueued before its epoch end but are only
+            // guaranteed DRAINED by this call. Without it, both frames
+            // landing inside the tick body (a descheduled coordinator on a
+            // loaded box) makes this decision read steps == 0 and skip the
+            // forced reduce silently: the cohort ends un-reduced and the
+            // final consensus bundle is never armed. The aggregate requires
+            // every live rank's epoch end, so after this drain the
+            // trailing-step view is exact, not lagging.
+            self.drain_timing();
             if self.needs_final_consensus_reduce() {
                 match self.trigger_averaging() {
                     Ok(()) => return,
