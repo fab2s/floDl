@@ -793,7 +793,7 @@ where
     /// The model the closure scores is always the cohort CONSENSUS —
     /// under cpu-async EASGD the elected rank swap-scores the reduce's
     /// consensus and restores its blend verbatim (see
-    /// [`EvalFn`](crate::distributed::ddp_run::EvalFn) for the
+    /// [`EvalFn`] for the
     /// per-backend mechanics). Cadence epochs are `epoch_splits`
     /// slices, so single-pass runs get interior evals too.
     ///

@@ -1435,6 +1435,11 @@ pub fn run_launcher_with_config(
                 me.clone(),
                 config.num_epochs,
             )
+            // The engine scalars ride window records only, so their meta
+            // declaration is honest exactly when the tick cadence is armed
+            // — otherwise the stream (and the saved archive baking it)
+            // would declare series no record ever carries.
+            .with_engine_scalar_declarations(config.reports_per_epoch.is_some())
             .with_record_log(record_log)
             .with_record_shipper(record_shipper)
             .with_status_board(status_board.clone())

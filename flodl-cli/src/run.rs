@@ -151,7 +151,7 @@ static COMPOSE_MOUNT_CACHE: std::sync::OnceLock<std::collections::HashMap<String
 ///
 /// Reads `docker-compose.yml` at `project_root` once per process and
 /// caches the `service → container_path` mapping. Falls back to
-/// [`DEFAULT_CONTAINER_PROJECT_ROOT`] when the compose file is missing,
+/// `DEFAULT_CONTAINER_PROJECT_ROOT` when the compose file is missing,
 /// unparseable, or doesn't declare a matching bind mount for `.`.
 ///
 /// This is what lets `exec_command` generate `cd <container-path>`
@@ -161,7 +161,7 @@ static COMPOSE_MOUNT_CACHE: std::sync::OnceLock<std::collections::HashMap<String
 /// `import` sibling helpers, and a naive relative `cd flodl-hf/convert`
 /// would resolve to the non-existent
 /// `/workspace/flodl-hf/flodl-hf/convert`.
-fn container_project_root(project_root: &Path, service: &str) -> String {
+pub fn container_project_root(project_root: &Path, service: &str) -> String {
     let cache = COMPOSE_MOUNT_CACHE.get_or_init(|| parse_compose_project_mounts(project_root));
     cache
         .get(service)

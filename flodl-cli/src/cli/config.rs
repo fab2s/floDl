@@ -253,7 +253,25 @@ pub(crate) fn dispatch_config(
         // and fans out via flodl::distributed::launcher. Fall through —
         // no early return. The launcher in the spawned subprocess owns
         // fan-out, log fan-in, ClusterController, exit propagation.
-        match cluster::prepare_cluster_env(&cluster, env, cmd) {
+        //
+        // `launcher_root` is the project root as the TRAINING COMMAND
+        // sees it — the compose mount for a `docker:` command, the host
+        // checkout otherwise. The envelope ships relative
+        // `ssh.identity_file` values absolutized in that frame, because
+        // the launcher inside the command hands them to ssh verbatim.
+        let launcher_root = match &outcome {
+            WalkOutcome::RunScript {
+                docker: Some(svc), ..
+            } => std::path::PathBuf::from(run::container_project_root(&project_root, svc)),
+            WalkOutcome::ExecCommand { config, .. } if config.docker.is_some() => {
+                std::path::PathBuf::from(run::container_project_root(
+                    &project_root,
+                    config.docker.as_deref().unwrap_or_default(),
+                ))
+            }
+            _ => project_root.clone(),
+        };
+        match cluster::prepare_cluster_env(&cluster, env, cmd, &launcher_root) {
             Ok(warnings) => {
                 // Emit at the cluster-dispatch site (this branch only
                 // runs when fdl really is fanning out via cluster mode).

@@ -214,6 +214,7 @@ pub fn prepare_cluster_env(
     cluster: &ClusterConfig,
     overlay_env: Option<&str>,
     cmd: &str,
+    launcher_root: &Path,
 ) -> Result<Vec<String>, String> {
     cluster.validate()?;
     let mut warnings: Vec<String> = Vec::new();
@@ -244,6 +245,25 @@ pub fn prepare_cluster_env(
     let counts = probe_worker_device_counts(&shippable)?;
     shippable.populate_ranks(&counts)?;
     shippable.validate()?;
+    // Ship a relative `ssh.identity_file` ABSOLUTE in the launcher's frame.
+    // The envelope's ssh consumer is the training binary's launcher (agent
+    // spawn, tunnel sessions), which hands the value to ssh verbatim from
+    // whatever cwd the run configured — while fdl's own ssh (the probe
+    // above, prebuild) resolves a relative path against its project root
+    // (see `resolve_identity_path`). `launcher_root` is the project root as
+    // the TRAINING COMMAND sees it: the compose mount for a `docker:`
+    // command, the host checkout otherwise — so one relative overlay value
+    // names the same key file in every frame that opens an ssh connection.
+    // Deliberately AFTER the device probe (which sshes with the un-rewritten
+    // relative value, resolved host-side) and before envelope emission.
+    for w in &mut shippable.workers {
+        if let Some(id) = w.ssh.as_mut().and_then(|s| s.identity_file.as_mut())
+            && !Path::new(id.as_str()).is_absolute()
+            && !id.starts_with('~')
+        {
+            *id = launcher_root.join(&*id).to_string_lossy().into_owned();
+        }
+    }
     let json = shippable.canonical_json()?;
     let hex = hex_encode(json.as_bytes());
     let (extra_hosts, host_warnings) = resolve_cluster_extra_hosts(cluster);
@@ -425,7 +445,7 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
             cmd.arg("-l").arg(user);
         }
         if let Some(id) = ssh.identity_file.as_deref() {
-            cmd.arg("-i").arg(id);
+            cmd.arg("-i").arg(resolve_identity_path(id));
         }
         if let Some(warning) = batchmode_override_warning(&ssh.options, &worker.host) {
             eprintln!("{warning}");
@@ -440,6 +460,31 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
 /// non-`yes` value, else `None`. flodl's remote ssh (dispatch + probes) is
 /// non-interactive, so a prompt hangs it; `BatchMode=yes` is the one truly
 /// required ssh option. Every other flodl default is freely overridable (M17).
+/// Resolve a relative `ssh.identity_file` against the PROJECT ROOT, not
+/// the process cwd. The same overlay value is consumed from two execution
+/// contexts — host-side (`fdl probe`'s remote fan-out) and container-side
+/// (cluster dispatch, where the project root is the workspace mount) — so
+/// an absolute path can only ever be right for one of them: a
+/// container-absolute key path broke the host-side probe of a
+/// containerized rank with "Identity file not accessible" + publickey
+/// denial while dispatch kept working. A project-relative path names the
+/// same file in both contexts, each side resolving against its own view
+/// of the checkout. Absolute and `~`-prefixed paths pass through
+/// untouched (ssh expands the tilde itself). Outside a project the
+/// fallback root is `~/.flodl` (the standard [`Context::resolve`]
+/// semantics); a relative key path only makes sense inside a checkout.
+///
+/// [`Context::resolve`]: crate::context::Context::resolve
+fn resolve_identity_path(id: &str) -> std::ffi::OsString {
+    if Path::new(id).is_absolute() || id.starts_with('~') {
+        return id.into();
+    }
+    crate::context::Context::resolve()
+        .root
+        .join(id)
+        .into_os_string()
+}
+
 pub(crate) fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
     opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
@@ -801,6 +846,54 @@ mod tests {
     use super::*;
     use crate::util::test_env::env_lock;
 
+    /// A relative `identity_file` resolves against the project root (the
+    /// same overlay is read host-side and container-side, and only a
+    /// project-relative path names the same key file in both contexts);
+    /// absolute and `~`-prefixed paths pass through untouched.
+    #[test]
+    fn a_relative_identity_file_resolves_against_the_project_root() {
+        use crate::config::{ClusterWorker, LocalDevices, SshConfig};
+        let worker_with_id = |id: &str| ClusterWorker {
+            host: "h".into(),
+            ranks: vec![0],
+            local_devices: LocalDevices::Explicit(vec![0]),
+            nccl_socket_ifname: "lo".into(),
+            path: "/tmp".into(),
+            ssh: Some(SshConfig {
+                identity_file: Some(id.into()),
+                ..SshConfig::default()
+            }),
+            tunnel: false,
+            arch: None,
+            data_path: None,
+            gpu_ram_share: None,
+            docker: None,
+            env: std::collections::BTreeMap::new(),
+        };
+        let identity_arg = |id: &str| -> std::ffi::OsString {
+            let mut cmd = Command::new("ssh");
+            apply_worker_ssh_opts(&mut cmd, &worker_with_id(id));
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+            let i = args
+                .iter()
+                .position(|a| a == "-i")
+                .expect("-i flag present");
+            args[i + 1].clone()
+        };
+
+        // Relative: project-root-joined (asserted against the same
+        // resolver the code uses, so the test is cwd-independent).
+        let expect = crate::context::Context::resolve()
+            .root
+            .join(".fdl/farm/key")
+            .into_os_string();
+        assert_eq!(identity_arg(".fdl/farm/key"), expect);
+
+        // Absolute and tilde: verbatim (ssh expands the tilde itself).
+        assert_eq!(identity_arg("/etc/flodl/key"), "/etc/flodl/key");
+        assert_eq!(identity_arg("~/.ssh/key"), "~/.ssh/key");
+    }
+
     #[test]
     fn remote_gpu_counts_parse_as_a_vendor_pair() {
         assert_eq!(parse_gpu_counts("2 0"), Some((2, 0)));
@@ -955,6 +1048,69 @@ commands:
         assert_eq!(hex_encode(b"hi"), "6869");
     }
 
+    /// The envelope ships a relative `ssh.identity_file` ABSOLUTE in the
+    /// launcher's frame (the launcher hands it to ssh verbatim from
+    /// whatever cwd the run configured); absolute and `~` values pass
+    /// through untouched. Asserted by decoding the envelope fdl actually
+    /// exports, not by inspecting an intermediate.
+    #[test]
+    fn prepare_cluster_env_absolutizes_relative_identity_into_the_envelope() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var(ENV_FULL_CLUSTER_JSON);
+        }
+        let yaml = "\
+cluster:
+  controller:
+    host: 127.0.0.1
+    port: 29500
+    path: /opt/flodl
+  workers:
+    - host: relative-key
+      local_devices: [0]
+      nccl_socket_ifname: lo
+      path: /opt/flodl
+      ssh:
+        target: 127.0.0.1
+        identity_file: .fdl/farm/key
+    - host: tilde-key
+      local_devices: [1]
+      nccl_socket_ifname: lo
+      path: /opt/flodl
+      ssh:
+        target: 127.0.0.1
+        identity_file: ~/.ssh/key
+commands:
+  train: { cluster: true, run: \"true\" }
+";
+        let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let cluster = project.cluster.as_ref().unwrap();
+        prepare_cluster_env(cluster, None, "train", Path::new("/container/mount"))
+            .expect("prepare OK");
+
+        let hex = std::env::var(ENV_FULL_CLUSTER_JSON).unwrap();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let shipped: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id_of = |host: &str| -> String {
+            shipped["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["host"] == host)
+                .and_then(|w| w["ssh"]["identity_file"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(id_of("relative-key"), "/container/mount/.fdl/farm/key");
+        assert_eq!(id_of("tilde-key"), "~/.ssh/key");
+        unsafe {
+            std::env::remove_var(ENV_FULL_CLUSTER_JSON);
+        }
+    }
+
     #[test]
     fn prepare_cluster_env_sets_required_vars() {
         let _guard = env_lock();
@@ -980,7 +1136,8 @@ commands:
 ";
         let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = project.cluster.as_ref().unwrap();
-        prepare_cluster_env(cluster, Some("cluster"), "train").expect("prepare OK");
+        prepare_cluster_env(cluster, Some("cluster"), "train", Path::new("/tmp"))
+            .expect("prepare OK");
 
         assert!(!std::env::var(ENV_FULL_CLUSTER_JSON).unwrap().is_empty());
         assert_eq!(std::env::var(ENV_FDL_CMD).unwrap(), "train");
@@ -1021,11 +1178,11 @@ commands:
         let project: ProjectConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let cluster = project.cluster.as_ref().unwrap();
         // None overlay → no FDL_ENV var set.
-        prepare_cluster_env(cluster, None, "train").unwrap();
+        prepare_cluster_env(cluster, None, "train", Path::new("/tmp")).unwrap();
         assert!(std::env::var_os(ENV_FDL_ENV).is_none());
 
         // Empty overlay → also no FDL_ENV var.
-        prepare_cluster_env(cluster, Some("   "), "train").unwrap();
+        prepare_cluster_env(cluster, Some("   "), "train", Path::new("/tmp")).unwrap();
         assert!(std::env::var_os(ENV_FDL_ENV).is_none());
 
         unsafe {
@@ -1095,7 +1252,7 @@ commands:
             env: std::collections::BTreeMap::new(),
             gpu_ram_share: None,
         };
-        let err = prepare_cluster_env(&cluster, None, "train").unwrap_err();
+        let err = prepare_cluster_env(&cluster, None, "train", Path::new("/tmp")).unwrap_err();
         assert!(err.contains("controller.host"), "got: {err}");
     }
 

@@ -284,6 +284,24 @@ impl ClusterDashboardSink {
         }
     }
 
+    /// Keep or drop the engine scalars' roll-up declarations
+    /// (`engine_reductions`). They are honest only when the sub-epoch
+    /// tick cadence is armed (`reports_per_epoch`): the engine scalars
+    /// ride window records exclusively, so a stream with no window
+    /// reports would declare keys no record ever carries — and the saved
+    /// archive bakes the declaration, promising series the page can
+    /// never plot. User-declared reductions
+    /// ([`Self::with_scalar_reductions`]) are unaffected: they describe
+    /// user scalars on the epoch cadence, which always runs.
+    pub fn with_engine_scalar_declarations(mut self, armed: bool) -> Self {
+        if !armed {
+            for key in engine_reductions().keys() {
+                self.scalar_reductions.remove(key);
+            }
+        }
+        self
+    }
+
     /// Attach (or clear) the append-only record-stream persistence. The
     /// launcher builds the log from `record_log_dir`; `None` leaves the
     /// stream live-only.
@@ -1149,6 +1167,40 @@ mod tests {
         assert_eq!(meta["reductions"]["anchor"], "last");
         assert_eq!(meta["reductions"]["sync_ms"], "last");
         assert_eq!(meta["reductions"]["d_raw"], "last");
+    }
+
+    /// With the tick cadence unarmed (`reports_per_epoch` unset) the engine
+    /// scalars ride NO record, so declaring them would promise series the
+    /// stream — and the saved archive baking it — can never carry. The
+    /// declaration is dropped; user scalars (epoch cadence, always runs)
+    /// keep theirs.
+    #[test]
+    fn unarmed_tick_cadence_drops_the_engine_scalar_declarations() {
+        use crate::monitor::record::Reduction;
+
+        let sink = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_engine_scalar_declarations(false)
+            .with_scalar_reductions({
+                let mut r = crate::monitor::record::Reductions::new();
+                r.insert("tokens_seen".to_string(), Reduction::Sum);
+                r
+            });
+        let meta = sink
+            .take_meta_record(7)
+            .expect("first call yields the meta");
+        assert_eq!(meta["reductions"]["tokens_seen"], "sum");
+        for key in ["anchor", "sync_ms", "cpu_avg_ms", "d_raw", "lambda_ema"] {
+            assert!(
+                meta["reductions"].get(key).is_none(),
+                "{key} must not be declared when no record can carry it"
+            );
+        }
+
+        // Armed keeps them — the default construction path.
+        let armed = ClusterDashboardSink::new(cluster(), "exa".to_string(), 1)
+            .with_engine_scalar_declarations(true);
+        let meta = armed.take_meta_record(7).expect("meta");
+        assert_eq!(meta["reductions"]["anchor"], "last");
     }
 
     /// A `meta` record carries no `path`, and `RecordLog::append` skips
