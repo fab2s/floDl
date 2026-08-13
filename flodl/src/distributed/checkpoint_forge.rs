@@ -37,6 +37,101 @@ use crate::nn::checkpoint::{
 use crate::nn::{Buffer, Module, Parameter};
 use crate::tensor::{DType, Result, TensorError};
 
+/// Type-erased consensus-model callback: `(version, schema, payloads)`.
+///
+/// Built at launch by [`consensus_checkpoint_fn`] around the user's
+/// `checkpoint_fn` (CPU backend only — NCCL fires the user callback on the
+/// elected rank, whose post-collective model IS the consensus) and installed
+/// on the forge, which fires it on its **detached** writer thread when an
+/// armed cycle's accumulation completes — the reduce loop never blocks on it
+/// (the coordinator must never go heartbeat-silent). Type-erased so the
+/// controller plumbing stays model-agnostic: the closure owns the only
+/// model-typed state.
+pub type ConsensusModelFn =
+    Arc<dyn Fn(u64, &ModelSchema, &[TensorPayload]) -> Result<()> + Send + Sync>;
+
+/// Wrap a user `checkpoint_fn` into a [`ConsensusModelFn`]: each fire builds
+/// a CPU probe model from `model_factory`, loads the consensus payloads into
+/// it positionally, calls `f(version, &model)`, and drops the probe. The
+/// residency is transient per fire, never steady — models hold `Rc` internals
+/// (not `Send`), so a cached probe could not live inside this `Send + Sync`
+/// closure anyway, and a fresh build per (rare) checkpoint fire is cheaper
+/// than a model-sized standing allocation. Panics in the user closure are
+/// caught and surfaced as errors so a misbehaving callback cannot kill the
+/// forge's writer thread.
+///
+/// Mental-model outcome, both backends: **`checkpoint_fn` always receives the
+/// consensus model** — here by construction (the frame is the consensus), on
+/// NCCL by post-collective timing. The model it receives lives on the CPU.
+pub(crate) fn consensus_checkpoint_fn<M, F>(
+    model_factory: F,
+    f: crate::distributed::ddp_run::CheckpointFn<M>,
+) -> ConsensusModelFn
+where
+    M: Module + 'static,
+    F: Fn(crate::tensor::Device) -> Result<M> + Send + Sync + 'static,
+{
+    Arc::new(move |version, schema, payloads| {
+        let model = model_factory(crate::tensor::Device::CPU)?;
+        load_payloads_into_model(&model, schema, payloads)?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(version, &model))).map_err(
+            |p| {
+                let what = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                TensorError::new(&format!("checkpoint_fn panicked: {what}"))
+            },
+        )?
+    })
+}
+
+/// Load a consensus cycle's accumulated payloads into `model` positionally:
+/// the first `param_names.len()` payloads are params, the rest the f32
+/// buffer subset, each mapped to its full-list buffer index via
+/// [`ModelSchema::f32_buffer_idx`]. Non-f32 buffers keep the model's own
+/// values (the reduce's passthrough semantics). Counts are validated so a
+/// factory/schema drift errors loudly instead of loading tensors into the
+/// wrong slots.
+fn load_payloads_into_model<M: Module + ?Sized>(
+    model: &M,
+    schema: &ModelSchema,
+    payloads: &[TensorPayload],
+) -> Result<()> {
+    let params = model.parameters();
+    let buffers = model.buffers();
+    if params.len() != schema.param_names.len()
+        || buffers.len() != schema.buffer_names.len()
+        || payloads.len() != schema.tensor_count()
+    {
+        return Err(TensorError::new(&format!(
+            "consensus checkpoint_fn: model has {} params + {} buffers, schema \
+             expects {} + {} ({} f32), frame carries {} tensors — factory/schema drift",
+            params.len(),
+            buffers.len(),
+            schema.param_names.len(),
+            schema.buffer_names.len(),
+            schema.f32_buffer_idx.len(),
+            payloads.len(),
+        )));
+    }
+    let _no_grad = crate::autograd::NoGradGuard::new();
+    let load_one = |dst: &crate::tensor::Tensor, p: &TensorPayload| -> Result<()> {
+        let vals = crate::distributed::controller::payload_to_f32(p)?;
+        let shape: Vec<i64> = p.shape.iter().map(|&d| d as i64).collect();
+        let src = crate::tensor::Tensor::from_f32(&vals, &shape, crate::tensor::Device::CPU)?;
+        dst.copy_(&src, false)
+    };
+    for (i, param) in params.iter().enumerate() {
+        load_one(&param.variable.data(), &payloads[i])?;
+    }
+    for (k, &bi) in schema.f32_buffer_idx.iter().enumerate() {
+        load_one(&buffers[bi].get(), &payloads[schema.param_names.len() + k])?;
+    }
+    Ok(())
+}
+
 /// Positional `.fdl` key for the `i`-th model **parameter** in a cluster
 /// consensus checkpoint (`Module::parameters()` order).
 ///
@@ -93,17 +188,34 @@ pub struct CheckpointForge {
     /// Static param/buffer names captured at launch. `None` when no schema was
     /// captured (factory failure) → model writes are skipped (meta-only).
     schema: Option<ModelSchema>,
-    /// Mutable accumulation state (armed path + tensors gathered so far).
+    /// Consensus-model callback (the launch-wrapped user `checkpoint_fn`),
+    /// fired on the detached writer thread when an armed cycle with a
+    /// `user_version` completes. `None` when no callback is configured or on
+    /// the NCCL path (elected-rank fire).
+    consensus_fn: Option<ConsensusModelFn>,
+    /// Mutable accumulation state (armed checkpoint + tensors gathered so far).
     inner: Mutex<ForgeState>,
+}
+
+/// One armed consensus capture: what to do with the cycle's materialized
+/// frame. Bundle write and user-callback fire are independent — a cadence
+/// with `save_path` does both, a cadence with only a `checkpoint_fn` fires
+/// without writing, the final-consensus arm writes without firing.
+struct ArmedCheckpoint {
+    /// `<stem>.fdl` destination; `None` = no bundle this cycle.
+    path: Option<PathBuf>,
+    /// Fire the consensus callback with this version after materialization;
+    /// `None` = no user fire this cycle.
+    user_version: Option<u64>,
 }
 
 /// What the forge has gathered toward the next consensus checkpoint.
 #[derive(Default)]
 struct ForgeState {
-    /// Armed model path for the current checkpoint cycle (`<stem>.fdl`). Set by
-    /// the coordinator before the cycle it wants captured; taken when the write
-    /// is spawned. `None` = not armed (frames are ignored).
-    pending_path: Option<PathBuf>,
+    /// Armed capture for the current checkpoint cycle. Set by the coordinator
+    /// before the cycle it wants captured; taken when the writer is spawned.
+    /// `None` = not armed (frames are ignored).
+    pending: Option<ArmedCheckpoint>,
     /// `Model`-reduce tensors gathered this cycle, in arrival order (params'
     /// frame, then buffers' frame). Moved in, never copied. Drained on write.
     accumulated: Vec<TensorPayload>,
@@ -115,12 +227,20 @@ struct ForgeState {
 }
 
 impl CheckpointForge {
-    /// Build a forge holding the launch-captured schema (or `None`).
-    pub fn new(schema: Option<ModelSchema>) -> Arc<Self> {
+    /// Build a forge holding the launch-captured schema (or `None`) and the
+    /// launch-wrapped consensus callback (or `None`).
+    pub fn new(schema: Option<ModelSchema>, consensus_fn: Option<ConsensusModelFn>) -> Arc<Self> {
         Arc::new(CheckpointForge {
             schema,
+            consensus_fn,
             inner: Mutex::new(ForgeState::default()),
         })
+    }
+
+    /// Whether a consensus callback is installed (the coordinator's gate for
+    /// user-fire arms on the CPU path).
+    pub fn has_consensus_fn(&self) -> bool {
+        self.consensus_fn.is_some()
     }
 
     /// Whether a model write is possible at all (a schema was captured). Lets
@@ -130,27 +250,37 @@ impl CheckpointForge {
         self.schema.is_some()
     }
 
-    /// Coordinator: arm a consensus model save to `model_path` (`<stem>.fdl`)
-    /// for the NEXT checkpoint cycle. Clears any partial accumulation (a new
-    /// checkpoint supersedes a missed one), so the forge starts the cycle
-    /// fresh.
-    pub fn arm(&self, model_path: PathBuf) {
+    /// Coordinator: arm a consensus capture for the NEXT checkpoint cycle —
+    /// a model save to `model_path` (`<stem>.fdl`), a consensus-callback fire
+    /// at `user_version`, or both. A both-`None` arm is a no-op. Clears any
+    /// partial accumulation (a new checkpoint supersedes a missed one), so
+    /// the forge starts the cycle fresh.
+    pub fn arm(&self, model_path: Option<PathBuf>, user_version: Option<u64>) {
+        if model_path.is_none() && user_version.is_none() {
+            return;
+        }
         let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
-        st.pending_path = Some(model_path);
+        st.pending = Some(ArmedCheckpoint {
+            path: model_path,
+            user_version,
+        });
         st.accumulated.clear();
         st.pending_outer = None;
     }
 
-    /// Whether a checkpoint is currently armed (a `<stem>.fdl` path is
+    /// Whether a bundle write is currently armed (a `<stem>.fdl` path is
     /// pending). The controller checks this to decide whether to snapshot the
     /// outer-optimizer momentum this window — a rare event, so the (cheap)
     /// momentum serialize only happens when a checkpoint is actually pending.
+    /// A user-fire-only arm does not count: the `.outer.fdl` sidecar rides
+    /// the bundle, and there is none.
     pub fn is_armed(&self) -> bool {
         self.inner
             .lock()
             .expect("checkpoint forge mutex poisoned")
-            .pending_path
-            .is_some()
+            .pending
+            .as_ref()
+            .is_some_and(|a| a.path.is_some())
     }
 
     /// Stash this cycle's outer-optimizer momentum payloads (one tensor per
@@ -165,8 +295,9 @@ impl CheckpointForge {
 
     /// Reduce thread: fold one `Model` reduce's averaged frame into the
     /// accumulation. The frame is **moved** in (no clone). When the gathered
-    /// tensor count reaches the schema's total (params + buffers), take the
-    /// armed path + accumulated tensors and spawn a **detached** writer,
+    /// tensor count reaches the schema's total (params + the f32 buffer
+    /// subset), take the armed capture + accumulated tensors and spawn a
+    /// **detached** writer — bundle write, consensus-callback fire, or both —
     /// returning immediately so the reduce loop keeps scattering. No-op when
     /// not armed or no schema was captured.
     ///
@@ -177,9 +308,9 @@ impl CheckpointForge {
             return; // no schema captured; .fdl skipped (meta-only)
         };
         let want = schema.tensor_count();
-        let (path, payloads, outer) = {
+        let (armed, payloads, outer) = {
             let mut st = self.inner.lock().expect("checkpoint forge mutex poisoned");
-            if st.pending_path.is_none() {
+            if st.pending.is_none() {
                 return; // not armed — drop this cycle's frame
             }
             // MOVE the frame's tensors into the accumulator (no copy).
@@ -187,24 +318,23 @@ impl CheckpointForge {
             if st.accumulated.len() < want {
                 return; // more model reduces to come this cycle (buffers)
             }
-            let path = st.pending_path.take().expect("armed checked above");
+            let armed = st.pending.take().expect("armed checked above");
             let payloads = std::mem::take(&mut st.accumulated);
             // Outer-optimizer momentum for this cycle, if any (None for
             // stateless OuterAvg => no `.outer.fdl`).
             let outer = st.pending_outer.take();
-            (path, payloads, outer)
+            (armed, payloads, outer)
         };
         if payloads.len() != want {
             // Overshoot: more tensors arrived than the schema expects — a wiring
             // bug. Skip rather than write a misaligned checkpoint.
             eprintln!(
                 "flodl ddp: consensus checkpoint accumulated {} tensors but schema \
-                 expects {} ({} params + {} buffers); .fdl skipped for {}",
+                 expects {} ({} params + {} f32 buffers); checkpoint skipped",
                 payloads.len(),
                 want,
                 schema.param_names.len(),
-                schema.buffer_names.len(),
-                path.display(),
+                schema.f32_buffer_idx.len(),
             );
             return;
         }
@@ -219,36 +349,52 @@ impl CheckpointForge {
             if !ok {
                 eprintln!(
                     "flodl ddp: outer-momentum has {} tensors but schema expects \
-                     {} params; .outer.fdl skipped for {}",
+                     {} params; .outer.fdl skipped",
                     o.len(),
                     schema.param_names.len(),
-                    path.display(),
                 );
             }
             ok
         });
         let schema = schema.clone();
+        let consensus_fn = armed
+            .user_version
+            .is_some()
+            .then(|| self.consensus_fn.clone())
+            .flatten();
         let spawn = std::thread::Builder::new()
             .name("flodl-ckpt-writer".to_string())
             .spawn(move || {
-                if let Err(e) = write_consensus_fdl(&schema, &payloads, &path) {
-                    eprintln!(
-                        "flodl ddp: consensus checkpoint write to {} failed: {e}",
-                        path.display(),
-                    );
-                }
-                // Outer-optimizer momentum rides the same writer: `<stem>.fdl`
-                // -> `<stem>.outer.fdl`, same atomic-rename commit. Written
-                // after the model so a present `.outer.fdl` implies a present
-                // `.fdl`.
-                if let Some(outer_payloads) = outer {
-                    let outer_path = path.with_extension("outer.fdl");
-                    if let Err(e) = write_outer_momentum_fdl(&outer_payloads, &outer_path) {
+                if let Some(path) = armed.path.as_ref() {
+                    if let Err(e) = write_consensus_fdl(&schema, &payloads, path) {
                         eprintln!(
-                            "flodl ddp: outer-momentum checkpoint write to {} failed: {e}",
-                            outer_path.display(),
+                            "flodl ddp: consensus checkpoint write to {} failed: {e}",
+                            path.display(),
                         );
                     }
+                    // Outer-optimizer momentum rides the same writer:
+                    // `<stem>.fdl` -> `<stem>.outer.fdl`, same atomic-rename
+                    // commit. Written after the model so a present
+                    // `.outer.fdl` implies a present `.fdl`.
+                    if let Some(outer_payloads) = outer {
+                        let outer_path = path.with_extension("outer.fdl");
+                        if let Err(e) = write_outer_momentum_fdl(&outer_payloads, &outer_path) {
+                            eprintln!(
+                                "flodl ddp: outer-momentum checkpoint write to {} failed: {e}",
+                                outer_path.display(),
+                            );
+                        }
+                    }
+                }
+                // Consensus-callback fire, AFTER the bundle write (a callback
+                // that reads the bundle back sees this cycle's write). Errors
+                // (including caught user panics) report loudly and never kill
+                // the run — parity with the elected-rank CheckpointResult
+                // error path on NCCL.
+                if let (Some(version), Some(f)) = (armed.user_version, consensus_fn)
+                    && let Err(e) = f(version, &schema, &payloads)
+                {
+                    eprintln!("flodl ddp: checkpoint_fn (v{version}, consensus) failed: {e}");
                 }
             });
         if let Err(e) = spawn {
@@ -259,8 +405,8 @@ impl CheckpointForge {
 
 /// Write a named, loadable `.fdl` straight from the accumulated averaged
 /// payloads + the static schema. Positional pairing: the first
-/// `param_names.len()` tensors are params, the rest buffers — the
-/// `GpuWorker::snapshot_params` / reduce order. Emits the payloads' raw native
+/// `param_names.len()` tensors are params, the rest the f32 buffer subset —
+/// the `GpuWorker::snapshot_params` / reduce order. Emits the payloads' raw native
 /// bytes directly (no `Tensor` reconstruction) and commits with a temp-file +
 /// atomic rename, so a crash mid-write never leaves a torn `.fdl` that resume
 /// could mistake for valid.
@@ -272,11 +418,11 @@ fn write_consensus_fdl(
     if payloads.len() != schema.tensor_count() {
         return Err(TensorError::new(&format!(
             "checkpoint_forge: accumulated {} tensors but schema expects \
-             {} ({} params + {} buffers) — schema/accumulation mismatch",
+             {} ({} params + {} f32 buffers) — schema/accumulation mismatch",
             payloads.len(),
             schema.tensor_count(),
             schema.param_names.len(),
-            schema.buffer_names.len(),
+            schema.f32_buffer_idx.len(),
         )));
     }
     // Pre-convert u32 wire shapes to the i64 dims the .fdl format stores;
@@ -286,15 +432,21 @@ fn write_consensus_fdl(
         .map(|p| p.shape.iter().map(|&d| d as i64).collect())
         .collect();
     // Positional keys: the first `param_names.len()` payloads are params
-    // (`p{i}`), the rest buffers (`b{j}`). Synthetic + unique — never the
-    // model's own (possibly repeated) names. Matches `load_consensus_checkpoint`.
+    // (`p{i}`), the rest the f32 buffer subset the frame carries — each keyed
+    // by its FULL buffer-list index (`b{f32_buffer_idx[k]}`), so the bundle
+    // stays load-compatible with rank-written bundles that carry every
+    // buffer. Non-f32 buffers never reach the frame; on load they surface in
+    // `LoadReport::missing` and the model keeps its constructed values (the
+    // same passthrough semantics the reduce gives them). Synthetic + unique
+    // keys — never the model's own (possibly repeated) names. Matches
+    // `load_consensus_checkpoint`.
     let param_count = schema.param_names.len();
     let keys: Vec<String> = (0..payloads.len())
         .map(|i| {
             if i < param_count {
                 consensus_param_key(i)
             } else {
-                consensus_buffer_key(i - param_count)
+                consensus_buffer_key(schema.f32_buffer_idx[i - param_count])
             }
         })
         .collect();
@@ -433,8 +585,9 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string(), "b".to_string()],
             buffer_names: vec!["running_mean".to_string()],
+            f32_buffer_idx: vec![0],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
         assert!(forge.can_write_model());
 
         let w = cpu_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
@@ -448,7 +601,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus.fdl");
 
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         forge.accumulate(params_frame); // partial: 2 of 3, no write yet
         assert!(!path.exists(), "no write before all model frames arrive");
         forge.accumulate(buffers_frame); // completes 3/3 → detached write
@@ -492,6 +645,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A model with a non-f32 buffer: the frame carries the f32 subset only,
+    /// so the forge completes at params + f32 buffers and keys each written
+    /// buffer by its FULL-list index. The non-f32 buffer's key is absent from
+    /// the bundle — a positional load reports it `missing` and the model
+    /// keeps its constructed value (the reduce's own passthrough semantics).
+    #[test]
+    fn non_f32_buffer_excluded_but_keys_stay_full_index() {
+        // Buffers: [step (Int64, idx 0), running (f32, idx 1)] — only
+        // `running` rides the frame, keyed b1 (never b0).
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec!["step".to_string(), "running".to_string()],
+            f32_buffer_idx: vec![1],
+        };
+        let forge = CheckpointForge::new(Some(schema), None);
+
+        let w = cpu_tensor(&[1.0, 2.0], &[2]);
+        let running = cpu_tensor(&[0.5], &[1]);
+        let params_frame = tensors_to_round_frame(&[&w], DTYPE_F32).unwrap();
+        let buffers_frame = tensors_to_round_frame(&[&running], DTYPE_F32).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("flodl_forge_nonf32_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("consensus.fdl");
+
+        forge.arm(Some(path.clone()), None);
+        forge.accumulate(params_frame); // 1 of 2
+        assert!(!path.exists(), "no write before the f32 subset completes");
+        forge.accumulate(buffers_frame); // completes 2/2 → detached write
+
+        let mut found = false;
+        for _ in 0..200 {
+            if path.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(found, "f32-subset accumulation produced the .fdl");
+
+        // Positional load over the FULL buffer list: b0 (int) is missing from
+        // the bundle and keeps its constructed value; b1 loads the consensus.
+        use crate::nn::{Buffer, Parameter};
+        let tw = Parameter::new(cpu_tensor(&[0.0; 2], &[2]), "w");
+        let tstep = Buffer::new(Tensor::from_i64(&[7], &[1], Device::CPU).unwrap(), "step");
+        let trun = Buffer::new(cpu_tensor(&[0.0], &[1]), "running");
+        let report = crate::nn::load_checkpoint_file(
+            path.to_str().unwrap(),
+            &[("p0".to_string(), tw.clone())],
+            &[
+                ("b0".to_string(), tstep.clone()),
+                ("b1".to_string(), trun.clone()),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(tw.variable.data().to_f32_vec().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(trun.get().to_f32_vec().unwrap(), vec![0.5]);
+        assert_eq!(
+            tstep.get().to_i64_vec().unwrap(),
+            vec![7],
+            "non-f32 buffer keeps its constructed value"
+        );
+        assert_eq!(report.missing, vec!["b0".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A bf16-wire run's consensus frames write an EXACT F32 checkpoint:
     /// the forge upcasts bf16 payloads (lossless) so resume never
     /// depends on the wire dtype. Values chosen bf16-representable.
@@ -501,8 +722,9 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string()],
             buffer_names: vec![],
+            f32_buffer_idx: vec![],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
         let w = cpu_tensor(&[1.5, -2.0, 0.25, 42.0], &[4]);
         let frame = tensors_to_round_frame(&[&w], DTYPE_BF16).unwrap();
         assert_eq!(frame.tensors[0].dtype, DTYPE_BF16);
@@ -510,7 +732,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flodl_forge_bf16_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus.fdl");
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         forge.accumulate(frame); // completes 1/1 → detached write
 
         let mut found = false;
@@ -545,8 +767,9 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string(), "b".to_string()],
             buffer_names: vec!["running_mean".to_string()],
+            f32_buffer_idx: vec![0],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
 
         let w = cpu_tensor(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
         let b = cpu_tensor(&[5.0, 6.0], &[2]);
@@ -559,7 +782,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("consensus.fdl");
 
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         assert!(forge.is_armed());
         // Stash momentum, then complete the model accumulation (params, buffers).
         forge.stash_outer_momentum(
@@ -610,14 +833,15 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string()],
             buffer_names: vec![],
+            f32_buffer_idx: vec![],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
         let w = cpu_tensor(&[1.0, 2.0], &[2]);
         let dir = std::env::temp_dir().join(format!("flodl_forge_noouter_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.fdl");
 
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap()); // completes, no stash
 
         let outer_path = path.with_extension("outer.fdl");
@@ -640,13 +864,136 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A user-fire-only arm (no `save_path`): the consensus callback fires
+    /// with the armed version and this cycle's payloads, no `.fdl` is
+    /// written, and `is_armed` (the outer-momentum gate, bundle-only) stays
+    /// false throughout.
+    #[test]
+    fn user_fire_without_bundle_fires_consensus_fn_only() {
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+            f32_buffer_idx: vec![],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f: ConsensusModelFn = Arc::new(move |version, schema, payloads| {
+            let vals = crate::distributed::controller::payload_to_f32(&payloads[0])?;
+            tx.send((version, schema.param_names.len(), vals)).ok();
+            Ok(())
+        });
+        let forge = CheckpointForge::new(Some(schema), Some(f));
+        assert!(forge.has_consensus_fn());
+
+        forge.arm(None, Some(3));
+        assert!(!forge.is_armed(), "a user-fire arm is not a bundle arm");
+        let w = cpu_tensor(&[1.0, 2.0], &[2]);
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap());
+        let (version, nparams, vals) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("consensus fn fired");
+        assert_eq!(version, 3);
+        assert_eq!(nparams, 1);
+        assert_eq!(vals, vec![1.0, 2.0]);
+    }
+
+    /// A cadence arm with BOTH destinations: the bundle writes and the
+    /// callback fires, callback strictly after the write (it may read the
+    /// bundle back).
+    #[test]
+    fn bundle_and_user_fire_arm_does_both() {
+        let schema = ModelSchema {
+            param_names: vec!["w".to_string()],
+            buffer_names: vec![],
+            f32_buffer_idx: vec![],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f: ConsensusModelFn = Arc::new(move |version, _schema, _payloads| {
+            tx.send(version).ok();
+            Ok(())
+        });
+        let forge = CheckpointForge::new(Some(schema), Some(f));
+        let dir = std::env::temp_dir().join(format!("flodl_forge_both_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.fdl");
+
+        forge.arm(Some(path.clone()), Some(4));
+        assert!(forge.is_armed(), "bundle armed");
+        let w = cpu_tensor(&[1.0], &[1]);
+        forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap());
+        let version = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("consensus fn fired");
+        assert_eq!(version, 4);
+        assert!(
+            path.exists(),
+            "bundle written before the callback fired (same thread, in order)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The launch wrap end-to-end: a fresh CPU probe is built per fire, the
+    /// consensus payloads land in its params positionally, and the user's
+    /// typed callback sees exactly the consensus values.
+    #[test]
+    fn consensus_checkpoint_fn_loads_consensus_into_probe_model() {
+        use crate::nn::Linear;
+        type Seen = Option<(u64, Vec<f32>, Vec<f32>)>;
+        let factory = |dev| Linear::on_device(2, 1, dev);
+        let got: Arc<Mutex<Seen>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&got);
+        let user: crate::distributed::ddp_run::CheckpointFn<Linear> =
+            Arc::new(move |version, model| {
+                let ps = model.parameters();
+                *sink.lock().unwrap() = Some((
+                    version,
+                    ps[0].variable.data().to_f32_vec()?,
+                    ps[1].variable.data().to_f32_vec()?,
+                ));
+                Ok(())
+            });
+        let wrap = consensus_checkpoint_fn(factory, user);
+
+        let probe = Linear::on_device(2, 1, Device::CPU).unwrap();
+        let schema = ModelSchema::from_module(&probe);
+        let w = cpu_tensor(&[0.5, -1.5], &[1, 2]);
+        let b = cpu_tensor(&[0.25], &[1]);
+        let frame = tensors_to_round_frame(&[&w, &b], DTYPE_F32).unwrap();
+        wrap(7, &schema, &frame.tensors).unwrap();
+
+        let (version, wv, bv) = got.lock().unwrap().take().expect("user fn fired");
+        assert_eq!(version, 7);
+        assert_eq!(wv, vec![0.5, -1.5]);
+        assert_eq!(bv, vec![0.25]);
+    }
+
+    /// A panicking user callback surfaces as an error (the forge's writer
+    /// thread reports it), never as a thread death.
+    #[test]
+    fn consensus_checkpoint_fn_catches_user_panic() {
+        use crate::nn::Linear;
+        let factory = |dev| Linear::on_device(2, 1, dev);
+        let user: crate::distributed::ddp_run::CheckpointFn<Linear> =
+            Arc::new(|_, _| panic!("boom"));
+        let wrap = consensus_checkpoint_fn(factory, user);
+
+        let probe = Linear::on_device(2, 1, Device::CPU).unwrap();
+        let schema = ModelSchema::from_module(&probe);
+        let w = cpu_tensor(&[0.5, -1.5], &[1, 2]);
+        let b = cpu_tensor(&[0.25], &[1]);
+        let frame = tensors_to_round_frame(&[&w, &b], DTYPE_F32).unwrap();
+        let err = wrap(1, &schema, &frame.tensors).unwrap_err();
+        assert!(err.to_string().contains("panicked"), "got: {err}");
+        assert!(err.to_string().contains("boom"), "got: {err}");
+    }
+
     #[test]
     fn unarmed_accumulate_is_noop() {
         let schema = ModelSchema {
             param_names: vec!["w".to_string()],
             buffer_names: vec![],
+            f32_buffer_idx: vec![],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
         let w = cpu_tensor(&[1.0, 2.0], &[2]);
         // No arm() — accumulate must not crash or write.
         forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap());
@@ -659,8 +1006,9 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string(), "b".to_string()],
             buffer_names: vec![],
+            f32_buffer_idx: vec![],
         };
-        let forge = CheckpointForge::new(Some(schema));
+        let forge = CheckpointForge::new(Some(schema), None);
         let stale = cpu_tensor(&[9.0], &[1]);
         let w = cpu_tensor(&[1.0, 2.0], &[2]);
         let b = cpu_tensor(&[3.0], &[1]);
@@ -669,10 +1017,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.fdl");
 
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         forge.accumulate(tensors_to_round_frame(&[&stale], DTYPE_F32).unwrap()); // partial 1/2
         // Re-arm: the stale partial is dropped, cycle restarts.
-        forge.arm(path.clone());
+        forge.arm(Some(path.clone()), None);
         forge.accumulate(tensors_to_round_frame(&[&w], DTYPE_F32).unwrap()); // 1/2
         forge.accumulate(tensors_to_round_frame(&[&b], DTYPE_F32).unwrap()); // 2/2 → write
 
@@ -709,6 +1057,7 @@ mod tests {
         let schema = ModelSchema {
             param_names: vec!["w".to_string()],
             buffer_names: vec![],
+            f32_buffer_idx: vec![],
         };
         // Two payloads but schema expects 1.
         let a = cpu_tensor(&[1.0], &[1]);

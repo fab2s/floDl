@@ -204,23 +204,42 @@ pub struct ModelSchema {
     pub param_names: Vec<String>,
     /// Buffer names, in `Module::buffers()` order.
     pub buffer_names: Vec<String>,
+    /// Indices into `buffer_names` of the buffers that ride the averaging
+    /// frame: the reduce path folds f32 buffers only (non-f32 buffers —
+    /// integer counters and the like — are deterministic per-rank
+    /// passthroughs that never reach the controller). The consensus frame
+    /// therefore carries exactly these buffers, in this (ascending) order,
+    /// and the checkpoint writer keys each one by its FULL-list index so a
+    /// positional load stays aligned with bundles that carry every buffer
+    /// (the rank-side failure-save writer does).
+    #[serde(default)]
+    pub f32_buffer_idx: Vec<usize>,
 }
 
 impl ModelSchema {
-    /// Capture the schema from a freshly-built model. Reads only names — no
-    /// weights, no device work — so it is safe to call on a CPU-built model
-    /// in the launcher process (no CUDA context touched).
+    /// Capture the schema from a freshly-built model. Reads names and dtype
+    /// metadata only — no weights, no device work — so it is safe to call on
+    /// a CPU-built model in the launcher process (no CUDA context touched).
     pub fn from_module<M: crate::nn::Module + ?Sized>(model: &M) -> Self {
+        let buffers = model.buffers();
         ModelSchema {
             param_names: model.parameters().iter().map(|p| p.name.clone()).collect(),
-            buffer_names: model.buffers().iter().map(|b| b.name.clone()).collect(),
+            buffer_names: buffers.iter().map(|b| b.name.clone()).collect(),
+            f32_buffer_idx: buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.get().dtype() == crate::tensor::DType::Float32)
+                .map(|(i, _)| i)
+                .collect(),
         }
     }
 
-    /// Total tensor count (params + buffers); the length the consensus frame
-    /// must match for a positional pairing.
+    /// Total tensor count the consensus frame carries (params + the f32
+    /// buffer subset); the length the accumulated frames must reach for a
+    /// positional pairing. Non-f32 buffers never ride the frame, so they
+    /// are not counted.
     pub fn tensor_count(&self) -> usize {
-        self.param_names.len() + self.buffer_names.len()
+        self.param_names.len() + self.f32_buffer_idx.len()
     }
 }
 
@@ -967,7 +986,62 @@ mod tests {
             "Linear params in declaration order"
         );
         assert!(schema.buffer_names.is_empty(), "Linear has no buffers");
+        assert!(schema.f32_buffer_idx.is_empty());
         assert_eq!(schema.tensor_count(), 2);
+    }
+
+    /// A non-f32 buffer is named in the schema but excluded from the frame
+    /// accounting: the reduce path ships the f32 subset only, so
+    /// `tensor_count()` (the forge's completion target) must not wait for
+    /// tensors that never arrive.
+    #[test]
+    fn model_schema_excludes_non_f32_buffers_from_frame_count() {
+        use crate::nn::{Buffer, Module, Parameter};
+        use crate::tensor::{Device, Tensor};
+
+        struct MixedBuffers {
+            w: Parameter,
+            step: Buffer, // Int64 — a counter, never averaged
+            running: Buffer,
+        }
+        impl Module for MixedBuffers {
+            fn forward(
+                &self,
+                input: &crate::autograd::Variable,
+            ) -> crate::tensor::Result<crate::autograd::Variable> {
+                Ok(input.clone())
+            }
+            fn parameters(&self) -> Vec<Parameter> {
+                vec![self.w.clone()]
+            }
+            fn buffers(&self) -> Vec<Buffer> {
+                vec![self.step.clone(), self.running.clone()]
+            }
+        }
+
+        let model = MixedBuffers {
+            w: Parameter::new(
+                Tensor::from_f32(&[1.0, 2.0], &[2], Device::CPU).unwrap(),
+                "w",
+            ),
+            step: Buffer::new(Tensor::from_i64(&[7], &[1], Device::CPU).unwrap(), "step"),
+            running: Buffer::new(
+                Tensor::from_f32(&[0.5], &[1], Device::CPU).unwrap(),
+                "running",
+            ),
+        };
+        let schema = ModelSchema::from_module(&model);
+        assert_eq!(
+            schema.buffer_names,
+            vec!["step".to_string(), "running".to_string()],
+            "all buffers named, whatever their dtype"
+        );
+        assert_eq!(
+            schema.f32_buffer_idx,
+            vec![1],
+            "only the f32 buffer rides the frame"
+        );
+        assert_eq!(schema.tensor_count(), 2, "1 param + 1 f32 buffer");
     }
 
     #[test]

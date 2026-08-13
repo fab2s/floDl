@@ -553,9 +553,18 @@ pub struct ClusterCoordinator {
     /// first reduce after the cohort crosses epoch `e` takes an atomic
     /// consensus+coverage checkpoint. Cleared to `None` once fired so it
     /// happens exactly once. The explicit-checkpoint path the resume contract
-    /// is validated against (the recurring cadence layers on the same
-    /// mechanism later).
+    /// is validated against; the recurring cadence (`checkpoint_every` +
+    /// `save_path`) layers on the same mechanism via
+    /// [`Self::maybe_arm_checkpoint`].
     checkpoint_at_epoch: Option<usize>,
+
+    /// Highest epoch the recurring bundle cadence has already fired for
+    /// (`checkpoint_every` + `save_path`): the first reduce after the cohort
+    /// crosses a new multiple of `checkpoint_every` takes an atomic
+    /// consensus+coverage checkpoint, exactly once per multiple. `0` = the
+    /// cadence has not fired yet (multiples start at `checkpoint_every ≥ 1`,
+    /// so `0` is never a valid target).
+    last_cadence_arm_epoch: usize,
 
     /// Resume coverage: in-progress epoch pools to reconstruct on kickoff
     /// (via [`crate::distributed::chunk_pool::ChunkPool::from_coverage`])

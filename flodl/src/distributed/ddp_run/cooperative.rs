@@ -282,9 +282,13 @@ impl<M: Module + 'static> Worker<M> {
     }
 
     /// Ask the controller to checkpoint at its next coherent occasion (a
-    /// request, not a command; see [`Self::request_eval`]). Folds into the
-    /// role-elected `Checkpoint` dispatch at the next epoch boundary.
-    /// Fire-and-forget; no-op on the single-device path.
+    /// request, not a command; see [`Self::request_eval`]). On the CPU
+    /// backend the request is served at the next reduce — the controller
+    /// fires `checkpoint_fn` on the consensus and/or writes the consensus
+    /// bundle, whichever is configured; with neither it is dropped loudly.
+    /// On NCCL it folds into the role-elected `Checkpoint` dispatch at the
+    /// next epoch boundary. Fire-and-forget; no-op on the single-device
+    /// path.
     pub fn request_checkpoint(&self) {
         self.worker_ref()
             .report_intent(crate::distributed::wire::IntentKind::CheckpointNow);
@@ -497,8 +501,11 @@ impl<M: Module + 'static> Worker<M> {
                 // falls back to an empty state, matching the via_coord path.
                 // `finish()` reaching this point IS the clean completion
                 // (error paths drop with `finished == false` and exit
-                // through the death record instead).
-                let final_snapshot = cluster.teardown(true);
+                // through the death record instead). `want_final = true`:
+                // the cooperative contract returns the rank's own final
+                // state (on cpu-async that is the rank's EASGD blend — the
+                // consensus lives in the controller's bundle).
+                let final_snapshot = cluster.teardown(true, true);
                 final_snapshot
                     .map(|snap| TrainedState {
                         params: snap.params,

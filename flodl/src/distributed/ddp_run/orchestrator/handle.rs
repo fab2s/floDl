@@ -417,6 +417,26 @@ impl DdpHandle {
                         }
                     }
                 }
+                // CPU backend: the user's checkpoint_fn fires CONTROLLER-side,
+                // on the forge's consensus materialization — the frame is the
+                // consensus by construction, so the callback always receives
+                // the consensus model (on cpu-async a rank's own model is an
+                // EASGD blend, never the consensus). Wrapped here, where the
+                // model type is still concrete; type-erased for the controller
+                // plumbing, installed on the forge by the launcher driver.
+                // NCCL keeps the elected-rank wire dispatch: there the rank's
+                // post-collective model IS the consensus.
+                let consensus_checkpoint_fn = match backend {
+                    crate::distributed::ddp_run::AverageBackend::Cpu => {
+                        rank_callbacks.checkpoint_fn.clone().map(|f| {
+                            crate::distributed::checkpoint_forge::consensus_checkpoint_fn(
+                                model_factory,
+                                f,
+                            )
+                        })
+                    }
+                    _ => None,
+                };
                 // Controller-scope coordinator wiring. The config is
                 // built by a FACTORY at world-formation time (the join
                 // window decides the world size, not the config file),
@@ -443,6 +463,9 @@ impl DdpHandle {
                         coord_config = coord_config.metrics_sink_tx(sink_tx);
                         if let Some(schema) = model_schema {
                             coord_config = coord_config.model_schema(schema);
+                        }
+                        if let Some(f) = consensus_checkpoint_fn {
+                            coord_config = coord_config.consensus_checkpoint_fn(f);
                         }
                         Ok(coord_config)
                     }),

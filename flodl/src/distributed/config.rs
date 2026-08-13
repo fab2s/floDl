@@ -520,8 +520,9 @@ pub struct TrainerConfig<M: Module> {
     ///
     /// The reason to reach for it is single-pass training
     /// (`num_epochs: 1`, the normal regime for LLM pretraining): such a
-    /// run has no interior epoch boundary, so no checkpoint and no eval
-    /// until it ends. Default: `1`.
+    /// run has no interior epoch boundary, so no mid-run checkpoint and no
+    /// eval until it ends (the final consensus bundle still writes when
+    /// [`Self::save_path`] is set). Default: `1`.
     pub epoch_splits: usize,
     /// Deterministic delivery transform (the augmentation seam), keyed
     /// by [`crate::data::PickKey`] and applied on each rank at its
@@ -579,10 +580,22 @@ pub struct TrainerConfig<M: Module> {
     /// it. Deaths and redistribution are surfaced in logs and on the
     /// live dashboard either way.
     pub max_failure: Option<crate::distributed::max_failure::MaxFailureThreshold>,
-    /// Save a checkpoint every N global epochs. `None` = no periodic save.
+    /// Checkpoint cadence in global epochs. `None` = no periodic
+    /// checkpoint. Each cadence crossing fires [`Self::checkpoint_fn`]
+    /// (when registered) with the consensus model, and — when
+    /// [`Self::save_path`] is set — writes the consensus bundle
+    /// (`<save_path>.fdl` + `.meta.json`), each write atomically
+    /// superseding the previous one so the bundle is always the latest
+    /// resume point.
     pub checkpoint_every: Option<usize>,
-    /// Checkpoint bundle stem for cluster-mode unrecoverable-failure
-    /// persistence. See [`crate::distributed::CheckpointBundle`].
+    /// Checkpoint bundle stem. Setting it makes the bundle the run's
+    /// canonical persist form: a natural clean end always writes the FINAL
+    /// consensus bundle (single-epoch runs included — the run tail's last
+    /// realized reduce is captured), [`Self::checkpoint_every`] adds
+    /// periodic consensus bundles, and cluster-mode unrecoverable failures
+    /// write a best-effort crash bundle (rank-0-local model — on cpu-async
+    /// that is a blend, not the consensus; crash-time rounds may be
+    /// wedged). See [`crate::distributed::CheckpointBundle`].
     pub save_path: Option<String>,
     /// Resume from a previously-saved checkpoint bundle stem.
     pub resume_from: Option<String>,
@@ -594,8 +607,14 @@ pub struct TrainerConfig<M: Module> {
     /// no mid-run checkpoint. See [`crate::distributed::CheckpointBundle`].
     pub checkpoint_at_epoch: Option<usize>,
 
-    /// Per-checkpoint callback (`version, &model`). Fires on the rank
-    /// chosen by [`crate::distributed::ddp_run::EpochCallbackPolicy`].
+    /// Per-checkpoint callback (`version, &model`). Always receives the
+    /// CONSENSUS model: on the CPU backend it fires controller-side on a
+    /// CPU-built copy loaded from the reduce's averaged frame (a rank's own
+    /// model is an EASGD blend on cpu-async, never the consensus); on NCCL
+    /// it fires on the rank chosen by
+    /// [`crate::distributed::ddp_run::EpochCallbackPolicy`], whose
+    /// post-collective model is the consensus. Solo runs fire it inline on
+    /// the training device.
     pub checkpoint_fn: Option<CheckpointFn<M>>,
     /// Per-epoch callback (`epoch, &mut worker`). Fires inside each
     /// worker thread before the epoch plan runs.
@@ -885,7 +904,9 @@ impl<M: Module> TrainerConfig<M> {
         self
     }
 
-    /// Register a checkpoint callback. Fires on the selected rank.
+    /// Register a checkpoint callback. Always receives the consensus model
+    /// (CPU backend: controller-side on a CPU copy; NCCL: elected rank,
+    /// post-collective). See [`Self::checkpoint_fn`].
     pub fn checkpoint_fn(mut self, f: CheckpointFn<M>) -> Self {
         self.checkpoint_fn = Some(f);
         self

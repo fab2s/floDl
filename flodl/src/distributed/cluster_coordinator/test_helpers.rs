@@ -203,6 +203,7 @@ impl ClusterCoordinator {
             checkpoint_every: config.checkpoint_every,
             seed: config.seed,
             checkpoint_at_epoch: config.checkpoint_at_epoch,
+            last_cadence_arm_epoch: 0,
             start_coverage: config.start_coverage.clone(),
             checkpoint_forge: config.checkpoint_forge.clone(),
             pending_checkpoint_coverage: None,

@@ -791,6 +791,208 @@ fn end_to_end_cadence_cpu_via_coord_smoke() {
     }
 }
 
+/// End-to-end natural-end persistence (the PR-B acceptance case): a
+/// SINGLE-EPOCH CPU cluster run with `save_path` set — the regime that
+/// previously persisted NOTHING (no interior epoch boundary, so no cadence
+/// checkpoint; the run trained to completion and left no model on disk) —
+/// must end with the final consensus bundle written by the controller forge
+/// from the run tail's last realized reduce: `<stem>.fdl` present and
+/// positionally loadable, `<stem>.meta.json` present. The run is driven to
+/// its NATURAL end (ticks auto-advance past the aggregated final epoch and
+/// broadcast `Shutdown`); nothing arms a checkpoint explicitly.
+#[test]
+fn end_to_end_cpu_natural_end_writes_final_consensus_bundle() {
+    use crate::distributed::controller::DeadRanks;
+    use crate::distributed::{CheckpointBundle, CheckpointForge, ModelSchema};
+
+    let world_size = 2usize;
+    let total_samples = 32usize;
+    let batch_size = 4usize;
+    let num_epochs = 1usize;
+
+    let dir = std::env::temp_dir().join(format!("flodl_natural_end_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("accept").to_string_lossy().into_owned();
+
+    // The forge is shared exactly as the launcher wires it: the controller
+    // taps averaged Model frames into it, the coordinator arms it.
+    let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+    let schema = ModelSchema::from_module(&ref_model);
+    let forge = CheckpointForge::new(Some(schema), None);
+    let dead_ranks = DeadRanks::new(world_size);
+    let controller = ClusterController::start_with_dead_ranks(
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        world_size,
+        TEST_SALT,
+        dead_ranks,
+        Some(Arc::clone(&forge)),
+        None,
+    )
+    .expect("controller starts");
+    let controller_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), controller.port());
+    let (reduce_addr, _relay_rx) =
+        spawn_relay(ChannelKind::Data, controller_addr, world_size, TEST_SALT);
+
+    let (coord_listener, coord_port) =
+        CCoord::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).expect("coord bind succeeds");
+    let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+    let (coord_addr, _ctrl_relay_rx) =
+        spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
+
+    let stem_for_coord = stem.clone();
+    let forge_for_coord = Arc::clone(&forge);
+    let config_for_coord = move || {
+        let mut cfg = ClusterCoordinatorConfig::new(
+            ApplyPolicy::Cadence,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 1).with_max_anchor(2),
+        )
+        .total_samples(total_samples)
+        .batch_size(batch_size)
+        .num_epochs(num_epochs)
+        .save_path(stem_for_coord);
+        cfg.checkpoint_forge = Some(forge_for_coord);
+        cfg
+    };
+    let coord_thread = thread::spawn(move || -> Result<CCoord> {
+        CCoord::start_from_listener(coord_listener, TEST_SALT, config_for_coord())
+    });
+
+    let initial_params: Vec<Tensor> = ref_model
+        .parameters()
+        .iter()
+        .map(|p| p.variable.data())
+        .collect();
+    let initial_buffers: Vec<Tensor> = ref_model.buffers().iter().map(|b| b.get()).collect();
+    drop(ref_model);
+
+    let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+    for rank_id in 0..world_size {
+        let initial_params = initial_params.clone();
+        let initial_buffers = initial_buffers.clone();
+        worker_handles.push(thread::spawn(move || -> Result<()> {
+            let cpu_client = crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                reduce_addr,
+                rank_id as u32,
+                world_size as u32,
+                TEST_SALT,
+            )?;
+            let config = WorkerConfig {
+                rank: rank_id,
+                world_size,
+                device: Device::CPU,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                augment: 1,
+                transform: None,
+                vram_max_usage: 0.90,
+                ram_max_usage: 0.50,
+                gpu_ram_share: None,
+                sample_cache: true,
+                disk_stage_gb: 0,
+                disk_stage_dir: None,
+                batch_size,
+                seed: 42,
+                epoch_splits: 1,
+                max_grad_norm: None,
+                vram_pool: false,
+                easgd_alpha: None,
+                gamma: 1.0,
+                bf16_wire: false,
+                timeline: None,
+                policy: ApplyPolicy::Cadence,
+                save_path: None,
+                model_sig: [0u8; 32],
+                profile_graph: false,
+                coord_liveness_timeout_secs:
+                    crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            };
+            let dataset: Arc<dyn crate::data::BatchDataSet> =
+                Arc::new(TestDataset { n: total_samples });
+            let worker = ClusterWorker::connect_and_build(
+                coord_addr,
+                Some(cpu_client),
+                rank_id as u32,
+                TEST_SALT,
+                config,
+                move |d| Linear::on_device(4, 2, d),
+                |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                dataset,
+                None,
+                RankCallbacks::default(),
+            )?;
+            worker.run_until_shutdown(mse_train)
+        }));
+    }
+
+    let mut coord = coord_thread
+        .join()
+        .expect("coord thread join")
+        .expect("start_from_listener succeeds");
+
+    coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+
+    // Drive ticks to the run's NATURAL end: the post-aggregate hook sees
+    // `next >= num_epochs` once epoch 0 aggregates and broadcasts Shutdown
+    // itself; workers exit on it. No manual shutdown_workers here — the
+    // natural-end path is exactly what this test exists to exercise.
+    let start = Instant::now();
+    while !worker_handles.iter().all(|h| h.is_finished()) {
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!(
+                "end_to_end_cpu_natural_end: workers still running after 30s \
+                 (natural-end shutdown never fired?)"
+            );
+        }
+        coord.tick().expect("tick");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for h in worker_handles {
+        h.join()
+            .expect("worker thread join")
+            .expect("worker exits clean");
+    }
+
+    // The forge's bundle write is detached; poll briefly for both pieces.
+    let model_path = CheckpointBundle::model_path(&stem);
+    let meta_path = CheckpointBundle::meta_path(&stem);
+    let start = Instant::now();
+    while (!model_path.exists() || !meta_path.exists()) && start.elapsed() < Duration::from_secs(5)
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        model_path.exists(),
+        "natural end wrote the final consensus bundle: {}",
+        model_path.display(),
+    );
+    assert!(
+        meta_path.exists(),
+        "natural end wrote the checkpoint meta: {}",
+        meta_path.display(),
+    );
+
+    // The bundle loads positionally into a fresh model, completely.
+    let fresh = Linear::on_device(4, 2, Device::CPU).unwrap();
+    let report = crate::distributed::load_consensus_checkpoint(
+        &fresh,
+        model_path.to_str().expect("utf8 model path"),
+    )
+    .expect("consensus bundle loads");
+    assert!(
+        report.missing.is_empty() && report.skipped.is_empty(),
+        "positional load is complete: missing={:?} skipped={:?}",
+        report.missing,
+        report.skipped,
+    );
+
+    coord.shutdown().expect("coord shutdown");
+    controller.shutdown().expect("controller shutdown");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // -----------------------------------------------------------------
 // End-to-end Sync+Cpu smoke test scaffolding
 // -----------------------------------------------------------------

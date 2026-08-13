@@ -1272,7 +1272,13 @@ pub fn run_launcher_with_config(
     // checkpoint reduce) — same Arc-sharing pattern as `dead_ranks`. Take the
     // schema out of the coord config (the coord never writes the model itself).
     let model_schema = coord_config.as_mut().and_then(|c| c.model_schema.take());
-    let checkpoint_forge = crate::distributed::CheckpointForge::new(model_schema);
+    // The launch-wrapped user checkpoint_fn travels the same conduit and is
+    // installed on the forge, which fires it on its detached writer thread
+    // when an armed cycle's consensus materializes (CPU backend only).
+    let consensus_fn = coord_config
+        .as_mut()
+        .and_then(|c| c.consensus_checkpoint_fn.take());
+    let checkpoint_forge = crate::distributed::CheckpointForge::new(model_schema, consensus_fn);
     if let Some(cfg) = coord_config.as_mut() {
         cfg.checkpoint_forge = Some(Arc::clone(&checkpoint_forge));
     }

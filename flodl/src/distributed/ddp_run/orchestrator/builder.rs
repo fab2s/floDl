@@ -347,20 +347,27 @@ where
         self
     }
 
-    /// Save a checkpoint every N global epochs.
+    /// Checkpoint cadence in global epochs: fires `checkpoint_fn` (when
+    /// set) with the consensus model, and writes the consensus bundle when
+    /// [`Self::save_path`] is set (each write atomically supersedes the
+    /// last).
     pub fn checkpoint_every(mut self, n: usize) -> Self {
         self.config = self.config.with_checkpoint_every(n);
         self
     }
 
-    /// Set the cluster-mode checkpoint bundle stem. Setting this also
-    /// flips NCCL routing to the controller-driven via_coord path
+    /// Set the checkpoint bundle stem. Setting this makes the bundle the
+    /// run's canonical persist form: a natural clean end always writes the
+    /// FINAL consensus bundle (single-epoch runs included), and
+    /// [`Self::checkpoint_every`] layers periodic consensus bundles on top.
+    /// It also flips NCCL routing to the controller-driven via_coord path
     /// (elastic membership + persistence on unrecoverable failure).
     ///
     /// On unrecoverable failure, the controller writes
     /// `<stem>.meta.json` (trajectory + ElChe state) and each rank
-    /// writes `<stem>.fdl` (model, rank 0) + `<stem>.optim`
-    /// (per-rank optimizer state) before exiting. See
+    /// writes `<stem>.fdl` (model, rank 0 — its OWN model, best-effort;
+    /// on cpu-async that is an EASGD blend, not the consensus) +
+    /// `<stem>.optim` (per-rank optimizer state) before exiting. See
     /// [`crate::distributed::CheckpointBundle`].
     pub fn save_path(mut self, path: impl Into<String>) -> Self {
         self.config = self.config.with_save_path(path);
@@ -587,7 +594,9 @@ where
         self
     }
 
-    /// Set the checkpoint function called on rank 0 after averaging.
+    /// Set the checkpoint function, called with the CONSENSUS model (CPU
+    /// backend: controller-side on a CPU copy loaded from the averaged
+    /// frame; NCCL: on the elected rank, post-collective).
     ///
     /// Receives `(version, &model)`. Errors are logged but do not stop training.
     ///

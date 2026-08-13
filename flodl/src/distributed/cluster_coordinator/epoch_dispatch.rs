@@ -1,7 +1,7 @@
 //! Epoch dispatch and progressive chunk-pool scheduling for
 //! [`super::ClusterCoordinator`].
 
-use crate::distributed::ddp_run::ApplyPolicy;
+use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
 use crate::distributed::wire::ControlMsgWire;
 use crate::tensor::{Result, TensorError};
 
@@ -124,24 +124,33 @@ impl ClusterCoordinator {
         if let Err(e) = self.broadcast_epoch_callback_role_if_dirty() {
             crate::verbose!("  ddp: epoch-callback role broadcast incomplete: {e}");
         }
-        // User checkpoint cadence: when entering epoch N (N > 0) and
-        // `N % checkpoint_every == 0`, broadcast a `Checkpoint(N)` frame
+        // User checkpoint cadence, NCCL only: when entering epoch N (N > 0)
+        // and `N % checkpoint_every == 0`, broadcast a `Checkpoint(N)` frame
         // before `StartEpoch`. Workers fire `checkpoint_fn(N, &model)`
         // on the rank selected by [`EpochCallbackPolicy`]; others have
         // `checkpoint_fn = None` and treat the frame as a no-op. The
         // version reflects "model state at the end of epoch N-1", which
         // matches the `(epoch + 1) % every == 0` checkpoint-cadence
         // semantic (where the `+1` is the same off-by-one as treating
-        // epoch as a 0-indexed counter).
+        // epoch as a 0-indexed counter). The rank's post-collective model is
+        // the consensus on NCCL, which is what makes the rank-side fire
+        // correct there. On the CPU path a rank's model is NOT reliably the
+        // consensus (cpu-async EASGD blends), so the callback fires
+        // CONTROLLER-side instead, from the forge's consensus
+        // materialization (`maybe_arm_checkpoint` — cadence and folded
+        // intent both served at the next reduce).
         if epoch > 0 {
             // Checkpoint fires on the cadence OR on a folded user intent
             // (`Worker::request_checkpoint`) — the intent is a request the
             // controller services at this coherent boundary, cleared once
             // folded.
-            let checkpoint_by_cadence = self
-                .checkpoint_every
-                .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
-            if checkpoint_by_cadence || self.pending_checkpoint_intent {
+            let checkpoint_by_cadence = matches!(self.backend, AverageBackend::Nccl)
+                && self
+                    .checkpoint_every
+                    .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
+            let checkpoint_by_intent =
+                matches!(self.backend, AverageBackend::Nccl) && self.pending_checkpoint_intent;
+            if checkpoint_by_cadence || checkpoint_by_intent {
                 self.pending_checkpoint_intent = false;
                 // Targeted dispatch: the coord's `checkpoint_role`
                 // is the sticky assignee; the worker no-ops unless

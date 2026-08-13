@@ -53,13 +53,18 @@ let handle = Trainer::builder(
     .num_epochs(50)
     .run()?;
 
-let state: TrainedState = handle.join()?;  // params + buffers (CPU)
+let state: TrainedState = handle.join()?;
 ```
 
-`state.params` / `state.buffers` are CPU tensors aligned with
-`build_model_on(Device::CPU)?.parameters()` and `.buffers()`. Drop them
-into a fresh CPU model for inference, or continue training via
-`Trainer::builder(...).resume_from(stem)` (or `TrainerConfig::resume_from`).
+On a single device, `state.params` / `state.buffers` are CPU tensors
+aligned with `build_model_on(Device::CPU)?.parameters()` and
+`.buffers()` — drop them into a fresh CPU model for inference. On
+multi-GPU / cluster runs the run's final model is the **consensus
+bundle on disk** (`.save_path(stem)` — a natural clean end always
+writes `<stem>.fdl`), not the in-process `TrainedState`, which comes
+back empty there: load it with `load_consensus_checkpoint`, or continue
+training via `Trainer::builder(...).resume_from(stem)` (or
+`TrainerConfig::resume_from`).
 
 Per-sample datasets plug in the same way: implement
 `DataSet::get(index)` (or use a shipped disk-backed reader like
@@ -300,10 +305,10 @@ let cfg = TrainerConfig::new(dataset)
 | `.num_epochs(n)` | `usize` | Total epochs. |
 | `.elche(cfg)` | `ElCheConfig` | DDP cadence + backend + tuning. |
 | `.max_grad_norm(f)` | `f64` | Per-rank gradient clip applied before AllReduce. Fused kernel. |
-| `.checkpoint_every(n)` | `usize` | Save a checkpoint every `n` epochs/aggregations. |
+| `.checkpoint_every(n)` | `usize` | Checkpoint cadence in epochs: fires `checkpoint_fn` (when set) with the consensus model, and writes the consensus bundle when `.save_path` is set (each write atomically supersedes the last). |
 | `.save_path(p)` | `String` | Stem for checkpoint bundles (writes `<stem>.fdl` + `<stem>.meta.json`). |
 | `.resume_from(p)` | `String` | Load bundle at start; restores params, buffers, optimizer, ElCheState. |
-| `.checkpoint_fn(f)` | `CheckpointFn<M>` | Called on the elected callback rank with `(epoch, &M)`. |
+| `.checkpoint_fn(f)` | `CheckpointFn<M>` | Called with `(epoch, &M)` on the CONSENSUS model: controller-side on a CPU copy (CPU backend), or on the elected rank post-collective (NCCL). |
 | `.epoch_fn(f)` | `EpochFn<M>` | Per-epoch worker callback (`(epoch, &mut GpuWorker<M>)`). |
 | `.metrics_fn(f)` | `MetricsFn` | Host-side per-epoch callback (`&EpochMetrics`). |
 | `.scheduler_fn(f)` | `SchedulerFn` | Per-worker LR scheduler factory. |
@@ -420,9 +425,10 @@ Controls which rank executes per-epoch callbacks (`checkpoint_fn`,
 "Epoch" normally fuses two things: a full pass over the data, and a
 periodic event during training. They coincide until you train **one pass**,
 which is the normal regime for LLM pretraining — and then the run has no
-interior boundary at all, so no eval, no checkpoint and no reduce-window
-bound until it ends. On rented hardware that can vanish, a lost box is a
-lost run.
+interior boundary at all, so no eval, no mid-run checkpoint and no
+reduce-window bound until it ends (the final consensus bundle still
+writes at a clean end when `.save_path` is set). On rented hardware that
+can vanish mid-pass, a lost box is a lost run.
 
 `epoch_splits` separates the two. `num_epochs` keeps counting **data
 passes**; `epoch_splits` says how finely to slice one:
@@ -831,6 +837,13 @@ TrainerConfig::new(dataset)
 The controller writes meta atomically alongside the model + optimizer
 files. Compatible with `.meta.json` from any prior flodl run.
 
+With `save_path` set, the bundle is the run's canonical persist form: a
+natural clean end always writes the FINAL consensus bundle (the run
+tail's last realized reduce is captured, single-epoch runs included),
+`checkpoint_every` layers periodic consensus bundles on top, and an
+unrecoverable failure writes a best-effort crash bundle (rank-0's own
+model — on cpu-async that is an EASGD blend, not the consensus).
+
 A resume restores more than weights. The meta file carries the balancer's
 learned trajectory, so the cadence controller comes back **calibrated**
 rather than starting over at `Probe`:
@@ -922,7 +935,9 @@ direction and its consistency invariant.
 
 ### Controller-driven checkpoint retry / role failover
 
-A save failure on the elected callback rank does not poison the run.
+NCCL path (the CPU backend fires `checkpoint_fn` controller-side on the
+forge's consensus materialization, so there is no rank dispatch to
+fail over). A save failure on the elected callback rank does not poison the run.
 The coordinator picks a new callback rank from survivors (cost-aware:
 lowest `smoothed_ms_per_batch` first, sticky within a run), re-issues
 the save, and resumes. Failed callbacks are time-excluded from

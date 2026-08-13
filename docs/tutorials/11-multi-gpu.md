@@ -50,6 +50,11 @@ rank, with NCCL cadence (the default `ElCheConfig::default() =
 nccl_cadence()`) and the meta-controller on by default. Zero code
 change.
 
+`state` carries the trained params + buffers on a single device; on a
+promoted multi-GPU run the final model is the consensus bundle on disk
+instead (set `.save_path(stem)` — a clean end always writes
+`<stem>.fdl`; reload with `load_consensus_checkpoint`).
+
 ```
   ddp: 2 GPUs (heterogeneous) | RTX 5060 Ti (16.0 GB) | GTX 1060 (6.0 GB)
   ddp: role=launcher → spawning 2 rank children
