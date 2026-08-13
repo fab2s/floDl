@@ -47,22 +47,28 @@
 #                      `["ProxyJump=bastion", "StrictHostKeyChecking=no"]`
 #     WATCH THE FRAME OF REFERENCE, and note it is not one frame.
 #     `identity_file:` is read by whichever process opens the ssh
-#     connection, and on a rig with a containerised training vehicle that
-#     is TWO different filesystem namespaces:
-#       - `fdl probe`, the cluster pre-flight build and the GPU-count
-#         query are `flodl-cli` (a host binary), so they resolve it on
-#         the HOST.
-#       - `fdl @cluster <cmd>` where the command declares `docker:` runs
-#         the training binary IN that container, and the launcher's own
-#         rank fan-out opens ssh from THERE, so it resolves it inside
-#         the container.
-#     No single value satisfies both. Pick the one the TRAINING path
-#     needs (a broken dispatch kills runs; a red probe only misreports),
-#     and expect `fdl @cluster probe` to fail on that host with
-#     `Identity file ... not accessible` + `Permission denied
-#     (publickey)`. Do not "fix" that by switching to the host path
-#     unless your vehicle has no `docker:` line -- you would trade a
-#     cosmetic probe failure for a broken run.
+#     connection, and on a rig with a containerised training vehicle
+#     that is TWO different filesystem namespaces: `fdl probe` opens ssh
+#     on the HOST, while `fdl @cluster <cmd>` for a command declaring
+#     `docker:` opens its dispatch ssh INSIDE that container (where the
+#     checkout is the workspace mount). No single ABSOLUTE path names
+#     the key in both.
+#     THE FIX IS A RELATIVE PATH: fdl resolves a relative
+#     `identity_file:` against the project root of whichever side opens
+#     the connection (host probe -> this checkout; containerised
+#     dispatch -> the workspace mount) -- the same file either way. For
+#     a key living in the repo (e.g. the join-config wizard's
+#     `.fdl/<farm>/` credentials or a rank container's minted key),
+#     write it relative:
+#       identity_file: .ssh-cuda-rank/cuda_rank_key
+#     The training launcher's own ssh (agent spawn, `tunnel: true`
+#     sessions) is covered too: the envelope fdl ships carries the value
+#     absolutized in the frame the training command executes in.
+#     Absolute and `~/` paths pass through everywhere untouched, so they
+#     stay per-frame: only use them when the key lives OUTSIDE the
+#     checkout, and expect the other frame's ssh to miss it. (A
+#     library-managed `ClusterBuilder` run without fdl keeps verbatim
+#     semantics -- there is no fdl to resolve a project root.)
 #     Everything else in a worker entry (`path:`, anything in `env:`) is
 #     resolved on the WORKER, which is a third frame again.
 #   - `tunnel:` (optional, default false) routes this worker's training
