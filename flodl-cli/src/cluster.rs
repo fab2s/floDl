@@ -258,10 +258,9 @@ pub fn prepare_cluster_env(
     // relative value, resolved host-side) and before envelope emission.
     for w in &mut shippable.workers {
         if let Some(id) = w.ssh.as_mut().and_then(|s| s.identity_file.as_mut())
-            && !Path::new(id.as_str()).is_absolute()
-            && !id.starts_with('~')
+            && !identity_passes_through(id)
         {
-            *id = launcher_root.join(&*id).to_string_lossy().into_owned();
+            *id = join_identity_path(launcher_root, id);
         }
     }
     let json = shippable.canonical_json()?;
@@ -456,10 +455,29 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
     }
 }
 
-/// The warning message when a worker's `ssh.options` set `BatchMode` to a
-/// non-`yes` value, else `None`. flodl's remote ssh (dispatch + probes) is
-/// non-interactive, so a prompt hangs it; `BatchMode=yes` is the one truly
-/// required ssh option. Every other flodl default is freely overridable (M17).
+/// True when an `ssh.identity_file` value passes through to ssh untouched:
+/// an explicit absolute path in ANY frame's spelling, or a `~`-prefixed
+/// home path (ssh expands the tilde itself). The value may name a file in
+/// a DIFFERENT filesystem namespace than the process reading it (a
+/// container mount, a remote box), so a POSIX-rooted path must count as
+/// absolute even on Windows — `Path::is_absolute()` alone calls
+/// `/workspace/key` relative there and a `join` grafts the drive on
+/// (`D:/workspace/key`, caught by the Windows CI leg). The reverse
+/// spelling is covered by `is_absolute()` (`C:\...`, UNC).
+pub(crate) fn identity_passes_through(id: &str) -> bool {
+    id.starts_with('/') || id.starts_with('~') || Path::new(id).is_absolute()
+}
+
+/// Join a relative `ssh.identity_file` onto a project root with a plain
+/// `/`, never [`Path::join`]: the result feeds ssh command lines and the
+/// cross-frame cluster envelope, where a forward slash is right on every
+/// platform (Windows OpenSSH included) — `Path::join` would render `\` on
+/// Windows and ship a platform-spelled path into frames that are not that
+/// platform.
+pub(crate) fn join_identity_path(root: &Path, id: &str) -> String {
+    format!("{}/{}", root.display(), id)
+}
+
 /// Resolve a relative `ssh.identity_file` against the PROJECT ROOT, not
 /// the process cwd. The same overlay value is consumed from two execution
 /// contexts — host-side (`fdl probe`'s remote fan-out) and container-side
@@ -469,22 +487,23 @@ pub(crate) fn apply_worker_ssh_opts(cmd: &mut Command, worker: &config::ClusterW
 /// containerized rank with "Identity file not accessible" + publickey
 /// denial while dispatch kept working. A project-relative path names the
 /// same file in both contexts, each side resolving against its own view
-/// of the checkout. Absolute and `~`-prefixed paths pass through
-/// untouched (ssh expands the tilde itself). Outside a project the
-/// fallback root is `~/.flodl` (the standard [`Context::resolve`]
-/// semantics); a relative key path only makes sense inside a checkout.
+/// of the checkout. Pass-through spellings: [`identity_passes_through`].
+/// Outside a project the fallback root is `~/.flodl` (the standard
+/// [`Context::resolve`] semantics); a relative key path only makes sense
+/// inside a checkout.
 ///
 /// [`Context::resolve`]: crate::context::Context::resolve
 fn resolve_identity_path(id: &str) -> std::ffi::OsString {
-    if Path::new(id).is_absolute() || id.starts_with('~') {
+    if identity_passes_through(id) {
         return id.into();
     }
-    crate::context::Context::resolve()
-        .root
-        .join(id)
-        .into_os_string()
+    join_identity_path(&crate::context::Context::resolve().root, id).into()
 }
 
+/// The warning message when a worker's `ssh.options` set `BatchMode` to a
+/// non-`yes` value, else `None`. flodl's remote ssh (dispatch + probes) is
+/// non-interactive, so a prompt hangs it; `BatchMode=yes` is the one truly
+/// required ssh option. Every other flodl default is freely overridable (M17).
 pub(crate) fn batchmode_override_warning(opts: &[String], host: &str) -> Option<String> {
     opts.iter().find_map(|opt| {
         let (k, v) = opt.split_once('=')?;
@@ -882,16 +901,22 @@ mod tests {
         };
 
         // Relative: project-root-joined (asserted against the same
-        // resolver the code uses, so the test is cwd-independent).
-        let expect = crate::context::Context::resolve()
-            .root
-            .join(".fdl/farm/key")
-            .into_os_string();
+        // resolver + joiner the code uses, so the test is cwd- and
+        // platform-independent — the join is a plain `/`, never the
+        // platform separator, because the value feeds ssh and
+        // cross-frame envelopes).
+        let expect: std::ffi::OsString =
+            join_identity_path(&crate::context::Context::resolve().root, ".fdl/farm/key").into();
         assert_eq!(identity_arg(".fdl/farm/key"), expect);
 
-        // Absolute and tilde: verbatim (ssh expands the tilde itself).
+        // Pass-through spellings, verbatim on EVERY platform: a
+        // POSIX-rooted path may name a file in another frame (a container
+        // mount), so it must not be called relative on Windows — the
+        // first Windows CI run grafted the drive on (`D:/etc/flodl/key`).
         assert_eq!(identity_arg("/etc/flodl/key"), "/etc/flodl/key");
         assert_eq!(identity_arg("~/.ssh/key"), "~/.ssh/key");
+        #[cfg(windows)]
+        assert_eq!(identity_arg("C:\\keys\\id"), "C:\\keys\\id");
     }
 
     #[test]
