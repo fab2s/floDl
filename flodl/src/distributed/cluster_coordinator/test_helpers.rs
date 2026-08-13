@@ -128,17 +128,28 @@ impl ClusterCoordinator {
     /// drive the full wire path should use `spawn_coord` /
     /// `start_from_listener` instead.
     #[cfg(test)]
-    pub(crate) fn for_test(mut config: ClusterCoordinatorConfig) -> Self {
+    pub(crate) fn for_test(config: ClusterCoordinatorConfig) -> Self {
+        Self::for_test_with_timing_tx(config).0
+    }
+
+    /// [`Self::for_test`] variant that keeps the timing sender, for tests
+    /// that need a message ENQUEUED but not yet drained — the tick-interior
+    /// arrival that the pre-decision drain in
+    /// `try_advance_or_shutdown_after_aggregate` exists for.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_timing_tx(
+        mut config: ClusterCoordinatorConfig,
+    ) -> (Self, mpsc::Sender<TimingMsgWire>) {
         let world_size = config.world_size;
         let salt: SessionSalt = [0u8; crate::distributed::wire::SESSION_SALT_BYTES];
-        let (_timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
+        let (timing_tx, timing_rx) = mpsc::channel::<TimingMsgWire>();
         let (_metrics_tx, metrics_rx) = mpsc::channel::<crate::distributed::wire::MetricsMsgWire>();
         let el_che = std::mem::replace(
             &mut config.el_che,
             crate::distributed::ddp::ElChe::new(world_size.max(1), 1),
         );
         let calibrated = config.start_elche_state.is_some() && el_che.is_calibrated();
-        ClusterCoordinator {
+        let coord = ClusterCoordinator {
             policy: config.policy,
             backend: config.backend,
             world_size,
@@ -258,7 +269,8 @@ impl ClusterCoordinator {
             dashboard_sink: config.dashboard_sink.clone(),
             latest_res: vec![crate::monitor::record::ResAcc::default(); world_size],
             event_lane: crate::monitor::event_lane::EventLane::new(),
-        }
+        };
+        (coord, timing_tx)
     }
 
     /// Test-only mutator for the window ledger's compute wall. Used by

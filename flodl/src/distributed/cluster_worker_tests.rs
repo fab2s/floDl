@@ -955,6 +955,24 @@ fn end_to_end_cpu_natural_end_writes_final_consensus_bundle() {
             .expect("worker exits clean");
     }
 
+    // Name the cause before asserting the symptom: a disconnect-truncated
+    // run and a skipped final reduce both end with clean worker exits and
+    // no bundle, and the file assert alone cannot tell them apart (the CI
+    // flake that motivated these). First, the epoch aggregated (the run
+    // did not fall apart mid-flight); second, every step was reduced (the
+    // forced end-of-run consensus reduce fired rather than being skipped
+    // on a lagging trailing-step view).
+    assert_eq!(
+        coord.last_aggregated_epoch(),
+        Some(0),
+        "the run truncated: epoch 0 never aggregated",
+    );
+    assert_eq!(
+        coord.global_step(),
+        total_samples / batch_size,
+        "the final consensus reduce was skipped: not every step was reduced",
+    );
+
     // The forge's bundle write is detached; poll briefly for both pieces.
     let model_path = CheckpointBundle::model_path(&stem);
     let meta_path = CheckpointBundle::meta_path(&stem);
