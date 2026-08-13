@@ -55,6 +55,7 @@ fn test_control_msg_variants() {
         params: vec![],
         buffers: vec![],
         version: 0,
+        realized: true,
     });
 }
 

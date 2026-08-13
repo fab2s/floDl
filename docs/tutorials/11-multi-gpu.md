@@ -324,7 +324,12 @@ Trainer::builder(model_factory, optim_factory, train_step)
 aggregate. `eval_fn` runs on the rank elected by
 `EpochCallbackPolicy::Fastest` (the default - the rank with the lowest
 `smoothed_ms_per_batch`, so eval is free compute on heterogeneous
-rigs). `eval_result_fn` receives the scalar result on the host.
+rigs). `eval_result_fn` receives the scalar result on the host. The
+model `eval_fn` scores is always the cohort consensus - under cpu-async
+EASGD the elected rank swaps the reduce's consensus in for the eval and
+restores its own blend verbatim afterwards, and every run with
+`eval_result_fn` wired scores one final canonical eval on the run's
+final consensus (the same model a checkpoint bundle persists).
 
 Pin a specific rank with `EpochCallbackPolicy::Rank(n)` - `n` is the
 **global rank index** (0..world_size), assigned sequentially by

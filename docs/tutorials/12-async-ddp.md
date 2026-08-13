@@ -345,7 +345,11 @@ the fastest rank has the most idle time at the sync barrier, so eval /
 save runs as free compute. Sticky within a run; re-resolves only on
 rank death. On the CPU backend `checkpoint_fn` fires controller-side
 instead, on the reduce's consensus — a rank's own model is an EASGD
-blend under cpu-async, never the consensus.
+blend under cpu-async, never the consensus. `eval_fn` closes the same
+hole rank-side: the CPU path serves it at the reduce, where the elected
+rank swaps the round's consensus in for the eval and restores its blend
+verbatim, and the final canonical eval scores the run's final consensus
+(the same model the checkpoint bundle persists).
 
 Pin to a specific global rank with `EpochCallbackPolicy::Rank(n)`
 when the research convention demands it. `n` is the **global rank**

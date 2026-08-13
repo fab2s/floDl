@@ -114,6 +114,7 @@ fn sync_params(dst: &mut GpuWorker<Linear>, src: &mut GpuWorker<Linear>) {
         params: snap.params,
         buffers: snap.buffers,
         version: 0,
+        realized: true,
     })
     .unwrap();
     if let Device::CUDA(idx) = test_device() {

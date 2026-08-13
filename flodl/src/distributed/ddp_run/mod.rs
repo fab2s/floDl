@@ -225,8 +225,15 @@ pub enum EvalCadence {
 ///
 /// Framework guarantees:
 /// - Fires on the rank selected by [`EpochCallbackPolicy`].
-/// - Sync-aligned: the chosen rank's model is at its post-AllReduce /
-///   post-EASGD-blend state when invoked.
+/// - **The model it scores is the cohort CONSENSUS**, on both backends.
+///   NCCL fires at the epoch boundary, where the post-collective model
+///   is the consensus. The CPU path serves eval AT the reduce: without
+///   EASGD the post-writeback model is the consensus already; under
+///   EASGD (cpu-async) the rank swap-scores the round's consensus and
+///   restores its blend verbatim, so training is unperturbed. The final
+///   canonical eval (fired once at the natural end when an
+///   `eval_result_fn` is wired) scores the run's final consensus — the
+///   same model the checkpoint bundle persists.
 /// - `model.eval()` is called before and `model.train()` after the
 ///   user's closure; no explicit mode flip needed inside.
 pub type EvalFn<M> =
@@ -1365,6 +1372,12 @@ pub struct AveragedParams {
     pub buffers: Vec<Tensor>,
     /// Monotonically increasing version number.
     pub version: u64,
+    /// Whether this round realized work: `params` is a true consensus
+    /// (mass > 0 reduce). `false` on all-idle / keep-local rounds, where
+    /// `params` hands back the rank's own state — a consensus consumer
+    /// (retained-consensus eval, armed consensus eval) must skip those,
+    /// mirroring the checkpoint forge's realized-work guard.
+    pub realized: bool,
 }
 
 /// Control signals from the coordinator to a GPU worker.
@@ -1467,7 +1480,33 @@ pub(crate) enum ControlMsg {
     /// dataset. Targeted: only the rank whose `rank == target_rank`
     /// runs; others silently no-op. Mirrors
     /// `ExecuteEvalCallback`.
+    ///
+    /// `adopt_consensus`: before scoring, overwrite the model's params
+    /// (and f32 buffers) with the rank's retained last realized
+    /// consensus. Set by the coordinator for the final canonical eval
+    /// on the CPU backend, where an EASGD rank's live model is a blend,
+    /// not the consensus. A worker without `easgd_alpha` ignores the
+    /// flag (its post-writeback model already IS the consensus); a
+    /// worker with no retained consensus reports the error instead of
+    /// silently scoring a blend.
     ExecuteEvalCallback {
+        schedule_id: u64,
+        epoch: u64,
+        target_rank: usize,
+        adopt_consensus: bool,
+    },
+    /// \[CPU path\] Arm a consensus eval for the next realized
+    /// averaging round: when the following `Update` with
+    /// `realized == true` lands, the targeted rank scores the round's
+    /// consensus (under EASGD: stash the post-reduce blend, adopt the
+    /// consensus, eval, restore the blend verbatim; without EASGD the
+    /// post-writeback model already is the consensus, so it evals in
+    /// place). Sent by the coordinator BEFORE the round's
+    /// `RequestParams` broadcast — control-channel FIFO guarantees the
+    /// arm is processed before the round's snapshot, so the directive
+    /// can never race its own round. Targeted like
+    /// [`Self::ExecuteEvalCallback`].
+    ArmConsensusEval {
         schedule_id: u64,
         epoch: u64,
         target_rank: usize,

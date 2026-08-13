@@ -392,8 +392,16 @@ multi-GPU, and multi-host clusters.
 }))
 ```
 
-The coordinator dispatches `eval_fn` per-epoch on the elected callback
-rank, and forwards the returned scalar to `eval_result_fn` on the host.
+The coordinator dispatches `eval_fn` on the elected callback rank and
+forwards the returned scalar to `eval_result_fn` on the host. The model
+it scores is always the cohort **consensus**: on NCCL the boundary
+dispatch lands post-collective; on the CPU backend the eval is served at
+the reduce, and under cpu-async EASGD the elected rank swap-scores the
+round's consensus and restores its blend verbatim, so training is
+unperturbed. A run with `eval_result_fn` wired also fires one final
+canonical eval at the natural end, scoring the run's final consensus —
+the same model the checkpoint bundle persists. Cadence epochs are
+`epoch_splits` slices, so single-pass runs get interior evals too.
 
 ### `EpochCallbackPolicy`
 

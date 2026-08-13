@@ -1,7 +1,7 @@
 //! Control-message dispatch: `handle_control` (non-blocking drain), `drain_until_shutdown`, and the central `dispatch_control` state machine.
 
 use crate::nn::Module;
-use crate::tensor::{Result, TensorError};
+use crate::tensor::Result;
 
 use super::super::{ControlMsg, TimingMsg, make_partition, pick_space};
 use super::GpuWorker;
@@ -58,6 +58,11 @@ impl<M: Module> GpuWorker<M> {
                 // so overshoot steps taken during the averaging round-trip
                 // keep their mass credit for the next frame.
                 self.steps_at_snapshot = self.steps_since_avg;
+                // The retained consensus may alias the pinned snapshot
+                // staging (decode-into); the D2H below clobbers those
+                // bytes, so invalidate BEFORE snapshotting. The round's
+                // `Update` re-retains.
+                self.last_consensus = None;
                 // Instrumentation (gated): time the GPU→CPU readout — the
                 // per-window snapshot the CPU averaging path pays to
                 // publish weights for the reduce.
@@ -80,6 +85,19 @@ impl<M: Module> GpuWorker<M> {
                 // Marker reset so a spurious second Update subtracts 0.
                 self.steps_since_avg = self.steps_since_avg.saturating_sub(self.steps_at_snapshot);
                 self.steps_at_snapshot = 0;
+                // Consensus consumers gate on realized rounds only: an
+                // all-idle round's payload is the rank's own state, not a
+                // consensus. An armed eval survives unrealized rounds and
+                // fires at the next realized one.
+                if avg.realized {
+                    if let Some((schedule_id, epoch)) = self.pending_consensus_eval.take() {
+                        self.consensus_eval_at_reduce(&avg, schedule_id, epoch);
+                    }
+                    // Retain for the final canonical eval (see
+                    // `last_consensus` on the struct for the validity
+                    // window).
+                    self.last_consensus = Some(avg);
+                }
             }
             ControlMsg::StageAdvisory { counts, segments } => {
                 // Purely advisory: forward to the background stager
@@ -278,6 +296,7 @@ impl<M: Module> GpuWorker<M> {
                 schedule_id,
                 epoch,
                 target_rank,
+                adopt_consensus,
             } => {
                 // Targeted: only the rank named by the coord runs.
                 // Mirrors the `Checkpoint` arm; worker never decides
@@ -287,52 +306,70 @@ impl<M: Module> GpuWorker<M> {
                 if target_rank != self.rank {
                     return Ok(false);
                 }
-                // Flip the model into eval mode for BN/Dropout/etc.
-                // correctness, run the user closure against the
-                // held-out dataset, then restore train mode. The
-                // scalar metric (or error) flows back to the
-                // controller via `TimingMsg::EvalResult`; the
-                // controller's `eval_result_fn` fires on receipt.
+                if self.eval_fn.is_none() {
+                    return Ok(false);
+                }
+                // `adopt_consensus` (final canonical eval, CPU): an EASGD
+                // rank's live model is a blend — overwrite it with the
+                // retained last realized consensus before scoring. Without
+                // `easgd_alpha` the post-writeback model already IS the
+                // consensus, so the flag is a no-op. No restore: this only
+                // fires at the run's settled end.
                 //
-                // `elapsed_ms` is measured around the closure (eval
-                // + train-mode flip) so the coord can time-exclude
-                // it from `wall_ms_accum[rank]` — symmetric with the
+                // `elapsed_ms` covers the whole sequence (adopt copies +
+                // eval + mode flips) so the coord's time exclusion absorbs
+                // exactly what stalled the rank — symmetric with the
                 // checkpoint path.
-                if let Some(ref f) = self.eval_fn {
-                    let start = std::time::Instant::now();
-                    let result = match self.eval_dataset.as_ref() {
-                        Some(ds) => {
-                            // Eval forwards run on ONE elected rank; letting
-                            // them feed the profiling accumulator would tilt
-                            // exactly this rank's per-node means.
-                            let profiling_paused = self.pause_graph_profiling();
-                            self.model.eval();
-                            let r = f(&self.model, ds.as_ref());
-                            self.model.train();
-                            if profiling_paused {
-                                self.resume_graph_profiling();
+                let start = std::time::Instant::now();
+                let (metric, error) = if adopt_consensus && self.easgd_alpha.is_some() {
+                    let retained = self
+                        .last_consensus
+                        .as_ref()
+                        .map(|a| (a.params.clone(), a.buffers.clone()));
+                    match retained {
+                        Some((params, buffers)) => {
+                            match self.adopt_consensus_for_final_eval(&params, &buffers) {
+                                Ok(()) => self.eval_metric(),
+                                Err(e) => (
+                                    f64::NAN,
+                                    Some(format!("final consensus adopt failed before eval: {e}")),
+                                ),
                             }
-                            r
                         }
-                        None => Err(TensorError::new(
-                            "ddp: eval_fn set without eval_dataset; \
-                             attach a held-out dataset via \
-                             DdpBuilder::eval_dataset(...)",
-                        )),
-                    };
-                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let (metric, error) = match result {
-                        Ok(m) => (m, None),
-                        Err(e) => (f64::NAN, Some(e.to_string())),
-                    };
-                    let _ = self.timing_tx.send(TimingMsg::EvalResult {
-                        rank: self.rank,
-                        schedule_id,
-                        epoch,
-                        metric,
-                        elapsed_ms,
-                        error,
-                    });
+                        None => (
+                            f64::NAN,
+                            Some(
+                                "final consensus eval requested but no realized \
+                                 consensus is retained on this rank"
+                                    .to_string(),
+                            ),
+                        ),
+                    }
+                } else {
+                    self.eval_metric()
+                };
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let _ = self.timing_tx.send(TimingMsg::EvalResult {
+                    rank: self.rank,
+                    schedule_id,
+                    epoch,
+                    metric,
+                    elapsed_ms,
+                    error,
+                });
+            }
+            ControlMsg::ArmConsensusEval {
+                schedule_id,
+                epoch,
+                target_rank,
+            } => {
+                // Targeted like `ExecuteEvalCallback`. Just arms — the
+                // next realized `Update` fires the consensus eval (see
+                // the `Update` arm above). A re-arm before the previous
+                // fired supersedes it (latest wins; the superseded eval
+                // is a missed cadence, not an error).
+                if target_rank == self.rank {
+                    self.pending_consensus_eval = Some((schedule_id, epoch));
                 }
             }
             ControlMsg::SetEpochCallbackRole { rank } => {
@@ -403,5 +440,97 @@ impl<M: Module> GpuWorker<M> {
             }
         }
         Ok(false)
+    }
+
+    /// Run the user's `eval_fn` against `eval_dataset` on the current
+    /// model and return `(metric, error)` — the `TimingMsg::EvalResult`
+    /// payload halves. Flips the model into eval mode for
+    /// BN/Dropout/etc. correctness and restores train mode after; eval
+    /// forwards run on ONE elected rank, so graph profiling is paused
+    /// around the closure (letting them feed the accumulator would tilt
+    /// exactly this rank's per-node means). Callers gate on
+    /// `eval_fn.is_some()` and own the elapsed measurement + result
+    /// send, so consensus-adopt copies land inside the same
+    /// time-excluded window.
+    pub(super) fn eval_metric(&mut self) -> (f64, Option<String>) {
+        let Some(ref f) = self.eval_fn else {
+            return (
+                f64::NAN,
+                Some("eval dispatched to a rank with no eval_fn (caller gate bug)".to_string()),
+            );
+        };
+        match self.eval_dataset.as_ref() {
+            Some(ds) => {
+                let profiling_paused = self.pause_graph_profiling();
+                self.model.eval();
+                let r = f(&self.model, ds.as_ref());
+                self.model.train();
+                if profiling_paused {
+                    self.resume_graph_profiling();
+                }
+                match r {
+                    Ok(m) => (m, None),
+                    Err(e) => (f64::NAN, Some(e.to_string())),
+                }
+            }
+            None => (
+                f64::NAN,
+                Some(
+                    "ddp: eval_fn set without eval_dataset; attach a held-out \
+                     dataset via DdpBuilder::eval_dataset(...)"
+                        .to_string(),
+                ),
+            ),
+        }
+    }
+
+    /// Fire an armed consensus eval at a realized reduce: score THIS
+    /// round's consensus, then leave the model exactly where the normal
+    /// writeback would have. Runs inside the `Update` arm, so no
+    /// training step can interleave.
+    ///
+    /// - `easgd_alpha == None`: the writeback already overwrote the
+    ///   model with the consensus — eval in place.
+    /// - `easgd_alpha == Some(_)`: the model holds the post-reduce
+    ///   blend; swap-score-restore (`scored_consensus_swap`) stashes the
+    ///   blend, adopts `avg.params`, evals, and restores the blend
+    ///   VERBATIM — bit-identical to a round with no eval.
+    ///
+    /// Best-effort like every callback dispatch: errors ride the
+    /// `EvalResult.error` field instead of failing the control loop.
+    fn consensus_eval_at_reduce(
+        &mut self,
+        avg: &super::super::AveragedParams,
+        schedule_id: u64,
+        epoch: u64,
+    ) {
+        if self.eval_fn.is_none() {
+            // Parity with the wire dispatch: a rank without eval_fn
+            // silently no-ops (role rotation without loud errors).
+            return;
+        }
+        let start = std::time::Instant::now();
+        let (metric, error) = match self.easgd_alpha {
+            None => {
+                // The writeback's H2D is async on the comm stream; eval
+                // forwards are not a train step, so `sync_before_forward`
+                // never covers them — fence here.
+                self.fence_comm_stream();
+                self.eval_metric()
+            }
+            Some(_) => match self.scored_consensus_swap(avg) {
+                Ok(me) => me,
+                Err(e) => (f64::NAN, Some(format!("consensus eval swap failed: {e}"))),
+            },
+        };
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let _ = self.timing_tx.send(TimingMsg::EvalResult {
+            rank: self.rank,
+            schedule_id,
+            epoch,
+            metric,
+            elapsed_ms,
+            error,
+        });
     }
 }

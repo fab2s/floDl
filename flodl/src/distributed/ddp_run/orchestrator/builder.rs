@@ -790,6 +790,13 @@ where
     /// ships the result back to the controller, where
     /// [`Self::eval_result_fn`] fires.
     ///
+    /// The model the closure scores is always the cohort CONSENSUS —
+    /// under cpu-async EASGD the elected rank swap-scores the reduce's
+    /// consensus and restores its blend verbatim (see
+    /// [`EvalFn`](crate::distributed::ddp_run::EvalFn) for the
+    /// per-backend mechanics). Cadence epochs are `epoch_splits`
+    /// slices, so single-pass runs get interior evals too.
+    ///
     /// Errors propagate to the controller as a string and surface in
     /// the per-epoch log; the run continues.
     pub fn eval_fn<E>(mut self, f: E) -> Self

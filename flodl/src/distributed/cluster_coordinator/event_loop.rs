@@ -1025,26 +1025,38 @@ impl ClusterCoordinator {
                     }
                 }
             }
-            // SINGLE CANONICAL EVAL. Every rank now holds the coherent
-            // consensus (the final reduce just landed, or there were no
-            // trailing steps), so dispatch ONE eval to the controller-chosen
-            // rank (`EpochCallbackPolicy::Fastest` by default) — the final
-            // metric is measured once on the canonical model, not redundantly
-            // on every rank. The scalar flows back via
+            // SINGLE CANONICAL EVAL. The final reduce just landed (or there
+            // were no trailing steps), so dispatch ONE eval to the
+            // controller-chosen rank (`EpochCallbackPolicy::Fastest` by
+            // default) — the final metric is measured once on the canonical
+            // model, not redundantly on every rank. The scalar flows back via
             // `TimingMsg::EvalResult` → `eval_result_fn`; mpsc is FIFO so the
             // rank evals before it processes the `Shutdown` sent next tick,
             // and the coordinator's teardown ticks drain the result. Only
             // when an `eval_result_fn` is wired and the chosen rank is alive.
+            //
+            // What the rank's live model IS at this point differs by
+            // backend: NCCL's post-collective model is the consensus, and so
+            // is a CPU alpha=None rank's post-writeback model — but a
+            // cpu-async EASGD rank holds a BLEND. `adopt_consensus` tells
+            // the rank to overwrite its model with its retained last
+            // realized consensus before scoring (a rank without
+            // `easgd_alpha` ignores the flag). A lone survivor gets `false`:
+            // with no live peer there was no reduce to retain from, and its
+            // own trajectory IS the canonical model.
             if self.eval_result_fn.is_some()
                 && self.run_phase == RunPhase::Training
                 && self.eval_role < self.world_size
                 && !self.is_dead(self.eval_role)
             {
                 self.run_phase = RunPhase::FinalEvalDispatched;
+                let adopt_consensus =
+                    matches!(self.backend, AverageBackend::Cpu) && self.active_count >= 2;
                 let msg = ControlMsgWire::ExecuteEvalCallback {
                     schedule_id: u64::MAX, // sentinel: the final canonical eval
                     epoch: self.num_epochs as u64,
                     target_rank: self.eval_role as u64,
+                    adopt_consensus,
                 };
                 if let Err(e) = self.send_control(self.eval_role, &msg) {
                     crate::verbose!("  ddp: final eval dispatch failed: {e}");

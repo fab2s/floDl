@@ -121,7 +121,9 @@ fn rank_policy_skips_fastest_re_resolve() {
 
 /// Integration test: `ExecuteEvalCallback` is dispatched ONLY to
 /// the rank named in `target_rank`. Non-role ranks never see the
-/// frame on their stream.
+/// frame on their stream. NCCL config: the boundary wire dispatch is
+/// NCCL-only now — the CPU path serves eval at the reduce via
+/// `ArmConsensusEval` (see `cpu_eval_cadence_arms_at_reduce`).
 #[test]
 fn eval_dispatched_to_role_only() {
     let world_size = 2;
@@ -133,7 +135,7 @@ fn eval_dispatched_to_role_only() {
     let (port, coord_handle) = spawn_coord(
         world_size,
         move || {
-            cfg_sync_cpu(world_size)
+            cfg_sync_nccl(world_size)
                 .total_samples(8)
                 .batch_size(4)
                 .num_epochs(2)

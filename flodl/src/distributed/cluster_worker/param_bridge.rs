@@ -134,7 +134,7 @@ pub(super) fn param_bridge_loop(
         // all) the triple degenerates to (0, n, n) — pre == post — from
         // a norm-only pass. Computed before the buffer reduce so a
         // later buffer error path can't mask the params triple.
-        let (avg_params, divergence, post_norm, pre_norm) = if total_n == 0.0 {
+        let (avg_params, divergence, post_norm, pre_norm, realized) = if total_n == 0.0 {
             let n = match crate::distributed::divergence::exact_norm(&params) {
                 Ok(n) => n,
                 Err(e) => {
@@ -143,7 +143,7 @@ pub(super) fn param_bridge_loop(
                     return;
                 }
             };
-            (params.clone(), 0.0, n, n)
+            (params.clone(), 0.0, n, n, false)
         } else {
             client.arm_divergence(&params);
             let (adopted, realized) = match sumcount_reduce(&mut client, &params, my_w) {
@@ -170,7 +170,7 @@ pub(super) fn param_bridge_loop(
             } else {
                 accum.finish_keep_local()
             };
-            (adopted, d, post_n, pre_n)
+            (adopted, d, post_n, pre_n, realized)
         };
 
         // Buffers (BatchNorm running stats etc.): equal weight among the
@@ -217,6 +217,7 @@ pub(super) fn param_bridge_loop(
             params: avg_params,
             buffers: avg_buffers,
             version,
+            realized,
         };
         if control_tx.send(ControlMsg::Update(avg)).is_err() {
             // Inner GpuWorker dropped its receiver; tear down.

@@ -993,6 +993,229 @@ fn end_to_end_cpu_natural_end_writes_final_consensus_bundle() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// End-to-end final canonical eval on cpu-async EASGD (the eval-consensus
+/// acceptance case): every rank ends the run holding a BLEND
+/// (`(1-α)·local + α·consensus`), so an eval of any live model would score
+/// a state that exists on no canonical artifact. The final eval dispatch
+/// carries `adopt_consensus`: the elected rank overwrites its model with
+/// the retained last realized consensus before scoring. The proof of
+/// correctness is EQUIVALENCE: the metric (defined as the model's first
+/// weight value) must equal the same weight in the consensus bundle the
+/// forge persisted from the same run — the eval scored exactly the model
+/// the checkpoint canonicalized.
+#[test]
+fn end_to_end_cpu_easgd_final_eval_scores_the_consensus() {
+    use crate::distributed::controller::DeadRanks;
+    use crate::distributed::{CheckpointBundle, CheckpointForge, ModelSchema};
+    use std::sync::Mutex;
+
+    let world_size = 2usize;
+    let total_samples = 32usize;
+    let batch_size = 4usize;
+    let num_epochs = 1usize;
+    let alpha = 0.5f64;
+
+    let dir = std::env::temp_dir().join(format!("flodl_final_eval_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stem = dir.join("accept").to_string_lossy().into_owned();
+
+    let ref_model = Linear::on_device(4, 2, Device::CPU).unwrap();
+    let schema = ModelSchema::from_module(&ref_model);
+    let forge = CheckpointForge::new(Some(schema), None);
+    let dead_ranks = DeadRanks::new(world_size);
+    let controller = ClusterController::start_with_dead_ranks(
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
+        world_size,
+        TEST_SALT,
+        dead_ranks,
+        Some(Arc::clone(&forge)),
+        None,
+    )
+    .expect("controller starts");
+    let controller_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), controller.port());
+    let (reduce_addr, _relay_rx) =
+        spawn_relay(ChannelKind::Data, controller_addr, world_size, TEST_SALT);
+
+    let (coord_listener, coord_port) =
+        CCoord::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).expect("coord bind succeeds");
+    let coord_real_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), coord_port);
+    let (coord_addr, _ctrl_relay_rx) =
+        spawn_relay(ChannelKind::Control, coord_real_addr, world_size, TEST_SALT);
+
+    // The final metric lands here via `eval_result_fn`.
+    let final_metric: Arc<Mutex<Option<(usize, f64)>>> = Arc::new(Mutex::new(None));
+    let metric_slot = Arc::clone(&final_metric);
+
+    let stem_for_coord = stem.clone();
+    let forge_for_coord = Arc::clone(&forge);
+    let config_for_coord = move || {
+        let mut cfg = ClusterCoordinatorConfig::new(
+            ApplyPolicy::Async,
+            AverageBackend::Cpu,
+            world_size,
+            ElChe::new(world_size, 1).with_max_anchor(2),
+        )
+        .total_samples(total_samples)
+        .batch_size(batch_size)
+        .num_epochs(num_epochs)
+        .save_path(stem_for_coord)
+        .eval_result_fn(Arc::new(move |epoch, metric| {
+            *metric_slot.lock().unwrap() = Some((epoch, metric));
+            Ok(())
+        }));
+        cfg.checkpoint_forge = Some(forge_for_coord);
+        cfg
+    };
+    let coord_thread = thread::spawn(move || -> Result<CCoord> {
+        CCoord::start_from_listener(coord_listener, TEST_SALT, config_for_coord())
+    });
+
+    let initial_params: Vec<Tensor> = ref_model
+        .parameters()
+        .iter()
+        .map(|p| p.variable.data())
+        .collect();
+    let initial_buffers: Vec<Tensor> = ref_model.buffers().iter().map(|b| b.get()).collect();
+    drop(ref_model);
+
+    let mut worker_handles: Vec<thread::JoinHandle<Result<()>>> = Vec::new();
+    for rank_id in 0..world_size {
+        let initial_params = initial_params.clone();
+        let initial_buffers = initial_buffers.clone();
+        worker_handles.push(thread::spawn(move || -> Result<()> {
+            let cpu_client = crate::distributed::cpu_reduce::CpuReduceClient::connect(
+                reduce_addr,
+                rank_id as u32,
+                world_size as u32,
+                TEST_SALT,
+            )?;
+            let config = WorkerConfig {
+                rank: rank_id,
+                world_size,
+                device: Device::CPU,
+                initial_params,
+                initial_buffers,
+                total_samples,
+                augment: 1,
+                transform: None,
+                vram_max_usage: 0.90,
+                ram_max_usage: 0.50,
+                gpu_ram_share: None,
+                sample_cache: true,
+                disk_stage_gb: 0,
+                disk_stage_dir: None,
+                batch_size,
+                seed: 42,
+                epoch_splits: 1,
+                max_grad_norm: None,
+                vram_pool: false,
+                easgd_alpha: Some(alpha),
+                gamma: 1.0,
+                bf16_wire: false,
+                timeline: None,
+                policy: ApplyPolicy::Async,
+                save_path: None,
+                model_sig: [0u8; 32],
+                profile_graph: false,
+                coord_liveness_timeout_secs:
+                    crate::distributed::ddp_run::DEFAULT_COORD_LIVENESS_TIMEOUT_SECS,
+            };
+            let dataset: Arc<dyn crate::data::BatchDataSet> =
+                Arc::new(TestDataset { n: total_samples });
+            // The metric IS the model's first weight value at eval time —
+            // it pins WHICH params the final eval saw.
+            let callbacks = RankCallbacks {
+                eval_fn: Some(Arc::new(|model: &Linear, _ds| {
+                    let w = model.parameters()[0].variable.data().to_f32_vec()?;
+                    Ok(w[0] as f64)
+                })),
+                eval_dataset: Some(Arc::new(TestDataset { n: total_samples })),
+                ..RankCallbacks::default()
+            };
+            let worker = ClusterWorker::connect_and_build(
+                coord_addr,
+                Some(cpu_client),
+                rank_id as u32,
+                TEST_SALT,
+                config,
+                move |d| Linear::on_device(4, 2, d),
+                |params| crate::nn::SGD::new(params, 0.01, 0.0),
+                dataset,
+                None,
+                callbacks,
+            )?;
+            worker.run_until_shutdown(mse_train)
+        }));
+    }
+
+    let mut coord = coord_thread
+        .join()
+        .expect("coord thread join")
+        .expect("start_from_listener succeeds");
+
+    coord.dispatch_epoch(0).expect("dispatch_epoch(0) succeeds");
+
+    // Drive to the natural end (the post-aggregate hook forces the final
+    // reduce if trailing steps exist, dispatches the final eval, then
+    // broadcasts Shutdown).
+    let start = Instant::now();
+    while !worker_handles.iter().all(|h| h.is_finished()) {
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!(
+                "end_to_end_cpu_easgd_final_eval: workers still running after \
+                 30s (natural-end shutdown never fired?)"
+            );
+        }
+        coord.tick().expect("tick");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for h in worker_handles {
+        h.join()
+            .expect("worker thread join")
+            .expect("worker exits clean");
+    }
+    // The EvalResult may still be in flight through the relay; keep
+    // ticking until `eval_result_fn` fires.
+    let start = Instant::now();
+    while final_metric.lock().unwrap().is_none() && start.elapsed() < Duration::from_secs(5) {
+        coord.tick().expect("tick");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (eval_epoch, metric) = final_metric
+        .lock()
+        .unwrap()
+        .expect("the final canonical eval must fire and report");
+    assert_eq!(eval_epoch, num_epochs, "the sentinel final-eval epoch");
+    assert!(metric.is_finite(), "final eval failed (NaN metric)");
+
+    // EQUIVALENCE: the metric equals the same weight in the consensus
+    // bundle the forge wrote — the eval scored the canonical model, not a
+    // rank's blend.
+    let model_path = CheckpointBundle::model_path(&stem);
+    let start = Instant::now();
+    while !model_path.exists() && start.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(model_path.exists(), "final consensus bundle written");
+    let fresh = Linear::on_device(4, 2, Device::CPU).unwrap();
+    crate::distributed::load_consensus_checkpoint(
+        &fresh,
+        model_path.to_str().expect("utf8 model path"),
+    )
+    .expect("consensus bundle loads");
+    let bundle_w = fresh.parameters()[0].variable.data().to_f32_vec().unwrap();
+    assert!(
+        (metric - bundle_w[0] as f64).abs() < 1e-6,
+        "the final eval must score exactly the persisted consensus: \
+         eval={metric}, bundle={}",
+        bundle_w[0]
+    );
+
+    coord.shutdown().expect("coord shutdown");
+    controller.shutdown().expect("controller shutdown");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // -----------------------------------------------------------------
 // End-to-end Sync+Cpu smoke test scaffolding
 // -----------------------------------------------------------------

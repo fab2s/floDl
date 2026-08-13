@@ -177,11 +177,21 @@ impl ClusterCoordinator {
             // user intent (`Worker::request_eval`). Targeted to the current
             // `eval_role` (parallels the `Checkpoint` dispatch above): the role
             // is sticky across cadences, re-resolved only on rank death when
-            // policy is `Fastest`.
-            let eval_by_cadence = self
-                .eval_every_epochs
-                .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
-            if eval_by_cadence || self.pending_eval_intent {
+            // policy is `Fastest`. NCCL only: the rank's post-collective
+            // model IS the consensus at the boundary (the eval frame is
+            // queued before StartEpoch, so no new-epoch step precedes it).
+            // On the CPU path the boundary model is NOT reliably the
+            // consensus (cpu-async EASGD blends, and atomic dispatch lets
+            // steps precede this frame), so cadence and intent are served
+            // AT the reduce instead via `maybe_arm_eval` — where the
+            // consensus exists by construction.
+            let eval_by_cadence = matches!(self.backend, AverageBackend::Nccl)
+                && self
+                    .eval_every_epochs
+                    .is_some_and(|every| every > 0 && epoch.is_multiple_of(every));
+            let eval_by_intent =
+                matches!(self.backend, AverageBackend::Nccl) && self.pending_eval_intent;
+            if eval_by_cadence || eval_by_intent {
                 self.pending_eval_intent = false;
                 // schedule_id derived from epoch for now (one eval
                 // per cadence); a richer scheduler would mint a
@@ -192,6 +202,7 @@ impl ClusterCoordinator {
                     schedule_id: epoch as u64,
                     epoch: epoch as u64,
                     target_rank: target as u64,
+                    adopt_consensus: false,
                 };
                 // Best-effort, same rationale as the checkpoint
                 // dispatch above.
