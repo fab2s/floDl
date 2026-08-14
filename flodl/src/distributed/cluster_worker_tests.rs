@@ -973,22 +973,32 @@ fn end_to_end_cpu_natural_end_writes_final_consensus_bundle() {
         "the final consensus reduce was skipped: not every step was reduced",
     );
 
-    // The forge's bundle write is detached; poll briefly for both pieces.
+    // The forge's bundle write is detached; poll for both pieces. The
+    // budget is generous because a loaded CI box legitimately stretches
+    // the writer thread's wall clock (a 90x-slower suite run was observed)
+    // and a slow write is not a defect. On expiry the message carries the
+    // forge's forensic counters, which split the silent failure modes: no
+    // arm (predicate hole), armed without a spawn (accumulation hole), or
+    // spawned without a file (writer/filesystem).
     let model_path = CheckpointBundle::model_path(&stem);
     let meta_path = CheckpointBundle::meta_path(&stem);
     let start = Instant::now();
-    while (!model_path.exists() || !meta_path.exists()) && start.elapsed() < Duration::from_secs(5)
+    while (!model_path.exists() || !meta_path.exists()) && start.elapsed() < Duration::from_secs(30)
     {
         thread::sleep(Duration::from_millis(10));
     }
+    let (arms, spawns) = forge.forensics();
     assert!(
         model_path.exists(),
-        "natural end wrote the final consensus bundle: {}",
+        "natural end wrote the final consensus bundle: {} \
+         (meta present: {}, forge arms: {arms}, writer spawns: {spawns})",
         model_path.display(),
+        meta_path.exists(),
     );
     assert!(
         meta_path.exists(),
-        "natural end wrote the checkpoint meta: {}",
+        "natural end wrote the checkpoint meta: {} \
+         (forge arms: {arms}, writer spawns: {spawns})",
         meta_path.display(),
     );
 
