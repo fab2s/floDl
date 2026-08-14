@@ -145,6 +145,52 @@ fn final_tail_arms_progressive() {
 }
 
 #[test]
+fn final_tail_arms_after_the_aggregated_pool_was_removed() {
+    // The forced end-of-run reduce runs POST-aggregate, and
+    // `aggregate_ready_epochs` removes the aggregated epoch's pool — so the
+    // tail check must read "epoch aggregated" as the tail rather than
+    // misreading the missing pool as "not dispatched yet". That misread
+    // left the natural-end bundle unwritten on loaded CI boxes (forge
+    // forensics: arms == 0 with every step provably reduced).
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = 2;
+    let cfg = ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 4),
+    )
+    .no_divergence_guard()
+    .total_samples(32)
+    .batch_size(4)
+    .num_epochs(1)
+    .save_path("/nonexistent/never-written");
+    let mut coord = ClusterCoordinator::for_test(cfg);
+
+    // Post-aggregate state: no pool for epoch 0 (removed), epoch 0
+    // aggregated. The pre-aggregate "no pool = not dispatched yet"
+    // reading must NOT apply.
+    assert!(coord.chunk_pools.is_empty());
+    assert!(
+        !coord.run_tail_within_one_window(0),
+        "not dispatched and not aggregated: not the tail"
+    );
+    coord.last_aggregated_epoch = Some(0);
+    assert!(
+        coord.run_tail_within_one_window(0),
+        "an aggregated epoch is the tail regardless of its removed pool"
+    );
+
+    coord.maybe_arm_checkpoint();
+    assert!(
+        coord.pending_checkpoint_coverage.is_some(),
+        "the post-aggregate forced reduce must arm the final bundle"
+    );
+}
+
+#[test]
 fn final_tail_ignores_non_final_epochs_and_missing_save_path() {
     use crate::distributed::ddp::ElChe;
     use crate::distributed::ddp_run::AverageBackend;

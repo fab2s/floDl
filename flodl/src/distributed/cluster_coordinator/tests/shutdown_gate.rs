@@ -109,6 +109,66 @@ fn final_reduce_decision_drains_pending_timing_first() {
 }
 
 #[test]
+fn post_aggregate_forced_reduce_arms_the_final_bundle() {
+    // The full CI-flake shape, both layers composed: the trailing-step
+    // report and the epoch end land inside one tick body, so the last
+    // reduce is the POST-aggregate forced one — by which point
+    // `aggregate_ready_epochs` has removed the epoch's pool. The
+    // pre-decision drain must surface the trailing step (layer one) and
+    // the tail check must treat the aggregated epoch as the tail despite
+    // its missing pool (layer two), so the forced reduce ARMS the forge —
+    // arms == 0 here was exactly the CI forensics signature.
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::{ApplyPolicy, AverageBackend};
+    use crate::distributed::{CheckpointForge, ModelSchema};
+
+    let world_size = 2;
+    let model = crate::nn::Linear::on_device(4, 2, crate::tensor::Device::CPU).unwrap();
+    let forge = CheckpointForge::new(Some(ModelSchema::from_module(&model)), None);
+    let mut cfg = super::super::ClusterCoordinatorConfig::new(
+        ApplyPolicy::Cadence,
+        AverageBackend::Cpu,
+        world_size,
+        ElChe::new(world_size, 1),
+    )
+    .no_divergence_guard()
+    .total_samples(32)
+    .batch_size(4)
+    .num_epochs(1)
+    .save_path("/nonexistent/never-written");
+    cfg.checkpoint_forge = Some(std::sync::Arc::clone(&forge));
+    let (mut coord, timing_tx) = ClusterCoordinator::for_test_with_timing_tx(cfg);
+
+    // Post-aggregate, pool removed, trailing-step report still undrained.
+    coord.last_aggregated_epoch = Some(0);
+    assert!(coord.chunk_pools.is_empty());
+    timing_tx
+        .send(crate::distributed::wire::TimingMsgWire::Batch {
+            rank: 0,
+            batch_ms: 1.0,
+            data_ms: 0.0,
+            step_count: 8,
+            param_norm: None,
+            batch_loss: 0.5,
+            sync_divergence: None,
+        })
+        .expect("timing enqueue");
+
+    coord.try_advance_or_shutdown_after_aggregate();
+
+    assert_eq!(
+        coord.run_phase,
+        RunPhase::Training,
+        "the forced final reduce must fire, not the shutdown broadcast",
+    );
+    let (arms, _) = forge.forensics();
+    assert_eq!(
+        arms, 1,
+        "the forced post-aggregate reduce must arm the final consensus bundle",
+    );
+}
+
+#[test]
 fn shutdown_gate_dead_rank_counts_as_settled() {
     // A dead rank's ack never arrives; the alive cohort's collective was
     // already released by the abort/rebuild path, so waiting for the
