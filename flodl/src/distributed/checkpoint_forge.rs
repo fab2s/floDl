@@ -195,6 +195,13 @@ pub struct CheckpointForge {
     consensus_fn: Option<ConsensusModelFn>,
     /// Mutable accumulation state (armed checkpoint + tensors gathered so far).
     inner: Mutex<ForgeState>,
+    /// Lifetime count of arms taken (relaxed; forensics only). With
+    /// `writers_spawned` this splits a missing artifact three ways: never
+    /// armed, armed but the cycle's frame never completed the accumulation,
+    /// or handed to a writer that has not finished yet.
+    arms_taken: std::sync::atomic::AtomicUsize,
+    /// Lifetime count of detached writer threads successfully spawned.
+    writers_spawned: std::sync::atomic::AtomicUsize,
 }
 
 /// One armed consensus capture: what to do with the cycle's materialized
@@ -234,7 +241,19 @@ impl CheckpointForge {
             schema,
             consensus_fn,
             inner: Mutex::new(ForgeState::default()),
+            arms_taken: std::sync::atomic::AtomicUsize::new(0),
+            writers_spawned: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Forensic counters: `(arms taken, writers spawned)`. Meant for test
+    /// failure messages and post-mortems, not control flow.
+    pub fn forensics(&self) -> (usize, usize) {
+        (
+            self.arms_taken.load(std::sync::atomic::Ordering::Relaxed),
+            self.writers_spawned
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Whether a consensus callback is installed (the coordinator's gate for
@@ -266,6 +285,8 @@ impl CheckpointForge {
         });
         st.accumulated.clear();
         st.pending_outer = None;
+        self.arms_taken
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a bundle write is currently armed (a `<stem>.fdl` path is
@@ -397,8 +418,14 @@ impl CheckpointForge {
                     eprintln!("flodl ddp: checkpoint_fn (v{version}, consensus) failed: {e}");
                 }
             });
-        if let Err(e) = spawn {
-            eprintln!("flodl ddp: failed to spawn checkpoint writer thread: {e}");
+        match spawn {
+            Ok(_) => {
+                self.writers_spawned
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                eprintln!("flodl ddp: failed to spawn checkpoint writer thread: {e}");
+            }
         }
     }
 }
