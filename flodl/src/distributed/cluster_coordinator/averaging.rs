@@ -787,7 +787,9 @@ impl ClusterCoordinator {
     /// Whether the run's remaining work fits within one reduce window: the
     /// tail criterion the final-consensus arm in
     /// [`Self::maybe_arm_checkpoint`] checks for `epoch` (the in-flight FINAL
-    /// epoch). Same near-empty shape as `refresh_final_window_plan`
+    /// epoch). An already-aggregated `epoch` is the tail unconditionally —
+    /// see the first check below, which also covers its removed pool.
+    /// Otherwise, same near-empty shape as `refresh_final_window_plan`
     /// (`remaining < Σcounts + world_size`), but policy-independent —
     /// progressive dispatch reads the epoch pool's undispatched remainder,
     /// non-progressive derives the remainder from the cached epoch plans
@@ -796,6 +798,18 @@ impl ClusterCoordinator {
     /// chunks; step counters ride timing reports), which only ever fires the
     /// arm a window early — an extra superseded bundle write, never a miss.
     pub(super) fn run_tail_within_one_window(&self, epoch: usize) -> bool {
+        // An epoch that has already aggregated has zero work remaining by
+        // definition — the deepest possible tail. This must be answered
+        // BEFORE the pool lookup below: `aggregate_ready_epochs` REMOVES
+        // an aggregated epoch's chunk pool, so a bare lookup misreads the
+        // absence as "not dispatched yet" and the forced post-aggregate
+        // end-of-run reduce becomes unarmable — the natural-end bundle
+        // then silently never writes (the CI-only flake's second layer,
+        // caught by the forge forensic counters: arms == 0 on a run whose
+        // every step had provably been reduced).
+        if self.last_aggregated_epoch.is_some_and(|agg| agg >= epoch) {
+            return true;
+        }
         let counts = self.el_che.batch_counts();
         let alive = |r: &usize| !self.is_dead(*r);
         let total_counts: usize = (0..self.world_size)
