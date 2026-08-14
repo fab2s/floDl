@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::Graph;
 use super::trend::{Trend, TrendGroup};
+use crate::monitor::envelope::EnvelopeAcc;
 use crate::tensor::{Device, GpuEvent, GpuEventFlags};
 
 /// Which clock produced a [`Profile`]'s timings.
@@ -160,20 +161,28 @@ struct NodeStatAcc {
     id: String,
     tag: String,
     level: usize,
-    min_secs: f64,
-    sum_secs: f64,
+    timing: EnvelopeAcc,
 }
 
 /// Internal accumulator behind [`Graph::profile_stats`]. Fed at every
 /// profile store; a source change (the graph moved devices) resets it,
 /// since host-clock and device-event samples must not average together.
+///
+/// Cumulative, not per-interval: the envelopes cover every accumulated
+/// pass and are read with `peek`, since a publish must not blank the
+/// history for the next reader.
 pub(crate) struct ProfileStatsAcc {
     source: ProfileSource,
     to_skip: usize,
-    samples: usize,
-    total_min_secs: f64,
-    total_sum_secs: f64,
+    total: EnvelopeAcc,
     nodes: Vec<NodeStatAcc>,
+}
+
+/// An accumulated envelope's field as a `Duration`, `None` reading as zero:
+/// an unfed accumulator has no timing to report and the surfaces render a
+/// zero rather than an absence.
+fn secs_or_zero(v: Option<f64>) -> Duration {
+    Duration::from_secs_f64(v.unwrap_or(0.0))
 }
 
 impl ProfileStatsAcc {
@@ -181,11 +190,15 @@ impl ProfileStatsAcc {
         ProfileStatsAcc {
             source,
             to_skip: PROFILE_WARMUP_PASSES,
-            samples: 0,
-            total_min_secs: f64::INFINITY,
-            total_sum_secs: 0.0,
+            total: EnvelopeAcc::default(),
             nodes: Vec::new(),
         }
+    }
+
+    /// Passes accumulated (warmup excluded). One total per fed pass, so the
+    /// envelope's own count is the sample count.
+    fn samples(&self) -> usize {
+        self.total.count() as usize
     }
 
     fn feed(&mut self, p: &Profile) {
@@ -201,43 +214,36 @@ impl ProfileStatsAcc {
                     id: n.id.clone(),
                     tag: n.tag.clone(),
                     level: n.level,
-                    min_secs: f64::INFINITY,
-                    sum_secs: 0.0,
+                    timing: EnvelopeAcc::default(),
                 })
                 .collect();
         }
-        let total = p.total.as_secs_f64();
-        self.total_min_secs = self.total_min_secs.min(total);
-        self.total_sum_secs += total;
+        self.total.push(p.total.as_secs_f64());
         for (acc, n) in self.nodes.iter_mut().zip(&p.nodes) {
-            let secs = n.duration.as_secs_f64();
-            acc.min_secs = acc.min_secs.min(secs);
-            acc.sum_secs += secs;
+            acc.timing.push(n.duration.as_secs_f64());
         }
-        self.samples += 1;
     }
 
     fn snapshot(&self, structural_hash: &str) -> ProfileStats {
-        let n = self.samples.max(1) as f64;
+        let total = self.total.peek();
         ProfileStats {
             source: self.source,
             structural_hash: structural_hash.to_string(),
-            samples: self.samples,
-            total_min: Duration::from_secs_f64(if self.samples > 0 {
-                self.total_min_secs
-            } else {
-                0.0
-            }),
-            total_mean: Duration::from_secs_f64(self.total_sum_secs / n),
+            samples: self.samples(),
+            total_min: secs_or_zero(total.map(|e| e.min)),
+            total_mean: secs_or_zero(total.map(|e| e.mean)),
             nodes: self
                 .nodes
                 .iter()
-                .map(|a| NodeStat {
-                    id: a.id.clone(),
-                    tag: a.tag.clone(),
-                    level: a.level,
-                    min: Duration::from_secs_f64(if self.samples > 0 { a.min_secs } else { 0.0 }),
-                    mean: Duration::from_secs_f64(a.sum_secs / n),
+                .map(|a| {
+                    let env = a.timing.peek();
+                    NodeStat {
+                        id: a.id.clone(),
+                        tag: a.tag.clone(),
+                        level: a.level,
+                        min: secs_or_zero(env.map(|e| e.min)),
+                        mean: secs_or_zero(env.map(|e| e.mean)),
+                    }
                 })
                 .collect(),
         }
@@ -411,11 +417,11 @@ impl Graph {
             .profile_stats_acc
             .borrow()
             .as_ref()
-            .is_none_or(|a| a.samples == 0);
+            .is_none_or(|a| a.samples() == 0);
         self.resolve_gpu_profile(nothing_to_serve);
         let acc = self.profile_stats_acc.borrow();
         let a = acc.as_ref()?;
-        if a.samples == 0 {
+        if a.samples() == 0 {
             return None;
         }
         Some(a.snapshot(self.structural_hash()))

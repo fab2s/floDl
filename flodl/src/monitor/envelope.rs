@@ -66,6 +66,10 @@ pub struct Envelope {
 /// on different cadences need two accumulators — draining is destructive, so a
 /// shared one would let whichever consumer publishes first blank the interval
 /// for the other.
+///
+/// Not every accumulator is per-interval: a *cumulative* one covers the whole
+/// run and is read repeatedly, so it reads with [`peek`](Self::peek) and never
+/// drains. Both kinds share the accumulator; only the read differs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvelopeAcc {
     min: f64,
@@ -115,17 +119,27 @@ impl EnvelopeAcc {
         self.n
     }
 
-    /// Take the interval's envelope and reset, or `None` if nothing was
-    /// observed.
-    pub fn take(&mut self) -> Option<Envelope> {
+    /// Read the envelope without draining, or `None` if nothing was observed.
+    ///
+    /// What a cumulative accumulator needs: the graph profiler keeps one
+    /// envelope per node for the whole run and is read at every publish, so a
+    /// draining read would hand the first reader the run and every later one a
+    /// fragment.
+    pub fn peek(&self) -> Option<Envelope> {
         if self.n == 0 {
             return None;
         }
-        let env = Envelope {
+        Some(Envelope {
             min: self.min,
             mean: self.sum / self.n as f64,
             max: self.max,
-        };
+        })
+    }
+
+    /// Take the interval's envelope and reset, or `None` if nothing was
+    /// observed.
+    pub fn take(&mut self) -> Option<Envelope> {
+        let env = self.peek()?;
         *self = Self::default();
         Some(env)
     }
@@ -170,6 +184,31 @@ mod tests {
             (10.0, 10.0, 10.0),
             "no contribution from the drained interval"
         );
+    }
+
+    #[test]
+    fn peek_reads_the_same_envelope_without_draining_it() {
+        // The cumulative case (graph profiler): read at every publish, keep
+        // accumulating. Every read must describe everything seen so far.
+        let mut acc = EnvelopeAcc::default();
+        assert_eq!(acc.peek(), None, "nothing observed -> absent, not zero");
+        acc.push(10.0);
+        acc.push(30.0);
+        assert_eq!(acc.peek(), acc.take(), "peek and take agree on the value");
+
+        let mut acc = EnvelopeAcc::default();
+        acc.push(10.0);
+        acc.push(30.0);
+        let first = acc.peek().unwrap();
+        acc.push(50.0);
+        let second = acc.peek().unwrap();
+        assert_eq!((first.mean, first.max), (20.0, 30.0));
+        assert_eq!(
+            (second.mean, second.max),
+            (30.0, 50.0),
+            "the first read must not have dropped the samples behind it"
+        );
+        assert_eq!(acc.count(), 3);
     }
 
     #[test]
