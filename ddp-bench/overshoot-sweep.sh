@@ -11,8 +11,21 @@
 #   PIN=320 STAGE=2 ./overshoot-sweep.sh    # stage 1b: cadence pinned (7 cells)
 #   PIN=320 STAGE=3 ./overshoot-sweep.sh    # + the depth probe (N=200, 400)
 #
-# Env: SWEEP_OUT (defaults to runs/overshoot-easgd, or runs/overshoot-pinned
-#      when PIN is set), STAGE (1, 2 or 3), PIN (fixed anchor, see below),
+# SMALL-MODEL A/B (the derived-overshoot safety question, 15 cells):
+#
+#   PROFILE=small SEEDS="1 2 3 4 5" ./overshoot-sweep.sh
+#
+# lenet's reduce is fixed-cost dominated (41 ms against a 65 ms window),
+# so the DERIVED per-rank budget lands at ~0.63 of the allocation where
+# resnet-graph sits at 0.04 and olmo at 0.21. Every overshoot quality
+# number so far was measured at ~0.2, so the small-model regime is the
+# one that ships untested. Arms are no-overshoot / the flat 15 that the
+# derivation replaced / the derived budget, over five seeds because the
+# claim is convergence and a one-seed gap there is initialization luck.
+#
+# Env: SWEEP_OUT (defaults per profile/PIN), STAGE (1, 2 or 3; ignored by
+#      PROFILE=small), PIN (fixed anchor, see below), PROFILE (olmo|small),
+#      SEEDS (space-separated, default 42; >1 suffixes each cell `-s<seed>`),
 #      FARM (default cluster-join), OVS_WALKINS (REQUIRED, see below).
 #
 # ── WHY WALK-IN AND NOT `fdl @cluster` FAN-OUT ─────────────────────────
@@ -172,8 +185,16 @@ cd "$(dirname "$0")/.."
 # the 13.6% wall win SURVIVES at 24 reduces instead of 64, since the 2.7x
 # wire traffic is the part a metered link may not afford.
 PIN=${PIN:-}
+
+# PROFILE selects the model under test. The orchestration below is the
+# same either way -- walk-in dials, the arm-identity gate, the roster
+# wait -- and that machinery is the expensive, rig-specific part, so a
+# second model is a profile here rather than a second copy of this file.
+PROFILE=${PROFILE:-olmo}
 if [ -n "$PIN" ]; then
   DEFAULT_OUT=runs/overshoot-pinned
+elif [ "$PROFILE" = small ]; then
+  DEFAULT_OUT=runs/overshoot-small
 else
   DEFAULT_OUT=runs/overshoot-easgd
 fi
@@ -185,19 +206,41 @@ FARM=${FARM:-cluster-join}
 LOGDIR=${OVS_LOGDIR:-target/overshoot-sweep}
 mkdir -p "$ABS_OUT" "$LOGDIR"
 
-MODEL=olmo-graph
-# Every arm runs cpu-async + diloco, so the harness writes each cell to
-# <arm>/olmo-graph/cpu-async-diloco/. The ARM is the outer directory
-# because the model and mode are constant here; only N and alpha move.
-CELL=$MODEL/cpu-async-diloco
-# --save-dashboard is timing-safe and therefore safe here even though wall
-# is a measured variable: the cluster path builds its dashboard sink
-# unconditionally, so the flag adds only the run-scoped cards (built
-# before the timer starts) and one file write at teardown. Same reasoning
-# sweep.sh records for the published numbers. --reports-per-epoch stays
-# OFF for the opposite reason: it emits on the hot path at the reduce
-# boundary, which is precisely the window being measured.
-FIXED="--model $MODEL --mode cpu-async --outer-optimizer diloco --train-tokens 20M --bf16-wire --epochs 1 --epoch-splits 20 --seed 42 --save-dashboard"
+# SEEDS is the axis that makes a QUALITY claim admissible. The olmo sweep
+# runs one seed on purpose (it measures throughput, where the effect dwarfs
+# seed noise, and its own report prints "single seed, NOT a quality verdict"
+# beside the eval column). The small-model question is the opposite shape:
+# the whole claim IS convergence, so a one-seed difference there would be
+# indistinguishable from initialization luck.
+SEEDS=${SEEDS:-42}
+SEED_COUNT=$(set -- $SEEDS; echo $#)
+
+if [ "$PROFILE" = small ]; then
+  # lenet: MNIST, no BatchNorm, ~0.44 ms/batch. Chosen because it is the
+  # measured WORST CASE for the derived budget -- its reduce is fixed-cost
+  # dominated (41 ms against a 65 ms window), so o_k lands at ~0.63 of the
+  # allocation where resnet-graph sits at 0.04. Plain cpu-async, no outer
+  # optimizer: DiLoCo consumes the window displacement as a pseudo-gradient,
+  # which is a second thing overshoot changes, and the point here is to
+  # isolate staleness.
+  MODEL=lenet
+  CELL=$MODEL/cpu-async
+  FIXED="--model $MODEL --mode cpu-async --epochs 20 --save-dashboard"
+else
+  MODEL=olmo-graph
+  # Every arm runs cpu-async + diloco, so the harness writes each cell to
+  # <arm>/olmo-graph/cpu-async-diloco/. The ARM is the outer directory
+  # because the model and mode are constant here; only N and alpha move.
+  CELL=$MODEL/cpu-async-diloco
+  # --save-dashboard is timing-safe and therefore safe here even though wall
+  # is a measured variable: the cluster path builds its dashboard sink
+  # unconditionally, so the flag adds only the run-scoped cards (built
+  # before the timer starts) and one file write at teardown. Same reasoning
+  # sweep.sh records for the published numbers. --reports-per-epoch stays
+  # OFF for the opposite reason: it emits on the hot path at the reduce
+  # boundary, which is precisely the window being measured.
+  FIXED="--model $MODEL --mode cpu-async --outer-optimizer diloco --train-tokens 20M --bf16-wire --epochs 1 --epoch-splits 20 --save-dashboard"
+fi
 if [ -n "$PIN" ]; then
   FIXED="$FIXED --min-anchor $PIN --max-anchor $PIN --guard none"
 fi
@@ -233,7 +276,20 @@ STAGE2_ARMS="D0:0:0.25 D1:104:0.25"
 # read eval_CE and d_peak, not the OK line.
 DEPTH_ARMS="E1:200:0.5 E2:400:0.5"
 
+# SMALL-MODEL arms: the decisive triple for "does the derived budget hurt a
+# model whose reduce is fixed-cost dominated". All three share one alpha
+# (omitted = the CpuAsync default 0.5), so overshoot is the only thing moving.
+#   N0   no overshoot at all -- the convergence reference.
+#   F15  the ceiling the derivation REPLACED. It is not a straw man: on lenet
+#        the derived budget is ~31/rank, so 15 is the nearest neighbour and
+#        isolates "more overshoot" from "derived rather than flat".
+#   AUTO the derived budget, which is what actually ships.
+# Read eval CE ACROSS SEEDS, never a single pair: the effect being looked for
+# is smaller than seed noise on a 20-epoch MNIST run.
+SMALL_ARMS="N0:0:default F15:15:default AUTO:auto:default"
+
 arms_for_stage() {
+  if [ "$PROFILE" = small ]; then echo "$SMALL_ARMS"; return; fi
   case "$1" in
     3) echo "$STAGE1_ARMS $STAGE2_ARMS $DEPTH_ARMS" ;;
     2) echo "$STAGE1_ARMS $STAGE2_ARMS" ;;
@@ -301,6 +357,8 @@ stamp() {
   { echo "arm:            $1"
     echo "max_overshoot:  $2"
     echo "easgd_alpha:    $3"
+    echo "seed:           $6"
+    echo "model:          $MODEL"
     echo "topology:       walk-in (farm=$FARM), rental-parity"
     echo "invocation:     $4"
     echo "walkins:        $5 box(es)"
@@ -335,14 +393,19 @@ echo "$(ts) OVERSHOOT SWEEP BEGIN rev=$(git rev-parse --short HEAD) stage=$STAGE
 echo "$(ts) fixed: $FIXED"
 echo "$(ts) arms: $ARMS"
 
-for arm in $ARMS; do
+for arm_seed in $(for a in $ARMS; do for s in $SEEDS; do echo "$a:$s"; done; done); do
+  seed=${arm_seed##*:}
+  arm=${arm_seed%:*}
   label=${arm%%:*}
   rest=${arm#*:}
   n=${rest%%:*}
   alpha=${rest##*:}
+  # One seed keeps the bare label, so an existing single-seed sweep dir
+  # stays resumable at exactly the paths it already wrote.
+  [ "$SEED_COUNT" -gt 1 ] && label="$label-s$seed"
 
   if cell_done "$label"; then echo "$(ts) SKIP $label (done)"; continue; fi
-  echo "$(ts) START $label (max_overshoot=$n easgd_alpha=$alpha)"
+  echo "$(ts) START $label (max_overshoot=$n easgd_alpha=$alpha seed=$seed)"
 
   # ONE core arg string, used by the controller AND appended to every dial.
   # Divergence there is the hazard this whole script is shaped around, so
@@ -350,7 +413,7 @@ for arm in $ARMS; do
   # the controller's is the sweep's cell, each walk-in's is absolute and
   # node-local so it can be neither root-owned repo pollution nor a write
   # into a read-only mount.
-  CORE_ARGS="$FIXED$(arm_flags "$n" "$alpha")"
+  CORE_ARGS="$FIXED --seed $seed$(arm_flags "$n" "$alpha")"
   WALKIN_OUT="/tmp/ovs-$label"
   clog="$LOGDIR/$label-controller.log"
 
@@ -449,7 +512,7 @@ EOF
   if [ $rc -eq 0 ] && [ "$degraded" -eq 0 ] && [ "$warns" -eq 0 ] \
      && [ "$agents_ok" -eq 1 ] && [ "$cfg_ok" -eq 1 ] \
      && grep -aq "done:" "$clog" && cell_done "$label"; then
-    stamp "$label" "$n" "$alpha" "fdl @$FARM ddp-bench $CORE_ARGS --output $OUT/$label" "$nw"
+    stamp "$label" "$n" "$alpha" "fdl @$FARM ddp-bench $CORE_ARGS --output $OUT/$label" "$nw" "$seed"
     echo "$(ts) OK $label"
   else
     echo "$(ts) FAIL $label rc=$rc degraded=$degraded libtorch_warnings=$warns agents_ok=$agents_ok arm_identity=$cfg_ok"
