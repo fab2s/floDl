@@ -140,6 +140,15 @@ impl ClusterCoordinator {
             return Ok(());
         }
         if self.cycle.all_alive_diverged(|r| self.is_dead(r)) {
+            // Stop the sync clock HERE: every alive rank's bridge SyncAck
+            // has landed, so this is the moment the round-trip is known to
+            // have finished. Must precede `finish_averaging_cpu`, which
+            // takes `last_sync_ms` to feed ElChe's overhead auto-tune.
+            // Together with the trigger-side start (see the DELIBERATE
+            // SEMANTICS note in `arm_cpu_cycle`) this makes the measured
+            // cost the whole rendezvous, transport included, which is what
+            // the anchor has to amortize.
+            self.cycle.capture_sync_elapsed_now();
             // Finalize FIRST, then flip to Idle — and flip even when the
             // finalize errored (re-running it would double-fold chunks and
             // double-bump the version; the error already surfaced). The
