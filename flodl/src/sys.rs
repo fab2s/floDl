@@ -62,9 +62,9 @@
 //! [`flodl_hw::testing`].
 
 pub use flodl_hw::{
-    ENV_TESTING_GPU_JSON, GpuArch, GpuInfo, GpuSurvey, GpuVendor, MemInfo, NoteKind, SurveyNote,
-    cpu_package_count, detect_gpus_for, detect_gpus_physical, mem_info, survey, survey_visible,
-    survey_visible_for,
+    AmdMetricsProbe, ENV_TESTING_GPU_JSON, GpuArch, GpuInfo, GpuMetrics, GpuSurvey, GpuVendor,
+    MemInfo, NoteKind, SurveyNote, amd_metrics_probes, cpu_package_count, detect_gpus_for,
+    detect_gpus_physical, mem_info, survey, survey_visible, survey_visible_for,
 };
 
 /// The GPU vendor this build of `flodl` can address, or `None` for a

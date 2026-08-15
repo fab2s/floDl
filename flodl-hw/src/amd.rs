@@ -205,6 +205,28 @@ fn probe_at(sys: &Path, kfd_dev: &Path, rocm: Option<&Path>, out: &mut GpuSurvey
 /// vendor id **and** a non-zero `simd_count`. HIP indexes GPUs in node
 /// order, so enumerating the filtered, sorted list reproduces it.
 fn read_topology(nodes_dir: &Path) -> Vec<GpuInfo> {
+    read_topology_with_dirs(nodes_dir)
+        .into_iter()
+        .map(|(gpu, _)| gpu)
+        .collect()
+}
+
+/// The node directory backing each device, in device-index order.
+///
+/// Position N here is device N from [`read_topology`], because both are
+/// the same walk. Live metrics resolve per device from the node's own
+/// `drm_render_minor`, so any drift between this ordering and
+/// detection's would report one card's temperature against another
+/// card's name. Sharing the walk is what makes that unrepresentable.
+pub(crate) fn gpu_node_dirs(nodes_dir: &Path) -> Vec<PathBuf> {
+    read_topology_with_dirs(nodes_dir)
+        .into_iter()
+        .map(|(_, dir)| dir)
+        .collect()
+}
+
+/// Every AMD GPU node paired with the directory it was read from.
+fn read_topology_with_dirs(nodes_dir: &Path) -> Vec<(GpuInfo, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(nodes_dir) else {
         return Vec::new();
     };
@@ -222,7 +244,7 @@ fn read_topology(nodes_dir: &Path) -> Vec<GpuInfo> {
     let mut out = Vec::new();
     for (_, dir) in dirs {
         if let Some(gpu) = read_node(&dir, out.len()) {
-            out.push(gpu);
+            out.push((gpu, dir));
         }
     }
     out
@@ -288,7 +310,7 @@ fn node_memory_mb(dir: &Path) -> u64 {
 /// *line* in this file never matches, because `gpu_id` is a **sibling
 /// file** rather than a property. The failure is silent -- it reports
 /// no GPU at all, on every host.
-fn prop(text: &str, key: &str) -> Option<u64> {
+pub(crate) fn prop(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         (parts.next()? == key).then(|| parts.next()?.parse().ok())?

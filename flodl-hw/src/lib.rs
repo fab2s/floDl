@@ -84,6 +84,7 @@
 mod amd;
 mod gpu;
 mod mem;
+mod metrics;
 mod nvidia;
 mod report;
 pub mod testing;
@@ -95,6 +96,7 @@ pub use gpu::{
     survey_visible_for,
 };
 pub use mem::{MemInfo, cpu_package_count, mem_info};
+pub use metrics::{AmdMetricsProbe, GpuMetrics, amd_metrics_probes};
 pub use nvidia::nvidia_driver_version;
 pub use report::{GpuSurvey, NoteKind, SurveyNote};
 pub use testing::ENV_TESTING_GPU_JSON;
