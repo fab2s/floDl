@@ -2,8 +2,12 @@
 //!
 //! CPU and RAM are read from `/proc/stat` and `/proc/meminfo` (Linux only).
 //! GPU identity (count, names, VRAM totals) comes from
-//! [`crate::sys::detect_gpus`] (nvidia-smi) and live metrics from NVML;
-//! neither initializes the CUDA runtime. The only CUDA-context-dependent
+//! [`crate::sys::detect_gpus`]. Live metrics have no single source: NVML
+//! for NVIDIA, amdgpu sysfs for AMD (NVIDIA publishes no utilization
+//! through sysfs, and asking AMD through a library would mean loading a
+//! GPU runtime). Each device's backend is resolved once, at construction,
+//! and neither of them initializes the CUDA runtime. The
+//! only CUDA-context-dependent
 //! read, caching-allocator reserved bytes, is gated on
 //! [`crate::tensor::gpu_has_primary_context`] so that constructing or
 //! polling a sampler never creates a CUDA context as a side effect.
@@ -174,15 +178,46 @@ impl Drop for GpuPollerHandle {
     }
 }
 
+/// Where one device's live metrics come from, resolved once at sampler
+/// construction.
+///
+/// The two vendors have no common source: NVIDIA publishes nothing
+/// through sysfs, and this crate must not load a GPU runtime to ask
+/// AMD, so each keeps its own backend. Resolving per device up front
+/// means the poller never re-decides and never pays a lookup per tick.
+#[derive(Clone)]
+enum LiveMetrics {
+    /// NVML through the shim, queried by physical index.
+    Nvml,
+    /// amdgpu sysfs, with every attribute path already resolved.
+    AmdSysfs(crate::sys::AmdMetricsProbe),
+    /// Nothing this build can read: a CPU-only build, or an AMD device
+    /// whose topology was unreadable (see [`crate::sys::amd_metrics_probes`]).
+    None,
+}
+
+/// One instantaneous utilization read, routed to the device's backend.
+fn read_util(physical_index: u8, live: &LiveMetrics) -> Option<f32> {
+    match live {
+        LiveMetrics::Nvml => {
+            crate::tensor::gpu_utilization_idx(physical_index as i32).map(|u| u as f32)
+        }
+        LiveMetrics::AmdSysfs(probe) => probe.read().util_percent.map(|u| u as f32),
+        LiveMetrics::None => None,
+    }
+}
+
 /// Static per-device identity, captured once at sampler construction
-/// from [`crate::sys::detect_gpus`] (nvidia-smi). No CUDA runtime
-/// involvement, and no per-sample process spawn.
+/// from [`crate::sys::detect_gpus`]. No CUDA runtime involvement, and
+/// no per-sample process spawn.
 struct GpuStatic {
-    /// Physical index (nvidia-smi / NVML enumeration). NVML queries
-    /// must use this: NVML ignores `CUDA_VISIBLE_DEVICES`.
+    /// Physical index (vendor-tool enumeration). NVML queries must use
+    /// this: NVML ignores `CUDA_VISIBLE_DEVICES`.
     physical_index: u8,
     name: String,
     total_bytes: Option<u64>,
+    /// Resolved live-metrics backend for this device.
+    live: LiveMetrics,
 }
 
 /// Enumerate GPUs without touching the CUDA runtime. Position in the
@@ -194,12 +229,34 @@ fn detect_gpu_statics() -> Vec<GpuStatic> {
     if !cfg!(feature = "gpu") {
         return Vec::new();
     }
-    crate::sys::detect_gpus()
+    let devices = crate::sys::detect_gpus();
+    // Resolved once, and only where an AMD device is actually present:
+    // the walk is cheap but pointless on a box that has none, and
+    // `detect_gpus` is already vendor-filtered to this build.
+    let amd = devices
+        .iter()
+        .any(|g| g.vendor == crate::sys::GpuVendor::Amd)
+        .then(crate::sys::amd_metrics_probes)
+        .unwrap_or_default();
+    devices
         .into_iter()
-        .map(|g| GpuStatic {
-            physical_index: g.index,
-            total_bytes: Some(g.vram_bytes()),
-            name: g.name,
+        .map(|g| {
+            // Probe position is device index by construction, so an
+            // absent entry means the topology was unreadable rather
+            // than that this device is the wrong one.
+            let live = match g.vendor {
+                crate::sys::GpuVendor::Amd => amd
+                    .get(g.index as usize)
+                    .cloned()
+                    .map_or(LiveMetrics::None, LiveMetrics::AmdSysfs),
+                _ => LiveMetrics::Nvml,
+            };
+            GpuStatic {
+                physical_index: g.index,
+                total_bytes: Some(g.vram_bytes()),
+                name: g.name,
+                live,
+            }
         })
         .collect()
 }
@@ -250,7 +307,10 @@ impl ResourceSampler {
         if gpus.is_empty() {
             return None;
         }
-        let physical: Vec<u8> = gpus.iter().map(|g| g.physical_index).collect();
+        let physical: Vec<(u8, LiveMetrics)> = gpus
+            .iter()
+            .map(|g| (g.physical_index, g.live.clone()))
+            .collect();
         let accum = Arc::new(Mutex::new(GpuUtilAccum {
             samples: physical
                 .iter()
@@ -269,13 +329,13 @@ impl ResourceSampler {
                         break;
                     }
                     if let Ok(mut acc) = accum2.lock() {
-                        for (i, &phys) in physical.iter().enumerate() {
-                            if let Some(util) = crate::tensor::gpu_utilization_idx(phys as i32) {
+                        for (i, (phys, live)) in physical.iter().enumerate() {
+                            if let Some(util) = read_util(*phys, live) {
                                 let buf = &mut acc.samples[i];
                                 if buf.len() == GPU_UTIL_WINDOW {
                                     buf.pop_front();
                                 }
-                                buf.push_back(util as f32);
+                                buf.push_back(util);
                             }
                         }
                     }
@@ -362,10 +422,12 @@ impl ResourceSampler {
             {
                 gpu.vram_allocated_bytes = Some(alloc);
             }
-            // Background average if available, else instant NVML sample
-            gpu.util_percent = util_averages.get(i).copied().flatten().or_else(|| {
-                crate::tensor::gpu_utilization_idx(g.physical_index as i32).map(|u| u as f32)
-            });
+            // Background average if available, else an instant sample
+            gpu.util_percent = util_averages
+                .get(i)
+                .copied()
+                .flatten()
+                .or_else(|| read_util(g.physical_index, &g.live));
             s.gpus.push(gpu);
         }
 
@@ -477,6 +539,47 @@ mod tests {
         // nvidia-smi, allocator stats stay None.
         for gpu in &s.gpus {
             assert!(gpu.vram_allocated_bytes.is_none());
+        }
+    }
+
+    /// Report which live-metrics backend this box resolved, and what it
+    /// reads.
+    ///
+    /// Nothing in the suite asserts that utilization is populated, and
+    /// nothing can: a box with no GPU has to pass too, so a backend that
+    /// silently resolves to nothing is indistinguishable from a green
+    /// run. `#[ignore]` because it asserts nothing and needs hardware.
+    /// Run it when bringing up a new box, which is the moment the answer
+    /// is in doubt:
+    ///
+    /// ```text
+    /// cargo test -p flodl --features cuda reports_this_hosts_gpu_metrics \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "hardware probe: prints what this host resolves, asserts nothing"]
+    fn reports_this_hosts_gpu_metrics() {
+        let mut sampler = ResourceSampler::new();
+        for g in &sampler.gpus {
+            println!(
+                "device {} ({}): backend {}",
+                g.physical_index,
+                g.name,
+                match g.live {
+                    LiveMetrics::Nvml => "NVML",
+                    LiveMetrics::AmdSysfs(_) => "amdgpu sysfs",
+                    LiveMetrics::None => "NONE -- no live metrics on this device",
+                },
+            );
+        }
+        // A couple of poll intervals, so the rolling window has content
+        // and this reports through the same path a run takes.
+        thread::sleep(GPU_POLL_INTERVAL * 2);
+        for gpu in sampler.sample().gpus {
+            println!(
+                "device {}: util={:?} vram_total={:?}",
+                gpu.device_index, gpu.util_percent, gpu.vram_total_bytes,
+            );
         }
     }
 }
