@@ -305,7 +305,32 @@ pub struct ClusterCoordinator {
     /// World_size minus exited workers.
     active_count: usize,
     /// Async-only: max batches a rank can run past the planned sync.
+    /// User-set (explicit `max_overshoot`) applies flat to every rank;
+    /// under auto it is superseded per rank by [`Self::overshoot_per_rank`].
     max_overshoot: usize,
+    /// Async-only, auto mode: the per-rank overshoot budget, re-derived
+    /// once per reduce from the allocation vector.
+    ///
+    /// `o_k = COVER · sync_overhead_ratio · counts_k`, i.e. the same
+    /// FRACTION of every rank's own allocation. Allocation is the single
+    /// source of truth for per-rank heterogeneity (ElChe reconciles
+    /// compute, data and transport into it), so deriving from it means the
+    /// budget can never disagree with the schedule, and inherits any
+    /// future improvement to that cost model for free.
+    ///
+    /// Proportional rather than absolute is load-bearing, not cosmetic. An
+    /// absolute budget does not shrink when the window does, so a stalled
+    /// anchor lets it swallow the whole window and drown the idle signal
+    /// that anchor growth feeds on — measured on the rig as a window
+    /// collapsing to 349 steps with 64 reduces where 21 were correct. A
+    /// proportional budget shrinks with the window, leaving the signal
+    /// intact so the anchor can climb back out.
+    overshoot_per_rank: Vec<usize>,
+    /// Guard veto on the derived budget: set by SuppressGrowth /
+    /// NudgeDown, cleared by Stable. While set, the budget is held where
+    /// it is rather than re-derived upward — the guard caps, ElChe
+    /// derives, and neither grows what the other governs.
+    overshoot_suppressed: bool,
 
     /// Per-rank, per-window bookkeeping: steps, compute wall, delivered
     /// (marginal) accumulators, first-batch fill. Advisory scheduling

@@ -7,6 +7,11 @@ use crate::tensor::{Result, TensorError};
 
 use super::{ClusterCoordinator, FinalWindowPlan};
 
+/// Fraction of the measured reduce that the derived overshoot budget aims
+/// to cover. See [`ClusterCoordinator::recompute_overshoot_budget`] for why
+/// this is 1.0 rather than the ~0.85 the rig can actually reach.
+const OVERSHOOT_COVER: f64 = 1.0;
+
 /// One rank's pre-composed post-reduce `Update` payload: the folded
 /// next-window chunk (Cadence atomic dispatch; `None` otherwise) plus
 /// the rollback token to un-take it if the send fails. Composed by
@@ -1130,9 +1135,100 @@ impl ClusterCoordinator {
             return 0;
         }
         if matches!(self.policy, ApplyPolicy::Async) {
-            base + self.max_overshoot
+            base + self.overshoot_for(rank)
         } else {
             base
+        }
+    }
+
+    /// This rank's overshoot allowance: the derived per-rank budget under
+    /// auto, the user's flat value when they set one explicitly. An
+    /// explicit `--max-overshoot` is an override and stays exactly that.
+    pub(super) fn overshoot_for(&self, rank: usize) -> usize {
+        if self.overshoot_auto {
+            self.overshoot_per_rank
+                .get(rank)
+                .copied()
+                .unwrap_or(self.overshoot_initial)
+        } else {
+            self.max_overshoot
+        }
+    }
+
+    /// Re-derive the per-rank overshoot budget. Called once per reduce from
+    /// `finish_averaging_head`.
+    ///
+    /// ```text
+    /// o_k = COVER · sync_ms / ms_per_batch_k
+    /// ```
+    ///
+    /// Straight from the measurement: the lookahead exists to cover the
+    /// reduce a rank would otherwise wait through, so it is that duration
+    /// converted into that rank's own work. The cover cap is therefore
+    /// structural rather than a clamp — `o_k · ms_k = sync_ms` by
+    /// construction, one reduce's worth and never more.
+    ///
+    /// NOT routed through `batch_counts`, though the two are equal when
+    /// allocation sits exactly at target (`counts_k = anchor · m_b/m_k`
+    /// makes the anchor cancel). They diverge whenever it does not, and the
+    /// dead zone plus `max_batch_diff` hold counts away from target for as
+    /// long as it is moving — on a collapsed window the count-routed form
+    /// read ~110 where the direct one reads ~129. Sizing a lookahead from
+    /// the schedule's *intent* rather than the rank's measured pace is an
+    /// error precisely when the schedule is still converging.
+    ///
+    /// Allocation is left alone deliberately, and that separation is real:
+    /// `sync_ms` reaches ElChe at exactly one site, the anchor-growth
+    /// proposal, and never touches the share vector. Shares answer "how is
+    /// work split by capacity", growth answers "how big must the window be
+    /// to amortize reduce + fill", and this answers "how much idle does the
+    /// reduce create for this rank". Three questions, one timing feed.
+    ///
+    /// `COVER = 1.0` deliberately, rather than the ~0.85 the rig measured
+    /// as actually reachable (the shortfall is the un-overlappable part of
+    /// a reduce: the rank must fence to snapshot and again to write back).
+    /// Over-provisioning is INERT — a budget four times the reachable figure
+    /// realized the same work and cost ~1% wall — so erring high buys
+    /// tolerance to a bad pace estimate exactly where it will be worst, on
+    /// an unfamiliar box.
+    ///
+    /// Capped at `counts_k` as well: a rank may not run more than one full
+    /// window past its schedule, which is also roughly where dispatch stops
+    /// anyway, since it streams at most one epoch ahead.
+    pub(super) fn recompute_overshoot_budget(&mut self, sync_ms: f64) {
+        if !self.overshoot_auto || !matches!(self.policy, ApplyPolicy::Async) {
+            return;
+        }
+        for rank in 0..self.world_size {
+            // No calibrated pace for this rank, or no reduce measured: hold
+            // its previous budget rather than size it from noise. Per rank,
+            // not all-or-nothing — a cohort member that has not reported yet
+            // must not freeze everyone else's budget.
+            let Some(cover) = self.el_che.batches_in(sync_ms, rank) else {
+                continue;
+            };
+            let base = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
+            let derived = (OVERSHOOT_COVER * cover).round() as usize;
+            // Two bounds. `base` is structural: a rank may not run more
+            // than one full window past its schedule, which is also about
+            // where dispatch stops anyway (it streams at most one epoch
+            // ahead). `overshoot_ceiling` is the operator's, and defaults
+            // to unbounded — under derivation a small absolute ceiling is
+            // not a safety valve, it is a silent cap on a computed value.
+            let derived = derived.min(base).min(self.overshoot_ceiling);
+            let slot = match self.overshoot_per_rank.get_mut(rank) {
+                Some(s) => s,
+                None => continue,
+            };
+            // A suppressing verdict holds the budget rather than freezing
+            // it forever: a derivation that came DOWN (shorter reduce, or a
+            // smaller share) still applies, because lowering it can only
+            // reduce staleness. Only growth waits for the guard to clear.
+            if self.overshoot_suppressed {
+                *slot = (*slot).min(derived);
+            } else {
+                *slot = derived;
+            }
         }
     }
 

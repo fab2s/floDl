@@ -320,29 +320,37 @@ impl ClusterCoordinator {
         // NudgeDown pulling the anchor back when weight-space divergence
         // rises — growth and convergence balance rather than being
         // hard-disabled.
+        // The guard CAPS the overshoot budget; it no longer grows it. The
+        // old `+1 per Stable` was a hill-climb toward a quantity that is
+        // directly computable from the allocation and the measured reduce
+        // (see `recompute_overshoot_budget`), and it could not arrive: at
+        // +1 per cycle from an initial of 3, a run with 24 reduces tops out
+        // at the ceiling of 15 while the rig's own measurements put full
+        // cover near 110 for the fast rank. Derivation replaces the search;
+        // the guard keeps its veto.
         match action {
             ConvergenceAction::Stable => {
                 self.el_che.apply_verdict(AnchorVerdict::Stable {
                     relax_up: self.policy == ApplyPolicy::Async && self.elche_relax_up,
                 });
-                if self.policy == ApplyPolicy::Async && self.overshoot_auto {
-                    self.max_overshoot = (self.max_overshoot + 1).min(self.overshoot_ceiling);
-                }
+                self.overshoot_suppressed = false;
             }
             ConvergenceAction::SuppressGrowth => {
                 self.el_che.apply_verdict(AnchorVerdict::SuppressGrowth);
+                self.overshoot_suppressed = true;
             }
             ConvergenceAction::NudgeDown { factor } => {
                 self.el_che
                     .apply_verdict(AnchorVerdict::NudgeDown { factor });
-                if self.overshoot_auto && self.policy == ApplyPolicy::Async {
-                    self.max_overshoot = self.overshoot_initial;
-                }
+                self.overshoot_suppressed = true;
             }
         }
-        if self.policy == ApplyPolicy::Async {
-            self.max_overshoot = self.max_overshoot.min(self.overshoot_ceiling);
-        }
+        // Re-derive AFTER `report_window` (so `batch_counts` is this
+        // window's) and after the verdict (so a suppressing verdict holds
+        // the budget where it is). `prev_sync_ms` is the same measurement
+        // ElChe just scheduled on, so the two cannot disagree about what
+        // the reduce cost.
+        self.recompute_overshoot_budget(prev_sync_ms);
 
         self.global_step += cycle_batches;
 

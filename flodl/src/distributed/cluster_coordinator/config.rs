@@ -380,7 +380,14 @@ impl ClusterCoordinatorConfig {
             convergence_guard: Box::new(LevelGuard::default()),
             elche_relax_up: false,
             overshoot_initial: 3,
-            overshoot_ceiling: 15,
+            // Unbounded by default: the auto budget is DERIVED from the
+            // allocation and the measured reduce, and carries its own
+            // structural bound (never more than one window's allocation).
+            // A small absolute ceiling on a computed value is not a safety
+            // valve, it is a silent cap — the legacy 15 held the fast rank
+            // to 14% of the cover its own hardware asked for. This stays a
+            // knob so an operator can impose a hard limit deliberately.
+            overshoot_ceiling: usize::MAX,
             overshoot_auto: true,
             total_samples: 0,
             epoch_splits: 1,
