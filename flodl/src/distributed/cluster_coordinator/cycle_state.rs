@@ -77,11 +77,12 @@ pub(super) enum CycleMachine {
         /// Wall-clock start of the current Pending window. Set when
         /// the phase flips to `Pending`; taken at finalize for the
         /// `CpuAvgEnd { duration_ms }` payload; read by the poll
-        /// ceiling. Distinct from [`AvgCycleState::started_at`]
-        /// (same trigger instant, different take-lifetime: the
-        /// elapsed capture takes `started_at` on all-acked, which on
-        /// the CPU path happens on post-update `Batch` evidence, not
-        /// at finalize).
+        /// ceiling. Distinct from [`AvgCycleState::started_at`] only in
+        /// take-lifetime; both are the same trigger instant, and on CPU
+        /// both are now taken at finalize (the divergence gate). They
+        /// used to diverge: `started_at` was taken on all-acked, which
+        /// on CPU fires from post-trigger `Batch` evidence and so
+        /// measured about one batch instead of the rendezvous.
         pending_since: Option<Instant>,
         /// Per-rank: true while a `Throttle` frame is outstanding
         /// (set by `check_throttle`'s steps-diff pacing or the
@@ -99,8 +100,12 @@ pub(super) enum CycleMachine {
 pub(super) struct AvgCycleState {
     /// Instant the cycle's trigger broadcast (`SyncNow` /
     /// `RequestParams`) went out. Anchor for the lag / upload
-    /// measurements; taken by [`Self::capture_sync_elapsed_if_complete`]
-    /// once every alive rank has acked.
+    /// measurements. Taken per backend, because "the rendezvous is
+    /// over" has a different witness in each: NCCL via
+    /// [`Self::capture_sync_elapsed_if_complete`] once every rank has
+    /// acked (the post-AllReduce `Batch` IS the evidence there), CPU via
+    /// [`Self::capture_sync_elapsed_now`] at the divergence gate, since
+    /// an ack there only proves the rank is still computing.
     pub(super) started_at: Option<Instant>,
     /// Per-rank `last_step_count` snapshot at trigger. The ack gate:
     /// a post-trigger frame whose `step_count` exceeds this proves the
@@ -284,10 +289,44 @@ impl AvgCycleState {
     /// acked. (Raw all-acked, not alive-acked: a dead rank never acks,
     /// deliberately leaving the cycle armed for the settle gates —
     /// see `nccl_sync_settled`.)
+    ///
+    /// NCCL ONLY. `acked` flips on any post-trigger frame whose
+    /// `step_count` passes the snapshot, and on the CPU backend that is
+    /// not evidence the rendezvous finished — under `Async` the ranks
+    /// keep training THROUGH the averaging, so each emits such a frame
+    /// within about one batch of the trigger. Letting that stop the
+    /// clock measured the reduce at ~206 ms against a real 13.8 s
+    /// round-trip (67x low, rig-measured 2026-08-15), which drove the
+    /// per-window overhead under `overhead_target` and stalled anchor
+    /// growth — the window then stayed tiny and the cohort paid ~2.7x
+    /// the reduces. `cycle_cpu.rs` already documented `acked` as invalid
+    /// sync evidence for CPU and moved the FINALIZE gate onto the
+    /// divergence slots; this measurement had been left behind on the
+    /// old signal. CPU captures at [`Self::capture_sync_elapsed_now`].
     pub(super) fn capture_sync_elapsed_if_complete(&mut self) {
+        if !matches!(self.machine, CycleMachine::NcclInline) {
+            return;
+        }
         if self.acked.iter().all(|&a| a)
             && let Some(start) = self.started_at.take()
         {
+            self.last_sync_ms = start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+
+    /// Stop the sync clock now, unconditionally. The CPU backend's
+    /// completion signal is the divergence slots (every alive rank's
+    /// bridge `SyncAck` has landed), which is the same gate
+    /// `poll_cpu_averaging` finalizes on — so the capture happens
+    /// exactly when the AllReduce round-trip is known to have finished.
+    ///
+    /// Cannot reuse the all-acked path even by moving it onto
+    /// `note_sync_ack`: that arm is guarded on `!acked[rank]`, so a
+    /// `Batch` that already flipped the flag would skip it and leave
+    /// `last_sync_ms` at zero — trading a 67x undercount for no signal
+    /// at all.
+    pub(super) fn capture_sync_elapsed_now(&mut self) {
+        if let Some(start) = self.started_at.take() {
             self.last_sync_ms = start.elapsed().as_secs_f64() * 1000.0;
         }
     }
@@ -537,11 +576,51 @@ mod tests {
         assert!(c.upload_ms[0].is_some());
         c.reset_upload_markers();
         assert!(c.upload_ms[0].is_none());
-        // All-acked takes started_at; a straggler frame is dropped.
-        c.note_batch_ack(0, 1, None);
+        // Finalizing takes started_at; a straggler frame is dropped.
+        // CPU finalizes at the divergence gate, not on an ack — see
+        // `capture_sync_elapsed_now`.
+        c.capture_sync_elapsed_now();
         assert!(c.started_at.is_none());
         c.note_snapshot_ready(0);
         assert!(c.upload_ms[0].is_none(), "late straggler dropped");
+    }
+
+    // The regression that made ElChe believe a 13.8 s reduce cost 206 ms.
+    // Under cpu-async the ranks train THROUGH the averaging, so each emits
+    // a post-trigger `Batch` within about one batch of the trigger. If that
+    // stops the sync clock, the measured reduce is one batch-time, the
+    // per-window overhead lands under `overhead_target`, and anchor growth
+    // stalls with the window stuck tiny. The rendezvous is only over when
+    // every alive rank's bridge `SyncAck` has landed.
+    #[test]
+    fn cpu_batch_ack_must_not_stop_the_sync_clock() {
+        let mut c = cpu_state(2);
+        c.arm(Instant::now(), &[0, 0]);
+        c.note_batch_ack(0, 1, None);
+        c.note_batch_ack(1, 1, None);
+        assert!(
+            c.started_at.is_some(),
+            "training through the reduce is not evidence the reduce finished"
+        );
+        assert_eq!(c.last_sync_ms, 0.0, "no sync duration recorded yet");
+        c.capture_sync_elapsed_now();
+        assert!(
+            c.started_at.is_none(),
+            "the divergence gate stops the clock"
+        );
+    }
+
+    // The NCCL half of the same split: there the post-AllReduce `Batch` IS
+    // the sync evidence (no separate bridge), so all-acked must still take
+    // the clock. Gating the capture on the backend has to leave this intact.
+    #[test]
+    fn nccl_batch_ack_still_stops_the_sync_clock() {
+        let mut c = nccl_state(2);
+        c.arm(Instant::now(), &[0, 0]);
+        c.note_batch_ack(0, 1, None);
+        c.note_batch_ack(1, 1, None);
+        assert!(c.started_at.is_none(), "all-acked takes started_at on NCCL");
+        assert!(c.last_sync_ms > 0.0, "a duration was recorded");
     }
 
     #[test]
