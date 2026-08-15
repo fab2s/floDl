@@ -1413,6 +1413,20 @@ impl ElChe {
             return None;
         }
         if !self.growth_enabled {
+            // Logged because this is the ONE growth-suppressing branch that
+            // used to be silent, and silence here is expensive: the anchor
+            // simply stops moving while every other signal looks healthy.
+            // Diagnosing a stalled window from the outside then means ruling
+            // out the overhead math, the cap, and the phase before landing
+            // here by elimination. `consecutive_stable` is included because
+            // it is the only way to tell "latched off and climbing back" from
+            // "latched off and being re-armed to zero every cycle".
+            crate::verbose!(
+                "  ddp: window-pressure growth suppressed — latched off by the \
+                 convergence guard ({}/{} consecutive stable verdicts toward re-arm)",
+                self.consecutive_stable,
+                GROWTH_REARM_STABLE,
+            );
             return None;
         }
         if self.window_cap_binding {
