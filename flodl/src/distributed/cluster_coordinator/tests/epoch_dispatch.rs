@@ -1916,3 +1916,187 @@ fn nccl_eval_cadence_stays_at_the_boundary() {
         "NCCL never advances the reduce-side eval ledger"
     );
 }
+
+// -----------------------------------------------------------------
+// Derived per-rank overshoot budget
+//
+// The budget answers "how much idle does the reduce create for THIS
+// rank", so it is the measured reduce converted into that rank's own
+// work. These pin the conversion, its two bounds, and the cases where
+// a rank must keep what it had rather than derive from nothing.
+// -----------------------------------------------------------------
+
+/// An async CPU coordinator whose ranks have known, distinct paces.
+///
+/// `wall_ms` over 10 batches each, so rank r's smoothed ms-per-batch is
+/// `wall_ms[r] / 10`. Seeded through `report_timing`, the same door the
+/// engine uses, rather than by writing the trust window directly.
+///
+/// The anchor is deliberately large: allocation is the derivation's
+/// structural bound, so an anchor of 1 would clamp every rank to a
+/// couple of batches and the test would pass without the conversion
+/// ever being exercised.
+fn coord_with_paces(wall_ms: &[f64]) -> ClusterCoordinator {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let world_size = wall_ms.len();
+    let mut el_che = ElChe::new(world_size, 100);
+    el_che.report_timing(wall_ms, &vec![10; world_size], 0.0);
+    let cfg =
+        ClusterCoordinatorConfig::new(ApplyPolicy::Async, AverageBackend::Cpu, world_size, el_che)
+            .no_divergence_guard();
+    ClusterCoordinator::for_test(cfg)
+}
+
+/// The conversion itself: `o_k = sync_ms / ms_per_batch_k`, so a faster
+/// rank gets a LARGER allowance out of the same reduce. Asserted as the
+/// relation rather than against baked numbers, because the schedule that
+/// supplies the bound is ElChe's to decide.
+#[test]
+fn derived_overshoot_is_the_reduce_converted_to_each_ranks_own_work() {
+    // ms_per_batch = [10, 20, 40]: rank 0 is four times rank 2's pace.
+    let mut coord = coord_with_paces(&[100.0, 200.0, 400.0]);
+    let sync_ms = 1_000.0;
+    coord.recompute_overshoot_budget(sync_ms);
+
+    for rank in 0..3 {
+        let ms = coord.el_che.batches_in(sync_ms, rank).expect("calibrated");
+        let base = coord.el_che.batch_counts()[rank];
+        assert_eq!(
+            coord.overshoot_for(rank),
+            (ms.round() as usize).min(base),
+            "rank {rank}: budget is the reduce in this rank's batches, bounded by its allocation",
+        );
+    }
+}
+
+/// The structural bound: a rank may not run more than one full window
+/// past its schedule, however long the reduce was.
+#[test]
+fn derived_overshoot_never_exceeds_one_windows_allocation() {
+    let mut coord = coord_with_paces(&[100.0, 200.0]);
+    // A reduce far longer than any window's compute.
+    coord.recompute_overshoot_budget(10_000_000.0);
+    for rank in 0..2 {
+        assert_eq!(
+            coord.overshoot_for(rank),
+            coord.el_che.batch_counts()[rank],
+            "rank {rank} clamps to its allocation rather than running away",
+        );
+    }
+}
+
+/// The operator's bound still binds when they set one deliberately.
+#[test]
+fn an_operator_ceiling_still_caps_the_derived_budget() {
+    let mut coord = coord_with_paces(&[100.0, 200.0]);
+    coord.overshoot_ceiling = 7;
+    coord.recompute_overshoot_budget(1_000_000.0);
+    for rank in 0..2 {
+        assert_eq!(
+            coord.overshoot_for(rank),
+            7,
+            "rank {rank} honours the ceiling"
+        );
+    }
+}
+
+/// An explicit `--max-overshoot` is an override, not a starting point:
+/// nothing is derived and every rank gets the flat value.
+#[test]
+fn an_explicit_max_overshoot_is_never_derived_over() {
+    let mut coord = coord_with_paces(&[100.0, 200.0]);
+    coord.overshoot_auto = false;
+    coord.max_overshoot = 42;
+    coord.recompute_overshoot_budget(1_000.0);
+    for rank in 0..2 {
+        assert_eq!(
+            coord.overshoot_for(rank),
+            42,
+            "rank {rank} keeps the operator's flat value",
+        );
+    }
+}
+
+/// Under a suppressing convergence verdict the budget may fall but never
+/// rise: lowering it can only reduce staleness, so holding a stale HIGH
+/// value would be the unsafe direction.
+#[test]
+fn a_suppressing_verdict_lowers_the_budget_but_never_raises_it() {
+    let mut coord = coord_with_paces(&[100.0, 200.0]);
+    coord.recompute_overshoot_budget(1_000.0);
+    let settled: Vec<usize> = (0..2).map(|r| coord.overshoot_for(r)).collect();
+    assert!(settled.iter().all(|&v| v > 1), "need headroom to move");
+
+    coord.overshoot_suppressed = true;
+    // A longer reduce would derive a BIGGER budget; suppression refuses it.
+    coord.recompute_overshoot_budget(100_000.0);
+    for (rank, &was) in settled.iter().enumerate() {
+        assert_eq!(
+            coord.overshoot_for(rank),
+            was,
+            "rank {rank}: suppressed growth holds",
+        );
+    }
+    // A shorter reduce derives a smaller one, which still applies.
+    coord.recompute_overshoot_budget(100.0);
+    for (rank, &was) in settled.iter().enumerate() {
+        assert!(
+            coord.overshoot_for(rank) < was,
+            "rank {rank}: suppression must not block a decrease",
+        );
+    }
+}
+
+/// A rank with no calibrated pace holds its previous budget, and does not
+/// freeze anyone else's: the loop is per rank, not all-or-nothing.
+#[test]
+fn an_uncalibrated_rank_holds_its_budget_without_freezing_the_cohort() {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    // Rank 1 reports no wall time, so its trust window stays empty.
+    let mut el_che = ElChe::new(2, 1);
+    el_che.report_timing(&[100.0, 0.0], &[10, 0], 0.0);
+    let cfg = ClusterCoordinatorConfig::new(ApplyPolicy::Async, AverageBackend::Cpu, 2, el_che)
+        .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    let before = coord.overshoot_for(1);
+
+    coord.recompute_overshoot_budget(1_000.0);
+
+    assert_eq!(
+        coord.overshoot_for(1),
+        before,
+        "an uncalibrated rank keeps what it had rather than deriving from a zero",
+    );
+    assert!(
+        coord.el_che.batches_in(1_000.0, 0).is_some(),
+        "rank 0 is calibrated, so it must have been sized this window",
+    );
+}
+
+/// Sync and Cadence never overshoot, so there is nothing to derive.
+#[test]
+fn a_non_async_policy_derives_no_budget() {
+    use crate::distributed::ddp::ElChe;
+    use crate::distributed::ddp_run::AverageBackend;
+
+    let mut el_che = ElChe::new(2, 1);
+    el_che.report_timing(&[100.0, 200.0], &[10, 10], 0.0);
+    let cfg = ClusterCoordinatorConfig::new(ApplyPolicy::Sync, AverageBackend::Cpu, 2, el_che)
+        .no_divergence_guard();
+    let mut coord = ClusterCoordinator::for_test(cfg);
+    let before: Vec<usize> = (0..2).map(|r| coord.overshoot_for(r)).collect();
+
+    coord.recompute_overshoot_budget(50_000.0);
+
+    for (rank, &was) in before.iter().enumerate() {
+        assert_eq!(
+            coord.overshoot_for(rank),
+            was,
+            "rank {rank}: no overshoot outside Async",
+        );
+    }
+}

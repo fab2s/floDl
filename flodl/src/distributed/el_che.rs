@@ -576,6 +576,23 @@ impl ElChe {
             .unwrap_or(0.0)
     }
 
+    /// How many batches `rank` would complete in `duration_ms`, at its
+    /// smoothed pace.
+    ///
+    /// The duration-to-work conversion any budget expressed in wall time
+    /// needs before it can be expressed in batches. It reads the rank's
+    /// own measured pace rather than the schedule's intent, which are the
+    /// same only while allocation sits exactly at target.
+    ///
+    /// `None` when the rank has no calibrated pace yet, so a caller sizing
+    /// a budget holds its previous value instead of deriving one from a
+    /// zero. Returning `0.0` there would be indistinguishable from a
+    /// genuine "no work fits", and the two call for opposite responses.
+    pub fn batches_in(&self, duration_ms: f64, rank: usize) -> Option<f64> {
+        let ms = self.smoothed_ms(rank);
+        (ms > 0.0 && duration_ms > 0.0).then(|| duration_ms / ms)
+    }
+
     /// Slow-cohort: ranks whose smoothed ms is within `(1 - COHORT_BAND)`
     /// of the slowest. Implements "fast GPU never anchor" by evidence —
     /// once timing converges, a clearly-faster rank falls outside the band
@@ -1935,5 +1952,53 @@ mod window_growth_policy_tests {
             "the same pressure must fire once Stable, got {:?}",
             el.proposed_anchor,
         );
+    }
+}
+
+#[cfg(test)]
+mod batches_in_tests {
+    use super::*;
+
+    /// The conversion is the rank's own smoothed pace, not the cohort's:
+    /// the same duration buys a fast rank more batches than a slow one.
+    #[test]
+    fn a_duration_converts_at_each_ranks_own_pace() {
+        let mut el_che = ElChe::new(3, 1);
+        // wall / batches -> ms_per_batch = [10, 20, 40].
+        el_che.report_timing(&[100.0, 200.0, 400.0], &[10, 10, 10], 0.0);
+
+        assert_eq!(el_che.batches_in(1_000.0, 0), Some(100.0));
+        assert_eq!(el_che.batches_in(1_000.0, 1), Some(50.0));
+        assert_eq!(el_che.batches_in(1_000.0, 2), Some(25.0));
+    }
+
+    /// An uncalibrated rank is `None`, never `Some(0.0)`. A caller sizing
+    /// a budget must hold its previous value there, and "no pace known"
+    /// and "no work fits" call for opposite responses.
+    #[test]
+    fn an_uncalibrated_rank_is_none_rather_than_zero() {
+        let mut el_che = ElChe::new(2, 1);
+        // Rank 1 reports nothing, so its trust window stays empty.
+        el_che.report_timing(&[100.0, 0.0], &[10, 0], 0.0);
+
+        assert_eq!(el_che.batches_in(1_000.0, 1), None);
+        assert!(el_che.batches_in(1_000.0, 0).is_some());
+    }
+
+    /// A rank index outside the cohort is `None`, not a panic: the caller
+    /// loops over `world_size` from its own state, which can lag.
+    #[test]
+    fn an_out_of_range_rank_is_none() {
+        let mut el_che = ElChe::new(2, 1);
+        el_che.report_timing(&[100.0, 100.0], &[10, 10], 0.0);
+        assert_eq!(el_che.batches_in(1_000.0, 99), None);
+    }
+
+    /// A zero or absent reduce measurement yields nothing to cover.
+    #[test]
+    fn a_zero_duration_is_none() {
+        let mut el_che = ElChe::new(2, 1);
+        el_che.report_timing(&[100.0, 100.0], &[10, 10], 0.0);
+        assert_eq!(el_che.batches_in(0.0, 0), None);
     }
 }

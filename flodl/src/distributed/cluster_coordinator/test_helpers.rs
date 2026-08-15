@@ -165,6 +165,8 @@ impl ClusterCoordinator {
             calibrated,
             active_count: world_size,
             max_overshoot: config.overshoot_initial,
+            overshoot_per_rank: vec![config.overshoot_initial; world_size],
+            overshoot_suppressed: false,
             window: super::window_ledger::WindowLedger::new(world_size),
             last_batch_ms: vec![0.0; world_size],
             last_step_count: vec![0; world_size],

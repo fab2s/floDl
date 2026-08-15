@@ -450,7 +450,18 @@ fn unset_max_overshoot_leaves_auto_tune_defaults() {
         coord_config.overshoot_auto,
         "unset max_overshoot keeps auto-tune on"
     );
-    assert_eq!(coord_config.overshoot_ceiling, 15);
+    // The ceiling is non-binding by default. Auto no longer hill-climbs
+    // toward a cap: it DERIVES the per-rank budget from the allocation and
+    // the measured reduce, bounded structurally at one window's allocation.
+    // A small absolute default (this asserted 15) silently held the fast
+    // rank to a fraction of the cover its hardware asked for, which is the
+    // bug the derivation replaced. The knob survives for an operator who
+    // wants a deliberate hard limit.
+    assert_eq!(
+        coord_config.overshoot_ceiling,
+        usize::MAX,
+        "unset max_overshoot leaves the derived budget uncapped"
+    );
 }
 
 // Same failure class as H13 above: `epoch_splits` reaches every rank
