@@ -1199,12 +1199,18 @@ impl ClusterCoordinator {
         if !self.overshoot_auto || !matches!(self.policy, ApplyPolicy::Async) {
             return;
         }
+        // Ranks that could not be sized this window. Named in the log
+        // because "derived a small budget" and "could not derive one" are
+        // indistinguishable in the budget vector alone, and they call for
+        // different responses.
+        let mut held = Vec::new();
         for rank in 0..self.world_size {
             // No calibrated pace for this rank, or no reduce measured: hold
             // its previous budget rather than size it from noise. Per rank,
-            // not all-or-nothing — a cohort member that has not reported yet
-            // must not freeze everyone else's budget.
+            // not all-or-nothing, because a cohort member that has not
+            // reported yet must not freeze everyone else's budget.
             let Some(cover) = self.el_che.batches_in(sync_ms, rank) else {
+                held.push(rank);
                 continue;
             };
             let base = self.el_che.batch_counts().get(rank).copied().unwrap_or(0);
@@ -1213,8 +1219,9 @@ impl ClusterCoordinator {
             // than one full window past its schedule, which is also about
             // where dispatch stops anyway (it streams at most one epoch
             // ahead). `overshoot_ceiling` is the operator's, and defaults
-            // to unbounded — under derivation a small absolute ceiling is
-            // not a safety valve, it is a silent cap on a computed value.
+            // to unbounded, because under derivation a small absolute
+            // ceiling is not a safety valve, it is a silent cap on a
+            // computed value.
             let derived = derived.min(base).min(self.overshoot_ceiling);
             let slot = match self.overshoot_per_rank.get_mut(rank) {
                 Some(s) => s,
@@ -1230,6 +1237,33 @@ impl ClusterCoordinator {
                 *slot = derived;
             }
         }
+
+        // One line per reduce, because the budget is a scheduling decision
+        // an operator otherwise cannot see at all: the run's config echo
+        // records `max_overshoot=auto`, which is the SETTING, and nothing
+        // recorded what auto actually chose. Without this, "did the
+        // lookahead fire, or did it derive zero and do nothing" can only be
+        // answered by inferring it from in-sync GPU utilisation after the
+        // fact. Printed every window rather than on change, so a steady
+        // budget reads as steady rather than as silence.
+        let guard = if self.overshoot_suppressed {
+            ", growth held by the convergence guard"
+        } else {
+            ""
+        };
+        let stale = if held.is_empty() {
+            String::new()
+        } else {
+            format!(", rank(s) {held:?} kept their previous budget (no calibrated pace yet)")
+        };
+        crate::verbose!(
+            "  ddp: overshoot budget {:?} covers a {:.0}ms reduce (window allocation {:?}){}{}",
+            self.overshoot_per_rank,
+            sync_ms,
+            self.el_che.batch_counts(),
+            guard,
+            stale,
+        );
     }
 
     /// Wake any progressive rank stalled in `wait_for_epoch_plan` after

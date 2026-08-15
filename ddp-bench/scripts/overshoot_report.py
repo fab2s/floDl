@@ -20,6 +20,7 @@ carries eval CE and the divergence trajectory beside it.
 Usage:  python3 overshoot_report.py <sweep-dir>
 """
 
+import glob
 import json
 import os
 import re
@@ -31,7 +32,37 @@ import sys
 # same thing.
 IDLE_PCT = 5
 
-CELL = os.path.join("olmo-graph", "cpu-async-diloco")
+def cell_of(arm_dir):
+    """The `<model>/<mode>` dir this arm wrote, or None.
+
+    Discovered rather than named: the sweep runs more than one model now
+    (`PROFILE=small` is lenet/cpu-async, not olmo-graph/cpu-async-diloco),
+    and a hardcoded cell reports "no cells" for a sweep that ran fine.
+    """
+    hits = sorted(glob.glob(os.path.join(arm_dir, "*", "*", "timeline.json")))
+    return os.path.dirname(hits[0]) if hits else None
+
+
+# Whether a bigger `final eval=` is better, keyed by model. Taken from each
+# model's own `eval_fn` in ddp-bench/src/models/: eval_accuracy for the
+# classifiers, eval_loss / eval_mse for the rest. It is NOT cosmetic -- the
+# same line `final eval=0.9912` is 99.1% accuracy for lenet and would be a
+# cross-entropy for olmo, so a shared "lower is better" verdict silently
+# inverts the conclusion on half the registry. Unknown models fall back to
+# lower-is-better and SAY so rather than guessing quietly.
+HIGHER_IS_BETTER = {"lenet", "logistic", "mlp", "resnet", "resnet-graph"}
+
+
+def eval_sense(model):
+    """(higher_is_better, column label) for a model name."""
+    if model in HIGHER_IS_BETTER:
+        return True, "eval_acc"
+    return False, "eval_CE"
+
+
+def arm_base(arm):
+    """`AUTO-s3` -> `AUTO`. Seeded cells of one arm share a base."""
+    return re.sub(r"-s\d+$", "", arm)
 
 
 def sync_spans(events):
@@ -111,9 +142,10 @@ def read_log(path):
 
 
 def read_arm(arm_dir):
-    tl_path = os.path.join(arm_dir, CELL, "timeline.json")
-    if not os.path.exists(tl_path):
+    cell = cell_of(arm_dir)
+    if cell is None:
         return None
+    tl_path = os.path.join(cell, "timeline.json")
     # A killed run leaves a zero-length or half-written timeline. Reading
     # sweeps that were interrupted is the normal case for this tool, not the
     # exception, so a corrupt cell is skipped rather than taking the report
@@ -132,8 +164,8 @@ def read_arm(arm_dir):
     wall_ms = samples[-1]["t"] if samples else 0
 
     row = {
-        "prov": read_provenance(os.path.join(arm_dir, CELL, "provenance.txt")),
-        "log": read_log(os.path.join(arm_dir, CELL, "training.log")),
+        "prov": read_provenance(os.path.join(cell, "provenance.txt")),
+        "log": read_log(os.path.join(cell, "training.log")),
         "syncs": len(spans),
         "sync_ms": [b - a for a, b in spans],
         "wall_ms": wall_ms,
@@ -178,10 +210,10 @@ def fmt(v, spec="{:.1f}", dash="-"):
 def main(root):
     arms = sorted(
         d for d in os.listdir(root)
-        if os.path.isdir(os.path.join(root, d, CELL))
+        if cell_of(os.path.join(root, d))
     )
     if not arms:
-        print(f"no cells under {root}/*/{CELL}")
+        print(f"no cells with a timeline under {root}/*/<model>/<mode>/")
         return 1
 
     rows = {}
@@ -193,9 +225,14 @@ def main(root):
     print(f"overshoot x EASGD sweep: {root}\n")
 
     print("ARM CONFIG AND OUTCOME")
-    hdr = "{:<5}{:>9}{:>8}{:>9}{:>7}{:>9}{:>9}{:>10}"
+    hdr = "{:<10}{:>9}{:>8}{:>9}{:>7}{:>9}{:>9}{:>10}"
+    models = {r["prov"].get("model", "") for r in rows.values()}
+    model = sorted(models)[0] if len(models) == 1 else ""
+    higher_better, eval_label = eval_sense(model)
+    if len(models) > 1:
+        print(f"  *** MIXED MODELS in one sweep {sorted(models)}: eval is not comparable")
     print(hdr.format("arm", "overshoot", "alpha", "wall_s", "syncs",
-                     "sync_s", "sync_%", "eval_CE"))
+                     "sync_s", "sync_%", eval_label))
     for arm in arms:
         r = rows.get(arm)
         if not r:
@@ -216,7 +253,7 @@ def main(root):
 
     print("\nGPU UTIL: INSIDE vs OUTSIDE THE AVERAGING WINDOW")
     print("(prediction: moves with overshoot, NOT with alpha)")
-    uhdr = "{:<5}{:<22}{:>10}{:>10}{:>11}{:>11}"
+    uhdr = "{:<10}{:<22}{:>10}{:>10}{:>11}{:>11}"
     print(uhdr.format("arm", "rank/dev/host", "in_mean", "out_mean",
                       "in_idle%", "out_idle%"))
     for arm in arms:
@@ -239,7 +276,7 @@ def main(root):
 
     print("\nWINDOW GEOMETRY AND DIVERGENCE")
     print("(prediction: d_raw rises with overshoot AND with (1-alpha); guard floor is 0.3)")
-    dhdr = "{:<5}{:>9}{:>9}{:>9}{:>9}{:>9}{:>9}"
+    dhdr = "{:<10}{:>9}{:>9}{:>9}{:>9}{:>9}{:>9}"
     print(dhdr.format("arm", "k_used", "k_max", "d_min", "d_med", "d_peak", "d_end"))
     for arm in arms:
         r = rows.get(arm)
@@ -259,7 +296,7 @@ def main(root):
     print("\nWORK CONSISTENCY")
     print("(every arm trains the same corpus: totals MUST match, and the epoch")
     print(" line count is the trainer's own record of a completed pass)")
-    whdr = "{:<5}{:>9}{:>8}{:>9}{:>9}{:>8}{:>9}"
+    whdr = "{:<10}{:>9}{:>8}{:>9}{:>9}{:>8}{:>9}"
     print(whdr.format("arm", "total", "epochs", "aggreg", "windows", "w_min", "w_typ"))
     totals = {}
     for arm in arms:
@@ -279,6 +316,54 @@ def main(root):
         else:
             print(f"  *** MISMATCH: arms did NOT execute equal work: {totals}")
             print("  *** work was lost or double-counted; the eval column is void")
+
+    # ACROSS SEEDS. The single most abused number in this table is eval CE,
+    # because a two-cell difference always LOOKS like a result. On a seeded
+    # sweep it is only a result if it clears the within-arm spread, so the
+    # spread is printed beside the mean rather than left to be assumed small.
+    # Absent when the sweep ran one seed per arm, which is the honest render
+    # of "this cannot answer a quality question".
+    groups = {}
+    for arm, r in rows.items():
+        groups.setdefault(arm_base(arm), []).append(r)
+    if any(len(v) > 1 for v in groups.values()):
+        print("\nACROSS SEEDS (the only admissible read of the eval column)")
+        ghdr = "{:<10}{:>5}{:>11}{:>10}{:>10}{:>10}{:>11}"
+        sense = "higher is better" if higher_better else "lower is better"
+        print(f"  metric: {eval_label} for model '{model or '?'}' ({sense})")
+        print(ghdr.format("arm", "n", "eval_mean", "eval_sd",
+                          "eval_min", "eval_max", "wall_mean"))
+        summary = {}
+        for base in sorted(groups):
+            evs = [g["log"]["eval"] for g in groups[base]
+                   if g["log"]["eval"] is not None]
+            walls = [g["log"]["wall"] or g["wall_ms"] / 1000.0
+                     for g in groups[base]]
+            if not evs:
+                continue
+            n = len(evs)
+            mean = sum(evs) / n
+            # Sample SD (n-1): these seeds are a sample of the seed
+            # population, not the population.
+            sd = (sum((e - mean) ** 2 for e in evs) / (n - 1)) ** 0.5 if n > 1 else 0.0
+            summary[base] = (mean, sd, n)
+            print(ghdr.format(base, n, f"{mean:.4f}", f"{sd:.4f}",
+                              f"{min(evs):.4f}", f"{max(evs):.4f}",
+                              f"{sum(walls) / len(walls):.1f}"))
+        ref = "N0" if "N0" in summary else None
+        if ref:
+            print(f"\n  vs {ref} (no overshoot). A gap inside the pooled spread is NOT a finding:")
+            m0, s0, n0 = summary[ref]
+            for base in sorted(summary):
+                if base == ref:
+                    continue
+                m1, s1, n1 = summary[base]
+                pooled = (s0 ** 2 / max(n0, 1) + s1 ** 2 / max(n1, 1)) ** 0.5
+                delta = m1 - m0
+                improved = delta > 0 if higher_better else delta < 0
+                verdict = "within noise" if pooled == 0 or abs(delta) < 2 * pooled \
+                    else ("BETTER" if improved else "WORSE")
+                print(f"    {base:<6} {delta:+.4f}  (2*SE = {2 * pooled:.4f})  {verdict}")
 
     # The sweep exists for these two differences. Equal throughput gain in
     # both with a quality gain only in the blended pair is the signature
@@ -300,7 +385,8 @@ def main(root):
               f"({fmt(wb)}s -> {fmt(wa)}s)")
         print(f"    eval CE {fmt(d_eval, '{:+.4f}')}   "
               f"({fmt(eb, '{:.4f}')} -> {fmt(ea, '{:.4f}')})  "
-              f"lower is better; single seed, NOT a quality verdict")
+              f"{'higher' if higher_better else 'lower'} is better; "
+              f"single seed, NOT a quality verdict")
     return 0
 
 
