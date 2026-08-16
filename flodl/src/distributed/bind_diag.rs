@@ -62,6 +62,7 @@ pub(crate) fn hint_suffix(port: u16, kind: std::io::ErrorKind) -> String {
 /// `st` `0A` is `TCP_LISTEN`; a connected socket to the same port is a
 /// different thing and must not match. The address column is
 /// `HEXADDR:HEXPORT`, so the port is parsed from hex, not decimal.
+#[cfg(any(target_os = "linux", test))]
 fn listen_inode(body: &str, port: u16) -> Option<u64> {
     for line in body.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -86,6 +87,7 @@ fn listen_inode(body: &str, port: u16) -> Option<u64> {
 ///
 /// Matches cgroup v2's systemd shape (`.../docker-<64hex>.scope`) and
 /// v1's (`/docker/<64hex>`), taking the short id `docker rm` accepts.
+#[cfg(any(target_os = "linux", test))]
 fn container_id(cgroup: &str) -> Option<String> {
     let at = cgroup.find("docker-").map(|i| i + 7).or_else(|| {
         cgroup
@@ -111,6 +113,7 @@ fn container_id(cgroup: &str) -> Option<String> {
 /// collision an operator hits with a leftover run. Saying so beats
 /// saying nothing, which is what a bare `None` would do in the one case
 /// this module exists for.
+#[cfg(any(target_os = "linux", test))]
 fn describe_unseen(port: u16) -> String {
     format!(
         "port {port} is held, but by a process outside this PID namespace. \
@@ -124,6 +127,7 @@ fn describe_unseen(port: u16) -> String {
 }
 
 /// Render the hint once the facts are known.
+#[cfg(any(target_os = "linux", test))]
 fn describe(pid: u32, name: &str, container: Option<&str>) -> String {
     match container {
         Some(cid) => format!(
@@ -312,6 +316,9 @@ mod tests {
     /// docker compose run --rm cuda sh -c \
     ///   'cargo test -p flodl --features cuda names_a_holder_in_another_container -- --ignored --nocapture'
     /// ```
+    // The probes read /proc; on any other platform the stub answers None
+    // and the assertions would fail for a reason that is not a defect.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "environment probe: needs a host-networked container + a foreign holder"]
     fn names_a_holder_in_another_container() {
@@ -324,6 +331,9 @@ mod tests {
         );
     }
 
+    // The probes read /proc; on any other platform the stub answers None
+    // and the assertions would fail for a reason that is not a defect.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "environment probe: scans /proc, needs a permissive host"]
     fn identifies_a_socket_this_process_holds() {
