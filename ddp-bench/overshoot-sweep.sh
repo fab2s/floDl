@@ -15,13 +15,21 @@
 #
 #   PROFILE=small SEEDS="1 2 3 4 5" ./overshoot-sweep.sh
 #
-# lenet's reduce is fixed-cost dominated (41 ms against a 65 ms window),
-# so the DERIVED per-rank budget lands at ~0.63 of the allocation where
-# resnet-graph sits at 0.04 and olmo at 0.21. Every overshoot quality
-# number so far was measured at ~0.2, so the small-model regime is the
-# one that ships untested. Arms are no-overshoot / the flat 15 that the
-# derivation replaced / the derived budget, over five seeds because the
-# claim is convergence and a one-seed gap there is initialization luck.
+# Arms are no-overshoot / the flat 15 the derivation replaced / the
+# derived budget, over five seeds because the claim is convergence and a
+# one-seed gap there is initialization luck.
+#
+# The original motivation for this profile claimed lenet ran at ratio
+# 0.63 against resnet-graph's 0.04, i.e. that a small model is the
+# adversarial case for a derived budget. THAT WAS WRONG: it came from a
+# median over six inter-sync gaps that are bimodal, so the estimator sat
+# in the short cluster. Recomputed as sum(sync)/sum(gaps) over a 25-window
+# run, lenet is 0.170 against olmo's 0.203 -- BELOW it, not triple. There
+# is no monotone "smaller model is worse" law; a high ratio comes from
+# small compute-per-window, which is anchor geometry as much as size.
+# The profile is still worth running (it is minutes, and the metric is a
+# classifier accuracy rather than an LM loss) but it is an ordinary point,
+# not a worst case.
 #
 # Env: SWEEP_OUT (defaults per profile/PIN), STAGE (1, 2 or 3; ignored by
 #      PROFILE=small), PIN (fixed anchor, see below), PROFILE (olmo|small),
@@ -204,6 +212,13 @@ ABS_OUT=ddp-bench/$OUT
 STAGE=${STAGE:-1}
 FARM=${FARM:-cluster-join}
 LOGDIR=${OVS_LOGDIR:-target/overshoot-sweep}
+# fdl-level flags for the CONTROLLER only (they precede the env selector, so
+# they cannot be confused with the arm's own args). `-v` is the useful one:
+# the coordinator prints the derived per-rank overshoot budget at that tier,
+# and without it the cell records `max_overshoot=auto` as a setting and
+# nothing about what auto actually chose. Unquoted on purpose so an empty
+# default contributes no argument at all.
+OVS_FDL_FLAGS=${OVS_FDL_FLAGS:-}
 mkdir -p "$ABS_OUT" "$LOGDIR"
 
 # SEEDS is the axis that makes a QUALITY claim admissible. The olmo sweep
@@ -239,7 +254,11 @@ else
   # sweep.sh records for the published numbers. --reports-per-epoch stays
   # OFF for the opposite reason: it emits on the hot path at the reduce
   # boundary, which is precisely the window being measured.
-  FIXED="--model $MODEL --mode cpu-async --outer-optimizer diloco --train-tokens 20M --bf16-wire --epochs 1 --epoch-splits 20 --save-dashboard"
+  # Token budget is overridable so a SHORT probe can read the settled
+  # per-rank shares before committing to a full cell. Pace is
+  # workload-dependent (lenet and olmo give different splits), so a
+  # share probe has to run the model it is projecting for.
+  FIXED="--model $MODEL --mode cpu-async --outer-optimizer diloco --train-tokens ${OVS_TOKENS:-20M} --bf16-wire --epochs 1 --epoch-splits 20 --save-dashboard"
 fi
 if [ -n "$PIN" ]; then
   FIXED="$FIXED --min-anchor $PIN --max-anchor $PIN --guard none"
@@ -288,7 +307,16 @@ DEPTH_ARMS="E1:200:0.5 E2:400:0.5"
 # is smaller than seed noise on a 20-epoch MNIST run.
 SMALL_ARMS="N0:0:default F15:15:default AUTO:auto:default"
 
+# SAFETY arms: the derived budget against no overshoot, nothing else moving.
+# F15 is deliberately absent -- it is not a shipping configuration, and on a
+# 31-minute cell each arm costs an hour and a half across seeds.
+SAFETY_ARMS="N0:0:default AUTO:auto:default"
+
 arms_for_stage() {
+  # An explicit arm set overrides everything, so any arm list can be run
+  # against any profile. The two are independent axes (what to train vs
+  # which knobs to move) and hardcoding one per profile conflated them.
+  if [ -n "${OVS_ARMS:-}" ]; then echo "$OVS_ARMS"; return; fi
   if [ "$PROFILE" = small ]; then echo "$SMALL_ARMS"; return; fi
   case "$1" in
     3) echo "$STAGE1_ARMS $STAGE2_ARMS $DEPTH_ARMS" ;;
@@ -352,6 +380,43 @@ config_matches() {
 # the cell holds results. The arm's own N and alpha go in explicitly:
 # they are the entire independent variable, and a run directory that
 # cannot say which arm it is cannot be read six months from now.
+# Reap a failed cell's controller and WAIT for its port to come back.
+#
+# Killing the `fdl` wrapper is not enough: fdl spawns the training binary,
+# so the launcher is a GRANDCHILD and it is the thing holding 1337. A
+# SIGTERM to the wrapper leaves it listening, and the next cell then dies
+# with `Address already in use` -- one failure becomes a cascade, which is
+# exactly how a token typo cost two cells. Escalate, then verify the port
+# is actually free rather than assuming the kill worked.
+reap_controller() {
+  kill "$@" 2>/dev/null
+  sleep 2
+  # Whatever still holds the control port, by PID, never `pkill -f` (which
+  # would match this script's own command line).
+  for _ in 1 2 3 4 5; do
+    holder=$(ss -ltnp 2>/dev/null | sed -n 's/.*:1337 .*pid=\([0-9]*\).*/\1/p' | head -1)
+    [ -z "$holder" ] && return 0
+    # A containerised controller (`docker:` in fdl.yml, which ddp-bench
+    # uses) is PID 1 inside its OWN pid namespace, and no signal from out
+    # here reaches it -- `sudo kill -9` fails too, which reads as a
+    # permissions problem and is not one. Docker owns its lifecycle, so
+    # the container is the thing to remove. Matches cgroup v2's
+    # `docker-<id>.scope` and v1's `/docker/<id>`.
+    cid=$(grep -oE 'docker[-/][0-9a-f]{12}' "/proc/$holder/cgroup" 2>/dev/null \
+            | head -1 | grep -oE '[0-9a-f]{12}')
+    if [ -n "$cid" ]; then
+      docker rm -f "$cid" >/dev/null 2>&1
+    else
+      kill -9 "$holder" 2>/dev/null
+    fi
+    sleep 2
+  done
+  if ss -ltn 2>/dev/null | grep -q ':1337 '; then
+    echo "$(ts) WARN: port 1337 is still held; the next cell will fail to bind." \
+         "Clear it by PID before re-running (see TODO.md rig hygiene)."
+  fi
+}
+
 stamp() {
   d="$ABS_OUT/$1/$CELL"; mkdir -p "$d"
   { echo "arm:            $1"
@@ -382,10 +447,20 @@ fi
 # convention. Read from the overlay rather than asked for: the token is
 # the farm's, and a second copy in the environment is a second thing to
 # get wrong.
-TOK=$(sed -n "s/^ *token: *//p" "fdl.$FARM.yml" | head -1 | tr -d "\"' \r")
+# Ask fdl for the RESOLVED token rather than grepping the farm file. An
+# overlay may inherit its credential (`inherit-from:`) instead of carrying
+# one, and a raw grep of the named file sees nothing there -- which yields
+# an empty token, dials that are refused, and a five-minute wait for a
+# quorum that cannot form. The file grep stays as a fallback so the script
+# still works if `config show`'s shape ever moves.
+TOK=$(./fdl "@$FARM" config show 2>/dev/null \
+        | sed -n "s/^ *token: *//p" | head -1 | awk '{print $1}' | tr -d "\"' \r")
+if [ -z "$TOK" ]; then
+  TOK=$(sed -n "s/^ *token: *//p" "fdl.$FARM.yml" | head -1 | tr -d "\"' \r")
+fi
 export TOK
 if [ -z "$TOK" ]; then
-  echo "$(ts) NOTE: no token: in fdl.$FARM.yml — dials must carry their own credential"
+  echo "$(ts) NOTE: no token resolved for farm $FARM - dials must carry their own credential"
 fi
 
 ARMS=$(arms_for_stage "$STAGE")
@@ -418,7 +493,7 @@ for arm_seed in $(for a in $ARMS; do for s in $SEEDS; do echo "$a:$s"; done; don
   clog="$LOGDIR/$label-controller.log"
 
   # shellcheck disable=SC2086
-  ./fdl "@$FARM" ddp-bench $CORE_ARGS --output "$OUT/$label" > "$clog" 2>&1 &
+  ./fdl $OVS_FDL_FLAGS "@$FARM" ddp-bench $CORE_ARGS --output "$OUT/$label" > "$clog" 2>&1 &
   cpid=$!
 
   # The window has to be open before anyone dials, or the dial is refused
@@ -429,7 +504,7 @@ for arm_seed in $(for a in $ARMS; do for s in $SEEDS; do echo "$a:$s"; done; don
     if [ "$waited" -ge 120 ] || ! kill -0 "$cpid" 2>/dev/null; then
       echo "$(ts) FAIL $label: controller never opened a join window"
       tail -15 "$clog" | sed 's/^/    /'
-      kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+      reap_controller "$cpid"; wait "$cpid" 2>/dev/null
       continue 2
     fi
   done
@@ -441,7 +516,7 @@ for arm_seed in $(for a in $ARMS; do for s in $SEEDS; do echo "$a:$s"; done; don
       *" -- "*)
         echo "$(ts) FAIL $label: an OVS_WALKINS entry carries its own '--'; args are appended by this script so the arm cannot drift"
         # shellcheck disable=SC2086
-        kill "$cpid" $wpids 2>/dev/null; wait 2>/dev/null
+        reap_controller "$cpid" $wpids; wait 2>/dev/null
         continue 2 ;;
     esac
     nw=$((nw+1))
@@ -464,7 +539,7 @@ EOF
       echo "$(ts) FAIL $label: quorum never reached"
       ./fdl "@$FARM" status 2>&1 | sed 's/^/    /' | tail -8
       # shellcheck disable=SC2086
-      kill "$cpid" $wpids 2>/dev/null; wait 2>/dev/null
+      reap_controller "$cpid" $wpids; wait 2>/dev/null
       continue 2
     fi
   done

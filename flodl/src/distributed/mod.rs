@@ -23,6 +23,7 @@
 //! heterogeneous cadence strategy, the launcher/controller/coordinator
 //! cluster runtime, and the wire protocol.
 
+pub(crate) mod bind_diag;
 pub(crate) mod checkpoint_forge;
 pub mod checkpoint_meta;
 pub(crate) mod chunk_pool;

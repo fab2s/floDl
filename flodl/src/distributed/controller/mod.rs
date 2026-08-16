@@ -208,7 +208,10 @@ impl ClusterController {
         outer_optimizer: Option<Box<dyn crate::distributed::OuterOptimizer>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
-            TensorError::new(&format!("cluster_controller: bind {bind_addr} failed: {e}"))
+            TensorError::new(&format!(
+                "cluster_controller: bind {bind_addr} failed: {e}{}",
+                crate::distributed::bind_diag::hint_suffix(bind_addr.port(), e.kind())
+            ))
         })?;
         let bound_port = listener
             .local_addr()

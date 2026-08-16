@@ -873,8 +873,12 @@ pub fn run_launcher_with_config(
         "0.0.0.0"
     };
     let mux_bind = format!("{mux_bind_ip}:{mux_port}");
-    let mux_listener = std::net::TcpListener::bind(&mux_bind)
-        .map_err(|e| TensorError::new(&format!("cluster launcher: bind {mux_bind} failed: {e}")))?;
+    let mux_listener = std::net::TcpListener::bind(&mux_bind).map_err(|e| {
+        TensorError::new(&format!(
+            "cluster launcher: bind {mux_bind} failed: {e}{}",
+            crate::distributed::bind_diag::hint_suffix(mux_port, e.kind())
+        ))
+    })?;
     let (port_mux, mux_accept) =
         crate::distributed::port_mux::PortMux::start(mux_listener, Arc::clone(&abort))?;
     let crate::distributed::port_mux::MuxAccept {
