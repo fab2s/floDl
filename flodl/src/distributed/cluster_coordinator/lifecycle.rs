@@ -42,7 +42,8 @@ impl ClusterCoordinator {
     pub fn bind(bind_addr: SocketAddr) -> Result<(TcpListener, u16)> {
         let listener = TcpListener::bind(bind_addr).map_err(|e| {
             TensorError::new(&format!(
-                "cluster_coordinator: bind {bind_addr} failed: {e}"
+                "cluster_coordinator: bind {bind_addr} failed: {e}{}",
+                crate::distributed::bind_diag::hint_suffix(bind_addr.port(), e.kind())
             ))
         })?;
         let bound_port = listener
