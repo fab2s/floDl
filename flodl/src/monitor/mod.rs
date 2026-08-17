@@ -1430,18 +1430,25 @@ impl Monitor {
 /// Number of digits needed to display a number.
 /// Discover the per-host telemetry pages published beside a dashboard
 /// archive: `(host, run)` for every `<archive dir>/telemetry/<host>/<run>/
-/// timeline.html` that exists at bake time, sorted. The storage fabric is
+/// timeline.html` that exists at bake time. The storage fabric is
 /// the index — the shippers created these dirs, no control-plane plumbing
 /// names them. A host whose shipper had not yet published its page when
 /// the archive baked is simply absent, never a broken link.
+///
+/// Order is hosts sorted, then WITHIN a host by the page's publish time
+/// (mtime), oldest first — the archive page's Timeline tab takes the last
+/// entry per host as the run's own. Run-id order would only be stamp order
+/// when every run in the dir shares a label (`<label>-<stamp>-<pid>`), so
+/// a shared run dir with mixed labels would present an older run as
+/// current. Name order breaks the tie when mtimes are unreadable or equal.
 fn discover_telemetry(archive_path: &str) -> Vec<(String, String)> {
     let root = match std::path::Path::new(archive_path).parent() {
         Some(p) => p.join("telemetry"),
         None => return Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut found: Vec<(String, Option<std::time::SystemTime>, String)> = Vec::new();
     let Ok(hosts) = std::fs::read_dir(&root) else {
-        return out;
+        return Vec::new();
     };
     for host in hosts.flatten() {
         if !host.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1455,16 +1462,22 @@ fn discover_telemetry(archive_path: &str) -> Vec<(String, String)> {
             if !run.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            if run.path().join("timeline.html").is_file() {
-                out.push((
+            let page = run.path().join("timeline.html");
+            if page.is_file() {
+                let mtime = std::fs::metadata(&page).and_then(|m| m.modified()).ok();
+                found.push((
                     host_name.clone(),
+                    mtime,
                     run.file_name().to_string_lossy().into_owned(),
                 ));
             }
         }
     }
-    out.sort();
-    out
+    found.sort();
+    found
+        .into_iter()
+        .map(|(host, _, run)| (host, run))
+        .collect()
 }
 
 fn digit_count(n: usize) -> usize {
@@ -1546,6 +1559,40 @@ mod tests {
         assert_eq!(arr[0]["host"], "exa", "sorted host-first: {idx}");
         assert_eq!(arr[0]["href"], "telemetry/exa/lenet-x-1/timeline.html");
         assert_eq!(arr[1]["host"], "pascal");
+    }
+
+    /// Within one host, entries order by the page's publish time so the
+    /// archive page's "last per host" pick is the newest run — a shared
+    /// run dir with mixed labels would otherwise present an older run
+    /// whose label sorts later as current.
+    #[test]
+    fn test_discover_telemetry_orders_by_publish_time() {
+        let dir = std::env::temp_dir().join(format!("flodl-arch-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // "resnet-…" sorts after "lenet-…" but was published FIRST.
+        for run in ["resnet-x-1", "lenet-x-2"] {
+            let d = dir.join("telemetry/exa").join(run);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("timeline.html"), "<!doctype html>").unwrap();
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("telemetry/exa/resnet-x-1/timeline.html"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let archive = dir.join("dashboard.html");
+        let idx = discover_telemetry(archive.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            idx,
+            vec![
+                ("exa".to_string(), "resnet-x-1".to_string()),
+                ("exa".to_string(), "lenet-x-2".to_string()),
+            ],
+            "older-published run must come first however its label sorts"
+        );
     }
 
     #[test]

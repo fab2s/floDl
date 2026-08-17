@@ -56,9 +56,10 @@ pub type ConsensusModelFn =
 /// residency is transient per fire, never steady — models hold `Rc` internals
 /// (not `Send`), so a cached probe could not live inside this `Send + Sync`
 /// closure anyway, and a fresh build per (rare) checkpoint fire is cheaper
-/// than a model-sized standing allocation. Panics in the user closure are
-/// caught and surfaced as errors so a misbehaving callback cannot kill the
-/// forge's writer thread.
+/// than a model-sized standing allocation. Panics anywhere in a fire (the
+/// factory, the positional load, the user closure) are caught and surfaced
+/// as errors so misbehaving user code cannot kill the forge's writer thread
+/// — the factory is user code too.
 ///
 /// Mental-model outcome, both backends: **`checkpoint_fn` always receives the
 /// consensus model** — here by construction (the frame is the consensus), on
@@ -72,18 +73,19 @@ where
     F: Fn(crate::tensor::Device) -> Result<M> + Send + Sync + 'static,
 {
     Arc::new(move |version, schema, payloads| {
-        let model = model_factory(crate::tensor::Device::CPU)?;
-        load_payloads_into_model(&model, schema, payloads)?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(version, &model))).map_err(
-            |p| {
-                let what = p
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| p.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                TensorError::new(&format!("checkpoint_fn panicked: {what}"))
-            },
-        )?
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let model = model_factory(crate::tensor::Device::CPU)?;
+            load_payloads_into_model(&model, schema, payloads)?;
+            f(version, &model)
+        }))
+        .map_err(|p| {
+            let what = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            TensorError::new(&format!("checkpoint_fn panicked: {what}"))
+        })?
     })
 }
 

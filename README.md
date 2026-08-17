@@ -487,6 +487,11 @@ let handle = Trainer::builder(model_factory, optim_factory, train_step)
 let state: TrainedState = handle.join()?;
 ```
 
+`state` carries the trained params + buffers on a single device; on a
+promoted multi-GPU run the final model is the **consensus bundle on
+disk** instead (set `.save_path(stem)` - a clean end always writes
+`<stem>.fdl`; reload with `load_consensus_checkpoint`).
+
 **ElChe - heterogeneous-rig cadence.** Mixed GPU generations? ElChe
 auto-balances: the slowest GPU anchors the pace; faster ones process
 proportionally more batches per averaging window, AllReduce overhead
@@ -809,7 +814,7 @@ codegen-units = 1
 | `TrainerConfig` | Umbrella: dataset, callbacks, checkpointing, resume, cluster topology. |
 | `ClusterBuilder` | Programmatic cluster construction (mirrors `fdl.cluster.yml`). |
 | `flodl::sys::detect_gpus` | GPU detection that loads no GPU runtime; vendor-plural (nvidia-smi / KFD), scoped to the build's vendor. Canonical pre-`Trainer::run` query. |
-| `TrendGuard` / `MsfGuard` / `NoGuard` | Convergence guards - TrendGuard is default. Guard is authoritative over `overhead_target`. |
+| `LevelGuard` / `GrowthGuard` / `NoGuard` | Convergence guards - LevelGuard (divergence level) is default; GrowthGuard watches the rate and may cut the anchor. Guard is authoritative over `overhead_target`. |
 | `EpochCallbackPolicy` | `Rank(global)` or `Fastest` (default - cost-aware, free-compute on heterogeneous rigs). |
 | `NcclComms` / `NcclRankComm` / `NcclAbortHandle` | Low-level NCCL when you need it. Init-on-main + `split()` everywhere. |
 | `GpuEvent` / `GpuStream` / `StreamGuard` | Async GPU-CPU pipeline, timing. |

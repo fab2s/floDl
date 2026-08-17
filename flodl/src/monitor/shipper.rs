@@ -34,7 +34,7 @@
 //! the shipper thread alone: `finish` warns, detaches it, and teardown
 //! proceeds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,12 @@ pub fn shipping_dest(dest_root: impl Into<PathBuf>, src: &Path) -> PathBuf {
 /// the destination is, plus the warn-once latch for destination errors.
 struct FollowState {
     offset: u64,
+    /// A rotation's tail is still being drained from the `.1` sibling
+    /// (`offset` points into it, not the active segment). Set on a
+    /// mid-tail destination error, cleared when the tail completes;
+    /// while set, the mirror is not byte-complete whatever the active
+    /// segment's length says.
+    recovering: bool,
     warned: bool,
 }
 
@@ -184,7 +190,7 @@ fn run_loop(src: &Path, dest: &Path, interval_ms: u64, stop: &AtomicBool) {
         let stopping = stop.load(Ordering::Relaxed);
         tick(src, dest, &mut logs, &mut aux, stopping);
         if stopping {
-            publish(dest);
+            publish(dest, &unpublished(src, &logs, &aux));
             return;
         }
         let wake = Instant::now() + interval;
@@ -218,6 +224,7 @@ fn tick(
         if name.ends_with(".log") {
             let st = logs.entry(rel.clone()).or_insert(FollowState {
                 offset: 0,
+                recovering: false,
                 warned: false,
             });
             follow_log(src, dest, &rel, st, cap);
@@ -261,19 +268,30 @@ fn follow_log(src: &Path, dest: &Path, rel: &Path, st: &mut FollowState, cap: u6
         return;
     };
     let len = md.len();
-    if len < st.offset {
+    if len < st.offset || st.recovering {
         // The active segment rotated under us: what it held now lives in
         // the `.1` sibling. Ship the tail this stream had not yet read —
         // uncapped, since rotation is segment-rare and the tail is at most
-        // one segment — then restart at the new active file's head.
+        // one segment — then restart at the new active file's head. The
+        // offset advances only by bytes that reached the destination, same
+        // contract as the active stream: a mid-tail destination error must
+        // not skip the remainder, and the new active segment must not ship
+        // before the tail is complete or the stream lands out of order.
         let mut rotated = src_path.clone().into_os_string();
         rotated.push(".1");
         let rotated = PathBuf::from(rotated);
         if let Ok(rmd) = fs::metadata(&rotated)
             && rmd.len() > st.offset
         {
-            let _ = copy_range(&rotated, st.offset, u64::MAX, dest, rel, st);
+            st.offset += copy_range(&rotated, st.offset, u64::MAX, dest, rel, st);
+            if st.offset < rmd.len() {
+                st.recovering = true;
+                return;
+            }
         }
+        // Tail fully shipped, or unrecoverable (no `.1` sibling: the ring
+        // dropped it). Restart at the new active file's head.
+        st.recovering = false;
         st.offset = 0;
     }
     if len > st.offset {
@@ -325,6 +343,7 @@ fn copy_range(
             return 0;
         }
     };
+    let start_len = out.metadata().map(|m| m.len()).unwrap_or(0);
     let mut remaining = max;
     let mut shipped = 0u64;
     let mut buf = [0u8; 64 * 1024];
@@ -337,7 +356,14 @@ fn copy_range(
         };
         if let Err(e) = out.write_all(&buf[..n]) {
             warn_once(st, &dest_path, &e);
-            break;
+            // A failed write_all may have landed a prefix of the chunk.
+            // This shipper is the destination's only writer, so its length
+            // is the truth of what shipped; counting less would re-append
+            // the landed prefix on retry and duplicate it.
+            return out
+                .metadata()
+                .map(|m| m.len().saturating_sub(start_len))
+                .unwrap_or(shipped);
         }
         shipped += n as u64;
         remaining -= n as u64;
@@ -382,8 +408,42 @@ fn copy_aux(src: &Path, dest: &Path, rel: &Path, st: &mut AuxState) {
     }
 }
 
-/// Rename every `.partial` under `dest` to its final name.
-fn publish(dest: &Path) {
+/// The streams whose mirror is NOT byte-complete after the final drain:
+/// a log whose source length differs from its shipped offset (an errored
+/// tail, or a rotation still mid-recovery), or an aux file whose last
+/// whole-copy failed. These must keep their `.partial` name — publishing
+/// them would present a silently truncated mirror as the full stream.
+fn unpublished(
+    src: &Path,
+    logs: &HashMap<PathBuf, FollowState>,
+    aux: &HashMap<PathBuf, AuxState>,
+) -> HashSet<PathBuf> {
+    let mut skip = HashSet::new();
+    for (rel, st) in logs {
+        if st.recovering {
+            skip.insert(rel.clone());
+            continue;
+        }
+        if let Ok(md) = fs::metadata(src.join(rel))
+            && md.len() != st.offset
+        {
+            skip.insert(rel.clone());
+        }
+    }
+    for (rel, st) in aux {
+        if let Ok(md) = fs::metadata(src.join(rel))
+            && (md.len() != st.len || md.modified().ok() != st.mtime)
+        {
+            skip.insert(rel.clone());
+        }
+    }
+    skip
+}
+
+/// Rename every `.partial` under `dest` to its final name, except the
+/// streams in `skip` (their mirror is incomplete; the `.partial` left
+/// behind is the honest marker, and a later harvest can adopt it).
+fn publish(dest: &Path, skip: &HashSet<PathBuf>) {
     let mut files = Vec::new();
     collect_files(dest, Path::new(""), &mut files);
     for rel in files {
@@ -394,7 +454,16 @@ fn publish(dest: &Path) {
             continue;
         };
         let from = dest.join(&rel);
-        let to = dest.join(rel.with_file_name(stem));
+        let final_rel = rel.with_file_name(stem);
+        if skip.contains(&final_rel) {
+            crate::msg!(
+                "warning: telemetry shipper: {} is missing shipped bytes; \
+                 leaving the .partial behind",
+                from.display(),
+            );
+            continue;
+        }
+        let to = dest.join(final_rel);
         if let Err(e) = fs::rename(&from, &to) {
             crate::msg!(
                 "warning: telemetry shipper: cannot publish {} ({e}); \
@@ -500,6 +569,67 @@ mod tests {
 
         let shipped = std::fs::read_to_string(dst.0.join("timeline.log")).unwrap();
         assert_eq!(shipped, "1\n2\n3\n4\n5\n6\n7\n");
+    }
+
+    /// A destination error mid-rotation-recovery drops nothing: the offset
+    /// advances only by shipped bytes, the new active segment waits its
+    /// turn (order), and the retry resumes the tail where it stopped.
+    #[test]
+    fn rotated_tail_survives_a_destination_error() {
+        let src = TempDir::new("rot-err-src");
+        let dst = TempDir::new("rot-err-dst");
+        append(&src.0.join("timeline.log.1"), "1\n2\n3\n");
+        append(&src.0.join("timeline.log"), "4\n");
+        let rel = PathBuf::from("timeline.log");
+        // "1\n2\n" shipped before the segment rotated.
+        let mut st = FollowState {
+            offset: 4,
+            recovering: false,
+            warned: false,
+        };
+        let partial = dst.0.join("timeline.log.partial");
+        append(&partial, "1\n2\n");
+
+        // A directory where the .partial must append: every write fails.
+        let held = dst.0.join("timeline.log.partial.held");
+        fs::rename(&partial, &held).unwrap();
+        fs::create_dir(&partial).unwrap();
+        follow_log(&src.0, &dst.0, &rel, &mut st, u64::MAX);
+        assert_eq!(st.offset, 4, "a failed tail copy must not advance");
+        assert!(st.recovering, "the incomplete tail must be latched");
+
+        // Destination recovers: the tail resumes, then the active segment.
+        fs::remove_dir(&partial).unwrap();
+        fs::rename(&held, &partial).unwrap();
+        follow_log(&src.0, &dst.0, &rel, &mut st, u64::MAX);
+        let shipped = std::fs::read_to_string(&partial).unwrap();
+        assert_eq!(shipped, "1\n2\n3\n4\n");
+        assert_eq!(st.offset, 2);
+        assert!(!st.recovering);
+    }
+
+    /// The stopping publish keeps `.partial` on any stream whose mirror is
+    /// not byte-complete: a truncated mirror must never wear the final
+    /// name.
+    #[test]
+    fn incomplete_stream_keeps_its_partial_name() {
+        let src = TempDir::new("skip-src");
+        let dst = TempDir::new("skip-dst");
+        append(&src.0.join("timeline.log"), "a\nb\n");
+        append(&dst.0.join("timeline.log.partial"), "a\n");
+        let mut logs = HashMap::new();
+        logs.insert(
+            PathBuf::from("timeline.log"),
+            FollowState {
+                offset: 2,
+                recovering: false,
+                warned: true,
+            },
+        );
+        let aux = HashMap::new();
+        publish(&dst.0, &unpublished(&src.0, &logs, &aux));
+        assert!(!dst.0.join("timeline.log").exists(), "must not publish");
+        assert!(dst.0.join("timeline.log.partial").exists());
     }
 
     /// Files appearing after start are picked up (the record-log tree

@@ -530,8 +530,9 @@ impl ClusterDashboardSink {
     /// maps and install them on the launcher's Monitor. Runs on every
     /// frame arrival: ranks trickle in at teardown, so partial sets
     /// converge to the full picture with the last rank. One map per
-    /// distinct GPU model, since averaging within a model is legitimate
-    /// while a cross-model mean describes no device that exists.
+    /// distinct (GPU model, clock source) pair: averaging within a model
+    /// is legitimate while a cross-model mean describes no device that
+    /// exists, and averaging across clocks describes no clock at all.
     fn rebake_heatmaps(&self) {
         use crate::graph::heatmap::{HeatLegend, HeatNode, bake_heatmap};
 
@@ -544,15 +545,30 @@ impl ClusterDashboardSink {
         };
         let maps = {
             let slots = self.graph_timings.lock().unwrap();
+            // Grouped by (GPU model, clock source), not model alone: a rank
+            // whose event profiling failed degrades to the host clock, and
+            // a launch-time mean averaged into siblings' execution-time
+            // means would render numbers no clock produced, labeled with
+            // the majority's clock. Split, each map's legend stays honest.
             let mut groups: std::collections::BTreeMap<
-                String,
+                (String, String),
                 Vec<&crate::distributed::wire::GraphProfileWire>,
             > = std::collections::BTreeMap::new();
             for p in slots.iter().flatten() {
-                groups.entry(p.gpu_model.clone()).or_default().push(p);
+                groups
+                    .entry((p.gpu_model.clone(), p.source.clone()))
+                    .or_default()
+                    .push(p);
+            }
+            // A model whose ranks split across two clocks yields two maps;
+            // suffix the source so the switcher pills stay distinct.
+            let mut model_counts: std::collections::HashMap<&String, usize> =
+                std::collections::HashMap::new();
+            for (model, _) in groups.keys() {
+                *model_counts.entry(model).or_default() += 1;
             }
             let mut maps = Vec::new();
-            for (model, frames) in &groups {
+            for ((model, source), frames) in &groups {
                 // Sample-weighted mean of means, min of mins, per node
                 // index (the hash gate on arrival guarantees the frames
                 // describe one graph).
@@ -585,10 +601,13 @@ impl ClusterDashboardSink {
                         acc.min_ms = 0.0;
                     }
                 }
-                let label = short_gpu_name(model);
+                let mut label = short_gpu_name(model);
+                if model_counts[model] > 1 {
+                    label.push_str(&format!(" ({source})"));
+                }
                 let legend = HeatLegend {
                     gpu_model: label.clone(),
-                    source: first.source.clone(),
+                    source: source.clone(),
                     samples,
                     ranks: frames.len(),
                     total_mean_ms: total_mean / weight_total,
@@ -1541,6 +1560,73 @@ mod tests {
         assert!(
             mon.heatmaps()[0].1.contains("10 passes"),
             "refused frame must not replace the stored aggregation",
+        );
+    }
+
+    /// Two ranks on the SAME GPU model but different clocks (one rank's
+    /// event profiling degraded to the host clock) bake two maps, never
+    /// one blended mean: a launch-time mean averaged into an
+    /// execution-time mean describes no clock. The labels carry the
+    /// source so the switcher pills stay distinct.
+    #[test]
+    fn graph_timings_split_mixed_clock_sources() {
+        use crate::distributed::wire::{GraphNodeTimingWire, GraphProfileWire};
+
+        let cluster = Arc::new(
+            ClusterBuilder::new()
+                .controller("127.0.0.1")
+                .port(29502)
+                .done()
+                .host("exa")
+                .ranks([0, 1])
+                .devices([0, 1])
+                .nccl_socket_ifname("lo")
+                .path("/opt/flodl")
+                .done()
+                .build()
+                .expect("test cluster builds"),
+        );
+        let sink = ClusterDashboardSink::new(cluster, "exa".to_string(), 1);
+        sink.set_svg(
+            0,
+            crate::graph::heatmap::GRAPHVIZ_FIXTURE.to_string(),
+            Some("g".to_string()),
+            Some("h1".to_string()),
+        );
+
+        let frame = |source: &str, mean: f64| GraphProfileWire {
+            hash: "h1".to_string(),
+            gpu_model: "NVIDIA GeForce RTX 5060 Ti".to_string(),
+            source: source.to_string(),
+            samples: 10,
+            total_min_ms: mean * 2.0,
+            total_mean_ms: mean * 2.2,
+            nodes: vec![
+                GraphNodeTimingWire {
+                    id: "linear_1".to_string(),
+                    level: 0,
+                    min_ms: mean * 0.9,
+                    mean_ms: mean,
+                },
+                GraphNodeTimingWire {
+                    id: "relu_2".to_string(),
+                    level: 1,
+                    min_ms: mean * 0.09,
+                    mean_ms: mean * 0.1,
+                },
+            ],
+        };
+        sink.set_graph_timings(0, frame("gpu events", 2.0));
+        sink.set_graph_timings(1, frame("host wall clock", 0.3));
+
+        let mon = sink.monitor.lock().unwrap();
+        let maps = mon.heatmaps();
+        assert_eq!(maps.len(), 2, "one map per clock source");
+        let labels: Vec<&str> = maps.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"RTX 5060 Ti (gpu events)"), "{labels:?}");
+        assert!(
+            labels.contains(&"RTX 5060 Ti (host wall clock)"),
+            "{labels:?}"
         );
     }
 }

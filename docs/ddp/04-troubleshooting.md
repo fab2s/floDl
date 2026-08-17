@@ -108,6 +108,15 @@ need a hard time bound (e.g. CI gating), `max_failure` + `ShutdownWithSave`
 is the right knob - it triggers a clean checkpoint exit rather than
 hanging.
 
+### Address already in use
+
+The bind error on a cluster port is self-diagnosing on Linux: it names
+the process holding the port (pid, name) and how to clear it — and when
+the holder is PID 1 inside a container's PID namespace, where `kill -9`
+fails in a way that reads as a permissions problem, it says
+`docker rm -f <container>` is the remedy. The diagnosis is advisory:
+if `/proc` cannot answer, the plain error stands.
+
 ### Cluster progressive hangs
 
 If `fdl @cluster` runs hang several epochs in, the cause is usually:

@@ -1061,12 +1061,17 @@ async function streamJob(out, url, init) {
   };
   // Every buffered line carries its absolute index `i`; tracking the
   // highest one seen is what lets a lost transport resume exactly
-  // where it died (`/api/jobs/last?from=`). Synthetic lines
-  // (heartbeats, gap markers) carry none and cost nothing.
+  // where it died (`/api/jobs/last?from=`). The stream preamble names
+  // the job the cursor belongs to — sent back as `&job=`, it keeps a
+  // reconnect that raced a NEW job from skipping that job's head.
+  // Synthetic lines (heartbeats, gap markers) carry none and cost
+  // nothing.
   let sawExit = false;
   let lastIdx = -1;
+  let jobId = null;
   const seeEvent = ev => {
     if (typeof ev.i === "number") lastIdx = ev.i;
+    if (typeof ev.job === "number") jobId = ev.job;
     if ("exit" in ev) sawExit = true;
     onEvent(ev);
   };
@@ -1106,7 +1111,8 @@ async function streamJob(out, url, init) {
       for (let attempt = 0; attempt < 10 && !body; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
         try {
-          const again = await fetch("/api/jobs/last?from=" + (lastIdx + 1),
+          const again = await fetch("/api/jobs/last?from=" + (lastIdx + 1)
+            + (jobId !== null ? "&job=" + jobId : ""),
             { headers: { "x-fdl-token": TOKEN } });
           if (again.ok) body = again.body;
         } catch { /* server not back yet */ }

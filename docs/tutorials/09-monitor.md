@@ -109,7 +109,13 @@ Open `http://localhost:3000` in a browser. The dashboard shows:
 - **Children**: the level below, compared on one metric and drillable
 - **Log table**: this level's rows, newest first
 - **Alerts**: rank losses, drift, dropped control frames — whole run, at any level
-- **Graph SVG**: collapsible architecture diagram (if provided)
+- **Tabs**: Overview / Architecture / Timeline on the navigation row.
+  Architecture holds the graph SVG and its timing heat maps (opens
+  expanded, viewport-capped, scrolls internally); Timeline embeds the
+  forensic timeline, crumb-aware — root shows the controller's,
+  `root/<host>` that host's — live-refreshing on the shipper's clock and
+  navigable the same way in a saved archive. Tab state rides the URL
+  hash beside the path, so deep links keep both.
 
 ### One view, repeated per level
 
@@ -214,8 +220,14 @@ Trainer::builder(model_factory, optim_factory, train_step)
 ```
 
 Reports fire at reduce boundaries, up to `n` per epoch, carrying per-rank
-loss / throughput aggregated up a `root → host → rank` tree. Off by
-default, and the per-epoch feed is unchanged either way. Details:
+loss / throughput aggregated up a `root → host → rank` tree. On cluster
+runs the root window record also carries curated engine observations —
+the ElChe `anchor`, `sync_ms` / `cpu_avg_ms` round-trips, the divergence
+`d_raw` and its `lambda_ema` growth proxy — so the metrics chart answers
+"what was the engine doing" live (declared `last` in the stream's meta:
+they are snapshots, not roll-ups, and a mode that lacks one contributes
+no key). Off by default, and the per-epoch feed is unchanged either way.
+Details:
 [DDP guide → Sub-epoch reports](../ddp/01-reference.md#sub-epoch-reports---reports_per_epoch).
 
 ### Querying the run by path
@@ -295,7 +307,8 @@ monitor.serve(3000)?;
 monitor.watch(&model);  // generates SVG, sends to dashboard
 ```
 
-The SVG appears in a collapsible section at the bottom of the dashboard. It is
+The SVG appears in the dashboard's Architecture tab, expanded
+(viewport-capped, scrolling internally). It is
 **run-scoped, not level-scoped**: the architecture describes the whole run, so
 the portal shows it at the root level only and never repeats it per host or per
 rank. The same holds for the "Training Configuration" card fed by
@@ -358,18 +371,23 @@ The monitor samples system resources on every `log` call:
 |--------|--------|----------------|
 | CPU % | `/proc/stat` (delta) | Linux |
 | RAM used/total | `/proc/meminfo` | Linux |
-| GPU utilization % | NVML (dynamic load) | NVIDIA GPU + driver |
+| GPU utilization % | NVML (NVIDIA, dynamic load) / amdgpu sysfs (AMD) | GPU + driver |
 | VRAM allocated / spill | libtorch caching allocator (`reserved_bytes`) | GPU feature enabled |
 
 Resources that aren't available are silently omitted from both the terminal
 output and the dashboard.
 
-**On ROCm, utilization is the one gap.** The allocator-backed VRAM figures
-come from libtorch and work on either vendor, but the utilization probe
-loads NVML, which is NVIDIA-only: on an AMD box it fails to load and the
-metric is omitted rather than reported wrong. Everything else in the
-dashboard — throughput, VRAM, batch share, timings — is unaffected. Use
-`rocm-smi` alongside the run for utilization until an AMD SMI probe lands.
+**Both vendors report live utilization.** NVIDIA reads NVML (dynamically
+loaded, nothing to install beyond the driver). AMD reads the amdgpu
+driver's own sysfs — no ROCm SMI, no library, no extra install; each
+device's paths are resolved once at sampler construction, so a poll tick
+stays a plain file read. Published attributes vary by part, so the probe
+records what the driver actually offers and reports a missing sensor as
+absent rather than zero. Temperature and power are read on AMD too,
+ahead of the sample fields that will carry them. Inside a container the
+AMD path needs `--device=/dev/kfd` — the same device node ROCm itself
+requires, so a container that cannot read it could not have trained
+either.
 
 ### VRAM metrics
 
@@ -442,6 +460,39 @@ this as `--save-dashboard`.
 
 Either way it needs **no dashboard port**: persisting a dashboard does not
 require serving one.
+
+### Forensic timeline
+
+Beside the dashboard, every process keeps a full-resolution **timeline**
+(per-GPU utilization and VRAM with idle gaps and sync windows shaded,
+the ElChe anchor trajectory, sync durations, divergence and its growth
+rate, loss and learning rate, host CPU/RAM, and the rank-reported
+samples of remote hosts). `timeline.html` renders it with drag/wheel
+zoom, a linked cursor, per-pixel min/max envelope decimation so spikes
+stay visible at any zoom, and per-kind toggles that govern everything
+derived from that kind. The dashboard's Timeline tab embeds it per host.
+
+Three properties worth knowing:
+
+- **It survives the crash it exists to explain.** Every sample and event
+  is also appended to a bounded JSONL ring on node-local disk
+  (`~/.flodl/telemetry/<run>/`): drop-oldest segments, I/O errors
+  swallowed, disk never on the training thread. `ddp-bench` prints the
+  spill directory in its end-of-run summary.
+- **Telemetry trickles to shared storage instead of bursting at
+  teardown.** A shipper mirrors the node-local dir to the shared run dir
+  on its own clock; appends land in `.partial` files that publish by
+  rename at teardown, so a `.partial` left behind honestly marks an
+  unpublished mirror, and a stalled shared mount can strand only the
+  shipper thread, never training or teardown. The record log
+  (`record_log_dir`) rides the same plane: the writer stages node-local
+  and the shipper mirrors it, so a shared destination can never stall a
+  record append.
+- **The archive indexes what landed.** A saved dashboard discovers the
+  per-host `timeline.html` pages the shippers published beside it
+  (`telemetry/<host>/<run>/`) and renders a per-host card of relative
+  links; a host still shipping when the archive baked is simply absent,
+  never a broken link.
 
 #### Theme, and the publication case
 

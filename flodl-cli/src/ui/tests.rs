@@ -331,20 +331,21 @@ fn a_publish_post_streams_ndjson_and_the_slot_replays_it() {
     let streamed = post(port, "/api/publish", Some(&token), "{}");
     assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
     assert!(streamed.contains("application/x-ndjson"), "{streamed}");
-    // First event: the command line. Then the spawn failure and the
-    // exit event, in order.
+    // Preamble first (the job id resume cursors belong to), then the
+    // command line, the spawn failure and the exit event, in order.
     let body = streamed.split("\r\n\r\n").nth(1).unwrap();
     let events: Vec<serde_json::Value> = body
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    assert_eq!(events[0]["job"], 1);
     assert_eq!(
-        events[0]["cmd"],
+        events[1]["cmd"],
         serde_json::json!(["fdl", "publish", "--json"])
     );
     assert!(
-        events[1]["t"].as_str().unwrap().contains("cannot spawn"),
+        events[2]["t"].as_str().unwrap().contains("cannot spawn"),
         "{events:?}",
     );
     assert!(events.last().unwrap()["exit"].is_null(), "{events:?}");
@@ -359,6 +360,33 @@ fn a_publish_post_streams_ndjson_and_the_slot_replays_it() {
     let resumed = get(port, "/api/jobs/last?from=2", Some(&local), Some(&token));
     assert!(!resumed.contains("\"cmd\""), "{resumed}");
     assert!(resumed.contains("\"exit\""), "{resumed}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A resume cursor is only honored against the job that minted it: a
+/// reconnect that raced a NEW job into the slot replays that job from
+/// its start (with a note) instead of silently skipping its head.
+#[test]
+fn a_stale_resume_cursor_replays_the_new_job_from_its_start() {
+    let tmp = tempdir();
+    let (port, token) = spawn_server(&tmp);
+    let local = format!("127.0.0.1:{port}");
+    let _ = post(port, "/api/publish", Some(&token), "{}");
+    let _ = post(port, "/api/publish", Some(&token), "{}");
+    // A cursor minted by job 1 landing on job 2.
+    let r = get(
+        port,
+        "/api/jobs/last?from=50&job=1",
+        Some(&local),
+        Some(&token),
+    );
+    assert!(r.contains("\"job\":2"), "{r}");
+    assert!(r.contains("earlier job"), "{r}");
+    assert!(r.contains("\"cmd\""), "must replay from the start: {r}");
+    // An id-less cursor pointing past this stream's end cannot come
+    // from this job either (indices only grow): equally stale.
+    let r = get(port, "/api/jobs/last?from=50", Some(&local), Some(&token));
+    assert!(r.contains("\"cmd\""), "must replay from the start: {r}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

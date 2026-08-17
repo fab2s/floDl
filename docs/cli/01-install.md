@@ -90,7 +90,7 @@ name (or in some positions, after):
 | `-v`             | Verbose output.                                                |
 | `-vv`            | Debug output.                                                  |
 | `-vvv`           | Trace output (maximum detail).                                 |
-| `-q`, `--quiet`  | Suppress non-error output.                                     |
+| `-q`, `--quiet`  | Lowest log level; hides docker's container-lifecycle narration (`Container … Creating/Created`). The command's own output is untouched. |
 | `--ansi`         | Force ANSI color (bypass TTY / `NO_COLOR` detection).          |
 | `--no-ansi`      | Disable ANSI color output.                                     |
 
@@ -105,7 +105,7 @@ default when no verbosity flag is passed.
 fdl -v ddp-bench quick    # verbose: DDP sync, cadence changes, prefetch detail
 fdl -vv gpu-test          # debug: per-batch timing, internal loops
 fdl -vvv shell            # trace: extreme granularity
-fdl --quiet test          # errors only
+fdl --quiet test          # lowest log level, no docker narration
 fdl --no-ansi config show # plain output for pipes and CI
 ```
 

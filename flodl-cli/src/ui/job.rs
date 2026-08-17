@@ -26,6 +26,11 @@ use super::{JOB_MAX_LINES, LedgerCtx, STREAM_HEARTBEAT, UiServer};
 /// threads, drained by however many sockets are following.
 #[derive(Debug)]
 pub(super) struct JobState {
+    /// Monotonic per-server job identity. A resume cursor (`?from=`) is
+    /// only meaningful against the stream that minted it; the id is what
+    /// lets a reconnect that raced a NEW job say so instead of silently
+    /// skipping the new job's head.
+    pub(super) id: u64,
     pub(super) buf: Mutex<JobBuf>,
     pub(super) done: AtomicBool,
 }
@@ -72,6 +77,7 @@ impl JobState {
 #[derive(Default)]
 pub(super) struct JobSlot {
     current: Mutex<Option<Arc<JobState>>>,
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 impl JobSlot {
@@ -84,6 +90,7 @@ impl JobSlot {
             return Err("a job is already running — follow it at /api/jobs/last".to_string());
         }
         let job = Arc::new(JobState {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed) + 1,
             buf: Mutex::new(JobBuf::default()),
             done: AtomicBool::new(false),
         });
@@ -192,14 +199,42 @@ pub(super) fn stream_job(
             job.push_final(serde_json::json!({ "exit": serde_json::Value::Null }));
         }
     }
-    follow(&mut stream, &job, 0);
+    follow(&mut stream, &job, 0, None);
 }
 
 /// `/api/jobs/last`: replay the current or finished job from its first
-/// line and follow while it runs.
-pub(super) fn follow_job(mut stream: TcpStream, server: &UiServer, from: usize) {
+/// line and follow while it runs. A resume cursor is honored only
+/// against the job that minted it: `job` is the client's recorded id
+/// (from the stream preamble), and a mismatch — or an id-less cursor
+/// pointing past this stream's end, which no same-job reconnect can
+/// produce — replays from the start with a note, never a silent gap.
+pub(super) fn follow_job(
+    mut stream: TcpStream,
+    server: &UiServer,
+    from: usize,
+    job_id: Option<u64>,
+) {
     match server.job.last() {
-        Some(job) => follow(&mut stream, &job, from),
+        Some(job) => {
+            let mut from = from;
+            let mut note = None;
+            let stale = match job_id {
+                Some(id) => id != job.id,
+                None => {
+                    let buf = job.buf.lock().expect("job buffer lock");
+                    from > buf.base + buf.lines.len()
+                }
+            };
+            if stale && from > 0 {
+                note = Some(format!(
+                    "(the resume cursor belongs to an earlier job — \
+                     replaying job {} from its start)",
+                    job.id,
+                ));
+                from = 0;
+            }
+            follow(&mut stream, &job, from, note)
+        }
         None => {
             let _ = stream.write_all(&error_json("404 Not Found", "no job has run yet"));
         }
@@ -208,8 +243,11 @@ pub(super) fn follow_job(mut stream: TcpStream, server: &UiServer, from: usize) 
 
 /// Stream a job's buffer as NDJSON from the start, then poll for new
 /// lines until the job is done and drained. A dead socket ends the
-/// following, never the job.
-pub(super) fn follow(stream: &mut TcpStream, job: &JobState, from: usize) {
+/// following, never the job. The stream opens with a synthetic
+/// `{"job": id}` preamble (unbuffered, no index) so every follower —
+/// including one that connected after the ring dropped the head —
+/// learns which stream its resume cursor will belong to.
+pub(super) fn follow(stream: &mut TcpStream, job: &JobState, from: usize, note: Option<String>) {
     // Streaming legs drop the write timeout: a reader throttled by its
     // own rendering cost (a coverage run floods tens of thousands of
     // lines — found live, tab in the foreground) or by a backgrounded
@@ -224,6 +262,16 @@ pub(super) fn follow(stream: &mut TcpStream, job: &JobState, from: usize) {
          Connection: close\r\n\r\n";
     if stream.write_all(header.as_bytes()).is_err() {
         return;
+    }
+    let preamble = format!("{{\"job\":{}}}\n", job.id);
+    if stream.write_all(preamble.as_bytes()).is_err() {
+        return;
+    }
+    if let Some(note) = note {
+        let line = serde_json::json!({ "s": "ui", "t": note });
+        if stream.write_all(format!("{line}\n").as_bytes()).is_err() {
+            return;
+        }
     }
     // `sent` is an ABSOLUTE stream position; the ring's `base` says
     // how much history is gone, so a follower that fell behind (or a
