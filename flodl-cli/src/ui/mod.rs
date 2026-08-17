@@ -195,7 +195,7 @@ fn handle(mut stream: TcpStream, server: &UiServer) {
             let _ = stream.write_all(&response);
         }
         Reply::StartJob(argv, ledger) => stream_job(stream, server, argv, ledger),
-        Reply::FollowJob { from } => follow_job(stream, server, from),
+        Reply::FollowJob { from, job } => follow_job(stream, server, from, job),
         Reply::Proxy(target) => proxy_dashboard(stream, server, &target),
     }
 }
@@ -212,6 +212,9 @@ enum Reply {
     FollowJob {
         /// Absolute line index to resume from (`?from=`).
         from: usize,
+        /// The job id the cursor belongs to (`?job=`, from the stream
+        /// preamble). A cursor is only honored against its own stream.
+        job: Option<u64>,
     },
     /// Forward this request target to the dashboard slot's loopback
     /// port and stream the response back.
@@ -397,6 +400,7 @@ fn api(req: &Request, path: &str, server: &UiServer) -> Reply {
                 .get("from")
                 .and_then(|f| f.parse().ok())
                 .unwrap_or(0),
+            job: req.query.get("job").and_then(|j| j.parse().ok()),
         },
         // The dashboard slot's target: GET = current port + a
         // reachability probe, POST = set (or clear with null).

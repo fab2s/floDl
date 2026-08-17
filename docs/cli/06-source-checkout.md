@@ -11,7 +11,7 @@ fdl check              # type-check without building
 fdl build              # debug build
 fdl fmt                # format the workspace (rustfmt)
 fdl fmt-check          # formatting check, byte-for-byte what CI runs
-fdl clippy             # lint (tests + workspace + ddp-bench)
+fdl clippy             # style gate: rustfmt check first, then clippy (tests + workspace + ddp-bench)
 fdl test               # all CPU tests
 fdl test-release       # tests in release mode
 fdl test-live          # tests needing network / external resources (see below)

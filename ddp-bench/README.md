@@ -128,3 +128,7 @@ With multiple GPUs, the per-batch LR schedule advances faster (global_step count
 Each run saves to `runs/<model>/<mode>/`:
 - `training.log` -- epoch-level loss and metrics
 - `timeline.json` / `timeline.csv` / `timeline.html` -- high-frequency profiling data
+- `telemetry/<host>/<run>/` -- each process's shipped timeline mirror
+  (JSONL spill + its own `timeline.html`), trickled in during the run.
+  The node-local spill ring lives under `~/.flodl/telemetry/<run>/` for
+  crash forensics; its directory is printed in the end-of-run summary.

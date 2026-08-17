@@ -306,7 +306,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.elche(cfg)` | `ElCheConfig` | DDP cadence + backend + tuning. |
 | `.max_grad_norm(f)` | `f64` | Per-rank gradient clip applied before AllReduce. Fused kernel. |
 | `.checkpoint_every(n)` | `usize` | Checkpoint cadence in epochs: fires `checkpoint_fn` (when set) with the consensus model, and writes the consensus bundle when `.save_path` is set (each write atomically supersedes the last). |
-| `.save_path(p)` | `String` | Stem for checkpoint bundles (writes `<stem>.fdl` + `<stem>.meta.json`). |
+| `.save_path(p)` | `String` | Stem for checkpoint bundles (writes `<stem>.fdl` + `<stem>.meta.json`). Writers create the stem's parent directories, and the run prints where the stem resolves in its first lines (a relative stem resolves against each process's working directory, not where the operator typed the command). |
 | `.resume_from(p)` | `String` | Load bundle at start; restores params, buffers, optimizer, ElCheState. |
 | `.checkpoint_fn(f)` | `CheckpointFn<M>` | Called with `(epoch, &M)` on the CONSENSUS model: controller-side on a CPU copy (CPU backend), or on the elected rank post-collective (NCCL). |
 | `.epoch_fn(f)` | `EpochFn<M>` | Per-epoch worker callback (`(epoch, &mut GpuWorker<M>)`). |
@@ -321,7 +321,7 @@ let cfg = TrainerConfig::new(dataset)
 | `.checkpoint_at_epoch(n)` | `usize` | One-shot coverage-granular checkpoint at the epoch any rank first reaches (progressive modes). Pairs with `.save_path`. |
 | `.eval_every(n)` | `usize` | Fire `eval_fn` every `n` epochs (`0` disables). The chained `DdpBuilder::eval_every` takes an `EvalCadence` instead. |
 | `.reports_per_epoch(n)` | `usize` | Emit up to `n` sub-epoch monitor reports per epoch, at reduce boundaries (`0` = off, the default). Fills the curve *between* epoch points — see [Sub-epoch reports](#sub-epoch-reports---reports_per_epoch). |
-| `.record_log(dir, max_bytes)` | `(String, u64)` | Persist the monitor record stream as append-only JSONL under `dir`, one drop-oldest ring per node capped at `max_bytes` (`0` = default). Off by default — see [Persisting the record stream](#persisting-the-record-stream---record_log). |
+| `.record_log(dir, max_bytes)` | `(String, u64)` | Persist the monitor record stream as append-only JSONL: staged on node-local disk, mirrored to `dir` by the telemetry shipper (a hung shared mount can never stall an append), one drop-oldest ring per node capped at `max_bytes` (`0` = default). Off by default — see [Persisting the record stream](#persisting-the-record-stream---record_log). |
 | `.save_dashboard(path)` | `String` | Write the run's dashboard as one self-contained HTML file at teardown (the full portal, no server, no sibling files). Off by default — see [Saving the dashboard](#saving-the-dashboard---save_dashboard). |
 | `.dashboard_theme(theme)` | `String` | Pin the saved dashboard's theme (`"light"` / `"dark"` / `"auto"`). Unset, a saved page follows the reader's `prefers-color-scheme`. `"light"` is the publication setting. |
 | `.scalar_reduction(key, r)` | `(String, Reduction)` | Declare how a **user scalar** rolls up across ranks (`Sum` / `Max` / `Min` / `Mean` / `Last`). Repeatable. Non-core keys default to `Mean`, which is wrong for a count — see [Declaring how a scalar rolls up](#declaring-how-a-scalar-rolls-up---scalar_reduction). |
@@ -523,6 +523,11 @@ Trainer::builder(model_factory, optim_factory, train_step)
   node aggregating **its direct children only**. Cross-rank means are
   weighted by realized work, so a hierarchical rollup equals the flat one.
   A metric a rank did not measure this window is **absent**, never zeroed.
+  The root window record additionally carries curated engine
+  observations — the ElChe `anchor`, `sync_ms` / `cpu_avg_ms`, the
+  divergence `d_raw` and its `lambda_ema` growth proxy — declared `last`
+  in the stream's `meta` (snapshots, not roll-ups; a mode that lacks one
+  contributes no key).
 - **Cost.** Zero extra wire traffic — the per-batch loss already reaches
   the controller on the existing timing frames. Disabled (the default) the
   whole path is one `Option` check per reduce.
@@ -570,6 +575,14 @@ runs/exp1/records/
   whole tree bounds to `nodes × max_bytes`.
 - **Never fails training.** Every I/O error here is swallowed and warned
   once. A full or read-only disk costs you observability, nothing else.
+- **Staged node-local, shipped to `dir`.** The writer appends on
+  node-local disk (under `~/.flodl/telemetry/`) and a shipper mirrors
+  the tree to `dir` on its own clock, so a shared destination — even a
+  hung sshfs/NFS mount — can never stall a record append. Mid-run the
+  destination holds `*.log.partial` mirrors that publish by rename at
+  teardown; a `.partial` left behind honestly marks an unpublished
+  mirror. The launcher prints the resolved destination in the run's
+  first lines (a relative `dir` resolves against the launcher's cwd).
 - **Tail-read resume.** Every `node` record is an absolute snapshot, so
   catching up is reading the last N lines
   (`RecordLog::tail(path, n)`) — no index, no checkpoint replay.
@@ -596,8 +609,9 @@ because an alert's `path` is the node it happened to:
 | `drift`        | warn     | the convergence guard had to correct the anchor              |
 | `overflow`     | warn     | alerts were dropped by the live cap (never silent)           |
 
-So `jq 'select(.kind=="event")' runs/exp1/records/root/*/*.log` is the
-run's incident list, and a rank's own log holds its metrics *and* the
+So `jq 'select(.kind=="event")' runs/exp1/records/root/*/*.log*` is the
+run's incident list (the trailing `*` also catches a still-shipping
+mirror's `.partial`), and a rank's own log holds its metrics *and* the
 alert that ended it, in order. Alerts are always printed to stdout too —
 you do not need `-v`, and you do not need `record_log`, to see them.
 

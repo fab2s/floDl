@@ -346,6 +346,12 @@ impl<M: Module> GpuWorker<M> {
                         ),
                     }
                 } else {
+                    // The consensus that makes this model current arrived as
+                    // an Update one tick ago: its H2D is async on the comm
+                    // stream and only `sync_before_forward` (a train-step
+                    // gate) consumes the pending flag. Same fence as
+                    // `consensus_eval_at_reduce`'s alpha-None arm.
+                    self.fence_comm_stream();
                     self.eval_metric()
                 };
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;

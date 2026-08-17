@@ -66,7 +66,11 @@ Live status of a running cluster: lifecycle phase (`waiting` /
 joined with what hardware, the join-window countdowns while it is
 still open, and — on `start: manual` / `hybrid` runs — the start
 switch's state (a staging roster renders **"roster startable, fire
-with `fdl start`"**). The controller serves the state as `state.json`
+with `fdl start`"**). Once a run's dashboard has bound, the output
+also carries a `dashboard: host:port` line — `state.json` always
+carries `dashboard_port` (`null` when the run serves none), which is
+how `fdl ui` embeds an already-running run's dashboard without being
+told the port. The controller serves the state as `state.json`
 over plain HTTP on its training port, so no extra port or config is
 involved — and `curl` works where fdl isn't installed.
 

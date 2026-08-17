@@ -807,8 +807,9 @@ function updateTimelinePanel(){
     const controller=typeof ARCHIVE_TELEMETRY_CONTROLLER!=='undefined'?ARCHIVE_TELEMETRY_CONTROLLER:null;
     const segs=current.split('/');
     const host=current!==ROOT&&segs.length>1?segs[1]:controller;
-    // Several runs can share the dir; run ids embed the UTC stamp, so
-    // the lexicographic last is the newest for that host.
+    // Several runs can share the dir; discovery orders each host's
+    // entries by publish time, so the last is the newest for that host
+    // (run-id order is only stamp order within one label).
     const mine=entries.filter(e=>e.host===host);
     const entry=mine.length?mine[mine.length-1]:null;
     if(!entry){

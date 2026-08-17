@@ -1,8 +1,114 @@
 # Upgrading floDl
 
-Four upgrades are documented here, newest first: the 0.8.0 multi-vendor
-GPU pass, the 0.7.0 monitor record surface, the 0.6.0 process-model
+Five upgrades are documented here, newest first: the 0.9.0
+consensus-artifact + observability pass, the 0.8.0 multi-vendor GPU
+pass, the 0.7.0 monitor record surface, the 0.6.0 process-model
 distributed rewrite, then the 0.5.0 CLI maturity pass.
+
+---
+
+## Upgrading to floDl 0.9.0 (the run's artifact is the consensus)
+
+0.9.0 makes the checkpoint bundle the run's canonical artifact — the
+model your callbacks receive, your evals score, and a clean end writes
+is now provably the same consensus — and grows the observability plane
+(graph timing heat maps, the rebuilt forensic timeline, live AMD
+metrics, the `fdl ui` operations page). Most of the surface is
+additive; the breaks concentrate in the distributed layer's config
+structs and one worker API.
+
+### TL;DR
+
+| Change | What it costs you |
+|---|---|
+| `ClusterWorker::run_until_shutdown` returns `Result<()>` | Code binding its old `Option<ParamSnapshot>` stops compiling. The run's final model is the consensus bundle on disk. |
+| New pub fields on config / data structs | Struct **literals** need the new field (or `..Default::default()`); builder and setter users are untouched. |
+| `TrendGuard` → `LevelGuard`, `MsfGuard` → `GrowthGuard` | Nothing now: deprecated aliases keep the old names compiling. The deep `ddp_run::convergence::` paths are gone; ddp-bench's `--guard trend\|msf` spellings fail fast — use `level` / `growth`. |
+| Managed-tier `TrainedState` comes back empty | Set `.save_path(stem)` and read the bundle; the cooperative tier's `finish()` is unchanged. |
+| Cluster wire version bumped (4 → 5) | Every box in one cohort must run the same flodl. |
+
+### The consensus bundle is the run's canonical persist form
+
+Three guarantees replaced three holes on the CPU averaging path: a
+natural clean end with `save_path` set always writes the FINAL
+consensus bundle (a single-epoch run no longer trains to completion
+and leaves nothing on disk), `checkpoint_fn` always receives the
+consensus (never a rank's EASGD blend), and `eval_fn` always scores it
+— served at the reduce, with the final canonical eval adopting the
+retained consensus, so the final metric describes exactly the model
+the bundle persists.
+
+The structural consequence is the one compile break: managed-tier rank
+children no longer materialize a per-rank final snapshot at teardown
+(nothing consumed it, and the run's model is on disk in better form),
+so `ClusterWorker::run_until_shutdown` returns `Result<()>`:
+
+```rust
+// before
+let snap = worker.run_until_shutdown(train_fn)?;   // Option<ParamSnapshot>
+
+// now
+worker.run_until_shutdown(train_fn)?;
+// the run's final model: .save_path("ckpts/run43") → ckpts/run43.fdl
+```
+
+Riders worth knowing: checkpoint writers create the stem's parent
+directories, the run prints where the stem resolves in its first
+lines, `request_checkpoint` / `request_eval` are served at the next
+reduce rather than an epoch boundary, and the crash-save bundle is
+documented for what it is (rank-0's own model, best-effort).
+
+### Struct literals: the new public fields
+
+None of these carry `#[non_exhaustive]`, so exhaustive struct literals
+and destructures stop compiling until they name the field (or use
+`..Default::default()` where a `Default` exists). Builder-style code is
+unaffected.
+
+| Struct | New field | Why |
+|---|---|---|
+| `TrainerConfig` / `DdpRunConfig` / `WorkerConfig` | `profile_graph: bool` | The timing heat map's data plane (see below). |
+| `ClusterCoordinatorConfig` | `consensus_checkpoint_fn` | The controller-side consensus checkpoint callback. |
+| `AveragedParams` | `realized: bool` | Distinguishes a realized consensus from a keep-local round. |
+| `ModelSchema` | `f32_buffer_idx: Vec<usize>` | Bundles carry the f32 buffer subset (a non-f32 buffer no longer silently disables consensus checkpoints). Old bundles still load. **`tensor_count()` changed meaning**: params + the f32 buffer subset, no longer params + all buffers. |
+| `graph::Profile` | `source: ProfileSource` | Says which clock produced the numbers (`GpuEvents` / `HostWallClock`). |
+| `monitor::TimelineBroadcast` | `rank_samples` | Remote hosts' samples now ride the broadcast. |
+
+### The convergence guards are named for what they measure
+
+`TrendGuard` → `LevelGuard` (watches the divergence **level**) and
+`MsfGuard` → `GrowthGuard` (watches the **rate** at which divergence
+compounds — the axis that may cut the anchor). Deprecated aliases in
+`flodl::compat` keep the old Rust names compiling at their documented
+paths; the deep `flodl::distributed::ddp_run::convergence::TrendGuard`
+/ `::MsfGuard` paths no longer resolve. `ddp-bench` renames hard:
+`--guard none|level|growth`, validated before a container starts.
+
+### No action needed, but worth knowing
+
+- **The async overshoot budget is derived per rank** from the measured
+  reduce and the rank's own pace; the flat default ceiling is now
+  non-binding. `--max-overshoot N` still pins a flat one.
+- **`record_log` / `--record-log` writes a shipped mirror**: the writer
+  stages on node-local disk and a shipper mirrors to your directory —
+  mid-run the destination holds `*.log.partial`, published by rename at
+  teardown. A hung shared mount can no longer stall a record append.
+- **AMD GPUs report live utilization** (amdgpu sysfs, no ROCm SMI, no
+  extra install). In a container the probe needs `--device=/dev/kfd` —
+  the node ROCm itself requires.
+- **The dashboard grew tabs** (Overview / Architecture / Timeline), and
+  `TrainerConfig::profile_graph` bakes per-GPU-model timing heat maps
+  from device-event profiles shipped at teardown.
+- **Graph profiling on CUDA now times execution, not the launch**
+  (device-side events; readings resolve one pass behind). If you pinned
+  profile numbers anywhere, expect them to grow to the true cost.
+
+### Cluster cohorts must be same-version
+
+`CONTROL_PROTOCOL_VERSION` went 4 → 5 (the graph-timings frame and the
+consensus-eval arm ride the control wire). As always, a mixed cohort
+refuses at the handshake, named. **Upgrade every box in a cohort
+together.**
 
 ---
 
