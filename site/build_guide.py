@@ -60,7 +60,7 @@ GUIDE_DIR = None
 # line-count, a release gate). `lint_doc_links` guards its own entry point, so
 # importing it runs nothing.
 sys.path.insert(0, os.path.join(REPO_ROOT, "ci", "release"))
-from lint_doc_links import strip_fences, slugify  # noqa: E402
+from lint_doc_links import raw_tag_hazards, strip_fences, slugify  # noqa: E402
 
 # Embedded skill assets: flodl-cli/assets/skills/ is the copy include_str!'d
 # into the fdl binary (the out-of-repo fallback for `fdl skill install`).
@@ -952,6 +952,19 @@ def main():
 
         content = rewrite_links(content, source_rel, source_to_permalink)
         content = strip_trailing_nav(content)
+
+        # A mid-paragraph line starting with a block-level HTML tag makes
+        # kramdown open a raw HTML block that never closes, and the page
+        # ships half-rendered (guide/cli/cluster did, 2026-08-17). The
+        # linter catches this at release time; failing here catches it at
+        # generation time, before a broken page can deploy.
+        hazards = raw_tag_hazards(content.split("\n"))
+        if hazards:
+            for lineno, text in hazards:
+                print(f"error: {source_rel}:{lineno}: mid-paragraph line starts "
+                      f"with a block-level HTML tag (rewrap it): {text[:60]}",
+                      file=sys.stderr)
+            sys.exit(1)
         clean_frontmatter = strip_source_from_frontmatter(frontmatter)
         clean_frontmatter = inject_channel(
             clean_frontmatter, permalinks[stub], channel, is_current

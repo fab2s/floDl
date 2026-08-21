@@ -468,8 +468,8 @@ for a working tree over ssh, `git+https://host/owner/repo#<ref>` (or
 UNCOMMITTED work, which is what a training crate living in no repo at all
 needs; `git+` insists on a ref because a default branch floats, and a
 floating ref is not a pin. Over ssh the credentials come from the `ssh:`
-block, so that key's forced command has to permit rsync (`rrsync -ro
-<dir>`) - the nologin join key does not.
+block, so that key's forced command has to permit rsync
+(`rrsync -ro <dir>`) - the nologin join key does not.
 
 The tree always lands on LOCAL disk first. cargo fingerprints by stat'ing
 every source file on every invocation, so building over a mount pays that
