@@ -182,10 +182,13 @@ HOST="$HOST_OS-$HOST_ARCH"
 # RUN_SETUP    install through `fdl setup --non-interactive` rather than
 #              a bare download: the wizard owns the whole recipe on that
 #              host, and no other leg exercises setup at all
+# CPU_TESTS    run flodl's CPU test suite here -- only where the suite
+#              meets an architecture it runs on nowhere else (linux
+#              x86_64 runs it every PR in ci.yml)
 # *_ADVISORY   this path has never run anywhere; report, do not block
 LT_FLAG=""; LT_DIR=""; LT_LIB=""
 REFUSE_FLAG=""; REFUSE_MSG=""
-COMPILE=0; GPU=0; ALL_VARIANTS=0; RUN_SETUP=0
+COMPILE=0; GPU=0; ALL_VARIANTS=0; RUN_SETUP=0; CPU_TESTS=0
 # INSTALL_ADVISORY is live (windows installs but does not compile).
 # COMPILE_ADVISORY is set by NO host now that macOS is green; it stays as
 # the mechanism for the next host added before it has ever run, which is
@@ -238,11 +241,10 @@ case "$HOST" in
         # aarch64 wheel is not self-contained (its runtime layer is 15
         # separate nvidia-* wheels) and no ROCm aarch64 build exists.
         LT_FLAG="--cpu"; LT_DIR=cpu-aarch64; LT_LIB="lib/libtorch.so"
-        COMPILE=1; RUN_SETUP=1
-        # Advisory until first green, per the macOS precedent above:
-        # neither the wheel repackage nor the shim compile has ever run
-        # on this host. Promote to a gate the run after it passes.
-        COMPILE_ADVISORY=1
+        COMPILE=1; RUN_SETUP=1; CPU_TESTS=1
+        # No *_ADVISORY: the wheel repackage, the shim compile and the
+        # scaffold train all went green on this host's first run
+        # (PR #67), so the leg gates like every other.
         REFUSE_FLAG="--cuda 12.8"; REFUSE_MSG="not available for Linux aarch64"
         ;;
     macos-aarch64)
@@ -675,6 +677,22 @@ elif [ "$COMPILE_ADVISORY" = 1 ]; then
 else
     fail "$HOST: flodl build/clippy"
 fi
+endgroup
+fi
+
+# =====================================================================
+if [ "$CPU_TESTS" = 1 ] && [ -n "$LT_DIR" ] && [ -d "libtorch/precompiled/$LT_DIR" ]; then
+group "flodl CPU test suite"
+# The suite meeting this architecture happens here or nowhere: a
+# claimed platform whose tests never execute is a green that means
+# nothing. `--lib` on purpose -- one link unit against libtorch instead
+# of the 60-odd separate `--tests` binaries (see the GPU link-check
+# note above) -- and `--skip leakcheck` mirrors `fdl test` (serial
+# global-counter tests that fail under the parallel runner). The
+# libtorch env is already exported from the variant this leg installed.
+cargo test -p flodl-sys -p flodl --lib -- --skip leakcheck \
+    || fail "$HOST: flodl CPU test suite"
+pass "$HOST ran the flodl CPU suite natively"
 endgroup
 fi
 
