@@ -137,7 +137,7 @@ For CUDA: `cargo add flodl --features cuda` + [CUDA toolkit](https://developer.n
 
 For AMD: `cargo add flodl --features rocm` + [ROCm](https://rocm.docs.amd.com/) (Linux only). `fdl probe` lists any missing toolkit packages with the command to install them.
 
-For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); a libtorch swap and `CARGO_BUILD_JOBS=2` are needed.
+For Apple Silicon (Mac M1/M2/M3/M4/M5): see [docs/mac-apple-silicon.md](https://github.com/flodl-labs/flodl/blob/main/docs/mac-apple-silicon.md) — flodl runs through the Docker `dev` service (Linux arm64); `fdl setup` fetches the container's libtorch itself (repackaged from the PyTorch wheel), and `CARGO_BUILD_JOBS=2` in `.env` is the one manual knob. Linux ARM servers (Graviton/Ampere) work the same way, CPU-only.
 
 > **Using tch-rs or PyTorch C++?** `fdl` also works as a standalone
 > libtorch manager outside of flodl: download any CPU/CUDA variant,
