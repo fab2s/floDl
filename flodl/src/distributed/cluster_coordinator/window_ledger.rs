@@ -242,24 +242,12 @@ impl WindowLedger {
     /// their reset placement is backend-specific (see
     /// [`WindowLedger::reset_steps`]).
     pub(crate) fn reset_timing(&mut self) {
-        for a in &mut self.wall_ms {
-            *a = 0.0;
-        }
-        for a in &mut self.delivered_ms {
-            *a = 0.0;
-        }
-        for n in &mut self.delivered_batches {
-            *n = 0;
-        }
-        for f in &mut self.first_batch_ms {
-            *f = 0.0;
-        }
-        for l in &mut self.loss_sum {
-            *l = 0.0;
-        }
-        for n in &mut self.loss_count {
-            *n = 0;
-        }
+        self.wall_ms.fill(0.0);
+        self.delivered_ms.fill(0.0);
+        self.delivered_batches.fill(0);
+        self.first_batch_ms.fill(0.0);
+        self.loss_sum.fill(0.0);
+        self.loss_count.fill(0);
     }
 
     /// Reset the per-rank step counts for a new window. Split from
@@ -267,9 +255,7 @@ impl WindowLedger {
     /// steps BEFORE the atomic-dispatch fold (chunk sizing reads them)
     /// while the timing reset rides the shared finish tail.
     pub(crate) fn reset_steps(&mut self) {
-        for s in &mut self.steps {
-            *s = 0;
-        }
+        self.steps.fill(0);
     }
 
     // --- test support ---------------------------------------------------

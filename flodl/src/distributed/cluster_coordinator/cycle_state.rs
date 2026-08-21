@@ -392,9 +392,7 @@ impl AvgCycleState {
     /// aren't read against a stale prior cycle. CPU arm only — on NCCL
     /// there's no SnapshotReady, so the slots stay `None` throughout.
     pub(super) fn reset_upload_markers(&mut self) {
-        for slot in &mut self.upload_ms {
-            *slot = None;
-        }
+        self.upload_ms.fill(None);
     }
 
     /// Open the CPU Pending window (phase + its wall-clock). No-op on

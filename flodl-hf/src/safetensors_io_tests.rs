@@ -1036,8 +1036,10 @@ fn save_safetensors_uses_hf_dotted_keys_and_le_f32() {
     assert_eq!(w_view.shape(), &[1_usize, 2]);
     let w_back: Vec<f32> = w_view
         .data()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     assert_eq!(w_back, w);
 
@@ -1046,8 +1048,10 @@ fn save_safetensors_uses_hf_dotted_keys_and_le_f32() {
         .unwrap();
     let b_back: Vec<f32> = b_view
         .data()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     assert_eq!(b_back, b);
 }

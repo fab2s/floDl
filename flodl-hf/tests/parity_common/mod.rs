@@ -25,8 +25,10 @@ use safetensors::tensor::TensorView;
 /// `f32` mask — the conversion happens in the test body).
 pub fn parse_i64(v: &TensorView<'_>) -> Vec<i64> {
     v.data()
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect()
 }
 
@@ -35,8 +37,10 @@ pub fn parse_i64(v: &TensorView<'_>) -> Vec<i64> {
 /// (logits, start_logits, end_logits, ...).
 pub fn parse_f32(v: &TensorView<'_>) -> Vec<f32> {
     v.data()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

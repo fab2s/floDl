@@ -24,8 +24,10 @@ fn bert_tokenizer_matches_parity_fixture_live() {
     let view = st.tensor("inputs.input_ids").unwrap();
     let expected_ids: Vec<i64> = view
         .data()
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect();
     let expected_shape: Vec<i64> = view.shape().iter().map(|&d| d as i64).collect();
 
@@ -45,8 +47,10 @@ fn bert_tokenizer_matches_parity_fixture_live() {
     let attn_view = st.tensor("inputs.attention_mask").unwrap();
     let expected_attn: Vec<i64> = attn_view
         .data()
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect();
     let actual_attn = enc.attention_mask.data().to_i64_vec().unwrap();
     assert_eq!(actual_attn, expected_attn, "attention_mask mismatch");
@@ -54,8 +58,10 @@ fn bert_tokenizer_matches_parity_fixture_live() {
     let tt_view = st.tensor("inputs.token_type_ids").unwrap();
     let expected_tt: Vec<i64> = tt_view
         .data()
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect();
     let actual_tt = enc.token_type_ids.data().to_i64_vec().unwrap();
     assert_eq!(actual_tt, expected_tt, "token_type_ids mismatch");
