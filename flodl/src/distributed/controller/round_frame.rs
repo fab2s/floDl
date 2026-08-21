@@ -753,13 +753,13 @@ pub(crate) fn accumulate_payload_into(payload: &TensorPayload, accum: &mut [f32]
     }
     match payload.dtype {
         DTYPE_F32 => {
-            for (a, c) in accum.iter_mut().zip(payload.bytes.chunks_exact(4)) {
-                *a += f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            for (a, c) in accum.iter_mut().zip(payload.bytes.as_chunks::<4>().0) {
+                *a += f32::from_le_bytes(*c);
             }
         }
         DTYPE_BF16 => {
-            for (a, c) in accum.iter_mut().zip(payload.bytes.chunks_exact(2)) {
-                *a += bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            for (a, c) in accum.iter_mut().zip(payload.bytes.as_chunks::<2>().0) {
+                *a += bf16_bits_to_f32(u16::from_le_bytes(*c));
             }
         }
         _ => unreachable!("payload_element_size validated the tag"),
@@ -821,16 +821,16 @@ pub(crate) fn scale_payload(payload: &mut TensorPayload, factor: f32) -> Result<
 pub(crate) fn scale_payload_bytes(bytes: &mut [u8], dtype: u8, factor: f32) -> Result<()> {
     match dtype {
         DTYPE_F32 => {
-            for c in bytes.chunks_exact_mut(4) {
-                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * factor;
-                c.copy_from_slice(&v.to_le_bytes());
+            for c in bytes.as_chunks_mut::<4>().0 {
+                let v = f32::from_le_bytes(*c) * factor;
+                *c = v.to_le_bytes();
             }
             Ok(())
         }
         DTYPE_BF16 => {
-            for c in bytes.chunks_exact_mut(2) {
-                let v = bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])) * factor;
-                c.copy_from_slice(&f32_to_bf16_bits(v).to_le_bytes());
+            for c in bytes.as_chunks_mut::<2>().0 {
+                let v = bf16_bits_to_f32(u16::from_le_bytes(*c)) * factor;
+                *c = f32_to_bf16_bits(v).to_le_bytes();
             }
             Ok(())
         }

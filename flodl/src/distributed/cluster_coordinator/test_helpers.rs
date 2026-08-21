@@ -431,9 +431,7 @@ impl ClusterCoordinator {
     /// re-arm path is independent of the ack slots (the NCCL re-arm
     /// token).
     pub(crate) fn set_all_nccl_ack_for_test(&mut self, acked: bool) {
-        for a in &mut self.cycle.acked {
-            *a = acked;
-        }
+        self.cycle.acked.fill(acked);
     }
 
     /// Put the CPU averaging machine into `Pending` (a cycle in

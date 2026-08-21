@@ -1269,9 +1269,7 @@ impl ElChe {
         }
         // The fill is a one-window signal: consume it so a stale value can't
         // drive a later cycle (mirrors the callback-slack one-shot).
-        for f in &mut self.pending_window_fill_ms {
-            *f = 0.0;
-        }
+        self.pending_window_fill_ms.fill(0.0);
 
         // Recompute batch counts from current (pre-proposal) anchor. The
         // commit/veto path recomputes again if the proposal lands.
@@ -1605,9 +1603,7 @@ impl ElChe {
         // (rather than letting the caller manage) avoids the
         // double-application bug where two back-to-back recomputes both
         // subtract the same slack.
-        for s in &mut self.pending_callback_slack_ms {
-            *s = 0.0;
-        }
+        self.pending_callback_slack_ms.fill(0.0);
     }
 }
 

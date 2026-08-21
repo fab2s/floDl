@@ -10,7 +10,11 @@
 //! routes are covered by pure argv builders plus a live smoke instead.
 //! And no test asserts a platform's own rendering of anything.
 
-use std::io::{Read as _, Write as _};
+// Write is NOT imported here: `use super::*` already carries the parent's
+// `use std::io::Write`, and current rustc flags an explicit `Write as _`
+// beside a glob-provided one as unused (the docker toolchain is older and
+// does not, which is how this shipped green locally and red in CI).
+use std::io::Read as _;
 
 use super::drive::{append_ledger, join_config_argv, publish_argv, route_argv, run_fdl};
 use super::http::{percent_decode, percent_encode};

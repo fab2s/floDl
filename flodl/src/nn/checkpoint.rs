@@ -548,22 +548,28 @@ fn tensor_from_raw_bytes(raw: &[u8], shape: &[i64], dtype: DType) -> Result<Tens
     match dtype {
         DType::Float32 => {
             let data: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             Tensor::from_f32(&data, shape, Device::CPU)
         }
         DType::Float64 => {
             let data: Vec<f64> = raw
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             Tensor::from_f64(&data, shape, Device::CPU)
         }
         DType::Int64 => {
             let data: Vec<i64> = raw
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect();
             Tensor::from_i64(&data, shape, Device::CPU)
         }

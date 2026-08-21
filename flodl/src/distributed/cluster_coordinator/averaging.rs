@@ -537,9 +537,7 @@ impl ClusterCoordinator {
         // window; step counts reset backend-specifically (see callers).
         self.window.reset_timing();
         self.cycle.clear_throttled();
-        for h in &mut self.dispatch_hold_logged {
-            *h = false;
-        }
+        self.dispatch_hold_logged.fill(false);
         self.cycle.reset_divergence_signals();
         // Overshoot gate is open again — kick any rank still sitting in
         // `wait_for_epoch_plan` (gated, or just finished its last chunk

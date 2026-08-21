@@ -127,9 +127,7 @@ impl Optimizer for RAdam {
         for slot in &mut self.v {
             *slot = None;
         }
-        for s in &mut self.steps {
-            *s = 0;
-        }
+        self.steps.fill(0);
     }
 
     fn zero_grad(&self) {

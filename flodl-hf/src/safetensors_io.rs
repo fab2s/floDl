@@ -662,8 +662,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks_exact(4) {
-                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for chunk in bytes.as_chunks::<4>().0 {
+                out.push(f32::from_le_bytes(*chunk));
             }
             Ok(out)
         }
@@ -675,10 +675,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 8);
-            for chunk in bytes.chunks_exact(8) {
-                let bits = f64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ]);
+            for chunk in bytes.as_chunks::<8>().0 {
+                let bits = f64::from_le_bytes(*chunk);
                 // Matches PyTorch's `.to(torch.float32)`: IEEE 754 narrowing,
                 // overflow saturates silently to ±inf, precision rounds to
                 // nearest-even. Transformer weights never hit the tails, so
@@ -695,8 +693,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 2);
-            for chunk in bytes.chunks_exact(2) {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            for chunk in bytes.as_chunks::<2>().0 {
+                let bits = u16::from_le_bytes(*chunk);
                 // bf16 is the top 16 bits of a f32 (same exponent).
                 out.push(f32::from_bits((bits as u32) << 16));
             }
@@ -710,8 +708,8 @@ pub fn tensor_view_to_f32_vec(view: &TensorView) -> Result<Vec<f32>> {
                 )));
             }
             let mut out = Vec::with_capacity(bytes.len() / 2);
-            for chunk in bytes.chunks_exact(2) {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            for chunk in bytes.as_chunks::<2>().0 {
+                let bits = u16::from_le_bytes(*chunk);
                 out.push(f16_bits_to_f32(bits));
             }
             Ok(out)
