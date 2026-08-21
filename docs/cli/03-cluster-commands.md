@@ -149,9 +149,10 @@ fdl invented would be right for everyone), `--cwd` (project dir inside
 the tree), `--build` (a shell recipe, default `cargo build --release`;
 it receives `LIBTORCH_PATH`, `FDL_GPU_FEATURE` and `LD_LIBRARY_PATH`,
 with the system ROCm runtime — `$ROCM_PATH` / `$HIP_PATH` / `$HSA_PATH`,
-else `/opt/rocm` — resolved ahead of libtorch's bundled copy), `--to
-<dir>` (the served directory, default `~/.flodl/run`; the guardrail
-key's `rrsync -ro` scopes to exactly this, so pick it deliberately),
+else `/opt/rocm` — resolved ahead of libtorch's bundled copy),
+`--to <dir>` (the served directory, default `~/.flodl/run`; the
+guardrail key's `rrsync -ro` scopes to exactly this, so pick it
+deliberately),
 `--identity <key>` (for an `rsync://` source the controller itself pulls
 over ssh), `--no-build` (skip the gate — recorded in the manifest,
 loudly), `--gate <variant>` (extra check-builds, below) and `--json`

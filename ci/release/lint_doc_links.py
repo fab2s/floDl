@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Markdown link, anchor and code-fence validator for the tracked doc corpus.
 
-Four checks:
+Five checks:
 
   1. FENCE BALANCE  -- a file with an unterminated code fence. This is the
      failure a doc *split* creates: a seam landing inside a fenced block
@@ -18,6 +18,12 @@ Four checks:
   4. GUIDE URLS     -- every hand-written `/guide/...` site URL, anywhere in the
      repo (markdown, HTML, Rust, YAML), matches a real published permalink from
      `site/_stubs/*.md`.
+
+  5. RAW-TAG WRAPS  -- no mid-paragraph line begins with a block-level HTML
+     tag. A hard wrap that puts something tag-shaped at column one (a code
+     span split as ``` `--to<newline><dir>` ```) opens an HTML block that
+     never closes, and BOTH renderers (GitHub's cmark-gfm, the site's
+     kramdown) ship everything after it as raw markdown.
 
 Checks 3 and 4 are the ones that motivated this script, and both guard failures
 that had already shipped:
@@ -138,6 +144,52 @@ def strip_fences(lines):
         if open_marker is None:
             content.append((i, line))
     return content, open_marker is not None
+
+
+# Block-level HTML tags shared by CommonMark's type-6 HTML-block rule and
+# kramdown's block parser: a line BEGINNING with one of these can interrupt
+# a paragraph and open a raw HTML block. Unknown tags (placeholders like
+# `<ref>`) cannot interrupt a paragraph, so they are deliberately not listed.
+BLOCK_TAGS = frozenset("""
+address article aside base basefont blockquote body caption center col
+colgroup dd details dialog dir div dl dt fieldset figcaption figure footer
+form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li
+link main menu menuitem nav noframes ol optgroup option p param section
+source summary table tbody td tfoot th thead title tr track ul
+""".split())
+
+RAW_TAG = re.compile(r"^<([A-Za-z][A-Za-z0-9-]*)(?=[\s/>])")
+
+
+def raw_tag_hazards(lines):
+    """(lineno, text) pairs where a MID-PARAGRAPH line begins with a
+    block-level HTML tag -- the hard-wrap class that half-renders a page.
+
+    Both renderers agree on the hazard: a line starting with a known block
+    tag interrupts the paragraph (CommonMark type-6 on GitHub, block HTML
+    in kramdown on the site), so a code span hard-wrapped as
+    ``` `--to<newline><dir>` ``` ends the paragraph and opens an HTML
+    element that never closes -- everything after ships as raw markdown:
+    literal `**`, dead fences, and the orphaned `--` upgraded to an
+    en-dash. Shipped exactly that way once (guide/cli/cluster,
+    2026-08-17), which is why this is a FAIL and not a style nit. The fix
+    is always a rewrap that keeps the tag-shaped token off column one.
+
+    Deliberate raw HTML stays legal: a tag at paragraph START (blank line
+    above), a tag continuing an HTML block (previous line also starts
+    with `<`), and a tag right after a fence are all allowed.
+    """
+    hazards = []
+    content, _ = strip_fences(lines)
+    for lineno, line in content:
+        m = RAW_TAG.match(line)
+        if not m or m.group(1).lower() not in BLOCK_TAGS:
+            continue
+        prev = lines[lineno - 2] if lineno >= 2 else ""
+        if not prev.strip() or prev.lstrip().startswith("<") or FENCE.match(prev):
+            continue
+        hazards.append((lineno, line.strip()))
+    return hazards
 
 
 def slugify(text):
@@ -334,7 +386,7 @@ def main():
             anchor_cache[rel] = anchors_of(os.path.join(root, rel))
         return anchor_cache[rel]
 
-    unbalanced, missing_files, missing_anchors = [], [], []
+    unbalanced, missing_files, missing_anchors, tag_hazards = [], [], [], []
 
     for rel in files:
         with open(os.path.join(root, rel), encoding="utf-8") as fh:
@@ -342,6 +394,8 @@ def main():
         content, odd = strip_fences(lines)
         if odd:
             unbalanced.append(rel)
+        for lineno, text in raw_tag_hazards(lines):
+            tag_hazards.append((rel, lineno, text))
 
         src_dir = os.path.dirname(rel)
         for lineno, target in links_of(content):
@@ -387,6 +441,12 @@ def main():
         print("FAIL: /guide/ URLs with no matching permalink in site/_stubs/:")
         for rel, lineno, url in bad_urls:
             print(f"  {rel}:{lineno}  ->  {url}")
+        fail = 1
+    if tag_hazards:
+        print("FAIL: mid-paragraph line starts with a block-level HTML tag "
+              "(interrupts the paragraph, half-renders the page; rewrap the line):")
+        for rel, lineno, text in tag_hazards:
+            print(f"  {rel}:{lineno}  ->  {text[:60]}")
         fail = 1
     if no_stubs:
         print("WARN: site/_stubs/ not found; skipping guide-URL check")
