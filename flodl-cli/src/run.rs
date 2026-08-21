@@ -253,16 +253,18 @@ fn find_project_mount(volumes: &[serde_yaml_ng::Value]) -> Option<String> {
 /// Resolve libtorch env vars from the project root, matching the Makefile logic:
 ///   LIBTORCH_HOST_PATH = ./libtorch/<active_variant>          (standalone)
 ///                      = <host.path>/libtorch/<host.arch>     (overlay)
-///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/cpu
+///   LIBTORCH_CPU_PATH  = ./libtorch/precompiled/(per-arch cpu dir)
 ///   CUDA_VERSION, CUDA_TAG from .arch metadata
 ///   FDL_GPU_FEATURE   = the cargo feature the active variant needs
 pub(crate) fn libtorch_env(project_root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::new();
 
-    // CPU path is always the same.
+    // CPU path is per-architecture: the container runs the host's arch,
+    // so an ARM host (Linux or Apple Silicon) mounts the cpu-aarch64
+    // build while x86 keeps the bare `cpu` compose default.
     env.push((
         "LIBTORCH_CPU_PATH".into(),
-        "./libtorch/precompiled/cpu".into(),
+        crate::libtorch::detect::container_cpu_path(),
     ));
 
     if let Some((info, host_path)) = resolve_libtorch(project_root)? {

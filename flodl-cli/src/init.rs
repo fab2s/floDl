@@ -868,9 +868,9 @@ fn env_example_template(mode: Mode) -> String {
     if mode == Mode::Mounted {
         s.push_str(
             "
-# libtorch mount points (host paths). Defaults live in docker-compose.yml.
-# Override to point at a different variant, e.g. an extracted linux-aarch64
-# build on Apple Silicon.
+# libtorch mount points (host paths). Defaults live in docker-compose.yml,
+# and only affect direct `docker compose` calls: `fdl` exports the per-arch
+# value itself (ARM hosts mount ./libtorch/precompiled/cpu-aarch64).
 #LIBTORCH_CPU_PATH=./libtorch/precompiled/cpu
 #LIBTORCH_HOST_PATH=./libtorch/precompiled/cu128
 

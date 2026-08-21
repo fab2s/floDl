@@ -714,7 +714,13 @@ fn prebuild_one_worker(
             project_root,
             vec![
                 ("LIBTORCH_HOST_PATH", host_path.clone()),
-                ("LIBTORCH_CPU_PATH", "./libtorch/precompiled/cpu".into()),
+                // Controller-side compose interpolation; per-arch like
+                // `run.rs`'s export, since the controller's container
+                // runs the controller's architecture.
+                (
+                    "LIBTORCH_CPU_PATH",
+                    crate::libtorch::detect::container_cpu_path(),
+                ),
             ],
         )
     } else {

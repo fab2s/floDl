@@ -199,6 +199,43 @@ pub fn variant_vendor(variant: &str) -> Option<GpuVendor> {
     }
 }
 
+/// Directory name under `precompiled/` for a CPU build targeting a
+/// platform.
+///
+/// Bare `cpu` stays the Linux x86_64 build: the reference platform, the
+/// compose fallback mount, and every existing checkout. Other platforms
+/// carry a suffix so one checkout shared across architectures (a
+/// NAS/virtiofs cluster mixing x86 and ARM hosts, or a macOS host beside
+/// its Linux container) holds each build under its own name and selects
+/// per host through `.active.<case>` or a cluster `arch:` entry. Flat
+/// siblings, not subdirectories: a variant id is `<family>/<name>`
+/// everywhere it travels (`.active`, overlay `arch:` values, per-host
+/// target-dir keying), and a third level for one family would break that
+/// grammar. `classify_variant_label` already reads any `cpu-*` basename
+/// as a CPU build, so the suffixed names derive no GPU feature.
+pub fn cpu_dir_name(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("linux", "aarch64") => "cpu-aarch64",
+        ("macos", _) => "cpu-macos",
+        _ => "cpu",
+    }
+}
+
+/// The CPU libtorch path a Linux container on THIS host mounts, as the
+/// project-relative spelling compose interpolates.
+///
+/// Container-facing on purpose: docker runs the host's architecture, so
+/// an Apple Silicon or Linux ARM host mounts the `cpu-aarch64` build
+/// while everything else keeps the bare `cpu` default. The value feeds
+/// `LIBTORCH_CPU_PATH`, whose compose fallback stays
+/// `./libtorch/precompiled/cpu`.
+pub fn container_cpu_path() -> String {
+    format!(
+        "./libtorch/precompiled/{}",
+        cpu_dir_name("linux", std::env::consts::ARCH)
+    )
+}
+
 /// The `export` lines a native-build recipe prints for a variant's
 /// vendor, in order.
 ///
@@ -450,6 +487,29 @@ mod tests {
         // breaking a hand-named CUDA build that works today.
         assert_eq!(variant_vendor("builds/mybuild"), Some(GpuVendor::Nvidia));
         assert_eq!(variant_vendor("builds/gfx"), Some(GpuVendor::Nvidia));
+    }
+
+    #[test]
+    fn cpu_dir_names_the_platform_and_stays_bare_on_the_reference() {
+        // Bare `cpu` = Linux x86_64 (and Windows, whose container is
+        // linux/amd64): every existing checkout and the compose default
+        // keep working. The suffixed names exist so builds for two
+        // architectures can share one checkout.
+        assert_eq!(cpu_dir_name("linux", "x86_64"), "cpu");
+        assert_eq!(cpu_dir_name("windows", "x86_64"), "cpu");
+        assert_eq!(cpu_dir_name("linux", "aarch64"), "cpu-aarch64");
+        assert_eq!(cpu_dir_name("macos", "aarch64"), "cpu-macos");
+        // Every name this mints must classify as a CPU build, or the
+        // feature derivation would hand a GPU feature to a CPU variant.
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+        ] {
+            let dir = format!("precompiled/{}", cpu_dir_name(os, arch));
+            assert_eq!(variant_vendor(&dir), None, "{dir}");
+        }
     }
 
     #[test]
