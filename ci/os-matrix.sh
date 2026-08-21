@@ -179,10 +179,13 @@ HOST="$HOST_OS-$HOST_ARCH"
 #              has three distinct refusal arms and macOS resolves CPU
 #              happily while still having to reject --cuda.
 # COMPILE      the framework can be built here afterwards
+# RUN_SETUP    install through `fdl setup --non-interactive` rather than
+#              a bare download: the wizard owns the whole recipe on that
+#              host, and no other leg exercises setup at all
 # *_ADVISORY   this path has never run anywhere; report, do not block
 LT_FLAG=""; LT_DIR=""; LT_LIB=""
 REFUSE_FLAG=""; REFUSE_MSG=""
-COMPILE=0; GPU=0; ALL_VARIANTS=0
+COMPILE=0; GPU=0; ALL_VARIANTS=0; RUN_SETUP=0
 # INSTALL_ADVISORY is live (windows installs but does not compile).
 # COMPILE_ADVISORY is set by NO host now that macOS is green; it stays as
 # the mechanism for the next host added before it has ever run, which is
@@ -225,10 +228,22 @@ case "$HOST" in
         LT_LIB="lib/libtorch.so"
         ;;
     linux-aarch64)
-        # Upstream publishes no archive for this host in any variant, so
-        # the whole leg is the assertion that fdl says so rather than
-        # building a URL that 404s.
-        REFUSE_FLAG="--cpu"; REFUSE_MSG="Unsupported platform"
+        # Upstream publishes no libtorch zip for this host in any
+        # variant; fdl repackages the CPU build from the torch wheel
+        # (self-contained: arm_compute + NVPL BLAS/LAPACK). This leg
+        # proves that recipe end to end and drives it through the setup
+        # wizard rather than a bare download, because setup owns the
+        # recipe (detect -> fetch -> activate -> dev image) and no other
+        # leg exercises it at all. GPU variants stay refused: the CUDA
+        # aarch64 wheel is not self-contained (its runtime layer is 15
+        # separate nvidia-* wheels) and no ROCm aarch64 build exists.
+        LT_FLAG="--cpu"; LT_DIR=cpu-aarch64; LT_LIB="lib/libtorch.so"
+        COMPILE=1; RUN_SETUP=1
+        # Advisory until first green, per the macOS precedent above:
+        # neither the wheel repackage nor the shim compile has ever run
+        # on this host. Promote to a gate the run after it passes.
+        COMPILE_ADVISORY=1
+        REFUSE_FLAG="--cuda 12.8"; REFUSE_MSG="not available for Linux aarch64"
         ;;
     macos-aarch64)
         # CPU only, and not a gap to fill later: upstream publishes no
@@ -244,7 +259,10 @@ case "$HOST" in
         # and upstream's own dylibs asked for a bundled libomp by
         # absolute Homebrew path. Both were reported as a warning nobody
         # had to act on.
-        LT_FLAG="--cpu"; LT_DIR=cpu; LT_LIB="lib/libtorch.dylib"
+        # `cpu-macos`, not bare `cpu`: the CPU dir names the platform so
+        # a Mach-O host build and a Linux container build can share one
+        # checkout (bare `cpu` stays the Linux x86_64 reference).
+        LT_FLAG="--cpu"; LT_DIR=cpu-macos; LT_LIB="lib/libtorch.dylib"
         COMPILE=1
         REFUSE_FLAG="--cuda 12.8"; REFUSE_MSG="macOS only supports CPU libtorch"
         ;;
@@ -388,7 +406,15 @@ group "Install libtorch via fdl ($LT_FLAG)"
 # Expand-Archive is not evidence the tree landed -- assert what the rest
 # of the toolchain reads.
 INSTALL_OK=1
-"$FDL" libtorch download $LT_FLAG || INSTALL_OK=0
+if [ "$RUN_SETUP" = 1 ]; then
+    # The whole recipe through the wizard: detect -> fetch -> activate ->
+    # dev image. Setup warns (never errors) on a docker image build
+    # failure, so what gates below is what every leg asserts anyway --
+    # the tree, the library, the headers and the pointer it produced.
+    "$FDL" setup --non-interactive || INSTALL_OK=0
+else
+    "$FDL" libtorch download $LT_FLAG || INSTALL_OK=0
+fi
 "$FDL" libtorch list || true
 
 LT="libtorch/precompiled/$LT_DIR"

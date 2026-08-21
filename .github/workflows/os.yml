@@ -81,7 +81,9 @@ jobs:
           # still works, and that is the one users have.
           - ubuntu-24.04       # x86_64: installs a vendor libtorch, builds the feature
           - ubuntu-26.04       # x86_64: the newest LTS, same sequence
-          - ubuntu-24.04-arm   # aarch64: no upstream archive; asserts fdl refuses
+          - ubuntu-24.04-arm   # aarch64: CPU repackaged from the torch wheel,
+                               # driven through `fdl setup` (the only leg that
+                               # exercises the wizard); GPU variants refused
           - macos-latest       # arm64: CPU only, upstream publishes nothing else
           - windows-latest     # x86_64: installs, does not compile
 

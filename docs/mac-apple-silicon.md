@@ -6,11 +6,15 @@ machines is **CPU via the `dev` Docker service**.
 
 Two halves to keep apart, because `fdl` handles them differently:
 
-- **Managing libtorch** works natively. `fdl libtorch download` fetches
-  PyTorch's macOS arm64 `.dylib` build directly, and `fdl probe` /
-  `fdl setup` report what a host is missing with `brew` hints. macOS arm64
-  is covered by the OS CI matrix, which asserts both the CPU install and
-  that `--cuda` / `--rocm` are refused with a reason.
+- **Managing libtorch** works natively, container build included. In a
+  Docker-mounted project, `fdl setup` fetches the **Linux arm64** libtorch
+  the container needs — repackaged by `fdl` from the official PyTorch
+  wheel — while `fdl libtorch download --cpu` in a native project fetches
+  PyTorch's macOS arm64 `.dylib` build. `fdl probe` reports what a host is
+  missing with `brew` hints. Both shapes are covered by the OS CI matrix
+  (the macOS leg asserts the `.dylib` install and the `--cuda` / `--rocm`
+  refusals; the Linux arm leg drives the wheel repackage through
+  `fdl setup` itself).
 - **Building flodl** is Docker-only. `flodl-sys`'s C++ shim has never been
   compiled green by clang-on-macOS (the CI matrix runs that step
   advisory), so `fdl build` / `fdl test` / `fdl clippy` go through the
@@ -31,75 +35,40 @@ own toolchain. A native `fdl` binary on the host is convenient for
 
 ## One-time setup
 
-### 1. Fetch the libtorch Linux arm64 build
-
-This is the one step `fdl` cannot do for you, and the reason is worth
-stating so the workaround does not look arbitrary. `fdl setup` names this
-gap on Apple Silicon rather than trying to fill it.
-
-The container needs **Linux arm64** `.so` files. `fdl libtorch download`
-on a Mac gets **macOS arm64** `.dylib` files: correct for the host, and
-unloadable inside a Linux container. The Linux arm64 build is not an
-option either: PyTorch publishes no `libtorch-linux-aarch64.zip` on
-`download.pytorch.org/libtorch/` at all, in any variant. `fdl` asserts
-this rather than guessing a URL (the OS CI matrix has an `ubuntu-24.04-arm`
-leg whose entire job is to check that `fdl` refuses with
-`Unsupported platform`).
-
-So the artifact gets extracted from the official PyPI wheel, which does
-ship Linux aarch64. This snippet runs inside a throw-away
-`python:3.12-slim` container so the resulting `.so` files are
-unambiguously Linux arm64:
+### 1. Run `fdl setup`
 
 ```bash
-mkdir -p libtorch/precompiled/cpu-linux-aarch64
-docker run --rm --platform linux/arm64 \
-  -v "$PWD/libtorch/precompiled/cpu-linux-aarch64:/out" \
-  python:3.12-slim bash -lc '
-set -e
-mkdir -p /tmp/dl && cd /tmp/dl
-pip download --no-deps --only-binary=:all: \
-  --platform manylinux_2_28_aarch64 \
-  --python-version 3.12 --implementation cp --abi cp312 \
-  torch==2.10.0 -d /tmp/dl
-WHL=$(ls /tmp/dl/torch-*.whl | head -1)
-python -c "import zipfile; zipfile.ZipFile(\"$WHL\").extractall(\"/tmp/whl\")"
-find /out -mindepth 1 -delete
-cp -a /tmp/whl/torch/include /out/
-cp -a /tmp/whl/torch/lib     /out/
-cp -a /tmp/whl/torch/share   /out/
-'
+./fdl setup
 ```
+
+The container needs **Linux arm64** `.so` files, and PyTorch publishes no
+`libtorch-linux-aarch64.zip` on `download.pytorch.org/libtorch/` in any
+variant — the compiled CPU bits ship inside the PyTorch *wheel* instead
+(self-contained: arm_compute + NVPL BLAS/LAPACK). In a Docker-mounted
+project, `fdl setup` (and `fdl libtorch download --cpu` under it) fetches
+that wheel, repackages `torch/{lib,include,share}` into
+`libtorch/precompiled/cpu-aarch64/`, activates it, and builds the `dev`
+image. GPU variants stay refused on Linux arm64: the CUDA aarch64 wheel is
+not self-contained, and no ROCm build exists there at all.
 
 Sanity checks:
 
 ```bash
-test -f libtorch/precompiled/cpu-linux-aarch64/include/torch/csrc/api/include/torch/torch.h
-ls    libtorch/precompiled/cpu-linux-aarch64/lib/libtorch*.so
-du -sh libtorch/precompiled/cpu-linux-aarch64
+test -f libtorch/precompiled/cpu-aarch64/include/torch/csrc/api/include/torch/torch.h
+ls    libtorch/precompiled/cpu-aarch64/lib/libtorch*.so
+du -sh libtorch/precompiled/cpu-aarch64
 # expected: libtorch.so + libtorch_cpu.so + libc10.so present, total ~380 MB
 ```
 
-### 2. Point the default mount path at the Linux build
+The CPU directory name carries the platform (`cpu` is the Linux x86_64
+reference build, `cpu-aarch64` the Linux arm64 one, `cpu-macos` the host's
+`.dylib` build), so container and host builds coexist in one checkout with
+nothing moved or symlinked. `fdl` exports the matching `LIBTORCH_CPU_PATH`
+to compose, so the container mounts `cpu-aarch64` automatically; only a
+direct `docker compose run` (bypassing `fdl`) needs the `.env` override in
+the next step.
 
-`docker-compose.yml` bind-mounts `./libtorch/precompiled/cpu` into the
-container. On a Mac that directory ships PyTorch's macOS `.dylib` files, which
-the Linux container can't use. Make `cpu/` a symlink to the Linux arm64 build:
-
-```bash
-cd libtorch/precompiled
-mv cpu cpu-macos-arm64               # preserve the macOS .dylib files
-ln -s cpu-linux-aarch64 cpu          # cpu/ now points at the Linux .so files
-cd ../..
-```
-
-Why a symlink and not the `LIBTORCH_CPU_PATH` env override? `docker compose run`
-honours `.env` for variable substitution, but the `fdl` CLI wrapper bypasses
-that path and always expands `${LIBTORCH_CPU_PATH:-./libtorch/precompiled/cpu}`
-to its hard-coded default. Re-pointing the default via a symlink is the
-non-destructive fix.
-
-### 3. Create `.env` for the docker-compose runtime
+### 2. Create `.env` for the docker-compose runtime
 
 ```bash
 cat > .env <<'EOF'
@@ -111,17 +80,23 @@ CARGO_BUILD_JOBS=2
 # Host UID/GID so files written into the bind-mount aren't owned by root.
 UID=501
 GID=20
+
+# Only needed for DIRECT `docker compose run` calls: `fdl` exports this
+# per-arch value itself, but compose alone falls back to the x86 default.
+LIBTORCH_CPU_PATH=./libtorch/precompiled/cpu-aarch64
 EOF
 ```
 
 Adjust `UID` / `GID` to your account (`id -u` / `id -g`). The `.env` file is
 gitignored — it's host-specific.
 
-Those three values are all a Mac needs. `.env.example` at the repo root is the
+Those values are all a Mac needs. `.env.example` at the repo root is the
 full reference if you want the other compose knobs (libtorch variant overrides,
 CUDA image tag, verbosity).
 
-### 4. Build the dev image
+### 3. Build the dev image (if setup did not)
+
+`fdl setup` builds it already; run this only if you skipped that step:
 
 ```bash
 docker compose build dev
@@ -174,40 +149,31 @@ the `dev` service's `environment:` list.
 
 ### `fdl setup` finished but `fdl build` still will not link
 
-Expected on Apple Silicon, and `fdl setup` says so on the way out:
-
-```
-  That is the macOS build, for the host. The dev container is
-  linux/arm64 and needs Linux aarch64 libtorch, which PyTorch
-  does not publish; it has to be extracted from the PyPI wheel.
-```
-
-Setup installs the host's macOS build, which is the right artifact for
-`fdl libtorch info` and for step 2's `mv cpu cpu-macos-arm64`, but it is
-not what the container loads. Steps 1 and 2 on this page are still
-required. Run them, then `fdl build`.
-
-Older versions forced a Linux **x86_64** download here on the reasoning
-that the container wants Linux libtorch. That is true on an Intel Mac and
-wrong on Apple Silicon, where the container is linux/arm64; the `.so`
-files landed in the bind-mount and failed to load as `cannot find -ltorch`
-or the missing-shared-object error below.
+Your `fdl` (or checkout) predates the wheel repackage. Two earlier
+generations of this failure exist in the wild: the oldest forced a Linux
+**x86_64** download (right on an Intel Mac, unloadable in a linux/arm64
+container), and the next fetched the host's macOS `.dylib` build and
+pointed at a manual wheel-extraction recipe that used to live on this
+page. Update, then re-run `fdl setup` — it now fetches the Linux arm64
+build into `libtorch/precompiled/cpu-aarch64` itself.
 
 ### `libtorch_cpu.so: cannot open shared object file`
 
-The container is mounting the macOS `.dylib` directory instead of the Linux
-`.so` directory. Inspect what's actually mounted:
+The container is mounting the wrong directory — macOS `.dylib` files, or
+an empty x86-named default. Inspect what's actually mounted:
 
 ```bash
 docker compose run --rm dev ls /usr/local/libtorch/lib | head
 # you want .so files (libtorch.so, libtorch_cpu.so, libc10.so), not .dylib
 ```
 
-If you see `.dylib`, the symlink swap in step 2 was not applied. Redo it:
+If this was a direct `docker compose run` rather than an `fdl` command,
+compose fell back to its x86 default mount; set `LIBTORCH_CPU_PATH` in
+`.env` as in step 2. If an `fdl` command did it, check the install:
 
 ```bash
-ls -la libtorch/precompiled/cpu                 # should be a symlink
-# lrwxr-xr-x ... cpu -> cpu-linux-aarch64
+ls libtorch/precompiled/cpu-aarch64/lib/libtorch*.so   # must exist
+cat libtorch/precompiled/cpu-aarch64/.arch             # platform=linux-aarch64
 ```
 
 ### `error[E0308]: mismatched types ... expected *const u8, found *const i8`
@@ -234,24 +200,22 @@ Don't run `docker compose up`. The `cuda` and `bench` services declare
 `docker compose run --rm dev …` (which `./fdl` does for you) or
 `docker compose build dev` to target only the CPU service.
 
-## Going back to native macOS later
+## Using the native macOS build
 
-The macOS arm64 libtorch (PyTorch's `.dylib` build) is preserved in
-`libtorch/precompiled/cpu-macos-arm64/`. To switch back from Docker to a
-native macOS build:
+The macOS arm64 libtorch (PyTorch's `.dylib` build) is its own variant and
+coexists with the container's Linux build — nothing needs moving:
 
 ```bash
-cd libtorch/precompiled
-rm cpu                                # remove the symlink
-mv cpu-macos-arm64 cpu                # restore the macOS .dylib files at the
-                                      # default location used by fdl
-cd ../..
-# … then point LIBTORCH_PATH at /full/path/to/libtorch/precompiled/cpu in
-# your shell, install cargo natively, and run `cargo build` outside Docker.
+fdl libtorch download --cpu     # outside a Docker-mounted project:
+                                # installs libtorch/precompiled/cpu-macos
+# … then point LIBTORCH_PATH at /full/path/to/libtorch/precompiled/cpu-macos
+# in your shell, install cargo natively, and run `cargo build` outside Docker.
 ```
 
-If you no longer have that directory, `fdl libtorch download --cpu` fetches
-the macOS arm64 build fresh.
+(A checkout migrated from the old manual recipe may still carry the
+`cpu-macos-arm64` / `cpu-linux-aarch64` directories and a `cpu` symlink
+from this page's previous instructions; they keep working, but a fresh
+`fdl setup` uses the new names and the symlink can go.)
 
 What is and is not covered natively: `fdl`'s libtorch management and
 diagnostics (`download`, `list`, `info`, `activate`, `probe`, `diagnose`)

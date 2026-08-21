@@ -16,6 +16,19 @@ use crate::util::system::GpuVendor;
 
 const LIBTORCH_VERSION: &str = "2.10.0";
 
+/// Python tag of the torch wheel the Linux aarch64 CPU variant is
+/// repackaged from.
+///
+/// PyTorch publishes no linux-aarch64 libtorch zip in any bucket; the
+/// compiled CPU bits ship inside the torch wheel instead, self-contained
+/// (arm_compute + NVPL BLAS/LAPACK, unmangled sonames), so the variant is
+/// the wheel's `torch/{lib,include,share}` flattened one level. The tag
+/// is coupled to [`LIBTORCH_VERSION`]: bump them together, against the
+/// listing at <https://download.pytorch.org/whl/cpu/>. Drift cannot ship
+/// silently -- the os-matrix arm leg downloads through this URL for real
+/// and a stale tag 404s there.
+const AARCH64_WHEEL_PY: &str = "cp312";
+
 /// Pre-built variant metadata.
 struct VariantSpec {
     /// Label for display (e.g. "CUDA 12.8").
@@ -117,11 +130,14 @@ pub struct DownloadOpts {
     pub custom_path: Option<PathBuf>,
     pub activate: bool,
     pub dry_run: bool,
-    /// Force the Linux x86_64 build regardless of host OS. Set when the
-    /// libtorch will be consumed inside a Linux Docker container rather
-    /// than linked against host cargo — without this, macOS hosts pick
-    /// `libtorch-macos-arm64-*.zip` (Mach-O dylibs) which then fail to
-    /// load inside the Linux container that bind-mounts the directory.
+    /// Force the Linux build at the HOST's architecture, regardless of
+    /// host OS. Set when the libtorch will be consumed inside a Linux
+    /// Docker container rather than linked against host cargo — without
+    /// this, macOS hosts pick `libtorch-macos-arm64-*.zip` (Mach-O
+    /// dylibs) which then fail to load inside the Linux container that
+    /// bind-mounts the directory. The arch is kept because the container
+    /// runs the host's: Apple Silicon needs the aarch64 wheel repackage,
+    /// an Intel Mac the x86_64 zip.
     pub force_linux: bool,
 }
 
@@ -269,21 +285,35 @@ fn relink_bundled_libomp(lib_dir: &Path) {
     }
 }
 
-fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String> {
-    // `force_linux` short-circuits host detection: the binary is destined
-    // for a Linux Docker container, so we always want the Linux x86_64
-    // build regardless of what the host is.
-    let (os, arch) = if force_linux {
-        ("linux", "x86_64")
-    } else {
-        (std::env::consts::OS, std::env::consts::ARCH)
-    };
-
-    download_url_for(spec, os, arch)
+/// The platform a download targets: the host, unless the artifact is
+/// destined for a Linux Docker container.
+fn target_platform(force_linux: bool) -> (&'static str, &'static str) {
+    target_platform_for(force_linux, std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Pure core of [`download_url`]: the host is a parameter rather than a
-/// global read.
+/// Pure core of [`target_platform`]: the host is a parameter, so both
+/// force arms are testable from any runner.
+///
+/// `force_linux` overrides the OS and KEEPS the architecture: docker runs
+/// the host's arch, so an Intel Mac or Windows box wants the Linux x86_64
+/// build while Apple Silicon wants Linux aarch64. Forcing x86_64
+/// unconditionally was the old behaviour, and on Apple Silicon it put
+/// unloadable x86 `.so` files in the bind-mount.
+fn target_platform_for(
+    force_linux: bool,
+    host_os: &'static str,
+    host_arch: &'static str,
+) -> (&'static str, &'static str) {
+    if force_linux {
+        ("linux", host_arch)
+    } else {
+        (host_os, host_arch)
+    }
+}
+
+/// The archive URL for a variant on an explicit platform — the host is a
+/// parameter rather than a global read (callers resolve it through
+/// [`target_platform`]).
 ///
 /// Every platform arm is reachable from any test runner as a result, which
 /// is the point. The Windows filename pattern differs from Linux's, this
@@ -294,6 +324,29 @@ fn download_url(spec: &VariantSpec, force_linux: bool) -> Result<String, String>
 fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, String> {
     match (os, arch) {
         ("linux", "x86_64") => {}
+        ("linux", "aarch64") => {
+            // No libtorch zip exists for this platform in any bucket; the
+            // CPU build ships inside the torch wheel (see
+            // [`AARCH64_WHEEL_PY`]) and is repackaged from it. The CUDA
+            // wheel is NOT self-contained -- its runtime layer is 15
+            // separate nvidia-* wheels -- and no ROCm aarch64 build
+            // exists at all, so GPU variants refuse rather than
+            // reconstruct an archive upstream does not publish.
+            if spec.arch_variant != "cpu" {
+                return Err(format!(
+                    "{} libtorch is not available for Linux aarch64.\n\
+                     Upstream ships only the CPU build for this platform (inside\n\
+                     the PyTorch wheel); GPU builds need `fdl libtorch build`.",
+                    spec.label
+                ));
+            }
+            return Ok(format!(
+                "https://download.pytorch.org/whl/cpu/\
+                 torch-{v}%2Bcpu-{py}-{py}-manylinux_2_28_aarch64.whl",
+                v = LIBTORCH_VERSION,
+                py = AARCH64_WHEEL_PY,
+            ));
+        }
         ("macos", "aarch64") => {
             // `cuda=none` stopped meaning "CPU build" when a second
             // vendor arrived: a ROCm spec carries it too, and without
@@ -324,7 +377,8 @@ fn download_url_for(spec: &VariantSpec, os: &str, arch: &str) -> Result<String, 
         _ => {
             return Err(format!(
                 "Unsupported platform: {} {}.\n\
-                 libtorch is available for Linux x86_64, macOS arm64, and Windows x86_64.",
+                 libtorch is available for Linux x86_64, Linux aarch64 (CPU),\n\
+                 macOS arm64, and Windows x86_64.",
                 os, arch
             ));
         }
@@ -536,17 +590,28 @@ pub fn run(opts: DownloadOpts) -> Result<String, String> {
 /// re-prints its reasoning and can only agree by accident.
 pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, String> {
     let spec = resolve_variant(&opts.variant);
-    let url = download_url(spec, opts.force_linux)?;
+    let (os, arch) = target_platform(opts.force_linux);
+    let url = download_url_for(spec, os, arch)?;
+    let platform = format!("{os}-{arch}");
+
+    // CPU builds are per-platform (the GPU dirs already carry the vendor
+    // in their name, and only one platform publishes each): the dir name
+    // routes on the TARGET platform so builds for two architectures can
+    // share one checkout. See `detect::cpu_dir_name` for the grammar.
+    let dir_name = if spec.arch_variant == "cpu" {
+        detect::cpu_dir_name(os, arch)
+    } else {
+        spec.dir_name
+    };
 
     // Determine install path
     let install_path = if let Some(ref p) = opts.custom_path {
         p.clone()
     } else {
-        ctx.root
-            .join(format!("libtorch/precompiled/{}", spec.dir_name))
+        ctx.root.join(format!("libtorch/precompiled/{}", dir_name))
     };
 
-    let variant_id = format!("precompiled/{}", spec.dir_name);
+    let variant_id = format!("precompiled/{}", dir_name);
 
     println!();
     println!("  libtorch {} ({})", LIBTORCH_VERSION, spec.label);
@@ -571,17 +636,34 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, Str
             v == LIBTORCH_VERSION || v.starts_with(&format!("{}+", LIBTORCH_VERSION))
         });
 
-        if ver_matches {
+        // A version match alone is not an identity match: two platforms'
+        // CPU builds carry the same version string, and a checkout seen
+        // from two frames (Windows + WSL2 on one tree, a forced-Linux
+        // fetch after a native one) can hold the wrong platform's build
+        // under this dir. Installs made before the key carry no
+        // `platform=` line and make no claim.
+        let existing_platform = read_arch_platform(&install_path);
+        let platform_matches = existing_platform.as_deref().is_none_or(|p| p == platform);
+
+        if ver_matches && platform_matches {
             println!();
             println!("  Already installed (version {}).", LIBTORCH_VERSION);
             return Ok(variant_id);
         }
 
         println!();
-        println!(
-            "  Removing existing installation (version: {})...",
-            existing_ver.as_deref().unwrap_or("unknown")
-        );
+        if ver_matches {
+            println!(
+                "  Installed build is for {}, this download targets {}; replacing...",
+                existing_platform.as_deref().unwrap_or("unknown"),
+                platform
+            );
+        } else {
+            println!(
+                "  Removing existing installation (version: {})...",
+                existing_ver.as_deref().unwrap_or("unknown")
+            );
+        }
         fs::remove_dir_all(&install_path)
             .map_err(|e| format!("cannot remove {}: {}", install_path.display(), e))?;
     }
@@ -612,26 +694,50 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, Str
     println!("  Downloading...");
     http::download_file(&url, &tmp_zip)?;
 
-    // Extract (the zip carries a top-level "libtorch/" dir)
+    // Extract. A libtorch zip carries a top-level "libtorch/" dir; a
+    // wheel (a zip too -- Linux aarch64 CPU arrives as one) roots at
+    // "torch/" with the python package beside the C++ payload.
     let tmp_extract = stage.path().join("extract");
     println!("  Extracting...");
     archive::extract_zip(&tmp_zip, &tmp_extract)?;
 
-    // Move extracted contents to target path
-    let extracted_lt = tmp_extract.join("libtorch");
-    let source = if extracted_lt.is_dir() {
-        &extracted_lt
-    } else {
-        &tmp_extract
-    };
-
     fs::create_dir_all(&install_path)
         .map_err(|e| format!("cannot create {}: {}", install_path.display(), e))?;
 
-    // Move all files from extracted dir to install path. Same
-    // filesystem now, so `move_contents`'s rename path is the one that
-    // fires.
-    move_contents(source, &install_path)?;
+    // Move extracted contents to target path. Same filesystem now, so
+    // the rename path is the one that fires.
+    let extracted_lt = tmp_extract.join("libtorch");
+    let wheel_root = tmp_extract.join("torch");
+    if wheel_root.join("lib").is_dir() {
+        // Repackage the wheel: only the C++ payload moves, flattened one
+        // level (torch/lib -> lib/ ...), which is the layout every other
+        // variant has and everything downstream reads. The python half
+        // of the wheel stays behind in staging and is dropped with it.
+        for sub in ["lib", "include", "share"] {
+            let from = wheel_root.join(sub);
+            if !from.is_dir() {
+                continue;
+            }
+            let to = install_path.join(sub);
+            if fs::rename(&from, &to).is_err() {
+                copy_dir_recursive(&from, &to)?;
+            }
+        }
+        // The wheel carries no build-version file; the already-installed
+        // check above reads it, so write what the zip would have held.
+        fs::write(
+            install_path.join("build-version"),
+            format!("{}+cpu\n", LIBTORCH_VERSION),
+        )
+        .map_err(|e| format!("cannot write build-version: {}", e))?;
+    } else {
+        let source = if extracted_lt.is_dir() {
+            &extracted_lt
+        } else {
+            &tmp_extract
+        };
+        move_contents(source, &install_path)?;
+    }
 
     // `stage` cleans itself up on drop, including on the error paths
     // above -- the predecessor leaked its temp zip and extract dir
@@ -657,10 +763,12 @@ pub fn run_with_context(opts: DownloadOpts, ctx: &Context) -> Result<String, Str
 
     relink_bundled_libomp(&lib_dir);
 
-    // Write .arch metadata (always, both project and global)
+    // Write .arch metadata (always, both project and global). `platform=`
+    // records what the binaries ARE -- the dir name is convention, this
+    // is fact -- and is what the already-installed check compares.
     let arch_content = format!(
-        "cuda={}\ntorch={}\narchs={}\nsource=precompiled\nvariant={}\n",
-        spec.arch_cuda, LIBTORCH_VERSION, spec.arch_archs, spec.arch_variant
+        "cuda={}\ntorch={}\narchs={}\nsource=precompiled\nvariant={}\nplatform={}\n",
+        spec.arch_cuda, LIBTORCH_VERSION, spec.arch_archs, spec.arch_variant, platform
     );
     fs::write(install_path.join(".arch"), arch_content)
         .map_err(|e| format!("cannot write .arch: {}", e))?;
@@ -743,6 +851,18 @@ impl Drop for Staging {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// The `platform=` key of an installed variant's `.arch`, when present.
+///
+/// Read locally rather than through a `LibtorchInfo` field: the
+/// already-installed check is the only consumer, and installs made before
+/// the key exist without it (absent = no claim, not a mismatch).
+fn read_arch_platform(dir: &Path) -> Option<String> {
+    fs::read_to_string(dir.join(".arch"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("platform=").map(|v| v.trim().to_string()))
 }
 
 fn move_contents(src: &Path, dest: &Path) -> Result<(), String> {
@@ -921,10 +1041,42 @@ mod tests {
 
     #[test]
     fn unsupported_platform_is_rejected() {
-        // linux-aarch64 has no upstream libtorch archive; `fdl libtorch
-        // build` from source is the path there.
-        let err = download_url_for(&CPU_SPEC, "linux", "aarch64").unwrap_err();
+        let err = download_url_for(&CPU_SPEC, "linux", "riscv64").unwrap_err();
         assert!(err.contains("Unsupported platform"), "got {err}");
+    }
+
+    #[test]
+    fn linux_aarch64_cpu_resolves_the_wheel() {
+        // No libtorch zip exists for this platform; the CPU variant is
+        // repackaged from the torch wheel. The URL is CONSTRUCTED --
+        // download.pytorch.org/whl/<bucket>/ serves plain filenames,
+        // unlike files.pythonhosted.org -- and was verified live
+        // (HTTP 200, 146 MB) on 2026-08-21.
+        let url = download_url_for(&CPU_SPEC, "linux", "aarch64").unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://download.pytorch.org/whl/cpu/\
+                 torch-{LIBTORCH_VERSION}%2Bcpu-{AARCH64_WHEEL_PY}-{AARCH64_WHEEL_PY}\
+                 -manylinux_2_28_aarch64.whl"
+            )
+        );
+    }
+
+    #[test]
+    fn linux_aarch64_refuses_gpu_variants_by_name() {
+        // The CUDA aarch64 wheel is not self-contained (its runtime layer
+        // is 15 separate nvidia-* wheels) and no ROCm aarch64 build
+        // exists, so both refuse rather than reconstruct an archive
+        // upstream does not publish.
+        for spec in [&CU126_SPEC, &CU128_SPEC, &ROCM70_SPEC, &ROCM71_SPEC] {
+            let err = download_url_for(spec, "linux", "aarch64").unwrap_err();
+            assert!(
+                err.contains("not available for Linux aarch64"),
+                "{}: got {err}",
+                spec.label
+            );
+        }
     }
 
     /// `otool -L` shape as upstream's arm64 archive actually prints it:
@@ -984,13 +1136,45 @@ libtorch/lib/libtorch_cpu.dylib:
     }
 
     #[test]
-    fn force_linux_ignores_the_host() {
-        // The container is Linux whatever the host is, so the docker path
-        // must never pick up a macOS or Windows filename.
-        let url = download_url(&CU128_SPEC, true).unwrap();
-        assert!(url.contains("libtorch-shared-with-deps-"), "got {url}");
-        assert!(!url.contains("-win-"), "got {url}");
-        assert!(!url.contains("macos"), "got {url}");
+    fn platform_key_reads_back_and_predates_itself_gracefully() {
+        let dir = std::env::temp_dir().join(format!("fdl-arch-key-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Pre-key install: no platform= line, no claim.
+        fs::write(dir.join(".arch"), "cuda=none\ntorch=2.10.0\n").unwrap();
+        assert_eq!(read_arch_platform(&dir), None);
+        // Current shape.
+        fs::write(
+            dir.join(".arch"),
+            "cuda=none\ntorch=2.10.0\nplatform=linux-aarch64\n",
+        )
+        .unwrap();
+        assert_eq!(read_arch_platform(&dir).as_deref(), Some("linux-aarch64"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn force_linux_overrides_the_os_and_keeps_the_arch() {
+        // The container is Linux whatever the host is, but it runs the
+        // HOST's architecture: an Intel Mac or Windows box wants the
+        // Linux x86_64 build, Apple Silicon wants Linux aarch64. Forcing
+        // x86_64 unconditionally was the old behaviour, and on Apple
+        // Silicon it put unloadable x86 .so files in the bind-mount.
+        assert_eq!(
+            target_platform_for(true, "macos", "x86_64"),
+            ("linux", "x86_64")
+        );
+        assert_eq!(
+            target_platform_for(true, "windows", "x86_64"),
+            ("linux", "x86_64")
+        );
+        assert_eq!(
+            target_platform_for(true, "macos", "aarch64"),
+            ("linux", "aarch64")
+        );
+        assert_eq!(
+            target_platform_for(false, "macos", "aarch64"),
+            ("macos", "aarch64")
+        );
     }
 
     // Variant routing. Asserted through the pure `variant_for_gpus` so no
