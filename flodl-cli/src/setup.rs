@@ -469,7 +469,8 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         println!();
         println!("  Building Docker images...");
 
-        // Create cargo cache dirs
+        // The cargo cache dirs every compose service shares (created here
+        // so the bind mounts are owned by the user, not by docker as root).
         let _ = std::fs::create_dir_all(".cargo-cache");
         let _ = std::fs::create_dir_all(".cargo-git");
 
@@ -485,8 +486,6 @@ pub fn run(opts: SetupOpts) -> Result<(), String> {
         // nodes), so building `cuda` on an AMD box builds the wrong one.
         if let Some(vendor) = active_vendor.filter(|_| !gpus.is_empty()) {
             let service = crate::run::resolve_docker_service(crate::run::LOGICAL_GPU_SERVICE, root);
-            let _ = std::fs::create_dir_all(format!(".cargo-cache-{service}"));
-            let _ = std::fs::create_dir_all(format!(".cargo-git-{service}"));
 
             let status = docker::compose_run(".", &["build", &service])?;
             if !status.success() {

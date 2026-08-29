@@ -16,8 +16,12 @@ services:
     image: flodl-rhel
     volumes:
       - .:/workspace
-      # Its own cargo cache: a tree built against this glibc has no
-      # business landing in the Debian images' registry cache.
+      # Its own cargo cache, for ownership rather than content: the
+      # registry cache holds crate sources, which are the same on every
+      # platform (built trees live in target/), and every other service
+      # shares ./.cargo-cache. This one runs as root with cargo's home
+      # under /root, and root-owned entries in the shared cache would
+      # break the uid-1000 services that write beside them.
       - ./.cargo-cache-rhel:/root/.cargo/registry
       - ${LIBTORCH_CPU_PATH:-./libtorch/precompiled/cpu}:/usr/local/libtorch:ro
     working_dir: /workspace
@@ -35,6 +39,11 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
+      # One registry + git cache for every service that runs as the host
+      # user: the cache holds crate sources and the index, identical for
+      # every image and toolchain (compiled output is per-service, in
+      # target/), and cargo's file locks work across bind mounts of the
+      # same directory, so concurrent containers serialize correctly.
       - ./.cargo-cache:/usr/local/cargo/registry
       - ./.cargo-git:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
@@ -90,8 +99,8 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
-      - ./.cargo-cache-cuda:/usr/local/cargo/registry
-      - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
       - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
       # SSH-agent socket forwarded so the launcher can ssh into remote
@@ -224,8 +233,8 @@ services:
     ipc: host
     volumes:
       - .:/workspace
-      - ./.cargo-cache-rocm:/usr/local/cargo/registry
-      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
       # LIBTORCH_HOST_PATH, same as the cuda services: fdl exports it
       # from the ACTIVE variant, so a `builds/gfx…` install (or a
@@ -276,8 +285,8 @@ services:
     # lands as `ubuntu` per the Dockerfile.cuda config.
     volumes:
       - .:/workspace
-      - ./.cargo-cache-cuda:/usr/local/cargo/registry
-      - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ./.cargo-credentials.toml:/usr/local/cargo/credentials.toml
       - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
       # Public key file → authorized_keys (read-only). Generate on host
@@ -356,8 +365,8 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
-      - ./.cargo-cache-bench:/usr/local/cargo/registry
-      - ./.cargo-git-bench:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ${LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
@@ -420,8 +429,8 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/workspace
-      - ./.cargo-cache-docsrs:/usr/local/cargo/registry
-      - ./.cargo-git-docsrs:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ./.target-docsrs:/opt/target
     working_dir: /workspace/flodl
     environment:

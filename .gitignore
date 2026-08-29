@@ -3,11 +3,7 @@ benchmarks/target
 Cargo.lock
 .cargo-cache/
 .cargo-git/
-.cargo-cache-cuda/
 .cargo-cache-rhel/
-.cargo-git-cuda/
-.cargo-cache-bench/
-.cargo-git-bench/
 .cargo-credentials.toml
 .idea/
 .*/
