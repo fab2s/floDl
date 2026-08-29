@@ -648,6 +648,45 @@ fn the_drop_in_names_the_per_platform_trap() {
     assert!(!plain.contains("ssh.socket"), "{plain}");
 }
 
+/// A door on the login port gets no daemon-level guardrail at all. The
+/// block is scoped by `Match LocalPort`, so on 22 it would confine every
+/// session on the box (no TTY, one permitted forward), the operator's
+/// own included. Found by generating a farm for a host-sshd door on 22:
+/// the file carried `Port 22` twice and a `Match LocalPort 22` block
+/// under a header promising that 22 stayed untouched.
+#[test]
+fn a_door_on_the_login_port_emits_no_daemon_guardrail() {
+    use crate::util::platform::Platform;
+    for door in [Door::Nologin, Door::A, Door::B] {
+        let conf = render_sshd_conf("f", door, 22, Platform::Debian);
+        for directive in [
+            "Match",
+            "Port 22",
+            "PermitTTY",
+            "ForceCommand",
+            "PermitOpen",
+        ] {
+            assert!(
+                !conf
+                    .lines()
+                    .any(|l| !l.starts_with('#') && l.contains(directive)),
+                "{door:?}: `{directive}` must not be a live directive on 22:\n{conf}"
+            );
+        }
+        assert!(
+            conf.contains("key line carries the whole guardrail"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(":2222"),
+            "must point at a dedicated port: {conf}"
+        );
+    }
+    // A dedicated port keeps the block.
+    let conf = render_sshd_conf("f", Door::B, 2222, Platform::Debian);
+    assert!(conf.contains("Match LocalPort 2222"), "{conf}");
+}
+
 /// A scaffolded overlay must never cost the project its commands.
 ///
 /// The placeholder form is the trap: a `commands:` key whose only
