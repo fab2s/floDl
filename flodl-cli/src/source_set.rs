@@ -44,11 +44,18 @@ use crate::util::sha256;
 pub const DIGEST_FILE: &str = ".fdl-run.sha256";
 
 /// The files that make up a source tree, as paths relative to `root`.
+///
+/// Entries are `/`-joined strings, not `PathBuf`s: the list crosses
+/// frames (rsync's `--files-from`, the `sha256sum` sidecar, a digest a
+/// worker on another OS recomputes), and a path rendered by THIS
+/// platform (`app\Cargo.toml` on Windows) is a different string with a
+/// different hash. `Path::join` accepts `/` on every platform for the
+/// way back to disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSet {
     pub root: PathBuf,
     /// Sorted, deduplicated, every entry an existing regular file.
-    pub files: Vec<PathBuf>,
+    pub files: Vec<String>,
     /// How many path crates contributed (0 for a whole-tree set).
     pub crates: usize,
 }
@@ -136,7 +143,7 @@ pub fn cargo_file_set(root: &Path, cwd: Option<&str>) -> Result<Option<FileSet>,
         crate_dirs.insert(dir);
     }
 
-    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
     for dir in &crate_dirs {
         let rel_dir = dir.strip_prefix(&root).unwrap_or(Path::new(""));
         let listing = cargo_output(
@@ -149,7 +156,7 @@ pub fn cargo_file_set(root: &Path, cwd: Option<&str>) -> Result<Option<FileSet>,
             }
             let rel = rel_dir.join(line);
             if root.join(&rel).is_file() {
-                files.insert(rel);
+                files.insert(slash(&rel));
             }
         }
     }
@@ -186,7 +193,7 @@ pub fn cargo_file_set(root: &Path, cwd: Option<&str>) -> Result<Option<FileSet>,
         for name in WORKSPACE_FILES {
             let rel = rel_anchor.join(name);
             if root.join(&rel).is_file() {
-                files.insert(rel);
+                files.insert(slash(&rel));
             }
         }
     }
@@ -196,6 +203,14 @@ pub fn cargo_file_set(root: &Path, cwd: Option<&str>) -> Result<Option<FileSet>,
         files: files.into_iter().collect(),
         crates: crate_dirs.len(),
     }))
+}
+
+/// A relative path as the `/`-joined string every frame agrees on.
+fn slash(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn cargo_output(args: &[&str], manifest: &Path) -> Result<String, Fail> {
@@ -219,14 +234,14 @@ fn cargo_output(args: &[&str], manifest: &Path) -> Result<String, Fail> {
 /// Every regular file under `tree` that a worker would receive: the
 /// pull excludes `target/` at any depth, and the two run files describe
 /// the tree rather than belong to it. Relative, sorted.
-pub fn tree_files(tree: &Path) -> Result<Vec<PathBuf>, Fail> {
+pub fn tree_files(tree: &Path) -> Result<Vec<String>, Fail> {
     let mut out = Vec::new();
     walk(tree, tree, &mut out)?;
     out.sort();
     Ok(out)
 }
 
-fn walk(tree: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Fail> {
+fn walk(tree: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), Fail> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| Fail::Permanent(format!("cannot list {}: {e}", dir.display())))?;
     for entry in entries {
@@ -246,7 +261,7 @@ fn walk(tree: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Fail> {
             if dir == tree && (name == MANIFEST_FILE || name == DIGEST_FILE) {
                 continue;
             }
-            out.push(path.strip_prefix(tree).unwrap_or(&path).to_path_buf());
+            out.push(slash(path.strip_prefix(tree).unwrap_or(&path)));
         }
     }
     Ok(())
@@ -261,7 +276,7 @@ pub fn sync(set: &FileSet, dest: &Path, notes: &mut Vec<String>) -> Result<(), F
     let list_path = dest.with_extension("files");
     let mut list = String::new();
     for f in &set.files {
-        list.push_str(&f.to_string_lossy());
+        list.push_str(f);
         list.push('\n');
     }
     std::fs::write(&list_path, list)
@@ -277,7 +292,7 @@ pub fn sync(set: &FileSet, dest: &Path, notes: &mut Vec<String>) -> Result<(), F
     let _ = std::fs::remove_file(&list_path);
     result?;
 
-    let wanted: BTreeSet<&PathBuf> = set.files.iter().collect();
+    let wanted: BTreeSet<&String> = set.files.iter().collect();
     let mut pruned = 0usize;
     for rel in tree_files(dest)? {
         if !wanted.contains(&rel) {
@@ -318,7 +333,7 @@ fn remove_empty_dirs(tree: &Path, dir: &Path) -> bool {
 
 /// Hash `files` under `tree` into the sidecar's text (`sha256sum`
 /// format) and the digest the manifest records.
-pub fn digest(tree: &Path, files: &[PathBuf]) -> Result<(String, TreeDigest), Fail> {
+pub fn digest(tree: &Path, files: &[String]) -> Result<(String, TreeDigest), Fail> {
     let mut sidecar = String::new();
     let mut bytes = 0u64;
     for rel in files {
@@ -328,7 +343,7 @@ pub fn digest(tree: &Path, files: &[PathBuf]) -> Result<(String, TreeDigest), Fa
         bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         sidecar.push_str(&hex);
         sidecar.push_str("  ");
-        sidecar.push_str(&rel.to_string_lossy());
+        sidecar.push_str(rel);
         sidecar.push('\n');
     }
     let d = TreeDigest {
@@ -369,23 +384,22 @@ pub fn verify(tree: &Path, expected: &TreeDigest) -> Result<(), Fail> {
             &expected.sha256[..expected.sha256.len().min(8)],
         )));
     }
-    let mut listed: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut listed: BTreeSet<String> = BTreeSet::new();
     let mut problems: Vec<String> = Vec::new();
     for line in sidecar.lines() {
         let Some((hex, rel)) = line.split_once("  ") else {
             continue;
         };
-        let rel = PathBuf::from(rel);
-        listed.insert(rel.clone());
-        match sha256::file_hex(&tree.join(&rel)) {
+        listed.insert(rel.to_string());
+        match sha256::file_hex(&tree.join(rel)) {
             Ok(h) if h == hex => {}
-            Ok(_) => problems.push(format!("{} differs", rel.display())),
-            Err(_) => problems.push(format!("{} is missing", rel.display())),
+            Ok(_) => problems.push(format!("{rel} differs")),
+            Err(_) => problems.push(format!("{rel} is missing")),
         }
     }
     for rel in tree_files(tree)? {
         if !listed.contains(&rel) {
-            problems.push(format!("{} is not in the published set", rel.display()));
+            problems.push(format!("{rel} is not in the published set"));
         }
     }
     if problems.is_empty() {
@@ -465,11 +479,7 @@ mod tests {
         let set = cargo_file_set(&root, Some("app"))
             .unwrap()
             .expect("a Cargo.toml at cwd yields a set");
-        let files: Vec<String> = set
-            .files
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        let files = &set.files;
         assert_eq!(set.crates, 2, "{files:?}");
         for must in [
             "Cargo.toml",
@@ -570,7 +580,7 @@ mod tests {
         write(&tree.join("target/release/bin"), "built");
         let set = FileSet {
             root: src.clone(),
-            files: vec![PathBuf::from("a/b/deep.rs"), PathBuf::from("a/keep.rs")],
+            files: vec!["a/b/deep.rs".to_string(), "a/keep.rs".to_string()],
             crates: 1,
         };
         let mut notes = Vec::new();
