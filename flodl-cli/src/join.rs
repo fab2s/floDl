@@ -144,11 +144,13 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         let started = Instant::now();
         // What happened, phrased for the re-dial line. Every branch that
         // is not re-dialable returns from here.
+        let mut clean_run = false;
         let outcome = match attempt(&eff, libtorch.as_ref(), &mut sig_cache) {
             Ok(code) => {
                 if !eff.persist {
                     return code;
                 }
+                clean_run = code == 0;
                 format!("agent exited with code {code}")
             }
             Err(fail) => {
@@ -171,9 +173,7 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
                 "attempt failed".to_string()
             }
         };
-        if started.elapsed() > BACKOFF_RESET_AFTER {
-            backoff = BACKOFF_MIN;
-        }
+        backoff = persist_backoff(backoff, clean_run, started.elapsed());
         eprintln!(
             "fdl join: {outcome} after {}s; re-dialing in {}s (--persist)",
             started.elapsed().as_secs(),
@@ -492,6 +492,24 @@ fn parse_ssh_spec(spec: &str) -> Result<SshConfig, String> {
         identity_file: None,
         options: Vec::new(),
     })
+}
+
+/// The delay before the next dial of a `--persist` loop.
+///
+/// A completed run (agent exit 0) resets the backoff whatever its
+/// length: it is the healthy signal, and the next run is usually being
+/// started right now. Doubling after it, as the loop once did, made a
+/// farm chaining short runs wait 10s, 20s, 40s, 60s for windows that were
+/// already open. Failures and no-window exits keep doubling toward
+/// [`BACKOFF_MAX`], and an attempt that stayed up past
+/// [`BACKOFF_RESET_AFTER`] resets too (a long run that ended badly is
+/// not a hot loop).
+fn persist_backoff(prev: Duration, clean_run: bool, elapsed: Duration) -> Duration {
+    if clean_run || elapsed > BACKOFF_RESET_AFTER {
+        BACKOFF_MIN
+    } else {
+        prev
+    }
 }
 
 /// A walk-in trusts the controller's host key on first use unless the
@@ -1653,6 +1671,29 @@ mod tests {
                 "StrictHostKeyChecking=yes".to_string(),
                 "ServerAliveInterval=5".to_string()
             ]
+        );
+    }
+
+    /// Seen on the rig: two clean 15s runs in a row and the standing
+    /// agents re-dialed in 20s, then 40s, treating each finished run as a
+    /// failure because only a 120s attempt reset the backoff.
+    #[test]
+    fn a_clean_run_resets_the_persist_backoff_and_a_failure_keeps_doubling() {
+        let short = Duration::from_secs(15);
+        // Clean exit after a short run: back to the floor.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), true, short),
+            BACKOFF_MIN
+        );
+        // Failure after a short attempt: the caller keeps doubling from here.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), false, short),
+            Duration::from_secs(40)
+        );
+        // A long attempt resets regardless of how it ended.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), false, BACKOFF_RESET_AFTER + short),
+            BACKOFF_MIN
         );
     }
 }

@@ -317,9 +317,11 @@ fdl join --ssh flodl-join@ctrl.example.com --identity ~/.ssh/join_key \
   run: rank children re-enter the binary with them.
 - `--devices 0,1` scopes the GPUs offered (default: all);
   `--host` names the worker in the roster (default: hostname).
-- `--persist` re-dials with backoff (5s doubling to 60s) whenever the
-  agent exits — no window open yet, run finished, controller rebooted —
-  the systemd / golden-image mode.
+- `--persist` re-dials whenever the agent exits — no window open yet,
+  run finished, controller rebooted — the systemd / golden-image mode.
+  A completed run re-dials after 5s (the next run is usually being
+  started right then); failures and dials with no window open back off
+  from 5s toward 60s.
 - Inside a project, the active libtorch's `lib/` rides
   `LD_LIBRARY_PATH` onto the binary automatically (`FDL_LIBTORCH_CASE`
   honored) and its variant label rides the join hello.
