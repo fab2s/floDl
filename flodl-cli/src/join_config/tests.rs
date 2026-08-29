@@ -1021,3 +1021,32 @@ fn farm_enumeration_unions_overlays_and_dirs_and_skips_non_farms() {
     assert!(text.contains("not farms: cluster"), "{text}");
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// The shell probe in the self-test must be a command every door
+/// refuses. rrsync exits 0 on a bare `true` (its connectivity-probe
+/// allowance), so with that probe door b's own key passed the "no
+/// shell" check for a reason unrelated to the guardrail.
+#[test]
+fn the_self_test_probe_is_one_rrsync_does_not_whitelist() {
+    let tmp = tempdir();
+    let mut cli = no_flags();
+    cli.label = Some("probefarm".to_string());
+    cli.controller = Some("op@ctrl:2222".to_string());
+    cli.dry_run = true;
+    let steps = wizard_at(&cli, &tmp).unwrap().steps().join("\n");
+    let probe = steps
+        .lines()
+        .find(|l| {
+            l.contains("ssh -i")
+                && l.contains("op@ctrl")
+                && !l.contains(" -L ")
+                && !l.contains("rsync")
+        })
+        .expect("a shell probe line");
+    assert!(probe.contains("op@ctrl id "), "{probe}");
+    assert!(
+        !probe.contains(" true"),
+        "rrsync whitelists `true`: {probe}"
+    );
+    let _ = fs::remove_dir_all(&tmp);
+}

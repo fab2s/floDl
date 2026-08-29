@@ -427,7 +427,11 @@ source on its next re-dial, with no reprovisioning.
   (a rebuild or a re-publish re-probes), not once per backoff tick. Without it the mismatch is
   still caught, but at formation, where it takes the whole cohort's
   attempt down. The probe is best-effort: a probe that fails or times
-  out joins without a signature and says so. One probe outcome deserves
+  out joins without a signature and says so. It runs OUTSIDE any
+  cluster, so a `main()` that bails on the local GPU count ahead of
+  `Trainer::run` answers nothing; let that gate step aside when
+  `flodl::distributed::launcher::model_sig_probe_requested()` is true
+  (ddp-bench does). One probe outcome deserves
   attention beyond its warning: a binary that exits non-zero under the
   probe will usually fail the same way when rank children re-enter it
   with the same arguments after admission.

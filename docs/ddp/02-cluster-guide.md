@@ -245,7 +245,7 @@ the window open for extra dial-in workers:
 
 | Knob | Meaning | Default |
 |---|---|---|
-| `min_rank_start` | Quorum in ranks; the run cannot start below it. | configured capacity |
+| `min_rank_start` | Quorum in ranks; the run cannot start below it. At least 2: a world of one rank has nothing to average with, and the window refuses to open rather than fail after the join. | configured capacity |
 | `join_timeout` | Window in seconds. Quorum reached early does NOT close it - late workers within the window still join. | 300 |
 | `target_ranks` | The window closes the moment this many ranks are in. Raise it above capacity to wait for self-deployed workers. | configured capacity |
 | `max_join_timeout` | Hard cap in seconds; quorum still unmet when it expires fails the run loudly. | 600 (or the window length when set higher) |

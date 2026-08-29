@@ -66,6 +66,13 @@ pub(crate) fn build_coord_config_from_builder(
     // ElChe construction: anchor (default 10 matches DdpRunConfig docs)
     // plus optional max/min/overhead_target/max_batch_diff knobs.
     let anchor = config.elche.anchor;
+    if world_size < 2 {
+        return Err(crate::tensor::TensorError::new(&format!(
+            "cluster: a world of {world_size} rank(s) cannot train as a cluster \
+             (nothing to average with); raise `min_rank_start` to 2 or more, \
+             or train single-GPU without a cluster"
+        )));
+    }
     let mut el_che = ElChe::new(world_size, anchor);
     if let Some(target) = config.elche.overhead_target {
         el_che = el_che.with_overhead_target(target);

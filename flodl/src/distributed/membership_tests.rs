@@ -305,6 +305,17 @@ fn config_cross_field_validation() {
         .unwrap_err()
         .to_string();
     assert!(msg.contains("min_rank_start"), "got: {msg}");
+    // One rank is refused too, at window open rather than at world
+    // formation: a rehearsal with quorum 1 waited out a whole join,
+    // formed, and then died in the cadence's `world_size >= 2` assert.
+    let lone = JoinConfig {
+        min_rank_start: 1,
+        ..test_config()
+    };
+    let msg = MembershipLedger::new(lone, None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains(">= 2"), "got: {msg}");
 
     let target_below_quorum = JoinConfig {
         min_rank_start: 4,
@@ -354,7 +365,7 @@ fn verdict_quorum_early_does_not_close_the_window() {
     // Quorum of 1 met immediately, but no target: the window stays open
     // so late workers within it are still admitted.
     let mut ledger = MembershipLedger::new(test_config(), None, None).unwrap();
-    admit_host(&mut ledger, "a", 1).unwrap();
+    admit_host(&mut ledger, "a", 2).unwrap();
     assert_eq!(
         ledger.verdict(Duration::from_secs(10), WINDOW, CAP, false),
         WindowVerdict::Open
@@ -409,12 +420,12 @@ fn verdict_cap_expiry_fails_loudly() {
 fn verdict_manual_holds_until_operator_start() {
     use crate::distributed::membership::StartMode;
     let config = JoinConfig {
-        min_rank_start: 1,
+        min_rank_start: 2,
         start_mode: StartMode::Manual,
         ..test_config()
     };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
-    admit_host(&mut ledger, "a", 1).unwrap();
+    admit_host(&mut ledger, "a", 2).unwrap();
     // Quorum met, window expired: a manual hold stays open where auto
     // would have formed.
     assert_eq!(
@@ -469,13 +480,13 @@ fn verdict_manual_start_is_quorum_gated() {
 fn verdict_hybrid_keeps_the_clock_and_adds_the_operator() {
     use crate::distributed::membership::StartMode;
     let config = JoinConfig {
-        min_rank_start: 1,
+        min_rank_start: 2,
         target_ranks: Some(3),
         start_mode: StartMode::Hybrid,
         ..test_config()
     };
     let mut ledger = MembershipLedger::new(config, None, None).unwrap();
-    admit_host(&mut ledger, "a", 1).unwrap();
+    admit_host(&mut ledger, "a", 2).unwrap();
     // Clock semantics intact: below target, inside the window → open.
     assert_eq!(
         ledger.verdict(Duration::ZERO, WINDOW, CAP, false),
@@ -521,7 +532,7 @@ fn manual_mode_refuses_target_ranks() {
     let config = JoinConfig {
         start_mode: StartMode::Manual,
         target_ranks: Some(2),
-        min_rank_start: 1,
+        min_rank_start: 2,
         ..test_config()
     };
     let msg = config.validate().unwrap_err().to_string();
@@ -669,7 +680,7 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
     });
 
     let config = JoinConfig {
-        min_rank_start: 1,
+        min_rank_start: 2,
         start_mode: StartMode::Manual,
         join_timeout_secs: 30,
         max_join_timeout_secs: 60,
@@ -694,7 +705,7 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
 
     // Walk in (quorum met → staging hold), then fire the start switch
     // from loopback, exactly as `fdl start` does on the controller box.
-    let (_conn, reply) = dial_and_join(port, &salt, "host-a", 1);
+    let (_conn, reply) = dial_and_join(port, &salt, "host-a", 2);
     assert!(matches!(reply, JoinMsgWire::Accept { .. }));
     let mut post = TcpStream::connect(("127.0.0.1", port)).unwrap();
     post.set_read_timeout(Some(Duration::from_secs(10)))
@@ -709,7 +720,7 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 
     let formed = gate.join().unwrap().expect("world forms on operator start");
-    assert_eq!(formed.world_size, 1);
+    assert_eq!(formed.world_size, 2);
 
     // THE invariant: a fresh dial on another channel still routes —
     // the dispatcher survived the staging flow.
@@ -837,7 +848,7 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
     let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
     let zero_key: SessionSalt = [0u8; SESSION_SALT_BYTES];
     let config = JoinConfig {
-        target_ranks: Some(1),
+        target_ranks: Some(2),
         ..test_config()
     };
     let abort = Arc::new(AtomicBool::new(false));
@@ -874,18 +885,18 @@ fn window_pre_shared_mode_drops_wrong_key_and_omits_salt() {
 
     // The salt-keyed hello is admitted, and the reply does NOT re-send
     // the pre-shared secret.
-    let (_conn, reply) = dial_and_join(port, &salt, "honest", 1);
+    let (_conn, reply) = dial_and_join(port, &salt, "honest", 2);
     match reply {
         JoinMsgWire::Accept {
             ranks, salt_hex, ..
         } => {
-            assert_eq!(ranks, vec![0]);
+            assert_eq!(ranks, vec![0, 1]);
             assert_eq!(salt_hex, None);
         }
         other => panic!("expected Accept, got {other:?}"),
     }
     let world = handle.join().unwrap().unwrap();
-    assert_eq!(world.world_size, 1);
+    assert_eq!(world.world_size, 2);
     assert_eq!(world.workers[0].member.host, "honest");
 }
 
@@ -894,7 +905,7 @@ fn window_rejects_non_hello_then_still_forms() {
     let salt: SessionSalt = [9u8; SESSION_SALT_BYTES];
     let zero_key: SessionSalt = [0u8; SESSION_SALT_BYTES];
     let config = JoinConfig {
-        target_ranks: Some(1),
+        target_ranks: Some(2),
         ..test_config()
     };
     let abort = Arc::new(AtomicBool::new(false));
@@ -925,10 +936,10 @@ fn window_rejects_non_hello_then_still_forms() {
         other => panic!("expected Reject, got {other:?}"),
     }
 
-    let (_conn, reply) = dial_and_join(port, &zero_key, "good", 1);
+    let (_conn, reply) = dial_and_join(port, &zero_key, "good", 2);
     assert!(matches!(reply, JoinMsgWire::Accept { .. }));
     let world = handle.join().unwrap().unwrap();
-    assert_eq!(world.world_size, 1);
+    assert_eq!(world.world_size, 2);
 }
 
 #[test]

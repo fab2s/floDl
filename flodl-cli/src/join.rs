@@ -310,6 +310,7 @@ fn resolve_effective(
         }
         (None, None) => None,
     };
+    let ssh = ssh.map(with_host_key_default);
     let mut ssh = ssh;
     if let (Some(cfg), Some(id)) = (ssh.as_mut(), &cli.identity) {
         cfg.identity_file = Some(id.clone());
@@ -491,6 +492,31 @@ fn parse_ssh_spec(spec: &str) -> Result<SshConfig, String> {
         identity_file: None,
         options: Vec::new(),
     })
+}
+
+/// A walk-in trusts the controller's host key on first use unless the
+/// operator says otherwise.
+///
+/// Every outbound ssh a join makes (the tunnel, the `rsync://` source
+/// pull, the `sshfs://` mount) runs non-interactively, so with ssh's
+/// default policy a box that has never seen the controller fails with
+/// `Host key verification failed` on its first dial: a fresh droplet, a
+/// container, a re-imaged node. `accept-new` records the key on first
+/// contact and refuses a CHANGED one afterwards, which is the pin that
+/// matters here: the door authenticates the worker's key, so the
+/// worker's first-use trust of the host is the ordinary direction. An
+/// explicit `StrictHostKeyChecking=` in `ssh.options` wins (a fleet
+/// whose image ships `ssh_known_hosts` may want `yes`).
+fn with_host_key_default(mut cfg: SshConfig) -> SshConfig {
+    if !cfg
+        .options
+        .iter()
+        .any(|o| o.trim_start().starts_with("StrictHostKeyChecking"))
+    {
+        cfg.options
+            .push("StrictHostKeyChecking=accept-new".to_string());
+    }
+    cfg
 }
 
 /// Parse `--devices`: comma-separated CUDA ids, or `all` for
@@ -938,20 +964,26 @@ fn model_sig_probe(
             None
         }
         _ => {
-            // Exit 0 and no signature has two very different causes: a
-            // binary older than the probe contract, or one that failed
-            // before reaching `Trainer::run` while still exiting 0.
-            // Guessing the first was wrong often enough to matter (a
-            // read-only project dir defeats a binary that creates an
-            // output directory in main, which is the walk-in's normal
-            // condition), so quote what it said and let the reader
-            // judge.
+            // Exit 0 and no signature has three causes, none visible
+            // from here: the binary's own pre-run gate stepped out (it
+            // saw one box outside any cluster — ddp-bench did exactly
+            // this on the first door rehearsal), the binary predates the
+            // probe contract, or it failed before reaching `Trainer::run`
+            // while still exiting 0 (a read-only project dir defeats a
+            // main that creates an output directory, which is the
+            // walk-in's normal condition). Its stderr is inherited, so
+            // the answer is usually on the line above; say so and name
+            // the way a gate steps aside.
             eprintln!(
                 "fdl join: model-sig probe exited 0 without printing a \
                  signature; joining without one — the formation-time check \
-                 still applies. Either the binary predates the probe, or it \
-                 failed before reaching the trainer (check its output above, \
-                 and that this box can write wherever it writes).",
+                 still applies. Either the binary's own pre-run gate exited \
+                 first (a GPU-count check sees ONE box here, outside any \
+                 cluster; let it step aside when \
+                 flodl::distributed::launcher::model_sig_probe_requested() is \
+                 true), or the binary predates the probe, or it failed before \
+                 reaching the trainer (its output is above; check that this \
+                 box can write wherever it writes).",
             );
             if !tail.is_empty() {
                 eprintln!("fdl join: last lines of the probe's output:");
@@ -1573,5 +1605,37 @@ mod tests {
     fn hex_encode_is_lowercase_bytewise() {
         assert_eq!(hex_encode(b"\x00\xff\x10"), "00ff10");
         assert_eq!(hex_encode(b"{}"), "7b7d");
+    }
+
+    /// A fresh box has never seen the controller's host key, and every
+    /// join ssh is non-interactive: without a default policy the first
+    /// dial dies on `Host key verification failed` (found on the first
+    /// container walk-in through door b). The default is accept-new,
+    /// and an operator's own setting is left alone.
+    #[test]
+    fn the_tunnel_accepts_the_controllers_host_key_on_first_use_unless_told_otherwise() {
+        let cfg = with_host_key_default(SshConfig {
+            target: Some("ctrl".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.options,
+            vec!["StrictHostKeyChecking=accept-new".to_string()]
+        );
+        let cfg = with_host_key_default(SshConfig {
+            target: Some("ctrl".into()),
+            options: vec![
+                "StrictHostKeyChecking=yes".into(),
+                "ServerAliveInterval=5".into(),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.options,
+            vec![
+                "StrictHostKeyChecking=yes".to_string(),
+                "ServerAliveInterval=5".to_string()
+            ]
+        );
     }
 }

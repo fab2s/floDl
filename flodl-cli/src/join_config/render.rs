@@ -454,8 +454,12 @@ impl Report {
             &self.controller.user,
             &self.controller.host,
         );
+        // `id`, not `true`: rrsync whitelists a bare `true` as a
+        // connectivity probe (rsbackup relies on it), so on door b that
+        // line exits 0 whether the key is guardrailed or not. A shell
+        // answers `id` with a uid; every door refuses it by name.
         let mut verify = vec![format!(
-            "ssh -i {key} -p {p} {u}@{h} true                 # must NOT give a shell"
+            "ssh -i {key} -p {p} {u}@{h} id                   # must be REFUSED by the door, never print a uid"
         )];
         match self.door {
             Door::B => verify.push(format!(
@@ -616,7 +620,7 @@ pub(super) fn render_overlay_scaffold(
          \x20   path: {root}\n\
          \x20   join:\n\
          \x20     discovery: true              # the window defines the world\n\
-         \x20     min_rank_start: 1            # RAISE to your fleet's quorum (in ranks)\n\
+         \x20     min_rank_start: 2            # your fleet's quorum, in RANKS; 2 is the floor\n\
          \x20     start: manual                # hold at quorum; `fdl start` fires it\n\
          \x20     join_timeout: 600\n\
          \x20     max_join_timeout: 1200\n\

@@ -141,7 +141,7 @@ pub struct JoinConfig {
 impl Default for JoinConfig {
     fn default() -> Self {
         JoinConfig {
-            min_rank_start: 1,
+            min_rank_start: 2,
             join_timeout_secs: 300,
             target_ranks: None,
             max_join_timeout_secs: 600,
@@ -157,11 +157,14 @@ impl JoinConfig {
     /// [`MembershipLedger::new`] so no window can run on an
     /// inconsistent config.
     pub fn validate(&self) -> Result<()> {
-        if self.min_rank_start == 0 {
-            return Err(TensorError::new(
-                "cluster join: min_rank_start must be >= 1 (a world of zero \
-                 ranks cannot train)",
-            ));
+        if self.min_rank_start < 2 {
+            return Err(TensorError::new(&format!(
+                "cluster join: min_rank_start must be >= 2, got {} (a world of \
+                 one rank has nothing to average with, and the cadence refuses \
+                 it after the window has already been spent; single-GPU \
+                 training is `Trainer::run` with no cluster)",
+                self.min_rank_start,
+            )));
         }
         if let Some(target) = self.target_ranks
             && target < self.min_rank_start

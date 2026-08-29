@@ -203,7 +203,7 @@ commands:
 #     user: flodl-join
 #     identity_file: /etc/flodl/join_key
 #     # port: 22
-#     # options: ["StrictHostKeyChecking=accept-new"]
+#     # options: ["ServerAliveInterval=5"]   # StrictHostKeyChecking defaults to accept-new
 #   token: <hex>                    # pre-shared credential (the run's
 #                                   # controller.join.token); unset = open admission
 #   bin: target/release/train       # training binary run in agent role: run
