@@ -150,6 +150,33 @@ The tree lands in `<served>/tree` (default `~/.flodl/run/tree`), which
 is what a worker's `--source` points at, and the manifest sits at its
 root so one fetch carries both.
 
+**What the tree contains is cargo's answer, not a copy of the checkout.**
+For a cargo project, publish lists the path crates the project resolves
+(`cargo metadata`: the project and every path dependency, which must all
+lie inside the source root) and takes each crate's own file list (`cargo
+package --list`: tracked and untracked-but-not-ignored files in a git
+repo, the crate directory minus `package.exclude` outside one), plus the
+workspace-level files no crate lists and every build reads: the root
+manifests, `Cargo.lock` (the one gitignored file that must travel, it is
+the verified pin), `rust-toolchain.toml`, `.cargo/config.toml`. Nothing
+else ships: not `target/`, not registry or model caches, not datasets,
+not whatever else lives beside the code. The report says how many files
+and bytes the tree is, so a tree that is suddenly large is visible before
+any worker pulls it. A tree with no `Cargo.toml` at the project dir (a
+script or make build) is copied whole, as the only honest default for a
+build system fdl does not understand. A remote source (`rsync://`,
+`git+`) is fetched whole into `<served>/fetch` first, since the listing
+needs the manifests, then reduced.
+
+**The tree carries its own digest.** Beside the manifest, `.fdl-run.sha256`
+lists every published file with its SHA-256 in `sha256sum` format (so
+`sha256sum -c .fdl-run.sha256` checks a tree by hand), and the manifest
+records that sidecar's hash with the file and byte counts. A worker
+recomputes it after every fetch and before it builds: a tree that
+differs from what was published, in any file, is refused as a transient
+failure naming the files, so a pull that straddled a re-publish re-dials
+into a coherent tree instead of building a mix.
+
 Flags: `--bin` (required — the artifact relative to the project dir; a
 workspace member's build lands in the WORKSPACE `target/`, so no rule
 fdl invented would be right for everyone), `--cwd` (project dir inside
@@ -199,6 +226,7 @@ publish:
 | `published_epoch` | unix seconds at publish, so a box can say how old its run is |
 | `run` | this publish's identity nonce; it rides each worker's join hello, and the window refuses a cohort whose members hold different ids (two boxes that fetched across a publish boundary would train two different runs as one world) |
 | `built` | `false` when `--no-build` skipped the gate; workers say so out loud |
+| `digest` | `sha256` of the `.fdl-run.sha256` sidecar, with `files` and `bytes`; a worker verifies the fetched tree against it before building |
 
 Do not hand-edit it: the next publish overwrites it, and its *presence*
 is what tells a worker the run is ready.

@@ -449,6 +449,11 @@ commit point: publish clears it before touching the tree and writes it
 only after the build passes, so a box dialing mid-publish finds no
 manifest and waits rather than training something unvalidated. That wait
 is a transient failure, and a failed gate publishes nothing at all.
+The tree itself is cargo's file list for the project and its path
+dependencies, not a copy of the checkout (build output, caches and
+datasets beside the code never ship), and it carries a `sha256sum`-format
+digest of every file that a worker verifies before building, so a pull
+that straddled a re-publish is refused by name rather than built.
 And every publish mints a fresh **run identity** (`run:` in the
 manifest) that rides each worker's join hello: the window refuses a
 cohort whose members hold different ids, so two boxes that fetched

@@ -99,7 +99,6 @@ pub const MANIFEST_FILE: &str = ".fdl-run.yml";
 /// build failed, finds no manifest and waits for the next dial rather
 /// than training something unvalidated.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Project directory inside the tree; `None` = its root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +140,13 @@ pub struct Manifest {
     /// worker can say out loud that nothing has compiled this tree yet.
     #[serde(default)]
     pub built: bool,
+    /// Content digest of the published file set: the hash of the
+    /// `.fdl-run.sha256` sidecar beside this manifest, plus its file and
+    /// byte counts. A worker recomputes it before building and refuses a
+    /// tree that differs (see [`crate::source_set`]). `None` (an older
+    /// manifest) checks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<crate::source_set::TreeDigest>,
 }
 
 impl Manifest {
@@ -312,6 +318,7 @@ pub fn materialize(
             run_rsync(
                 &rsync_argv(&format!("{}/", path.display()), dest, None, None),
                 dest,
+                true,
             )?;
             notes.push(format!(
                 "source: copied {} into {}",
@@ -321,7 +328,7 @@ pub fn materialize(
         }
         Source::Rsync(target) => {
             let argv = rsync_argv(&format!("{}/", target.remote), dest, Some(target), ssh);
-            run_rsync(&argv, dest)?;
+            run_rsync(&argv, dest, false)?;
             notes.push(format!(
                 "source: pulled {} into {}",
                 target.remote,
@@ -383,7 +390,13 @@ fn rsync_argv(
     argv
 }
 
-fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
+/// Run an assembled rsync. `local` says both ends are on this box, which
+/// changes what a failure can mean: no key, no forced command, no far
+/// side to be down — only files that could not be read or written, and a
+/// partial tree is never published (a tree missing a file is a different
+/// program), so the fix is the file's permissions or the crate's own
+/// `package.exclude`.
+pub(crate) fn run_rsync(argv: &[String], dest: &Path, local: bool) -> Result<(), Fail> {
     if !crate::util::system::has_command("rsync") {
         return Err(Fail::Permanent(format!(
             "a source spec needs rsync, which is not installed — {} (it is \
@@ -397,6 +410,17 @@ fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
         .output()
         .map_err(|e| Fail::Permanent(format!("spawn rsync: {e}")))?;
     if !out.status.success() {
+        if local {
+            return Err(Fail::Permanent(format!(
+                "copying the source into {} failed ({}): {} — a file rsync \
+                 cannot read is not published (a partial tree is a different \
+                 program); fix its permissions, or leave it out through the \
+                 crate's `package.exclude`",
+                dest.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
         // Transient on purpose, the same call slice C's tunnel makes: a
         // far side that is down and a path or key that is wrong are not
         // distinguishable from here, and a wrong one keeps saying so
