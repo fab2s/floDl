@@ -681,19 +681,22 @@ fn attempt(
         }
     };
 
-    // The run's arguments belong to the run. A published manifest replaces
-    // whatever this box carried, because rank children re-enter the binary
-    // with them: a standing fleet holding its own copy would train the new
-    // run with the previous one's hyperparameters. Saying so out loud is
-    // the difference between authority and a silent substitution.
+    // What this box knows of the run's arguments serves ONE purpose now:
+    // the pre-dial model-signature probe, which has to run the binary
+    // with something. The ranks themselves re-enter the binary with the
+    // arguments the controller states at admission (`RunSpec` in the
+    // accept reply), so a box that knows nothing trains the right run
+    // anyway. A published manifest is the best pre-dial guess, since the
+    // controller published it; a `--` tail is the operator's.
     let args: &[String] = match &prepared.args {
         Some(published) => {
             if !eff.bin_args.is_empty() && published != &eff.bin_args {
                 eprintln!(
                     "{}",
                     style::dim(&format!(
-                        "fdl join: the published run's arguments replace \
-                         this box's ({} -> {})",
+                        "fdl join: probing with the published run's arguments \
+                         rather than this box's ({} -> {}); the ranks run \
+                         what the controller states at admission either way",
                         eff.bin_args.join(" "),
                         published.join(" "),
                     )),
@@ -713,7 +716,21 @@ fn attempt(
     // mtime and a re-publish changes the args, so staleness invalidates
     // itself; the libtorch variant is deliberately not in the recipe
     // (the manifest — names, shapes, dtypes — is device-independent).
-    let model_sig_hex = if eff.sig_probe {
+    let model_sig_hex = if eff.sig_probe && args.is_empty() {
+        // No manifest and no tail: probing would run the binary's
+        // DEFAULT configuration and hash a model the run may not use,
+        // then be refused at the door for a mismatch that is not one.
+        // The formation-time check still guards the cohort.
+        eprintln!(
+            "{}",
+            style::dim(
+                "fdl join: no arguments known before the dial (the controller \
+                 supplies the run's at admission), so the model-signature probe \
+                 is skipped; the formation-time check still applies"
+            ),
+        );
+        None
+    } else if eff.sig_probe {
         match probe_recipe_digest(&bin, args) {
             Some(digest) => match sig_cache {
                 Some((key, cached)) if *key == digest => cached.clone(),

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::distributed::port_mux::StreamSource;
+use crate::distributed::wire::RunSpec;
 use crate::distributed::wire::{
     CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
     salt_to_hex, write_channel_magic,
@@ -620,6 +621,7 @@ fn join_messages_round_trip_through_control_frames() {
             ranks: vec![1, 2],
             salt_hex: Some(salt_to_hex(&salt)),
             formation_wait_secs: 480,
+            run: RunSpec::default(),
         },
         JoinMsgWire::Reject {
             reason: "duplicate".to_string(),
@@ -698,6 +700,7 @@ fn operator_start_leaves_the_mux_dispatcher_alive() {
             true,
             None,
             None,
+            &RunSpec::default(),
             &gate_abort,
             &gate_board,
         )
@@ -755,6 +758,7 @@ fn spawn_window(
             pre_shared_salt,
             None,
             None,
+            &RunSpec::default(),
             &abort,
             &status,
         )
@@ -815,6 +819,7 @@ fn window_open_mode_admits_hands_out_salt_and_closes_on_target() {
             ranks,
             salt_hex,
             formation_wait_secs,
+            ..
         } => {
             assert_eq!(ranks, vec![0]);
             // Open admission hands the session salt out in the reply.

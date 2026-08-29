@@ -220,7 +220,7 @@ publish:
 | `cwd` | project directory inside the tree (default: its root); governs the build AND the run |
 | `build` | build recipe, a shell line (default `cargo build --release`) |
 | `bin` | built artifact, relative to `cwd` — what workers run |
-| `args` | the binary's own arguments (everything after `--`) |
+| `args` | the binary's arguments as published: the pre-dial model-signature probe runs with them. The ranks themselves run the arguments the CONTROLLER states at admission (its own command line), so these document the run rather than define it |
 | `origin` | the source spec the controller resolved, for provenance |
 | `rustc` | `rustc -V` on the controller — advisory; a worker reports a mismatch, never enforces it |
 | `published_epoch` | unix seconds at publish, so a box can say how old its run is |
@@ -235,11 +235,18 @@ is what tells a worker the run is ready.
 again and every box picks the new run up on its next dial, with nothing
 to edit on any worker. That is the point of the manifest: a worker's own
 config keeps only what is stable for that box (its credentials, its
-libtorch policy, where to pull from), while `cwd` / `build` / `bin` /
-`args` belong to the run and come from the controller. `args` is the
-sharp case rather than a convenience: they must match the run, because
-rank children re-enter the binary with them, so a fleet carrying its own
-copy would train the next run with the previous one's hyperparameters.
+libtorch policy, where to pull from), while `cwd` / `build` / `bin`
+belong to the run and come from the controller through it. **The
+arguments come from the controller directly, at admission**: the accept
+reply carries the controller's own command line, and every admitted
+box spawns its relay and ranks with exactly that list, never with what
+`fdl join` was given. Rank children re-enter the binary with those
+arguments, so this is what makes a world consistent by construction: a
+box that brings its own binary (`bin:`) and knows nothing about the run
+trains the right one, and two boxes admitted into one world cannot hold
+different arguments. What a worker knows locally (the manifest's `args`,
+a `--` tail on `fdl join`) only feeds the pre-dial model-signature probe;
+a box that knows nothing skips the probe and is checked at formation.
 
 **The build is validation, not an artifact.** One build gates the
 publish; every worker still compiles its own, because a controller

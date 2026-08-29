@@ -441,10 +441,12 @@ has the pairing, and `fdl publish` prints both.
 
 So chaining runs on a standing fleet is one command: publish again, and
 every box picks the new run up on its next dial with nothing to edit
-anywhere. `args` is why this is a correctness matter rather than an
-ergonomic one — they must match the run, since rank children re-enter the
-binary with them, so a fleet carrying its own copy trains the next run
-with the previous one's hyperparameters. The manifest's PRESENCE is the
+anywhere. The run's arguments do not even travel through the manifest:
+the controller states them at admission (the accept reply carries its
+own command line) and every admitted box spawns its ranks with exactly
+that list, so a box that brings its own binary and knows nothing about
+the run trains the right one, and one world cannot hold two argument
+lists. The manifest's `args` feed the pre-dial model-signature probe. The manifest's PRESENCE is the
 commit point: publish clears it before touching the tree and writes it
 only after the build passes, so a box dialing mid-publish finds no
 manifest and waits rather than training something unvalidated. That wait

@@ -33,8 +33,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::wire::{
-    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
-    connect_with_retry, salt_from_hex, scaled_deadline_secs, write_channel_magic,
+    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, RunSpec, SESSION_SALT_BYTES,
+    SessionSalt, connect_with_retry, salt_from_hex, scaled_deadline_secs, write_channel_magic,
     write_stall_timeout,
 };
 use crate::tensor::{Result, TensorError};
@@ -161,6 +161,9 @@ pub(crate) struct JoinOutcome {
     pub relay_spec_hex: Option<String>,
     /// The join connection, kept open as the host control link.
     pub stream: TcpStream,
+    /// The run the controller stated at admission; relay and ranks are
+    /// spawned with its arguments, never with this process's own.
+    pub run: RunSpec,
 }
 
 /// Client half of the join protocol: dial the controller, send `hello`,
@@ -215,11 +218,12 @@ pub(crate) fn join_world(
              otherwise the controller went away mid-join",
         )
     })?;
-    let (ranks, salt, formation_wait_secs) = match reply.decode::<JoinMsgWire>()? {
+    let (ranks, salt, formation_wait_secs, run) = match reply.decode::<JoinMsgWire>()? {
         JoinMsgWire::Accept {
             ranks,
             salt_hex,
             formation_wait_secs,
+            run,
         } => {
             let salt = match (pre_shared, salt_hex) {
                 (Some(s), _) => s,
@@ -231,7 +235,7 @@ pub(crate) fn join_world(
                     ));
                 }
             };
-            (ranks, salt, formation_wait_secs)
+            (ranks, salt, formation_wait_secs, run)
         }
         JoinMsgWire::Reject { reason } => {
             return Err(TensorError::new(&format!(
@@ -299,6 +303,7 @@ pub(crate) fn join_world(
                 envelope_hex,
                 relay_spec_hex,
                 stream,
+                run,
             })
         }
         JoinMsgWire::Abort { reason } => Err(TensorError::new(&format!(
@@ -565,7 +570,20 @@ pub(crate) fn spawn_host_children(
     }
     let exe = std::env::current_exe()
         .map_err(|e| TensorError::new(&format!("cluster agent: current_exe() failed: {e}")))?;
-    let user_args: Vec<String> = std::env::args().skip(1).collect();
+    // The run's arguments come from the controller, not from this
+    // process's own argv: what `fdl join` was given (a manifest's args,
+    // a `--` tail, nothing at all) served the pre-dial probe; the ranks
+    // re-enter the binary with what the controller runs. Said once, so a
+    // box that trained something unexpected has the list in its log.
+    let user_args: Vec<String> = outcome.run.args.clone();
+    eprintln!(
+        "cluster agent: run arguments from the controller: {}",
+        if user_args.is_empty() {
+            "(none)".to_string()
+        } else {
+            user_args.join(" ")
+        }
+    );
 
     let mut children: Vec<HostChild> = Vec::with_capacity(devices.len() + 1);
     let spawn_result: Result<()> = (|| {
@@ -983,6 +1001,7 @@ mod tests {
                     ranks: vec![3, 4],
                     salt_hex: Some(salt_to_hex(&salt)),
                     formation_wait_secs: 60,
+                    run: RunSpec::default(),
                 },
                 JoinMsgWire::WorldFormed {
                     // Controller-authored addresses deliberately WRONG
@@ -1097,6 +1116,7 @@ mod tests {
                     ranks: vec![0],
                     salt_hex: None,
                     formation_wait_secs: 60,
+                    run: RunSpec::default(),
                 },
                 JoinMsgWire::WorldFormed {
                     envelope_hex: test_envelope_hex("10.0.0.1", 9000),
@@ -1136,6 +1156,7 @@ mod tests {
                     ranks: vec![0],
                     salt_hex: Some(salt_to_hex(&salt)),
                     formation_wait_secs: 60,
+                    run: RunSpec::default(),
                 },
                 JoinMsgWire::Abort {
                     reason: "quorum not met".to_string(),
@@ -1161,6 +1182,7 @@ mod tests {
                 ranks: vec![0],
                 salt_hex: None,
                 formation_wait_secs: 60,
+                run: RunSpec::default(),
             }],
         );
         let err = join_world("127.0.0.1", port, None, test_hello(), None, None)

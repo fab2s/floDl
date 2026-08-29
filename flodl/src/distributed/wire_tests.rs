@@ -647,3 +647,30 @@ fn private_or_local_classification() {
         assert!(!is_private_or_local(ip(a)), "{a} should be public");
     }
 }
+
+/// The accept reply carries the run: the controller's argument list,
+/// which every admitted box spawns its ranks with. Round-trips through
+/// the frame with an empty list too (a controller run with no
+/// arguments is a legal run, and "none" must be sayable).
+#[test]
+fn accept_carries_the_run_arguments() {
+    use crate::distributed::wire::{JoinMsgWire, RunSpec};
+    for args in [vec![], vec!["--model".to_string(), "lenet".to_string()]] {
+        let msg = JoinMsgWire::Accept {
+            ranks: vec![0, 1],
+            salt_hex: None,
+            formation_wait_secs: 30,
+            run: RunSpec { args: args.clone() },
+        };
+        let frame = ControlFrame::encode(&ZERO_SALT, MsgKind::Join, &msg).unwrap();
+        let mut buf = Vec::new();
+        frame.write_to(&mut buf).unwrap();
+        let back = ControlFrame::read_from(&mut Cursor::new(buf), &ZERO_SALT)
+            .unwrap()
+            .unwrap();
+        match back.decode::<JoinMsgWire>().unwrap() {
+            JoinMsgWire::Accept { run, .. } => assert_eq!(run.args, args),
+            other => panic!("expected Accept, got {other:?}"),
+        }
+    }
+}

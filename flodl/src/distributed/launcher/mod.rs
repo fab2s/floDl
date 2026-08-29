@@ -986,6 +986,11 @@ pub fn run_launcher_with_config(
     let gate_abort = Arc::clone(&abort);
     let gate_status = status_board.clone();
     let gate_source = crate::distributed::port_mux::StreamSource::Mux(mux_join);
+    // The run, as this process states it: its own argument list, which
+    // every admitted box spawns its ranks with (see `RunSpec`).
+    let gate_run = crate::distributed::wire::RunSpec {
+        args: env::args().skip(1).collect(),
+    };
     let gate = thread::Builder::new()
         .name("flodl-join-gate".to_string())
         .spawn(move || {
@@ -996,6 +1001,7 @@ pub fn run_launcher_with_config(
                 !open_admission,
                 None,
                 expected_model_sig,
+                &gate_run,
                 &gate_abort,
                 &gate_status,
             )
