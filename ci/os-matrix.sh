@@ -482,6 +482,99 @@ endgroup
 fi
 
 # =====================================================================
+group "fdl probe -- walk-in tooling"
+# A join: block that names a transport makes probe report the tool it
+# needs, spelled for THIS family's package manager. The decider is unit
+# tested per family from any host; this is the live half: the message
+# that reaches an operator on this OS, from the binary, through the
+# config loader. Runners have no sshfs, so the negative branch is the
+# one that executes -- and the assertion says which branch ran.
+FDL_ABS="$PWD/$FDL"
+case "$HOST_OS" in
+    linux)
+        if grep -Eiq '^(ID|ID_LIKE)=.*(rhel|fedora|centos|rocky|almalinux)' /etc/os-release; then
+            SSHFS_HINT="sudo dnf install -y fuse-sshfs"
+        else
+            SSHFS_HINT="sudo apt install -y sshfs"
+        fi ;;
+    macos)   SSHFS_HINT="brew install sshfs" ;;
+    windows) SSHFS_HINT="WSL2" ;;
+esac
+WALKIN=$(mktemp -d)
+printf 'join:\n  controller: 127.0.0.1:1337\n  bin: /bin/true\n  data_source: sshfs://op@ctrl:/flodl/data\n' > "$WALKIN/fdl.yml"
+WALKIN_JSON=$(cd "$WALKIN" && "$FDL_ABS" probe --json --skip-mount 2>/dev/null || true)
+if command -v sshfs >/dev/null 2>&1; then
+    if has "$WALKIN_JSON" "needs sshfs"; then
+        fail "$HOST: sshfs is installed, probe must not report it missing"
+    else
+        note "$HOST: sshfs is installed here, so the missing-tool branch did not run"
+    fi
+elif has "$WALKIN_JSON" "needs sshfs" && has "$WALKIN_JSON" "$SSHFS_HINT"; then
+    pass "probe names the missing sshfs with this family's install line ($SSHFS_HINT)"
+else
+    fail "$HOST: probe should report sshfs missing with \`$SSHFS_HINT\`; got: $WALKIN_JSON"
+fi
+rm -rf "$WALKIN"
+endgroup
+
+# =====================================================================
+group "fdl join-config -- the sshd drop-in"
+# The wizard's drop-in is port-scoped (Match LocalPort). On the login
+# port that scope would confine every session on the box, so the file
+# must carry no live directive there; on a dedicated port it must carry
+# the block -- and where an sshd exists, the real daemon gets the last
+# word on whether the file parses. --yes: no tty here, and it never
+# counts for the key install (which --no-install-key declines anyway).
+FARM=$(mktemp -d)
+FARM_OK=1
+(cd "$FARM" && "$FDL_ABS" join-config ci-22 --controller ci@localhost --no-install-key --yes >/dev/null 2>&1) \
+    || { FARM_OK=0; fail "$HOST: join-config on port 22 failed"; }
+(cd "$FARM" && "$FDL_ABS" join-config ci-2222 --controller ci@localhost:2222 --no-install-key --yes >/dev/null 2>&1) \
+    || { FARM_OK=0; fail "$HOST: join-config on port 2222 failed"; }
+if [ "$FARM_OK" = 1 ]; then
+    CONF22="$FARM/.fdl/ci-22/sshd-ci-22.conf"
+    CONF2222="$FARM/.fdl/ci-2222/sshd-ci-2222.conf"
+    if grep -Ev '^[[:space:]]*(#|$)' "$CONF22" | grep -q .; then
+        fail "$HOST: a door on port 22 must emit no live sshd directive:"; sed 's/^/    /' "$CONF22"
+    else
+        pass "port 22 drop-in carries no live directive (the key line is the guardrail)"
+    fi
+    if grep -q '^Match LocalPort 2222' "$CONF2222"; then
+        pass "port 2222 drop-in scopes the guardrail to the door"
+    else
+        fail "$HOST: port 2222 drop-in lacks its Match LocalPort block"; sed 's/^/    /' "$CONF2222"
+    fi
+    # sshd -t needs the host keys, which only root reads. Root directly
+    # (the rocky legs) or passwordless sudo (hosted runners); anything
+    # else is reported as not run, never as ok.
+    SSHD=""; SUDO=""
+    for c in sshd /usr/sbin/sshd /usr/libexec/sshd-keygen-wrapper; do
+        if command -v "$c" >/dev/null 2>&1; then SSHD="$c"; break; fi
+    done
+    if [ -n "$SSHD" ] && [ "$(id -u)" != 0 ]; then
+        if sudo -n true >/dev/null 2>&1; then SUDO="sudo -n"; else SSHD=""; fi
+    fi
+    if [ -z "$SSHD" ]; then
+        note "$HOST: no sshd, or no root to run it: the drop-in was not parsed by a real daemon here"
+    elif $SUDO "$SSHD" -t -f "$CONF2222" >/dev/null 2>&1; then
+        SPLIT=$($SUDO "$SSHD" -T -f "$CONF2222" -C user=ci,host=x,addr=127.0.0.1,laddr=127.0.0.1,lport=2222 2>/dev/null | grep -E '^(forcecommand|permitopen|permittty) ' | tr '\n' ' ')
+        # Door b (the default): the daemon confines the port but forces
+        # NO command -- the key line carries rrsync, and a daemon-level
+        # ForceCommand would override it into a tunnel that works while
+        # the source pull fails. `forcecommand none` is the invariant.
+        if has "$SPLIT" "forcecommand none" && has "$SPLIT" "permitopen 127.0.0.1:1337" && has "$SPLIT" "permittty no"; then
+            pass "real sshd accepts the drop-in and confines port 2222: $SPLIT"
+        else
+            fail "$HOST: sshd -T on port 2222 did not show the guardrail: $SPLIT"
+        fi
+    else
+        fail "$HOST: sshd -t rejects the generated drop-in:"; $SUDO "$SSHD" -t -f "$CONF2222" 2>&1 | sed 's/^/    /'
+    fi
+fi
+rm -rf "$FARM"
+endgroup
+
+# =====================================================================
 # Point the toolchain at the variant this run installed, BEFORE anything
 # compiles. Found by running the script locally: without it the toolkit
 # phase below picked up whatever libtorch was already on the box and
