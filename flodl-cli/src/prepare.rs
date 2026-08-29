@@ -708,9 +708,9 @@ fn parse_source(spec: &str) -> Result<SshTarget, Fail> {
 fn mount_sshfs(target: &SshTarget, mountpoint: &Path, ssh: Option<&SshConfig>) -> Result<(), Fail> {
     if !crate::util::system::has_command("sshfs") {
         return Err(Fail::Permanent(format!(
-            "data_source needs sshfs, which is not installed — \
-             `sudo apt install sshfs` (or mount `{}` during provisioning \
-             and declare a bare `data_path:`)",
+            "data_source needs sshfs, which is not installed — {} (or mount `{}` \
+             during provisioning and declare a bare `data_path:`)",
+            crate::util::requirements::install_hint(&["sshfs".to_string()]),
             target.remote,
         )));
     }

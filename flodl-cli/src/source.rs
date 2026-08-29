@@ -385,13 +385,12 @@ fn rsync_argv(
 
 fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
     if !crate::util::system::has_command("rsync") {
-        return Err(Fail::Permanent(
-            "a source spec needs rsync, which is not installed — \
-             `sudo apt install rsync` (it is what preserves mtimes, so \
-             cargo stays incremental instead of rebuilding everything \
-             every dial)"
-                .to_string(),
-        ));
+        return Err(Fail::Permanent(format!(
+            "a source spec needs rsync, which is not installed — {} (it is \
+             what preserves mtimes, so cargo stays incremental instead of \
+             rebuilding everything every dial)",
+            crate::util::requirements::install_hint(&["rsync".to_string()]),
+        )));
     }
     let out = Command::new(&argv[0])
         .args(&argv[1..])
@@ -423,11 +422,10 @@ fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
 /// remote bookkeeping to keep in sync when the spec changes.
 fn run_git(url: &str, git_ref: &str, dest: &Path) -> Result<(), Fail> {
     if !crate::util::system::has_command("git") {
-        return Err(Fail::Permanent(
-            "a `git+` source spec needs git, which is not installed — \
-             `sudo apt install git`"
-                .to_string(),
-        ));
+        return Err(Fail::Permanent(format!(
+            "a `git+` source spec needs git, which is not installed — {}",
+            crate::util::requirements::install_hint(&["git".to_string()]),
+        )));
     }
     let dest_s = dest.display().to_string();
     git(&["init", "--quiet", &dest_s], "initialise")?;

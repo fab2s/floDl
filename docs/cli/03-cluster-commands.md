@@ -38,6 +38,13 @@ post-deploy smoke test.
   unzip, a C++ compiler) and the ACTIVE variant's vendor toolkit
   headers — the full set `flodl-sys/build.rs` demands (7 headers on
   ROCm, which has no metapackage), each with the install command.
+- **Walk-in tooling**: when the project carries a `join:` block, the
+  tools its transports reach for (`sshfs` for `data_source: sshfs://`,
+  `rsync` / `git` for `source.from:`). A named transport whose tool is
+  missing is an error, since `fdl join` refuses the box over it; a door
+  tool the block does not name is a warning, because a box that mounts
+  its data root at provisioning time and runs a declared `bin:` needs
+  neither. Every install line is spelled for this box's package manager.
 - **NCCL availability**: host-level `libnccl.so` linkage, version. On
   workers with `docker: <svc>` declared in `fdl.cluster.yml`, the
   probe reports "via Docker image `<svc>`" instead of erroring on a
