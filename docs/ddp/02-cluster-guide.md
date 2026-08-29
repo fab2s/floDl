@@ -245,7 +245,7 @@ the window open for extra dial-in workers:
 
 | Knob | Meaning | Default |
 |---|---|---|
-| `min_rank_start` | Quorum in ranks; the run cannot start below it. | configured capacity |
+| `min_rank_start` | Quorum in ranks; the run cannot start below it. At least 2: a world of one rank has nothing to average with, and the window refuses to open rather than fail after the join. | configured capacity |
 | `join_timeout` | Window in seconds. Quorum reached early does NOT close it - late workers within the window still join. | 300 |
 | `target_ranks` | The window closes the moment this many ranks are in. Raise it above capacity to wait for self-deployed workers. | configured capacity |
 | `max_join_timeout` | Hard cap in seconds; quorum still unmet when it expires fails the run loudly. | 600 (or the window length when set higher) |
@@ -441,14 +441,21 @@ has the pairing, and `fdl publish` prints both.
 
 So chaining runs on a standing fleet is one command: publish again, and
 every box picks the new run up on its next dial with nothing to edit
-anywhere. `args` is why this is a correctness matter rather than an
-ergonomic one — they must match the run, since rank children re-enter the
-binary with them, so a fleet carrying its own copy trains the next run
-with the previous one's hyperparameters. The manifest's PRESENCE is the
+anywhere. The run's arguments do not even travel through the manifest:
+the controller states them at admission (the accept reply carries its
+own command line) and every admitted box spawns its ranks with exactly
+that list, so a box that brings its own binary and knows nothing about
+the run trains the right one, and one world cannot hold two argument
+lists. The manifest's `args` feed the pre-dial model-signature probe. The manifest's PRESENCE is the
 commit point: publish clears it before touching the tree and writes it
 only after the build passes, so a box dialing mid-publish finds no
 manifest and waits rather than training something unvalidated. That wait
 is a transient failure, and a failed gate publishes nothing at all.
+The tree itself is cargo's file list for the project and its path
+dependencies, not a copy of the checkout (build output, caches and
+datasets beside the code never ship), and it carries a `sha256sum`-format
+digest of every file that a worker verifies before building, so a pull
+that straddled a re-publish is refused by name rather than built.
 And every publish mints a fresh **run identity** (`run:` in the
 manifest) that rides each worker's join hello: the window refuses a
 cohort whose members hold different ids, so two boxes that fetched

@@ -110,13 +110,15 @@ pub fn probe_local(
     // unpack anything, whatever the build strategy.
     let tools = requirements::missing_host_tools();
     if !tools.is_empty() {
+        let packages: Vec<String> = tools.iter().map(|t| t.to_string()).collect();
         issues.push(format!(
-            "missing host tools `fdl` needs: {}. Install with `sudo apt install {}` \
-             (or the equivalent for your distribution).",
+            "missing host tools `fdl` needs: {}. {}",
             tools.join(", "),
-            tools.join(" "),
+            requirements::install_hint(&packages),
         ));
     }
+
+    check_walkin_tools(&mut issues, &mut warnings);
 
     ProbeReport {
         host,
@@ -126,6 +128,25 @@ pub fn probe_local(
         nccl,
         issues,
         warnings,
+    }
+}
+
+/// The tools this box's `join:` block reaches for. A box with no join
+/// block is not a walk-in and hears nothing; a block that names a
+/// transport whose tool is missing is an issue (`fdl join` exits 2 on
+/// it); a door tool the block does not name is a warning, since the
+/// operator may well never ask this box for that mode.
+pub(super) fn check_walkin_tools(issues: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let Ok((Some(join), _)) = crate::config::load_join_block() else {
+        return;
+    };
+    for gap in requirements::walkin_tool_gaps(&join) {
+        let msg = requirements::tool_gap_message(&gap);
+        if gap.needed_by.is_some() {
+            issues.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
 }
 

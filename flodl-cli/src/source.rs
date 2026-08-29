@@ -99,7 +99,6 @@ pub const MANIFEST_FILE: &str = ".fdl-run.yml";
 /// build failed, finds no manifest and waits for the next dial rather
 /// than training something unvalidated.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Project directory inside the tree; `None` = its root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +140,13 @@ pub struct Manifest {
     /// worker can say out loud that nothing has compiled this tree yet.
     #[serde(default)]
     pub built: bool,
+    /// Content digest of the published file set: the hash of the
+    /// `.fdl-run.sha256` sidecar beside this manifest, plus its file and
+    /// byte counts. A worker recomputes it before building and refuses a
+    /// tree that differs (see [`crate::source_set`]). `None` (an older
+    /// manifest) checks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<crate::source_set::TreeDigest>,
 }
 
 impl Manifest {
@@ -312,6 +318,7 @@ pub fn materialize(
             run_rsync(
                 &rsync_argv(&format!("{}/", path.display()), dest, None, None),
                 dest,
+                true,
             )?;
             notes.push(format!(
                 "source: copied {} into {}",
@@ -321,7 +328,7 @@ pub fn materialize(
         }
         Source::Rsync(target) => {
             let argv = rsync_argv(&format!("{}/", target.remote), dest, Some(target), ssh);
-            run_rsync(&argv, dest)?;
+            run_rsync(&argv, dest, false)?;
             notes.push(format!(
                 "source: pulled {} into {}",
                 target.remote,
@@ -383,21 +390,37 @@ fn rsync_argv(
     argv
 }
 
-fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
+/// Run an assembled rsync. `local` says both ends are on this box, which
+/// changes what a failure can mean: no key, no forced command, no far
+/// side to be down — only files that could not be read or written, and a
+/// partial tree is never published (a tree missing a file is a different
+/// program), so the fix is the file's permissions or the crate's own
+/// `package.exclude`.
+pub(crate) fn run_rsync(argv: &[String], dest: &Path, local: bool) -> Result<(), Fail> {
     if !crate::util::system::has_command("rsync") {
-        return Err(Fail::Permanent(
-            "a source spec needs rsync, which is not installed — \
-             `sudo apt install rsync` (it is what preserves mtimes, so \
-             cargo stays incremental instead of rebuilding everything \
-             every dial)"
-                .to_string(),
-        ));
+        return Err(Fail::Permanent(format!(
+            "a source spec needs rsync, which is not installed — {} (it is \
+             what preserves mtimes, so cargo stays incremental instead of \
+             rebuilding everything every dial)",
+            crate::util::requirements::install_hint(&["rsync".to_string()]),
+        )));
     }
     let out = Command::new(&argv[0])
         .args(&argv[1..])
         .output()
         .map_err(|e| Fail::Permanent(format!("spawn rsync: {e}")))?;
     if !out.status.success() {
+        if local {
+            return Err(Fail::Permanent(format!(
+                "copying the source into {} failed ({}): {} — a file rsync \
+                 cannot read is not published (a partial tree is a different \
+                 program); fix its permissions, or leave it out through the \
+                 crate's `package.exclude`",
+                dest.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
         // Transient on purpose, the same call slice C's tunnel makes: a
         // far side that is down and a path or key that is wrong are not
         // distinguishable from here, and a wrong one keeps saying so
@@ -423,11 +446,10 @@ fn run_rsync(argv: &[String], dest: &Path) -> Result<(), Fail> {
 /// remote bookkeeping to keep in sync when the spec changes.
 fn run_git(url: &str, git_ref: &str, dest: &Path) -> Result<(), Fail> {
     if !crate::util::system::has_command("git") {
-        return Err(Fail::Permanent(
-            "a `git+` source spec needs git, which is not installed — \
-             `sudo apt install git`"
-                .to_string(),
-        ));
+        return Err(Fail::Permanent(format!(
+            "a `git+` source spec needs git, which is not installed — {}",
+            crate::util::requirements::install_hint(&["git".to_string()]),
+        )));
     }
     let dest_s = dest.display().to_string();
     git(&["init", "--quiet", &dest_s], "initialise")?;

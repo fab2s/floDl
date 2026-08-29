@@ -60,8 +60,8 @@ use serde::Serialize;
 
 use crate::distributed::port_mux::StreamSource;
 use crate::distributed::wire::{
-    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, SESSION_SALT_BYTES, SessionSalt,
-    expect_channel_magic, salt_to_hex, scaled_deadline_secs,
+    CHANNEL_MAGIC_JOIN, ControlFrame, JoinMsgWire, MsgKind, RunSpec, SESSION_SALT_BYTES,
+    SessionSalt, expect_channel_magic, salt_to_hex, scaled_deadline_secs,
 };
 use crate::tensor::{Result, TensorError};
 
@@ -141,7 +141,7 @@ pub struct JoinConfig {
 impl Default for JoinConfig {
     fn default() -> Self {
         JoinConfig {
-            min_rank_start: 1,
+            min_rank_start: 2,
             join_timeout_secs: 300,
             target_ranks: None,
             max_join_timeout_secs: 600,
@@ -157,11 +157,14 @@ impl JoinConfig {
     /// [`MembershipLedger::new`] so no window can run on an
     /// inconsistent config.
     pub fn validate(&self) -> Result<()> {
-        if self.min_rank_start == 0 {
-            return Err(TensorError::new(
-                "cluster join: min_rank_start must be >= 1 (a world of zero \
-                 ranks cannot train)",
-            ));
+        if self.min_rank_start < 2 {
+            return Err(TensorError::new(&format!(
+                "cluster join: min_rank_start must be >= 2, got {} (a world of \
+                 one rank has nothing to average with, and the cadence refuses \
+                 it after the window has already been spent; single-GPU \
+                 training is `Trainer::run` with no cluster)",
+                self.min_rank_start,
+            )));
         }
         if let Some(target) = self.target_ranks
             && target < self.min_rank_start
@@ -812,6 +815,7 @@ pub(crate) fn run_join_window(
     pre_shared_salt: bool,
     expected_dataset_sig: Option<[u8; 32]>,
     expected_model_sig: Option<[u8; 32]>,
+    run: &RunSpec,
     abort: &AtomicBool,
     status: &crate::distributed::status::StatusBoard,
 ) -> Result<FormedWorld> {
@@ -923,6 +927,7 @@ pub(crate) fn run_join_window(
             pre_shared_salt,
             started,
             cap,
+            run,
         ) {
             Ok(member) => {
                 let snap_ranks = ledger.joined_ranks();
@@ -982,6 +987,7 @@ fn handle_join_dial(
     pre_shared_salt: bool,
     started: Instant,
     cap: Duration,
+    run: &RunSpec,
 ) -> std::result::Result<JoinedMember, String> {
     expect_channel_magic(stream, CHANNEL_MAGIC_JOIN, "cluster join").map_err(|e| e.to_string())?;
     let frame = match ControlFrame::read_from(stream, join_key) {
@@ -1044,6 +1050,7 @@ fn handle_join_dial(
         // What is left of the hard cap is exactly how long this worker
         // may have to wait for WorldFormed.
         formation_wait_secs: cap.saturating_sub(started.elapsed()).as_secs(),
+        run: run.clone(),
     };
     let write =
         ControlFrame::encode(join_key, MsgKind::Join, &accept).and_then(|f| f.write_to(stream));

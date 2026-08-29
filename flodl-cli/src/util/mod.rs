@@ -7,6 +7,7 @@ pub mod install_prompt;
 pub mod platform;
 pub mod prompt;
 pub mod requirements;
+pub mod sha256;
 pub mod shell;
 pub mod system;
 #[cfg(test)]

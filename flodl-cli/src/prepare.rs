@@ -338,6 +338,14 @@ fn fetch_source(
     let dest = Context::global().root.join(SOURCE_SUBDIR);
     crate::source::materialize(&source, &dest, spec.ssh, notes)?;
     let manifest = Manifest::read(&dest)?;
+    if let Some(d) = manifest.as_ref().and_then(|m| m.digest.as_ref()) {
+        crate::source_set::verify(&dest, d)?;
+        notes.push(format!(
+            "run tree verified: {} files, sha256 {}…",
+            d.files,
+            &d.sha256[..d.sha256.len().min(12)]
+        ));
+    }
     if let Some(m) = &manifest {
         notes.push(format!(
             "run manifest: {}bin {}{}{}{}",
@@ -708,9 +716,9 @@ fn parse_source(spec: &str) -> Result<SshTarget, Fail> {
 fn mount_sshfs(target: &SshTarget, mountpoint: &Path, ssh: Option<&SshConfig>) -> Result<(), Fail> {
     if !crate::util::system::has_command("sshfs") {
         return Err(Fail::Permanent(format!(
-            "data_source needs sshfs, which is not installed — \
-             `sudo apt install sshfs` (or mount `{}` during provisioning \
-             and declare a bare `data_path:`)",
+            "data_source needs sshfs, which is not installed — {} (or mount `{}` \
+             during provisioning and declare a bare `data_path:`)",
+            crate::util::requirements::install_hint(&["sshfs".to_string()]),
             target.remote,
         )));
     }

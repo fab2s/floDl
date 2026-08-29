@@ -27,6 +27,7 @@ use crate::builtins::PublishArgs;
 use crate::context::Context;
 use crate::prepare::Fail;
 use crate::source::{self, Manifest};
+use crate::source_set;
 use crate::style;
 
 /// Served-directory name under the root, and the tree inside it. The
@@ -34,6 +35,8 @@ use crate::style;
 /// carries both.
 const SERVED_SUBDIR: &str = "run";
 const TREE_SUBDIR: &str = "tree";
+/// Where a remote source lands whole before it is reduced to its set.
+const FETCH_SUBDIR: &str = "fetch";
 
 /// Run `fdl publish`. `args_tail` is everything after a standalone `--`:
 /// the training binary's own arguments, which belong to the RUN and
@@ -167,7 +170,7 @@ fn publish(
 
     let mut notes = Vec::new();
     let result = (|| -> Result<Manifest, Fail> {
-        source::materialize(&source, &tree, cli.ssh_config().as_ref(), &mut notes)?;
+        let set = acquire(&source, &served, &tree, cli, &mut notes)?;
         let built = if cli.no_build {
             notes.push(
                 "--no-build: nothing has compiled this tree, so the first \
@@ -190,6 +193,22 @@ fn publish(
             }
             true
         };
+        // Hash what is served, after the gate: the gate's `target/` is
+        // not in the set, and nothing in the set changed under it. The
+        // sidecar lands before the manifest so the manifest stays the
+        // commit point.
+        let files = match &set {
+            Some(set) => set.files.clone(),
+            None => source_set::tree_files(&tree)?,
+        };
+        let (sidecar, digest) = source_set::digest(&tree, &files)?;
+        source_set::write_sidecar(&tree, &sidecar)?;
+        notes.push(format!(
+            "tree: {} files, {} — digest {}…",
+            digest.files,
+            human_bytes(digest.bytes),
+            &digest.sha256[..12],
+        ));
         Ok(Manifest {
             cwd: cli.cwd.clone(),
             build: cli.build.clone(),
@@ -200,12 +219,94 @@ fn publish(
             published_epoch: unix_seconds(),
             run: Some(run_nonce()),
             built,
+            digest: Some(digest),
         })
     })();
     crate::prepare::print_notes("publish", &notes);
     let manifest = result?;
     manifest.write(&tree)?;
     Ok((served, tree, manifest))
+}
+
+/// Land the source in the served tree.
+///
+/// A cargo project ships its cargo-derived file set and nothing else
+/// (see [`source_set`]): a local source is listed in place and only the
+/// set is copied; a remote one is fetched whole into `<served>/fetch`
+/// first, since the listing needs the manifests, then reduced. A tree
+/// with no `Cargo.toml` at the project dir is copied whole, as before.
+/// Returns the set when there is one, for the digest.
+fn acquire(
+    source: &source::Source,
+    served: &Path,
+    tree: &Path,
+    cli: &PublishArgs,
+    notes: &mut Vec<String>,
+) -> Result<Option<source_set::FileSet>, Fail> {
+    let root: PathBuf = match source {
+        source::Source::Local(path) => {
+            if !path.is_dir() {
+                return Err(Fail::Permanent(format!(
+                    "source {} is not a readable directory",
+                    path.display()
+                )));
+            }
+            path.clone()
+        }
+        _ => {
+            let fetch = served.join(FETCH_SUBDIR);
+            source::materialize(source, &fetch, cli.ssh_config().as_ref(), notes)?;
+            fetch
+        }
+    };
+    match source_set::cargo_file_set(&root, cli.cwd.as_deref())? {
+        Some(set) => {
+            source_set::sync(&set, tree, notes)?;
+            notes.push(format!(
+                "source: {} files from {} crate(s), cargo's own listing of {}{}",
+                set.files.len(),
+                set.crates,
+                root.display(),
+                cli.cwd
+                    .as_deref()
+                    .map(|c| format!(" (project {c})"))
+                    .unwrap_or_default(),
+            ));
+            Ok(Some(set))
+        }
+        None => {
+            notes.push(
+                "source: no Cargo.toml at the project dir, copying the whole tree \
+                 (a cargo project ships only what its crates list)"
+                    .to_string(),
+            );
+            match source {
+                source::Source::Local(_) => {
+                    source::materialize(source, tree, cli.ssh_config().as_ref(), notes)?;
+                }
+                _ => {
+                    let fetched = source::Source::Local(root);
+                    source::materialize(&fetched, tree, None, notes)?;
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
 }
 
 /// Compile the tree once, against this box's own libtorch.
@@ -305,6 +406,7 @@ fn report_value(served: &Path, tree: &Path, manifest: &Manifest) -> serde_json::
         "toolchain": manifest.rustc,
         "args": manifest.args,
         "run": manifest.run,
+        "digest": manifest.digest,
         "origin": manifest.origin,
         "published_epoch": manifest.published_epoch,
         "host": host,
@@ -327,6 +429,14 @@ fn report(served: &Path, tree: &Path, manifest: &Manifest) {
     }
     if !manifest.args.is_empty() {
         println!("  args:      {}", manifest.args.join(" "));
+    }
+    if let Some(d) = &manifest.digest {
+        println!(
+            "  tree:      {} files, {} — sha256 {}… (workers verify it before building)",
+            d.files,
+            human_bytes(d.bytes),
+            &d.sha256[..12],
+        );
     }
     let host = crate::cluster::resolve_local_hostname();
     if let Some(run) = &manifest.run {
@@ -784,6 +894,7 @@ mod tests {
             published_epoch: Some(1_780_000_000),
             run: Some("a1b2c3d4e5f60718".into()),
             built: true,
+            digest: None,
         };
         manifest.write(&dir).unwrap();
         assert_eq!(Manifest::read(&dir).unwrap(), Some(manifest));

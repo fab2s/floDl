@@ -648,6 +648,45 @@ fn the_drop_in_names_the_per_platform_trap() {
     assert!(!plain.contains("ssh.socket"), "{plain}");
 }
 
+/// A door on the login port gets no daemon-level guardrail at all. The
+/// block is scoped by `Match LocalPort`, so on 22 it would confine every
+/// session on the box (no TTY, one permitted forward), the operator's
+/// own included. Found by generating a farm for a host-sshd door on 22:
+/// the file carried `Port 22` twice and a `Match LocalPort 22` block
+/// under a header promising that 22 stayed untouched.
+#[test]
+fn a_door_on_the_login_port_emits_no_daemon_guardrail() {
+    use crate::util::platform::Platform;
+    for door in [Door::Nologin, Door::A, Door::B] {
+        let conf = render_sshd_conf("f", door, 22, Platform::Debian);
+        for directive in [
+            "Match",
+            "Port 22",
+            "PermitTTY",
+            "ForceCommand",
+            "PermitOpen",
+        ] {
+            assert!(
+                !conf
+                    .lines()
+                    .any(|l| !l.starts_with('#') && l.contains(directive)),
+                "{door:?}: `{directive}` must not be a live directive on 22:\n{conf}"
+            );
+        }
+        assert!(
+            conf.contains("key line carries the whole guardrail"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains(":2222"),
+            "must point at a dedicated port: {conf}"
+        );
+    }
+    // A dedicated port keeps the block.
+    let conf = render_sshd_conf("f", Door::B, 2222, Platform::Debian);
+    assert!(conf.contains("Match LocalPort 2222"), "{conf}");
+}
+
 /// A scaffolded overlay must never cost the project its commands.
 ///
 /// The placeholder form is the trap: a `commands:` key whose only
@@ -980,5 +1019,34 @@ fn farm_enumeration_unions_overlays_and_dirs_and_skips_non_farms() {
     assert!(text.contains("full"), "{text}");
     assert!(text.contains("MISSING"), "{text}");
     assert!(text.contains("not farms: cluster"), "{text}");
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The shell probe in the self-test must be a command every door
+/// refuses. rrsync exits 0 on a bare `true` (its connectivity-probe
+/// allowance), so with that probe door b's own key passed the "no
+/// shell" check for a reason unrelated to the guardrail.
+#[test]
+fn the_self_test_probe_is_one_rrsync_does_not_whitelist() {
+    let tmp = tempdir();
+    let mut cli = no_flags();
+    cli.label = Some("probefarm".to_string());
+    cli.controller = Some("op@ctrl:2222".to_string());
+    cli.dry_run = true;
+    let steps = wizard_at(&cli, &tmp).unwrap().steps().join("\n");
+    let probe = steps
+        .lines()
+        .find(|l| {
+            l.contains("ssh -i")
+                && l.contains("op@ctrl")
+                && !l.contains(" -L ")
+                && !l.contains("rsync")
+        })
+        .expect("a shell probe line");
+    assert!(probe.contains("op@ctrl id "), "{probe}");
+    assert!(
+        !probe.contains(" true"),
+        "rrsync whitelists `true`: {probe}"
+    );
     let _ = fs::remove_dir_all(&tmp);
 }

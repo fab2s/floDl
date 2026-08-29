@@ -78,7 +78,7 @@ const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(120);
 /// re-dials through transient failures and agent exits, and returns only
 /// on a permanent one.
 pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
-    let (block, project_root) = match load_join_block() {
+    let (block, project_root) = match config::load_join_block() {
         Ok(pair) => pair,
         Err(e) => {
             crate::cli_error!("{e}");
@@ -144,11 +144,13 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
         let started = Instant::now();
         // What happened, phrased for the re-dial line. Every branch that
         // is not re-dialable returns from here.
+        let mut clean_run = false;
         let outcome = match attempt(&eff, libtorch.as_ref(), &mut sig_cache) {
             Ok(code) => {
                 if !eff.persist {
                     return code;
                 }
+                clean_run = code == 0;
                 format!("agent exited with code {code}")
             }
             Err(fail) => {
@@ -171,9 +173,7 @@ pub fn run(cli: &JoinArgs, bin_tail: Option<&[String]>) -> i32 {
                 "attempt failed".to_string()
             }
         };
-        if started.elapsed() > BACKOFF_RESET_AFTER {
-            backoff = BACKOFF_MIN;
-        }
+        backoff = persist_backoff(backoff, clean_run, started.elapsed());
         eprintln!(
             "fdl join: {outcome} after {}s; re-dialing in {}s (--persist)",
             started.elapsed().as_secs(),
@@ -310,6 +310,7 @@ fn resolve_effective(
         }
         (None, None) => None,
     };
+    let ssh = ssh.map(with_host_key_default);
     let mut ssh = ssh;
     if let (Some(cfg), Some(id)) = (ssh.as_mut(), &cli.identity) {
         cfg.identity_file = Some(id.clone());
@@ -440,32 +441,6 @@ fn resolve_effective(
     })
 }
 
-/// Load the top-level `join:` block from the PROJECT config (base
-/// fdl.yml merged with the active env overlay when one is selected),
-/// plus the directory it lives in (the project root — where libtorch/
-/// is anchored). The walk steps over command-level fdl.ymls
-/// ([`config::find_project_config`]): `fdl join` typically runs from
-/// the command dir the training binary expects as cwd (e.g.
-/// `ddp-bench/`), whose own fdl.yml is a command config that neither
-/// carries a `join:` block nor marks the libtorch root. `Ok(None)`
-/// root/block when there is no project at all — flags carry everything
-/// then; a present-but-broken project config is a loud error, not a
-/// silent fallback (the operator may be relying on `join.bin`).
-fn load_join_block() -> Result<(Option<WorkerJoin>, Option<PathBuf>), String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
-    let Some(config_path) = config::find_project_config(&cwd) else {
-        return Ok((None, None));
-    };
-    let env_name = std::env::var("FDL_ENV")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let project = config::load_project_with_env(&config_path, env_name.as_deref())
-        .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
-    let root = config_path.parent().map(Path::to_path_buf);
-    Ok((project.join, root))
-}
-
 /// Parse `host[:port]`, default port [`DEFAULT_CONTROLLER_PORT`] —
 /// same convention as `fdl status --addr`.
 fn parse_host_port(spec: &str) -> Result<(String, u16), String> {
@@ -517,6 +492,49 @@ fn parse_ssh_spec(spec: &str) -> Result<SshConfig, String> {
         identity_file: None,
         options: Vec::new(),
     })
+}
+
+/// The delay before the next dial of a `--persist` loop.
+///
+/// A completed run (agent exit 0) resets the backoff whatever its
+/// length: it is the healthy signal, and the next run is usually being
+/// started right now. Doubling after it, as the loop once did, made a
+/// farm chaining short runs wait 10s, 20s, 40s, 60s for windows that were
+/// already open. Failures and no-window exits keep doubling toward
+/// [`BACKOFF_MAX`], and an attempt that stayed up past
+/// [`BACKOFF_RESET_AFTER`] resets too (a long run that ended badly is
+/// not a hot loop).
+fn persist_backoff(prev: Duration, clean_run: bool, elapsed: Duration) -> Duration {
+    if clean_run || elapsed > BACKOFF_RESET_AFTER {
+        BACKOFF_MIN
+    } else {
+        prev
+    }
+}
+
+/// A walk-in trusts the controller's host key on first use unless the
+/// operator says otherwise.
+///
+/// Every outbound ssh a join makes (the tunnel, the `rsync://` source
+/// pull, the `sshfs://` mount) runs non-interactively, so with ssh's
+/// default policy a box that has never seen the controller fails with
+/// `Host key verification failed` on its first dial: a fresh droplet, a
+/// container, a re-imaged node. `accept-new` records the key on first
+/// contact and refuses a CHANGED one afterwards, which is the pin that
+/// matters here: the door authenticates the worker's key, so the
+/// worker's first-use trust of the host is the ordinary direction. An
+/// explicit `StrictHostKeyChecking=` in `ssh.options` wins (a fleet
+/// whose image ships `ssh_known_hosts` may want `yes`).
+fn with_host_key_default(mut cfg: SshConfig) -> SshConfig {
+    if !cfg
+        .options
+        .iter()
+        .any(|o| o.trim_start().starts_with("StrictHostKeyChecking"))
+    {
+        cfg.options
+            .push("StrictHostKeyChecking=accept-new".to_string());
+    }
+    cfg
 }
 
 /// Parse `--devices`: comma-separated CUDA ids, or `all` for
@@ -681,19 +699,22 @@ fn attempt(
         }
     };
 
-    // The run's arguments belong to the run. A published manifest replaces
-    // whatever this box carried, because rank children re-enter the binary
-    // with them: a standing fleet holding its own copy would train the new
-    // run with the previous one's hyperparameters. Saying so out loud is
-    // the difference between authority and a silent substitution.
+    // What this box knows of the run's arguments serves ONE purpose now:
+    // the pre-dial model-signature probe, which has to run the binary
+    // with something. The ranks themselves re-enter the binary with the
+    // arguments the controller states at admission (`RunSpec` in the
+    // accept reply), so a box that knows nothing trains the right run
+    // anyway. A published manifest is the best pre-dial guess, since the
+    // controller published it; a `--` tail is the operator's.
     let args: &[String] = match &prepared.args {
         Some(published) => {
             if !eff.bin_args.is_empty() && published != &eff.bin_args {
                 eprintln!(
                     "{}",
                     style::dim(&format!(
-                        "fdl join: the published run's arguments replace \
-                         this box's ({} -> {})",
+                        "fdl join: probing with the published run's arguments \
+                         rather than this box's ({} -> {}); the ranks run \
+                         what the controller states at admission either way",
                         eff.bin_args.join(" "),
                         published.join(" "),
                     )),
@@ -713,7 +734,21 @@ fn attempt(
     // mtime and a re-publish changes the args, so staleness invalidates
     // itself; the libtorch variant is deliberately not in the recipe
     // (the manifest — names, shapes, dtypes — is device-independent).
-    let model_sig_hex = if eff.sig_probe {
+    let model_sig_hex = if eff.sig_probe && args.is_empty() {
+        // No manifest and no tail: probing would run the binary's
+        // DEFAULT configuration and hash a model the run may not use,
+        // then be refused at the door for a mismatch that is not one.
+        // The formation-time check still guards the cohort.
+        eprintln!(
+            "{}",
+            style::dim(
+                "fdl join: no arguments known before the dial (the controller \
+                 supplies the run's at admission), so the model-signature probe \
+                 is skipped; the formation-time check still applies"
+            ),
+        );
+        None
+    } else if eff.sig_probe {
         match probe_recipe_digest(&bin, args) {
             Some(digest) => match sig_cache {
                 Some((key, cached)) if *key == digest => cached.clone(),
@@ -964,20 +999,26 @@ fn model_sig_probe(
             None
         }
         _ => {
-            // Exit 0 and no signature has two very different causes: a
-            // binary older than the probe contract, or one that failed
-            // before reaching `Trainer::run` while still exiting 0.
-            // Guessing the first was wrong often enough to matter (a
-            // read-only project dir defeats a binary that creates an
-            // output directory in main, which is the walk-in's normal
-            // condition), so quote what it said and let the reader
-            // judge.
+            // Exit 0 and no signature has three causes, none visible
+            // from here: the binary's own pre-run gate stepped out (it
+            // saw one box outside any cluster — ddp-bench did exactly
+            // this on the first door rehearsal), the binary predates the
+            // probe contract, or it failed before reaching `Trainer::run`
+            // while still exiting 0 (a read-only project dir defeats a
+            // main that creates an output directory, which is the
+            // walk-in's normal condition). Its stderr is inherited, so
+            // the answer is usually on the line above; say so and name
+            // the way a gate steps aside.
             eprintln!(
                 "fdl join: model-sig probe exited 0 without printing a \
                  signature; joining without one — the formation-time check \
-                 still applies. Either the binary predates the probe, or it \
-                 failed before reaching the trainer (check its output above, \
-                 and that this box can write wherever it writes).",
+                 still applies. Either the binary's own pre-run gate exited \
+                 first (a GPU-count check sees ONE box here, outside any \
+                 cluster; let it step aside when \
+                 flodl::distributed::launcher::model_sig_probe_requested() is \
+                 true), or the binary predates the probe, or it failed before \
+                 reaching the trainer (its output is above; check that this \
+                 box can write wherever it writes).",
             );
             if !tail.is_empty() {
                 eprintln!("fdl join: last lines of the probe's output:");
@@ -1599,5 +1640,60 @@ mod tests {
     fn hex_encode_is_lowercase_bytewise() {
         assert_eq!(hex_encode(b"\x00\xff\x10"), "00ff10");
         assert_eq!(hex_encode(b"{}"), "7b7d");
+    }
+
+    /// A fresh box has never seen the controller's host key, and every
+    /// join ssh is non-interactive: without a default policy the first
+    /// dial dies on `Host key verification failed` (found on the first
+    /// container walk-in through door b). The default is accept-new,
+    /// and an operator's own setting is left alone.
+    #[test]
+    fn the_tunnel_accepts_the_controllers_host_key_on_first_use_unless_told_otherwise() {
+        let cfg = with_host_key_default(SshConfig {
+            target: Some("ctrl".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.options,
+            vec!["StrictHostKeyChecking=accept-new".to_string()]
+        );
+        let cfg = with_host_key_default(SshConfig {
+            target: Some("ctrl".into()),
+            options: vec![
+                "StrictHostKeyChecking=yes".into(),
+                "ServerAliveInterval=5".into(),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            cfg.options,
+            vec![
+                "StrictHostKeyChecking=yes".to_string(),
+                "ServerAliveInterval=5".to_string()
+            ]
+        );
+    }
+
+    /// Seen on the rig: two clean 15s runs in a row and the standing
+    /// agents re-dialed in 20s, then 40s, treating each finished run as a
+    /// failure because only a 120s attempt reset the backoff.
+    #[test]
+    fn a_clean_run_resets_the_persist_backoff_and_a_failure_keeps_doubling() {
+        let short = Duration::from_secs(15);
+        // Clean exit after a short run: back to the floor.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), true, short),
+            BACKOFF_MIN
+        );
+        // Failure after a short attempt: the caller keeps doubling from here.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), false, short),
+            Duration::from_secs(40)
+        );
+        // A long attempt resets regardless of how it ended.
+        assert_eq!(
+            persist_backoff(Duration::from_secs(40), false, BACKOFF_RESET_AFTER + short),
+            BACKOFF_MIN
+        );
     }
 }

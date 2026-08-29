@@ -1071,10 +1071,13 @@ fn run() -> flodl::tensor::Result<()> {
             // - `FLODL_INTERNAL_CLUSTER_JSON` (slim) = rank child
             // - `FLODL_INTERNAL_FULL_CLUSTER_JSON` (full) = launcher process
             //   (will SSH/fork ranks before training begins)
-            // Either one means "don't bail on the local GPU count".
-            let in_cluster =
-                std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
-                    || std::env::var_os("FLODL_INTERNAL_FULL_CLUSTER_JSON").is_some();
+            // Either one means "don't bail on the local GPU count". So
+            // does `fdl join`'s model-signature probe: it asks what the
+            // model is, from a box that is one member of a world not
+            // formed yet, and a bail here answers nothing.
+            let in_cluster = std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
+                || std::env::var_os("FLODL_INTERNAL_FULL_CLUSTER_JSON").is_some()
+                || flodl::distributed::launcher::model_sig_probe_requested();
             if mode.requires_multi_gpu() && gpu_count < 2 && !in_cluster {
                 eprintln!("  skipping {} (requires 2+ GPUs, have {})", mode, gpu_count);
                 continue;

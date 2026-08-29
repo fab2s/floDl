@@ -369,3 +369,29 @@ pub fn config_layer_sources(base_path: &Path, env: Option<&str>) -> Vec<PathBuf>
         .map(|ls| ls.into_iter().map(|(p, _)| p).collect())
         .unwrap_or_else(|_| vec![base_path.to_path_buf()])
 }
+
+/// Load the top-level `join:` block from the PROJECT config (base
+/// fdl.yml merged with the active env overlay when one is selected),
+/// plus the directory it lives in (the project root — where libtorch/
+/// is anchored). The walk steps over command-level fdl.ymls
+/// ([`find_project_config`]): `fdl join` typically runs from
+/// the command dir the training binary expects as cwd (e.g.
+/// `ddp-bench/`), whose own fdl.yml is a command config that neither
+/// carries a `join:` block nor marks the libtorch root. `Ok(None)`
+/// root/block when there is no project at all — flags carry everything
+/// then; a present-but-broken project config is a loud error, not a
+/// silent fallback (the operator may be relying on `join.bin`).
+pub fn load_join_block() -> Result<(Option<super::WorkerJoin>, Option<PathBuf>), String> {
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
+    let Some(config_path) = find_project_config(&cwd) else {
+        return Ok((None, None));
+    };
+    let env_name = std::env::var("FDL_ENV")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let project = load_project_with_env(&config_path, env_name.as_deref())
+        .map_err(|e| format!("cannot load {}: {e}", config_path.display()))?;
+    let root = config_path.parent().map(Path::to_path_buf);
+    Ok((project.join, root))
+}

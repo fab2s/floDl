@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use crate::util::platform::Platform;
 use crate::util::system;
 
 /// Host tools `fdl` itself shells out to: (probe name, Debian package).
@@ -263,8 +264,12 @@ pub fn toolkit_gap(vendor: flodl_hw::GpuVendor) -> Option<ToolkitGap> {
 /// `g++` is the one host tool whose rpm goes by a different name.
 /// Kept in sync by hand with `flodl-sys/build.rs`'s `rpm` closure.
 pub fn rpm_name(deb: &str) -> String {
-    if deb == "g++" {
-        return "gcc-c++".to_string();
+    match deb {
+        "g++" => return "gcc-c++".to_string(),
+        // EPEL carries it under the fuse- prefix (verified by repoquery
+        // on EL9); a bare `sshfs` matches nothing there.
+        "sshfs" => return "fuse-sshfs".to_string(),
+        _ => {}
     }
     match deb.strip_suffix("-dev") {
         Some(stem) => format!("{stem}-devel"),
@@ -274,34 +279,125 @@ pub fn rpm_name(deb: &str) -> String {
 
 /// The install line for a package list, contextual to the platform.
 ///
-/// Debian and RHEL-family are spelled out because those are the
-/// platforms cloud hosts use (package names verified on both); the
+/// The one place a package-manager spelling is decided: every "X is not
+/// installed" message routes through here, so a message written on an
+/// apt box does not tell a dnf box the wrong command. Debian and
+/// RHEL-family are spelled out because those are the platforms cloud
+/// hosts use (package names verified on both, via [`rpm_name`]); the
 /// others get a direction rather than a fabricated command, which is
 /// the honest thing when the names are not verified.
 pub fn install_hint(packages: &[String]) -> String {
     if packages.is_empty() {
         return String::new();
     }
-    if cfg!(target_os = "macos") {
-        format!(
-            "brew install {}   (names may differ on macOS)",
-            packages.join(" ")
-        )
-    } else if cfg!(target_os = "windows") {
-        "no native Windows build is supported; use WSL2 \
-         (https://flodl.dev/guide/windows-wsl)"
-            .to_string()
-    } else if crate::util::platform::Platform::detect() == crate::util::platform::Platform::Rhel {
-        let list = packages.iter().map(|p| rpm_name(p)).collect::<Vec<_>>();
-        format!(
-            "sudo dnf install {}   (or your distribution's equivalent)",
-            list.join(" ")
-        )
-    } else {
-        format!(
-            "sudo apt install {}   (or your distribution's equivalent)",
-            packages.join(" ")
-        )
+    if cfg!(target_os = "windows") {
+        return "no native Windows build is supported; use WSL2 \
+                (https://flodl.dev/guide/windows-wsl)"
+            .to_string();
+    }
+    let plat = Platform::detect();
+    let names: Vec<String> = match plat {
+        Platform::Rhel => packages.iter().map(|p| rpm_name(p)).collect(),
+        _ => packages.to_vec(),
+    };
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    match plat.install(&refs) {
+        Some(cmd) if plat == Platform::MacOs => format!("{cmd}   (names may differ on macOS)"),
+        Some(cmd) => format!("{cmd}   (or your distribution's equivalent)"),
+        None => format!("install {} with your package manager", names.join(" ")),
+    }
+}
+
+/// A tool a walk-in reaches for and does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolGap {
+    /// Command probed on PATH.
+    pub tool: &'static str,
+    /// The `join:` field that reaches for it, when one does. `None` is
+    /// the advisory case: nothing in this box's config names the tool,
+    /// so `fdl join` will not miss it unless the config grows a use.
+    pub needed_by: Option<&'static str>,
+    /// The install line for this platform.
+    pub install: String,
+}
+
+/// The tools a `join:` block's transports reach for, checked against
+/// PATH: `data_source: sshfs://` needs sshfs, `source.from: rsync://`
+/// needs rsync, `source.from: git+...` needs git.
+///
+/// A tool the block names is required: `fdl join` refuses the box
+/// without it, permanently. The two door tools (sshfs, rsync) are also
+/// reported when the block does NOT name them, as advisory gaps: a box
+/// that mounts its data root at provisioning time and runs a declared
+/// `bin:` needs neither, and the operator is trusted to know which
+/// modes the box will be asked for. The toolchain is out of scope here:
+/// `fdl join` names rustup itself, since a distribution's cargo is not
+/// the answer.
+pub fn walkin_tool_gaps(join: &crate::config::WorkerJoin) -> Vec<ToolGap> {
+    walkin_tool_gaps_with(join, system::has_command)
+}
+
+/// [`walkin_tool_gaps`] with the PATH probe injected, so the table is
+/// testable from a host that has everything installed.
+pub fn walkin_tool_gaps_with(
+    join: &crate::config::WorkerJoin,
+    has: impl Fn(&str) -> bool,
+) -> Vec<ToolGap> {
+    use crate::spec::split_scheme;
+    let data_scheme = join.data_source.as_deref().map(|s| split_scheme(s).0);
+    let source_scheme = join.source.as_ref().map(|s| split_scheme(&s.from).0);
+    let named = |tool: &str| -> Option<&'static str> {
+        match tool {
+            "sshfs" if data_scheme == Some(Some("sshfs")) => Some("data_source: sshfs://"),
+            "rsync" if source_scheme == Some(Some("rsync")) => Some("source.from: rsync://"),
+            "git" if matches!(source_scheme, Some(Some(s)) if s.starts_with("git+")) => {
+                Some("source.from: git+")
+            }
+            _ => None,
+        }
+    };
+    ["sshfs", "rsync", "git"]
+        .into_iter()
+        .filter(|tool| !has(tool))
+        .filter_map(|tool| {
+            let needed_by = named(tool);
+            // git only matters when a spec names it: it is not a door
+            // tool, and most boxes have it for unrelated reasons.
+            if tool == "git" && needed_by.is_none() {
+                return None;
+            }
+            Some(ToolGap {
+                tool,
+                needed_by,
+                install: install_hint(&[tool.to_string()]),
+            })
+        })
+        .collect()
+}
+
+/// One line per gap, in the severity the caller asked for: a named
+/// tool reads as a refusal `fdl join` will issue, an advisory one as
+/// what the box cannot do until it is installed.
+pub fn tool_gap_message(gap: &ToolGap) -> String {
+    match gap.needed_by {
+        Some(field) => format!(
+            "`{field}` in this box's join: block needs {tool}, which is not installed; \
+             `fdl join` will refuse to dial. {install}",
+            tool = gap.tool,
+            install = gap.install,
+        ),
+        None => {
+            let does = match gap.tool {
+                "sshfs" => "mount a `data_source: sshfs://` root",
+                _ => "pull a `source.from: rsync://` tree",
+            };
+            format!(
+                "{tool} is not installed, so this box cannot {does}. Fine if it is \
+                 never asked to; otherwise {install}",
+                tool = gap.tool,
+                install = gap.install,
+            )
+        }
     }
 }
 
@@ -383,6 +479,78 @@ mod tests {
         }
     }
 
+    fn join(data_source: Option<&str>, source: Option<&str>) -> crate::config::WorkerJoin {
+        crate::config::WorkerJoin {
+            data_source: data_source.map(str::to_string),
+            source: source.map(|from| crate::config::WorkerSource {
+                from: from.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn walkin_gaps_are_required_when_the_block_names_the_transport() {
+        let nothing = |_: &str| false;
+        let gaps = walkin_tool_gaps_with(
+            &join(
+                Some("sshfs://op@ctrl:/flodl/data"),
+                Some("rsync://op@ctrl:/tree"),
+            ),
+            nothing,
+        );
+        let by_tool = |t: &str| gaps.iter().find(|g| g.tool == t).cloned();
+        assert_eq!(
+            by_tool("sshfs").unwrap().needed_by,
+            Some("data_source: sshfs://")
+        );
+        assert_eq!(
+            by_tool("rsync").unwrap().needed_by,
+            Some("source.from: rsync://")
+        );
+        // git is not named by an rsync source, and it is not a door tool.
+        assert!(by_tool("git").is_none(), "{gaps:?}");
+
+        let gaps = walkin_tool_gaps_with(&join(None, Some("git+https://h/o/r#v1")), nothing);
+        let git = gaps.iter().find(|g| g.tool == "git").unwrap();
+        assert_eq!(git.needed_by, Some("source.from: git+"));
+        let msg = tool_gap_message(git);
+        assert!(msg.contains("refuse to dial"), "{msg}");
+        assert!(msg.contains(&install_hint(&["git".to_string()])), "{msg}");
+    }
+
+    #[test]
+    fn walkin_door_tools_are_advisory_when_unnamed_and_silent_when_present() {
+        // A bare data_path and a declared bin name no transport: the two
+        // door tools are still reported, softly, and git is not.
+        let gaps = walkin_tool_gaps_with(&join(None, None), |_| false);
+        let tools: Vec<_> = gaps.iter().map(|g| g.tool).collect();
+        assert_eq!(tools, ["sshfs", "rsync"]);
+        assert!(gaps.iter().all(|g| g.needed_by.is_none()), "{gaps:?}");
+        let msg = tool_gap_message(&gaps[0]);
+        assert!(msg.contains("Fine if it is never asked to"), "{msg}");
+        assert!(!msg.contains("refuse"), "{msg}");
+
+        // Everything installed: nothing to say, named or not.
+        let gaps =
+            walkin_tool_gaps_with(&join(Some("sshfs://h:/d"), Some("rsync://h:/t")), |_| true);
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
+
+    #[test]
+    fn install_hint_speaks_this_platforms_manager() {
+        // Whatever the family, the hint is the Platform decider's line
+        // (plus a caveat), never a spelling of its own, which is the
+        // whole point of having one.
+        let plat = Platform::detect();
+        let hint = install_hint(&["rsync".to_string()]);
+        match plat.install(&["rsync"]) {
+            Some(cmd) if !cfg!(target_os = "windows") => assert!(hint.starts_with(&cmd), "{hint}"),
+            _ => assert!(!hint.contains("sudo"), "{hint}"),
+        }
+    }
+
     #[test]
     fn install_hint_is_empty_when_nothing_is_missing() {
         assert!(install_hint(&[]).is_empty());
@@ -457,6 +625,8 @@ mod tests {
             ("g++", "gcc-c++"),
             ("curl", "curl"),
             ("unzip", "unzip"),
+            ("sshfs", "fuse-sshfs"),
+            ("rsync", "rsync"),
         ] {
             assert_eq!(rpm_name(deb), rpm, "{deb}");
         }

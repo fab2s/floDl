@@ -407,18 +407,14 @@ fdl.yaml
             s.push_str(
                 ".cargo-cache/
 .cargo-git/
-.cargo-cache-cuda/
-.cargo-git-cuda/
 ",
             );
         }
         Mode::Mounted => {
-            // Mounted libtorch + separate cargo caches per docker service.
+            // Mounted libtorch + the cargo caches every service shares.
             s.push_str(
                 ".cargo-cache/
 .cargo-git/
-.cargo-cache-cuda/
-.cargo-git-cuda/
 libtorch/
 ",
             );
@@ -474,8 +470,8 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     user: "${{UID:-1000}}:${{GID:-1000}}"
     volumes:
       - .:/workspace
-      - ./.cargo-cache-cuda:/usr/local/cargo/registry
-      - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -520,8 +516,8 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     ipc: host
     volumes:
       - .:/workspace
-      - ./.cargo-cache-rocm:/usr/local/cargo/registry
-      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -584,8 +580,8 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     user: "${{UID:-1000}}:${{GID:-1000}}"
     volumes:
       - .:/workspace
-      - ./.cargo-cache-cuda:/usr/local/cargo/registry
-      - ./.cargo-git-cuda:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ${{LIBTORCH_HOST_PATH:-./libtorch/precompiled/cu128}}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true
@@ -631,8 +627,8 @@ fn docker_compose_template(crate_name: &str, baked: bool) -> String {
     ipc: host
     volumes:
       - .:/workspace
-      - ./.cargo-cache-rocm:/usr/local/cargo/registry
-      - ./.cargo-git-rocm:/usr/local/cargo/git
+      - ./.cargo-cache:/usr/local/cargo/registry
+      - ./.cargo-git:/usr/local/cargo/git
       - ${{LIBTORCH_HOST_PATH:-./libtorch/precompiled/rocm70}}:/usr/local/libtorch:ro
     working_dir: /workspace
     stdin_open: true

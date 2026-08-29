@@ -136,6 +136,26 @@ pub const ENV_AGENT_JSON: &str = "FLODL_INTERNAL_AGENT_JSON";
 /// auto-promote, before any cluster role, touching no CUDA context.
 pub const ENV_MODEL_SIG_PROBE: &str = "FLODL_INTERNAL_MODEL_SIG_PROBE";
 
+/// True when this process is `fdl join`'s model-signature probe.
+///
+/// The probe asks what the model IS, not whether this box can train it,
+/// and it runs OUTSIDE any cluster: a `main()` that gates on the local
+/// GPU count ahead of [`Trainer::run`] ("cpu-async needs 2+ GPUs, have
+/// 1") therefore exits before the trainer can answer, and the join
+/// proceeds without a signature. Let such a gate step aside when this
+/// returns true; the same gate keeps its meaning for a real run.
+///
+/// ```no_run
+/// use flodl::distributed::launcher::model_sig_probe_requested;
+/// let in_cluster = std::env::var_os("FLODL_INTERNAL_CLUSTER_JSON").is_some()
+///     || model_sig_probe_requested();
+/// ```
+///
+/// [`Trainer::run`]: crate::distributed::Trainer::run
+pub fn model_sig_probe_requested() -> bool {
+    std::env::var_os(ENV_MODEL_SIG_PROBE).is_some()
+}
+
 /// Environment variable carrying the fdl command name (e.g. `train`) the
 /// launcher should invoke on remote hosts via `ssh ... fdl <cmd>`. Set by
 /// fdl-cli when invoking the user binary as a launcher; required by the
@@ -966,6 +986,11 @@ pub fn run_launcher_with_config(
     let gate_abort = Arc::clone(&abort);
     let gate_status = status_board.clone();
     let gate_source = crate::distributed::port_mux::StreamSource::Mux(mux_join);
+    // The run, as this process states it: its own argument list, which
+    // every admitted box spawns its ranks with (see `RunSpec`).
+    let gate_run = crate::distributed::wire::RunSpec {
+        args: env::args().skip(1).collect(),
+    };
     let gate = thread::Builder::new()
         .name("flodl-join-gate".to_string())
         .spawn(move || {
@@ -976,6 +1001,7 @@ pub fn run_launcher_with_config(
                 !open_admission,
                 None,
                 expected_model_sig,
+                &gate_run,
                 &gate_abort,
                 &gate_status,
             )

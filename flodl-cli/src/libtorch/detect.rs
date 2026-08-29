@@ -49,9 +49,9 @@ pub fn read_active(root: &Path) -> Option<LibtorchInfo> {
             if !case_file.exists() {
                 eprintln!(
                     "fdl: FDL_LIBTORCH_CASE={case} but `{}` does not exist. \
-                     Create it with `fdl libtorch use <variant> --as {case}` \
-                     or hand-write the variant path (e.g. \
-                     `precompiled/cu128`).",
+                     Create it with the variant path as its one line, e.g. \
+                     `echo precompiled/cu128 > {}`.",
+                    case_file.display(),
                     case_file.display(),
                 );
                 return None;

@@ -101,7 +101,12 @@ pub const CONTROL_FRAME_MAGIC: u32 = 0xF10D_17C4;
 // v5: `TimingMsgWire` gained `DashboardGraphTimings` (per-rank
 // accumulated graph timings at clean teardown, for the dashboard's
 // timing heat map).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
+// v6: `JoinMsgWire::Accept` carries the run (`RunSpec`: the controller's
+// own argument list). An agent spawns its relay and ranks with it
+// instead of with whatever `fdl join` was given, so a box that brings its
+// own binary and knows nothing about the run trains the right one, and
+// two boxes admitted into one world cannot hold different arguments.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Channel-select magics (single-port mux)
@@ -1714,6 +1719,21 @@ pub enum RendezvousMsgWire {
     },
 }
 
+/// What a run IS, as the controller states it at admission.
+///
+/// Carried in [`JoinMsgWire::Accept`]. The controller process is the
+/// training binary, so its own argument list is the run's: every rank on
+/// every host re-enters the binary with exactly this list, taken from one
+/// place. A worker therefore needs to know nothing about a run to join
+/// it beyond which binary to run and where the controller is. Shaped as
+/// its own message so a resident farm daemon can later push it again
+/// over a standing connection for the next run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSpec {
+    /// The binary's arguments (`argv[1..]` of the controller process).
+    pub args: Vec<String>,
+}
+
 /// Wire-side membership message. Carried inside a [`ControlFrame`]
 /// tagged with [`MsgKind::Join`] on the join channel
 /// ([`CHANNEL_MAGIC_JOIN`]).
@@ -1794,6 +1814,9 @@ pub enum JoinMsgWire {
         /// self-describes instead of guessing the controller's window
         /// config.
         formation_wait_secs: u64,
+        /// The run every admitted box will execute: the controller's own
+        /// argument list, which its relay and ranks are spawned with.
+        run: RunSpec,
     },
     /// Controller → worker agent: join refused (version skew, dataset
     /// mismatch, duplicate host, capacity abuse). The connection is

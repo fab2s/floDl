@@ -38,6 +38,13 @@ post-deploy smoke test.
   unzip, a C++ compiler) and the ACTIVE variant's vendor toolkit
   headers — the full set `flodl-sys/build.rs` demands (7 headers on
   ROCm, which has no metapackage), each with the install command.
+- **Walk-in tooling**: when the project carries a `join:` block, the
+  tools its transports reach for (`sshfs` for `data_source: sshfs://`,
+  `rsync` / `git` for `source.from:`). A named transport whose tool is
+  missing is an error, since `fdl join` refuses the box over it; a door
+  tool the block does not name is a warning, because a box that mounts
+  its data root at provisioning time and runs a declared `bin:` needs
+  neither. Every install line is spelled for this box's package manager.
 - **NCCL availability**: host-level `libnccl.so` linkage, version. On
   workers with `docker: <svc>` declared in `fdl.cluster.yml`, the
   probe reports "via Docker image `<svc>`" instead of erroring on a
@@ -143,6 +150,33 @@ The tree lands in `<served>/tree` (default `~/.flodl/run/tree`), which
 is what a worker's `--source` points at, and the manifest sits at its
 root so one fetch carries both.
 
+**What the tree contains is cargo's answer, not a copy of the checkout.**
+For a cargo project, publish lists the path crates the project resolves
+(`cargo metadata`: the project and every path dependency, which must all
+lie inside the source root) and takes each crate's own file list (`cargo
+package --list`: tracked and untracked-but-not-ignored files in a git
+repo, the crate directory minus `package.exclude` outside one), plus the
+workspace-level files no crate lists and every build reads: the root
+manifests, `Cargo.lock` (the one gitignored file that must travel, it is
+the verified pin), `rust-toolchain.toml`, `.cargo/config.toml`. Nothing
+else ships: not `target/`, not registry or model caches, not datasets,
+not whatever else lives beside the code. The report says how many files
+and bytes the tree is, so a tree that is suddenly large is visible before
+any worker pulls it. A tree with no `Cargo.toml` at the project dir (a
+script or make build) is copied whole, as the only honest default for a
+build system fdl does not understand. A remote source (`rsync://`,
+`git+`) is fetched whole into `<served>/fetch` first, since the listing
+needs the manifests, then reduced.
+
+**The tree carries its own digest.** Beside the manifest, `.fdl-run.sha256`
+lists every published file with its SHA-256 in `sha256sum` format (so
+`sha256sum -c .fdl-run.sha256` checks a tree by hand), and the manifest
+records that sidecar's hash with the file and byte counts. A worker
+recomputes it after every fetch and before it builds: a tree that
+differs from what was published, in any file, is refused as a transient
+failure naming the files, so a pull that straddled a re-publish re-dials
+into a coherent tree instead of building a mix.
+
 Flags: `--bin` (required — the artifact relative to the project dir; a
 workspace member's build lands in the WORKSPACE `target/`, so no rule
 fdl invented would be right for everyone), `--cwd` (project dir inside
@@ -186,12 +220,13 @@ publish:
 | `cwd` | project directory inside the tree (default: its root); governs the build AND the run |
 | `build` | build recipe, a shell line (default `cargo build --release`) |
 | `bin` | built artifact, relative to `cwd` — what workers run |
-| `args` | the binary's own arguments (everything after `--`) |
+| `args` | the binary's arguments as published: the pre-dial model-signature probe runs with them. The ranks themselves run the arguments the CONTROLLER states at admission (its own command line), so these document the run rather than define it |
 | `origin` | the source spec the controller resolved, for provenance |
 | `rustc` | `rustc -V` on the controller — advisory; a worker reports a mismatch, never enforces it |
 | `published_epoch` | unix seconds at publish, so a box can say how old its run is |
 | `run` | this publish's identity nonce; it rides each worker's join hello, and the window refuses a cohort whose members hold different ids (two boxes that fetched across a publish boundary would train two different runs as one world) |
 | `built` | `false` when `--no-build` skipped the gate; workers say so out loud |
+| `digest` | `sha256` of the `.fdl-run.sha256` sidecar, with `files` and `bytes`; a worker verifies the fetched tree against it before building |
 
 Do not hand-edit it: the next publish overwrites it, and its *presence*
 is what tells a worker the run is ready.
@@ -200,11 +235,18 @@ is what tells a worker the run is ready.
 again and every box picks the new run up on its next dial, with nothing
 to edit on any worker. That is the point of the manifest: a worker's own
 config keeps only what is stable for that box (its credentials, its
-libtorch policy, where to pull from), while `cwd` / `build` / `bin` /
-`args` belong to the run and come from the controller. `args` is the
-sharp case rather than a convenience: they must match the run, because
-rank children re-enter the binary with them, so a fleet carrying its own
-copy would train the next run with the previous one's hyperparameters.
+libtorch policy, where to pull from), while `cwd` / `build` / `bin`
+belong to the run and come from the controller through it. **The
+arguments come from the controller directly, at admission**: the accept
+reply carries the controller's own command line, and every admitted
+box spawns its relay and ranks with exactly that list, never with what
+`fdl join` was given. Rank children re-enter the binary with those
+arguments, so this is what makes a world consistent by construction: a
+box that brings its own binary (`bin:`) and knows nothing about the run
+trains the right one, and two boxes admitted into one world cannot hold
+different arguments. What a worker knows locally (the manifest's `args`,
+a `--` tail on `fdl join`) only feeds the pre-dial model-signature probe;
+a box that knows nothing skips the probe and is checked at formation.
 
 **The build is validation, not an artifact.** One build gates the
 publish; every worker still compiles its own, because a controller
@@ -275,9 +317,11 @@ fdl join --ssh flodl-join@ctrl.example.com --identity ~/.ssh/join_key \
   run: rank children re-enter the binary with them.
 - `--devices 0,1` scopes the GPUs offered (default: all);
   `--host` names the worker in the roster (default: hostname).
-- `--persist` re-dials with backoff (5s doubling to 60s) whenever the
-  agent exits — no window open yet, run finished, controller rebooted —
-  the systemd / golden-image mode.
+- `--persist` re-dials whenever the agent exits — no window open yet,
+  run finished, controller rebooted — the systemd / golden-image mode.
+  A completed run re-dials after 5s (the next run is usually being
+  started right then); failures and dials with no window open back off
+  from 5s toward 60s.
 - Inside a project, the active libtorch's `lib/` rides
   `LD_LIBRARY_PATH` onto the binary automatically (`FDL_LIBTORCH_CASE`
   honored) and its variant label rides the join hello.
@@ -392,7 +436,11 @@ source on its next re-dial, with no reprovisioning.
   (a rebuild or a re-publish re-probes), not once per backoff tick. Without it the mismatch is
   still caught, but at formation, where it takes the whole cohort's
   attempt down. The probe is best-effort: a probe that fails or times
-  out joins without a signature and says so. One probe outcome deserves
+  out joins without a signature and says so. It runs OUTSIDE any
+  cluster, so a `main()` that bails on the local GPU count ahead of
+  `Trainer::run` answers nothing; let that gate step aside when
+  `flodl::distributed::launcher::model_sig_probe_requested()` is true
+  (ddp-bench does). One probe outcome deserves
   attention beyond its warning: a binary that exits non-zero under the
   probe will usually fail the same way when rank children re-enter it
   with the same arguments after admission.
